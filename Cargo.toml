@@ -1,0 +1,147 @@
+[package]
+name = "meterstore"
+version = "0.1.0"
+edition = "2024"
+description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hupe1980/meterstore"
+keywords = ["metering", "iceberg", "timeseries", "postgres"]
+categories = ["database", "data-structures"]
+readme = "README.md"
+# Set by the highest dependency floor (metering and iceberg both want
+# 1.94), not by this crate's own syntax, which needs only 1.88.
+rust-version = "1.94"
+
+# docs.rs otherwise builds default features only, which would document neither
+# Flight SQL nor the catalog facade nor the testkit — all three of which the
+# crate-level documentation talks about. A published crate whose docs describe
+# surfaces the docs do not contain is worse than one that says less.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+# Large dependency trees (DataFusion + Iceberg) produce test binaries whose
+# unwind tables exceed the 16 MB the macOS linker can encode compactly. The
+# resulting note is about debug-info layout, not about this crate's code, and
+# there is no action to take — but `-D warnings` would otherwise fail the build
+# on developer machines while passing in CI.
+linker_messages = "allow"
+
+[dependencies]
+# --- Query Engine ---
+# Single-sourced: every DataFusion-dependent crate must track this same major.
+# A duplicate `datafusion` in `cargo tree -d` is a build failure, not a warning:
+# two majors give mutually incompatible `TableProvider` and `RecordBatch` types.
+datafusion = "53.1"
+async-trait = "0.1"
+# The same `arrow` DataFusion already pulls (re-exported as `crate::arrow`),
+# declared only to switch on the `json` feature so `QueryResult::to_json` can walk
+# a `RecordBatch` into JSON rows. Pinned to the shared 58 major; the duplicate gate
+# fails the build if it ever diverges from DataFusion's arrow.
+arrow = { version = "58.4", default-features = false, features = ["json"] }
+
+# --- Cold Tier: Apache Iceberg ---
+iceberg = "0.10"
+iceberg-datafusion = "0.10"
+iceberg-catalog-sql = "0.10"
+iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs"] }
+# REST catalog client, and the basis for the read-only catalog facade that lets
+# Spark/Trino/DuckDB/PyIceberg read the history directly from object storage,
+# without MeterStore in the data path.
+iceberg-catalog-rest = { version = "0.10", optional = true }
+
+# --- Hot Tier: PostgreSQL ---
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal", "time"] }
+
+# --- Domain Layer ---
+# `metering` owns the domain: MeterInterval, MeasurementSeries, QualityFlag,
+# MeasurementUnit, IntervalResolution, DST-aware billing aggregation, gas
+# conversion, Ersatzwertbildung. MeterStore persists and queries those types —
+# it does not redefine them. Part of the mako platform (hupe1980/mako).
+metering = { version = "0.16", features = ["serde"] }
+
+# Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
+# Mixing the two would force a conversion at every row boundary. time-tz is
+# load-bearing: Europe/Berlin DST gives 92- and 100-interval days, and every
+# daily aggregate depends on getting that right.
+time = { version = "0.3", features = ["macros"] }
+time-tz = "2"
+# Settlement is money — never f64.
+rust_decimal = "1"
+
+# --- Erasure ---
+# Pseudonymous references must be unpredictable: a reference an attacker can
+# guess or recompute is a re-identification path that survives erasure. This is
+# the OS CSPRNG, not `std`'s hash seed, which is explicitly documented as not
+# cryptographically secure.
+getrandom = "0.3"
+# Keyed hash of an erased identifier, so a replaying pipeline can be refused
+# without the audit trail retaining the identifier it just erased.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# --- Runtime ---
+tokio = { version = "1.0", features = ["full"] }
+futures-util = "0.3"
+
+# --- Optional ---
+# CDC seam. No v1 implementation — archival is the ingestion path, since
+# metering data arrives in batches and hours of lake latency is correct.
+# Present so a future latency requirement needs no restructure.
+rustcdc = { version = "0.7", optional = true }
+testcontainers = { version = "0.23", optional = true }
+testcontainers-modules = { version = "0.11", features = ["postgres"], optional = true }
+tempfile = { version = "3.27", optional = true }
+axum = { version = "0.8", optional = true }
+thiserror = "2.0.19"
+tracing = "0.1.44"
+serde_json = "1.0.151"
+serde = { version = "1.0.229", features = ["derive"] }
+# Pinned to the same major as `arrow` (itself sourced via datafusion). The CI
+# duplicate-dependency gate fails the build if these ever diverge, because two
+# parquet versions mean two incompatible `WriterProperties` types.
+parquet = { version = "58.4", default-features = false, features = ["arrow", "zstd", "snap"] }
+async-stream = "0.3.6"
+futures = "0.3.33"
+opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
+toml = "0.9"
+# --- Serving: Flight SQL (§13.7.3) ---
+# Pinned to the same major as `arrow`, which is itself sourced via datafusion.
+# The duplicate-dependency gate covers `arrow`, so a Flight version pulling a
+# second one fails the build rather than producing two mutually unusable
+# `RecordBatch` types. `tonic` and `prost` follow arrow-flight's own floors.
+arrow-flight = { version = "58.4", features = ["flight-sql"], optional = true }
+tonic = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+tokio-test = "0.4.5"
+criterion = { version = "0.7", features = ["async_tokio"] }
+# Turns a bound `TcpListener` into the connection stream tonic serves, so the
+# Flight tests can take an ephemeral port instead of racing on a fixed one.
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[features]
+default = ["rest-catalog"]
+rest-catalog = ["dep:iceberg-catalog-rest"]
+# Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
+catalog-facade = ["dep:axum"]
+# Arrow Flight SQL over the unified hot + cold view (§13.7.3). The one surface
+# an external client cannot assemble for itself.
+flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
+cdc = ["dep:rustcdc"]
+testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+
+# Benchmarks run under `cargo bench`, not under `cargo test`: criterion's own
+# harness collects samples, and the default one would treat each benchmark as a
+# test and report nothing useful.
+[[bench]]
+name = "encoding"
+harness = false

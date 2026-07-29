@@ -1,0 +1,680 @@
+//! A harness, a workload generator, and the assertions that matter.
+//!
+//! Behind the `testkit` feature, and part of the public API on purpose: the
+//! properties in §17.3 are what a *deployment* needs to be able to check, not
+//! only what this crate needs to check about itself. A utility integrating
+//! MeterStore should be able to run the same oracle against its own
+//! configuration and its own volumes.
+//!
+//! # The oracle
+//!
+//! > For any archival history and any query range, a query over the unified
+//! > view must equal the same query against a single reference table holding
+//! > every row ever written, with latest-version-wins applied.
+//!
+//! [`Oracle`] is that sentence, executable. It keeps every row the workload ever
+//! produced, resolves them the way the domain says to, and compares against what
+//! the store returns. It is deliberately a *different implementation* of
+//! resolution — a `BTreeMap` fold in Rust rather than a window function in SQL —
+//! because an oracle that shared the implementation under test would agree with
+//! it about everything, including its mistakes.
+//!
+//! # Why the generator is seeded
+//!
+//! A failure nobody can reproduce is a failure nobody can fix.
+//! [`MeteringWorkload`] takes a seed and derives everything from it, so a
+//! failing run is replayable from the seed alone. The generator is a small
+//! explicit PRNG rather than a dependency, so the sequence is stable across
+//! toolchains and crate versions — a workload that changed shape when a
+//! transitive dependency bumped would quietly stop testing what it used to.
+
+use std::collections::BTreeMap;
+
+use metering::interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte};
+use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::resolution::IntervalResolution;
+use rust_decimal::Decimal;
+use time::{Duration, OffsetDateTime};
+
+use crate::encode::StoredSeries;
+use crate::error::{Error, Result};
+use crate::version::{ScopedVersion, Version, VersionScope};
+
+pub mod harness;
+
+pub use harness::TestHarness;
+
+/// A deterministic PRNG.
+///
+/// SplitMix64: three lines, no dependency, and a fixed sequence for a given
+/// seed forever. A workload whose shape drifted when a transitive dependency
+/// bumped would quietly stop testing what it used to, and the failure mode is
+/// that coverage silently narrows rather than that anything breaks.
+#[derive(Debug, Clone)]
+pub struct Rng(u64);
+
+impl Rng {
+    /// Seed the generator.
+    pub const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    /// The next value in the sequence.
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value below `n`.
+    pub fn below(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next_u64() % n }
+    }
+
+    /// Whether an event with probability `p` occurs.
+    pub fn chance(&mut self, p: f64) -> bool {
+        let scale = 1_000_000u64;
+        self.below(scale) < (p.clamp(0.0, 1.0) * scale as f64) as u64
+    }
+}
+
+/// A generated metering workload.
+///
+/// Shaped like the real thing rather than like uniform noise, because the
+/// properties under test are sensitive to exactly the ways metering data is not
+/// uniform: corrections are rare and recent, some intervals never arrive, and
+/// the day length changes twice a year.
+#[derive(Debug, Clone)]
+pub struct MeteringWorkload {
+    seed: u64,
+    malo_ids: usize,
+    days: i64,
+    start: OffsetDateTime,
+    resolution: Duration,
+    correction_rate: f64,
+    gap_rate: f64,
+    operator: String,
+    malo_offset: usize,
+    sparte: Sparte,
+    unit: MeasurementUnit,
+}
+
+impl MeteringWorkload {
+    /// A workload starting at `start`, with defaults matching §17.3.
+    pub fn new(start: OffsetDateTime) -> Self {
+        Self {
+            seed: 0x5EED,
+            malo_ids: 10,
+            days: 3,
+            start,
+            resolution: Duration::minutes(15),
+            correction_rate: 0.0,
+            gap_rate: 0.0,
+            operator: "9900000000001".to_string(),
+            malo_offset: 0,
+            sparte: Sparte::Strom,
+            unit: Sparte::Strom.billing_unit(),
+        }
+    }
+
+    /// Measure a different commodity, in that commodity's billing unit.
+    ///
+    /// Water is the one that matters most here: it is billed in m³, so a store
+    /// that only ever saw electricity would never notice it was treating the
+    /// unit as decoration. Override the unit with [`in_unit`](Self::in_unit) for
+    /// gas held as unconverted Betriebsvolumen.
+    pub fn sparte(mut self, sparte: Sparte) -> Self {
+        self.sparte = sparte;
+        self.unit = sparte.billing_unit();
+        self
+    }
+
+    /// Store the values in a unit other than the Sparte's billing unit.
+    pub fn in_unit(mut self, unit: MeasurementUnit) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    /// Report at an interval other than 15 minutes.
+    ///
+    /// Sub-quarter-hourly data is what iMSys can already deliver and what §14a
+    /// steering will need, and the interval count per day is not 96 — so a
+    /// workload that only ever generated quarter-hours would leave every
+    /// resolution-dependent path (completeness, the DST calendar, the expected
+    /// interval UDF) asserted against a single value.
+    ///
+    /// Rejected if it does not divide a day evenly: a workload that generated a
+    /// ragged final interval would fail for a reason that has nothing to do with
+    /// what it was written to test.
+    pub fn resolution(mut self, resolution: Duration) -> Result<Self> {
+        let seconds = resolution.whole_seconds();
+        if seconds <= 0 || Duration::DAY.whole_seconds() % seconds != 0 {
+            return Err(Error::config(format!(
+                "workload resolution {resolution} must be a positive divisor of 24 h"
+            )));
+        }
+        self.resolution = resolution;
+        Ok(self)
+    }
+
+    /// Fix the seed. A failing run is replayable from this alone.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// How many measuring points report.
+    pub fn malo_ids(mut self, n: usize) -> Self {
+        self.malo_ids = n.max(1);
+        self
+    }
+
+    /// How many days the workload covers.
+    pub fn days(mut self, n: i64) -> Self {
+        self.days = n.max(1);
+        self
+    }
+
+    /// Shift the generated MaLo-IDs so two workloads describe different meters.
+    ///
+    /// MaLo-IDs are derived from the index, not from the seed, so two workloads
+    /// of the same size describe the *same* measuring points however they are
+    /// seeded. That is right for replaying one population and wrong for composing
+    /// several — and composing them is exactly what a multi-Sparte portfolio is,
+    /// since a Marktlokation belongs to one commodity and `sparte` is deliberately
+    /// not part of the merge key.
+    pub fn malo_offset(mut self, offset: usize) -> Self {
+        self.malo_offset = offset;
+        self
+    }
+
+    /// The share of intervals that are later corrected.
+    ///
+    /// Rare by default because they are rare in practice, and because that is
+    /// the property merge elision depends on (§9.2).
+    pub fn with_corrections(mut self, rate: f64) -> Self {
+        self.correction_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// The share of intervals that never arrive.
+    ///
+    /// A gap is ordinary — a meter can simply not report — and completeness
+    /// exists to say so (§9.6). A workload with none of them never exercises it.
+    pub fn with_gaps(mut self, rate: f64) -> Self {
+        self.gap_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Start the workload on the day German local time loses an hour.
+    ///
+    /// The 92-interval day. A workload that never spans one leaves the most
+    /// error-prone fixture in the domain untested.
+    pub fn spanning_spring_forward(mut self) -> Self {
+        self.start = time::macros::datetime!(2026-03-28 00:00 UTC);
+        self.days = self.days.max(3);
+        self
+    }
+
+    /// Start the workload on the day German local time gains an hour.
+    ///
+    /// The 100-interval day, and the dangerous direction: a check that assumed
+    /// 96 would call a four-interval shortfall complete.
+    pub fn spanning_autumn_back(mut self) -> Self {
+        self.start = time::macros::datetime!(2026-10-24 00:00 UTC);
+        self.days = self.days.max(3);
+        self
+    }
+
+    /// The interval range the workload covers.
+    pub fn range(&self) -> (OffsetDateTime, OffsetDateTime) {
+        (self.start, self.start + Duration::days(self.days))
+    }
+
+    /// Generate the series, in delivery order.
+    ///
+    /// Corrections come *after* the deliveries they correct, which is what makes
+    /// the version axis meaningful: a store that happened to apply them in the
+    /// other order would pass a test whose input arrived pre-sorted.
+    pub fn generate(&self) -> Result<Vec<StoredSeries>> {
+        let mut rng = Rng::new(self.seed);
+        let mut out = Vec::new();
+        let mut corrections: Vec<(usize, OffsetDateTime, Decimal)> = Vec::new();
+
+        for day in 0..self.days {
+            let day_start = self.start + Duration::days(day);
+            let steps = Duration::DAY.whole_seconds() / self.resolution.whole_seconds();
+
+            for malo in 0..self.malo_ids {
+                let mut intervals = Vec::new();
+                for step in 0..steps {
+                    let from = day_start + self.resolution * step as i32;
+                    if rng.chance(self.gap_rate) {
+                        continue;
+                    }
+                    let kwh = Decimal::new(rng.below(500) as i64 + 1, 2);
+                    if rng.chance(self.correction_rate) {
+                        corrections.push((malo, from, kwh + Decimal::new(100, 2)));
+                    }
+                    intervals.push(self.interval(from, kwh));
+                }
+                // A delivery is split per version scope, not per day. A UTC day
+                // is not inside one local month: 2026-07-31T22:00Z is already
+                // August in Berlin, so a day-aligned batch at a month end spans
+                // two scopes and encoding rejects it (§4.2). Real ingestion has
+                // the same constraint, which is the point of generating it.
+                for (_, group) in group_by_scope(intervals) {
+                    let anchor = group[0].from;
+                    out.push(self.stored(malo, group, FIRST_VERSION, anchor)?);
+                }
+            }
+        }
+
+        // Corrections are grouped per measuring point so each lands as one
+        // delivery, which is how a market message arrives.
+        let mut by_malo: BTreeMap<usize, Vec<MeterInterval>> = BTreeMap::new();
+        for (malo, from, kwh) in corrections {
+            by_malo
+                .entry(malo)
+                .or_default()
+                .push(self.interval(from, kwh));
+        }
+        for (malo, mut intervals) in by_malo {
+            intervals.sort_by_key(|i| i.from);
+            // A version scope covers one local month, so a correction batch
+            // spanning a month boundary has to be split — encoding rejects a
+            // scope that does not cover its intervals (§4.2).
+            for (_, group) in group_by_scope(intervals) {
+                let anchor = group[0].from;
+                out.push(self.stored(malo, group, CORRECTION_VERSION, anchor)?);
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn interval(&self, from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
+        MeterInterval {
+            from,
+            to: from + self.resolution,
+            value_kwh: kwh,
+            quality: QualityFlag::Measured,
+            obis_code: "1-0:1.8.0".parse().ok(),
+        }
+    }
+
+    fn stored(
+        &self,
+        malo: usize,
+        intervals: Vec<MeterInterval>,
+        version: u128,
+        scope_anchor: OffsetDateTime,
+    ) -> Result<StoredSeries> {
+        let malo_id = malo_id(self.malo_offset + malo);
+        let recorded_at = intervals.last().map(|i| i.to).unwrap_or(scope_anchor);
+
+        let mut series = MeasurementSeries::new(
+            malo_id,
+            "1-0:1.8.0".parse().ok(),
+            intervals,
+            MeasurementSource::Mscons {
+                pid: 13_005,
+                message_ref: None,
+                sender_mp_id: self.operator.clone(),
+            },
+            recorded_at,
+        );
+        // Declared explicitly rather than left to `obis_code.default_resolution()`,
+        // which answers for the channel and not for this delivery. At anything but
+        // 15 minutes the two disagree, and completeness would then measure the
+        // series against an expectation nothing in the workload produced.
+        series.resolution = Some(self.declared_resolution());
+
+        Ok(StoredSeries::of(
+            self.sparte,
+            series,
+            ScopedVersion::new(
+                VersionScope::for_interval(&self.operator, scope_anchor)?,
+                Version::new(version)?,
+            ),
+            recorded_at,
+        )
+        .in_unit(self.unit))
+    }
+
+    /// The workload's interval length as the domain spells it.
+    fn declared_resolution(&self) -> IntervalResolution {
+        let seconds = u32::try_from(self.resolution.whole_seconds())
+            .expect("the builder rejects non-positive resolutions");
+        IntervalResolution::from_seconds(seconds)
+            .expect("the builder rejects a zero-length resolution")
+    }
+}
+
+/// Split intervals into runs sharing a local month.
+fn group_by_scope(intervals: Vec<MeterInterval>) -> Vec<(time::Date, Vec<MeterInterval>)> {
+    let mut out: Vec<(time::Date, Vec<MeterInterval>)> = Vec::new();
+    for interval in intervals {
+        let month = metering::calendar::local_month(interval.from);
+        match out.last_mut() {
+            Some((m, group)) if *m == month => group.push(interval),
+            _ => out.push((month, vec![interval])),
+        }
+    }
+    out
+}
+
+/// The version a first delivery carries.
+const FIRST_VERSION: u128 = 20_260_101_000_001;
+/// The version a correction carries. Higher, so it supersedes within its scope.
+const CORRECTION_VERSION: u128 = 20_260_201_000_002;
+
+/// A synthetic 11-digit Marktlokations-ID.
+fn malo_id(n: usize) -> String {
+    format!("{:011}", 10_000_000_000u64 + n as u64)
+}
+
+/// The reference implementation the store is checked against (§17.3).
+///
+/// Holds every row the workload ever produced and resolves them independently:
+/// a fold over a map in Rust, rather than the window function the store plans.
+/// Two implementations that share code agree about their shared mistakes, which
+/// is the one thing an oracle must not do.
+#[derive(Debug, Default, Clone)]
+pub struct Oracle {
+    /// `(malo_id, obis_code, from)` → the winning row, per version scope.
+    rows: BTreeMap<(String, String, OffsetDateTime), (String, u128, Decimal)>,
+}
+
+impl Oracle {
+    /// An empty reference.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record everything a delivery asserted, applying latest-version-wins.
+    ///
+    /// Versions are compared **within a scope only** (§4.2). Two versions in
+    /// different scopes are not ordered, so neither supersedes the other and
+    /// both would survive resolution — which is exactly the inflation
+    /// `VersionScope::for_interval` exists to prevent, so the oracle has to
+    /// model it rather than assume it away.
+    pub fn record(&mut self, series: &[StoredSeries]) -> Result<()> {
+        for stored in series {
+            let scope = stored.version.scope().as_str().to_string();
+            let version = stored.version.version().get();
+
+            for interval in &stored.series.intervals {
+                let obis = interval
+                    .obis_code
+                    .or(stored.series.obis_code)
+                    .ok_or_else(|| Error::encode("obis_code", "no channel on interval or series"))?
+                    .to_string();
+                let key = (stored.series.malo_id.clone(), obis, interval.from);
+
+                match self.rows.get(&key) {
+                    // Same scope: the higher version is the value in force.
+                    Some((existing, seen, _)) if *existing == scope => {
+                        if version >= *seen {
+                            self.rows
+                                .insert(key, (scope.clone(), version, interval.value_kwh));
+                        }
+                    }
+                    // A different scope is not comparable. The generator never
+                    // produces one for the same key, so this is a guard against
+                    // the *test* drifting rather than the store.
+                    Some((existing, _, _)) => {
+                        return Err(Error::VersionScopeMismatch {
+                            left: existing.clone(),
+                            right: scope,
+                        });
+                    }
+                    None => {
+                        self.rows
+                            .insert(key, (scope.clone(), version, interval.value_kwh));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rows the reference expects in `[from, to)`.
+    pub fn row_count(&self, from: OffsetDateTime, to: OffsetDateTime) -> u64 {
+        self.rows
+            .keys()
+            .filter(|(_, _, start)| *start >= from && *start < to)
+            .count() as u64
+    }
+
+    /// The sum of the values in force over `[from, to)`.
+    pub fn sum_kwh(&self, from: OffsetDateTime, to: OffsetDateTime) -> Decimal {
+        self.rows
+            .iter()
+            .filter(|((_, _, start), _)| *start >= from && *start < to)
+            .map(|(_, (_, _, value))| *value)
+            .sum()
+    }
+
+    /// The sum of the values in force for one measuring point.
+    pub fn sum_kwh_for(&self, malo_id: &str, from: OffsetDateTime, to: OffsetDateTime) -> Decimal {
+        self.rows
+            .iter()
+            .filter(|((malo, _, start), _)| malo == malo_id && *start >= from && *start < to)
+            .map(|(_, (_, _, value))| *value)
+            .sum()
+    }
+
+    /// Every measuring point the reference knows about.
+    pub fn malo_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.rows.keys().map(|(malo, _, _)| malo.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Total rows held.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the reference is empty.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
+
+    #[test]
+    fn the_generator_is_reproducible_from_its_seed() {
+        // A failure nobody can reproduce is a failure nobody can fix.
+        let workload = MeteringWorkload::new(START).seed(42).with_corrections(0.1);
+        let a = workload.generate().unwrap();
+        let b = workload.generate().unwrap();
+
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.series.malo_id, y.series.malo_id);
+            assert_eq!(x.series.intervals.len(), y.series.intervals.len());
+            assert_eq!(x.version, y.version);
+        }
+    }
+
+    #[test]
+    fn different_seeds_produce_different_workloads() {
+        let a = MeteringWorkload::new(START)
+            .seed(1)
+            .with_gaps(0.2)
+            .generate()
+            .unwrap();
+        let b = MeteringWorkload::new(START)
+            .seed(2)
+            .with_gaps(0.2)
+            .generate()
+            .unwrap();
+
+        let rows =
+            |v: &[StoredSeries]| -> usize { v.iter().map(|s| s.series.intervals.len()).sum() };
+        assert_ne!(rows(&a), rows(&b), "one seed must not stand in for another");
+    }
+
+    #[test]
+    fn a_workload_with_no_corrections_has_one_version_per_key() {
+        let series = MeteringWorkload::new(START)
+            .malo_ids(3)
+            .days(2)
+            .generate()
+            .unwrap();
+        assert!(
+            series
+                .iter()
+                .all(|s| s.version.version().get() == FIRST_VERSION),
+            "corrections must be opt-in: elision depends on them being rare"
+        );
+    }
+
+    #[test]
+    fn corrections_arrive_after_the_deliveries_they_correct() {
+        // A store that applied them in the other order would pass a test whose
+        // input happened to arrive pre-sorted.
+        let series = MeteringWorkload::new(START)
+            .malo_ids(2)
+            .days(2)
+            .seed(7)
+            .with_corrections(0.5)
+            .generate()
+            .unwrap();
+
+        let first_correction = series
+            .iter()
+            .position(|s| s.version.version().get() == CORRECTION_VERSION)
+            .expect("the workload must produce corrections");
+        assert!(
+            series[..first_correction]
+                .iter()
+                .all(|s| s.version.version().get() == FIRST_VERSION)
+        );
+    }
+
+    #[test]
+    fn the_oracle_keeps_the_highest_version_within_a_scope() {
+        let workload = MeteringWorkload::new(START).malo_ids(1).days(1);
+        let base = workload.generate().unwrap();
+
+        let mut oracle = Oracle::new();
+        oracle.record(&base).unwrap();
+        let before = oracle.sum_kwh(START, START + Duration::DAY);
+
+        // Restate the same intervals at a higher version, +1 kWh each.
+        let mut corrected = base.clone();
+        for stored in &mut corrected {
+            for interval in &mut stored.series.intervals {
+                interval.value_kwh += Decimal::ONE;
+            }
+            stored.version = ScopedVersion::new(
+                stored.version.scope().clone(),
+                Version::new(CORRECTION_VERSION).unwrap(),
+            );
+        }
+        oracle.record(&corrected).unwrap();
+
+        let intervals = oracle.row_count(START, START + Duration::DAY);
+        assert_eq!(
+            oracle.sum_kwh(START, START + Duration::DAY),
+            before + Decimal::from(intervals),
+            "each interval counted once, at its corrected value"
+        );
+    }
+
+    #[test]
+    fn the_oracle_counts_a_corrected_interval_once() {
+        let workload = MeteringWorkload::new(START).malo_ids(2).days(1).seed(9);
+        let series = workload.generate().unwrap();
+        let distinct: usize = series
+            .iter()
+            .flat_map(|s| {
+                s.series
+                    .intervals
+                    .iter()
+                    .map(|i| (s.series.malo_id.clone(), i.from))
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        let mut oracle = Oracle::new();
+        oracle.record(&series).unwrap();
+        assert_eq!(oracle.len(), distinct);
+    }
+
+    #[test]
+    fn a_gap_rate_actually_removes_intervals() {
+        let full = MeteringWorkload::new(START).malo_ids(4).days(1).seed(3);
+        let holey = full.clone().with_gaps(0.25);
+
+        let rows = |w: &MeteringWorkload| -> usize {
+            w.generate()
+                .unwrap()
+                .iter()
+                .map(|s| s.series.intervals.len())
+                .sum()
+        };
+        assert!(rows(&holey) < rows(&full));
+    }
+
+    #[test]
+    fn the_dst_workloads_span_their_transition() {
+        let spring = MeteringWorkload::new(START).spanning_spring_forward();
+        let (from, to) = spring.range();
+        assert!(from <= time::macros::datetime!(2026-03-29 00:00 UTC));
+        assert!(to > time::macros::datetime!(2026-03-29 00:00 UTC));
+
+        let autumn = MeteringWorkload::new(START).spanning_autumn_back();
+        let (from, to) = autumn.range();
+        assert!(from <= time::macros::datetime!(2026-10-25 00:00 UTC));
+        assert!(to > time::macros::datetime!(2026-10-25 00:00 UTC));
+    }
+
+    #[test]
+    fn generated_malo_ids_are_eleven_digits() {
+        // The hot table's OBIS constraint is not the only shape that matters; a
+        // MaLo is 11 digits and a fixture that ignored that would not be
+        // exercising the real key width.
+        for n in [0, 1, 42, 999] {
+            assert_eq!(malo_id(n).len(), 11);
+            assert!(malo_id(n).chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn a_workload_spanning_a_month_boundary_splits_its_correction_scopes() {
+        // A scope covers one local month, and encoding rejects a scope that does
+        // not cover its intervals. A correction batch spanning the boundary has
+        // to become two deliveries.
+        let series = MeteringWorkload::new(datetime!(2026-07-30 00:00 UTC))
+            .malo_ids(1)
+            .days(4)
+            .seed(11)
+            .with_corrections(0.5)
+            .generate()
+            .unwrap();
+
+        for stored in &series {
+            for interval in &stored.series.intervals {
+                assert!(
+                    stored.version.scope().covers(interval.from),
+                    "scope {} does not cover {}",
+                    stored.version.scope(),
+                    interval.from
+                );
+            }
+        }
+    }
+}

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Two DataFusion majors in one graph give mutually incompatible
+  # `TableProvider` types. This already happened once via
+  # `datafusion-table-providers`, so it is a hard gate, not a lint.
+  single-sourced-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: No duplicate datafusion / arrow / iceberg
+        run: |
+          # `cargo tree -d` also lists a package twice when it is built for both
+          # host and target (build-dependencies), at the *same* version. That is
+          # not a conflict. Only differing versions of a single-sourced crate are.
+          conflicts=$(cargo tree -d --edges normal 2>/dev/null \
+            | grep -oE '^(datafusion|arrow|iceberg|parquet|metering|time|rust_decimal) v[0-9.]+' \
+            | sort -u \
+            | awk '{ seen[$1]++ } END { for (n in seen) if (seen[n] > 1) print n }')
+          if [ -n "$conflicts" ]; then
+            echo "::error::multiple versions of a single-sourced dependency: $conflicts"
+            cargo tree -d --edges normal
+            exit 1
+          fi
+          echo "single-sourced dependencies OK"
+
+  # A declared MSRV that nothing checks is a guess. This makes it a fact.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features --all-targets
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,65 @@
+# Supply-chain policy.
+#
+# Every exception below is an *accepted* risk with a stated reason and a revisit
+# condition, not a silenced warning. An unexplained ignore is worse than no gate
+# at all: it looks like the check passed.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    # MPL-2.0 is deliberately *not* allowed. Nothing in the graph needs it, and
+    # its file-level copyleft is a question a utility's procurement review should
+    # be asked before the answer is already in the lockfile.
+    # libbz2-rs-sys, reached through datafusion -> async-compression -> bzip2.
+    # The original bzip2 licence: BSD-style, permissive, no copyleft, compatible
+    # with this crate's MIT OR Apache-2.0 dual licensing.
+    "bzip2-1.0.6",
+    # tiny-keccak, reached through iceberg-storage-opendal -> reqsign-aws-v4.
+    # A public-domain dedication — the most permissive terms there are.
+    "CC0-1.0",
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # `paste` is unmaintained. Not a vulnerability — the crate works, nobody is
+    # updating it. Reached through `datafusion-common`, so there is nothing to
+    # do here beyond waiting for DataFusion to drop it.
+    # Revisit: when DataFusion removes the dependency.
+    "RUSTSEC-2024-0436",
+
+    # `quick-xml` quadratic attribute checking, and unbounded namespace
+    # allocation. Both are denial of service against a parser fed **untrusted**
+    # XML. Reached through `opendal-core` and `reqsign-aws-v4`, which parse
+    # responses from the configured object store and its IAM endpoint — trusted
+    # infrastructure, not attacker-supplied input. No patched version exists
+    # within the range opendal pins, so this cannot be resolved by updating.
+    # Revisit: when opendal releases against a patched quick-xml.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # `rustls-pemfile` is unmaintained, and `tokio-tar` mis-parses PAX extended
+    # headers. Both arrive **only** through `testcontainers`, a dev-dependency:
+    # neither is compiled into the library, and the tar files involved are
+    # container images this repository's own tests pull. `tokio-tar` is archived
+    # with no safe upgrade available.
+    # Revisit: when testcontainers moves off bollard's TLS stack and off
+    # tokio-tar, or when a maintained fork is adopted upstream.
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2025-0111",
+]
+
+[bans]
+multiple-versions = "warn"
+# Single-sourced: see .github/workflows/ci.yml. A second `datafusion` major
+# gives mutually incompatible `TableProvider` types, which does not fail
+# obviously — a crate simply cannot be used with the other's types.
+deny = [{ name = "datafusion-table-providers" }]

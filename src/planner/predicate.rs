@@ -1,0 +1,415 @@
+//! Extracting a [`TimeRange`] from DataFusion filter expressions.
+//!
+//! Only the `from` column matters here: it decides which tier holds a row, so a
+//! bound on it is what lets the planner skip a tier entirely. Every other
+//! predicate is left to DataFusion.
+//!
+//! **The analysis is deliberately conservative.** Failing to recognise a bound
+//! costs a wider scan; wrongly inferring one loses rows. So anything not
+//! provably a bound on `from` widens the range rather than narrowing it, and
+//! `OR` — where one branch may be unbounded — discards bounds entirely.
+
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
+use time::OffsetDateTime;
+
+use crate::encode::schema::col;
+use crate::planner::split::TimeRange;
+
+/// Extract the tightest provable bound on `from` from a set of filters.
+///
+/// Filters are implicitly `AND`ed, so bounds intersect.
+pub fn time_range(filters: &[Expr]) -> TimeRange {
+    filters
+        .iter()
+        .map(range_of)
+        .fold(TimeRange::unbounded(), intersect)
+}
+
+/// Express a range as filters the cold provider can prune on.
+///
+/// The tier split narrows a query's range, and that narrowing is only useful to
+/// Iceberg if it reaches the scan as a predicate — otherwise partition pruning
+/// and row-group statistics see the original, wider bounds.
+pub fn range_filters(range: TimeRange) -> Vec<Expr> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(start) = range.start() {
+        out.push(datafusion::logical_expr::col(col::FROM).gt_eq(timestamp_lit(start)));
+    }
+    if let Some(end) = range.end() {
+        out.push(datafusion::logical_expr::col(col::FROM).lt(timestamp_lit(end)));
+    }
+    out
+}
+
+/// A ceiling on the domain version axis, for a reproducible read.
+///
+/// The Iceberg snapshot pins *transaction* time — what the store had been told
+/// by a given moment. It does not pin the domain's own version axis, because a
+/// snapshot taken after a correction landed contains both versions and
+/// resolution would pick the newer one. Settlement reruns need the value that
+/// was in force, so the ceiling is a second, independent bound: keep only
+/// versions at or below `max`, then resolve among those.
+pub fn version_ceiling(max: crate::version::Version) -> Expr {
+    use crate::encode::schema::{VERSION_PRECISION, VERSION_SCALE};
+    datafusion::logical_expr::col(col::VERSION).lt_eq(datafusion::logical_expr::lit(
+        ScalarValue::Decimal128(Some(max.to_i128()), VERSION_PRECISION, VERSION_SCALE),
+    ))
+}
+
+/// A timestamp literal in the unit and zone the storage schema uses.
+fn timestamp_lit(t: OffsetDateTime) -> Expr {
+    datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(
+        Some((t.unix_timestamp_nanos() / 1_000) as i64),
+        Some("UTC".into()),
+    ))
+}
+
+/// The range a single expression constrains `from` to.
+fn range_of(filter: &Expr) -> TimeRange {
+    match filter {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            Operator::And => intersect(range_of(left), range_of(right)),
+
+            // A row satisfying either branch qualifies, so the result is the
+            // union — and unioning with an unrecognised branch yields no usable
+            // bound. Narrowing here would silently drop rows.
+            Operator::Or => TimeRange::unbounded(),
+
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
+                as_from_bound(left, *op, right).unwrap_or_else(TimeRange::unbounded)
+            }
+
+            _ => TimeRange::unbounded(),
+        },
+
+        Expr::Between(Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        }) if is_from_column(expr) => {
+            match (as_timestamp(low), as_timestamp(high)) {
+                // BETWEEN is inclusive on both sides; our upper bound is
+                // exclusive, so the high value must still be matched.
+                (Some(lo), Some(hi)) => TimeRange::new(Some(lo), Some(exclusive_after(hi))),
+                _ => TimeRange::unbounded(),
+            }
+        }
+
+        _ => TimeRange::unbounded(),
+    }
+}
+
+/// Interpret `left op right` as a bound on `from`, if it is one.
+///
+/// Handles the literal on either side, flipping the operator when the column is
+/// on the right.
+fn as_from_bound(left: &Expr, op: Operator, right: &Expr) -> Option<TimeRange> {
+    if is_from_column(left) {
+        bound_from(op, as_timestamp(right)?)
+    } else if is_from_column(right) {
+        bound_from(flip(op), as_timestamp(left)?)
+    } else {
+        None
+    }
+}
+
+/// The range implied by `from <op> value`.
+fn bound_from(op: Operator, value: OffsetDateTime) -> Option<TimeRange> {
+    Some(match op {
+        Operator::Lt => TimeRange::new(None, Some(value)),
+        Operator::LtEq => TimeRange::new(None, Some(exclusive_after(value))),
+        Operator::Gt => TimeRange::new(Some(exclusive_after(value)), None),
+        Operator::GtEq => TimeRange::new(Some(value), None),
+        // A point lookup is a range of one instant.
+        Operator::Eq => TimeRange::new(Some(value), Some(exclusive_after(value))),
+        _ => return None,
+    })
+}
+
+/// Mirror a comparison so the column can be treated as the left operand.
+fn flip(op: Operator) -> Operator {
+    match op {
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        other => other,
+    }
+}
+
+/// The smallest instant strictly after `t`, at storage resolution.
+///
+/// Storage is microsecond-precision, so converting an inclusive bound to an
+/// exclusive one is exact rather than an approximation.
+fn exclusive_after(t: OffsetDateTime) -> OffsetDateTime {
+    t + time::Duration::microseconds(1)
+}
+
+/// Whether an expression refers to the `from` column.
+fn is_from_column(expr: &Expr) -> bool {
+    // `CAST(from AS ...)` still refers to the same column, and DataFusion
+    // frequently inserts casts around timestamp comparisons.
+    match expr {
+        Expr::Column(c) => c.name == col::FROM,
+        Expr::Cast(cast) => is_from_column(&cast.expr),
+        Expr::TryCast(cast) => is_from_column(&cast.expr),
+        _ => false,
+    }
+}
+
+/// Read a literal timestamp, whatever unit it was written in.
+fn as_timestamp(expr: &Expr) -> Option<OffsetDateTime> {
+    let scalar = match expr {
+        Expr::Literal(v, _) => v,
+        Expr::Cast(cast) => return as_timestamp(&cast.expr),
+        _ => return None,
+    };
+
+    let nanos: i128 = match scalar {
+        ScalarValue::TimestampNanosecond(Some(v), _) => i128::from(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => i128::from(*v) * 1_000,
+        ScalarValue::TimestampMillisecond(Some(v), _) => i128::from(*v) * 1_000_000,
+        ScalarValue::TimestampSecond(Some(v), _) => i128::from(*v) * 1_000_000_000,
+        _ => return None,
+    };
+
+    OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()
+}
+
+/// The tighter of two ranges.
+fn intersect(a: TimeRange, b: TimeRange) -> TimeRange {
+    let start = match (a.start(), b.start()) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+    let end = match (a.end(), b.end()) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+    TimeRange::new(start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{col as df_col, lit};
+    use time::macros::datetime;
+
+    const T10: OffsetDateTime = datetime!(2026-07-10 00:00 UTC);
+    const T20: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
+
+    /// A timestamp literal in the unit storage uses.
+    fn ts(t: OffsetDateTime) -> Expr {
+        lit(ScalarValue::TimestampMicrosecond(
+            Some((t.unix_timestamp_nanos() / 1_000) as i64),
+            Some("UTC".into()),
+        ))
+    }
+
+    fn from() -> Expr {
+        df_col(col::FROM)
+    }
+
+    #[test]
+    fn range_filters_round_trip_through_extraction() {
+        // What the split narrows must be re-extractable, or the cold scan is
+        // handed bounds the planner cannot then use for pruning.
+        let range = TimeRange::between(T10, T20);
+        let recovered = time_range(&range_filters(range));
+        assert_eq!(recovered, range);
+    }
+
+    #[test]
+    fn range_filters_omit_absent_bounds() {
+        assert!(range_filters(TimeRange::unbounded()).is_empty());
+        assert_eq!(range_filters(TimeRange::new(Some(T10), None)).len(), 1);
+        assert_eq!(range_filters(TimeRange::new(None, Some(T20))).len(), 1);
+        assert_eq!(range_filters(TimeRange::between(T10, T20)).len(), 2);
+    }
+
+    #[test]
+    fn no_filters_gives_an_unbounded_range() {
+        assert_eq!(time_range(&[]), TimeRange::unbounded());
+    }
+
+    #[test]
+    fn greater_than_or_equal_becomes_an_inclusive_lower_bound() {
+        let r = time_range(&[from().gt_eq(ts(T10))]);
+        assert_eq!(r.start(), Some(T10));
+        assert_eq!(r.end(), None);
+    }
+
+    #[test]
+    fn strictly_greater_than_excludes_the_bound_itself() {
+        let r = time_range(&[from().gt(ts(T10))]);
+        assert_eq!(r.start(), Some(exclusive_after(T10)));
+        assert!(r.start().unwrap() > T10);
+    }
+
+    #[test]
+    fn less_than_becomes_an_exclusive_upper_bound() {
+        let r = time_range(&[from().lt(ts(T20))]);
+        assert_eq!(r.end(), Some(T20));
+        assert_eq!(r.start(), None);
+    }
+
+    #[test]
+    fn less_than_or_equal_still_matches_the_bound() {
+        // Our upper bound is exclusive, so <= must extend past the value or the
+        // matching row is dropped.
+        let r = time_range(&[from().lt_eq(ts(T20))]);
+        assert!(r.end().unwrap() > T20);
+    }
+
+    #[test]
+    fn a_conjunction_intersects_bounds() {
+        let r = time_range(&[from().gt_eq(ts(T10)), from().lt(ts(T20))]);
+        assert_eq!(r, TimeRange::between(T10, T20));
+    }
+
+    #[test]
+    fn a_nested_and_intersects_too() {
+        let r = time_range(&[from().gt_eq(ts(T10)).and(from().lt(ts(T20)))]);
+        assert_eq!(r, TimeRange::between(T10, T20));
+    }
+
+    #[test]
+    fn the_tightest_bound_wins() {
+        let mid = datetime!(2026-07-15 00:00 UTC);
+        let r = time_range(&[from().gt_eq(ts(T10)), from().gt_eq(ts(mid))]);
+        assert_eq!(r.start(), Some(mid));
+    }
+
+    #[test]
+    fn a_literal_on_the_left_flips_the_operator() {
+        // `'2026-07-10' <= from` is the same as `from >= '2026-07-10'`.
+        let r = time_range(&[ts(T10).lt_eq(from())]);
+        assert_eq!(r.start(), Some(T10));
+        assert_eq!(r.end(), None);
+    }
+
+    #[test]
+    fn between_is_inclusive_on_both_sides() {
+        let r = time_range(&[from().between(ts(T10), ts(T20))]);
+        assert_eq!(r.start(), Some(T10));
+        assert!(r.end().unwrap() > T20, "the high value must still match");
+    }
+
+    #[test]
+    fn equality_is_a_single_instant() {
+        let r = time_range(&[from().eq(ts(T10))]);
+        assert_eq!(r.start(), Some(T10));
+        assert!(r.end().unwrap() > T10);
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn a_disjunction_yields_no_bound() {
+        // One branch could be unbounded, so narrowing would drop rows.
+        let r = time_range(&[from().gt_eq(ts(T10)).or(from().lt(ts(T20)))]);
+        assert_eq!(r, TimeRange::unbounded());
+    }
+
+    #[test]
+    fn a_disjunction_does_not_poison_a_sibling_conjunct() {
+        // The AND still contributes its own bound.
+        let r = time_range(&[
+            from().gt_eq(ts(T10)),
+            from().gt_eq(ts(T20)).or(from().lt(ts(T10))),
+        ]);
+        assert_eq!(r.start(), Some(T10));
+    }
+
+    #[test]
+    fn predicates_on_other_columns_are_ignored() {
+        let r = time_range(&[df_col(col::MALO_ID).eq(lit("12345678901"))]);
+        assert_eq!(r, TimeRange::unbounded());
+    }
+
+    #[test]
+    fn a_bound_on_another_timestamp_column_is_not_used() {
+        // `to` does not determine the tier; only `from` does.
+        let r = time_range(&[df_col(col::TO).gt_eq(ts(T10))]);
+        assert_eq!(r, TimeRange::unbounded());
+    }
+
+    #[test]
+    fn a_cast_around_the_column_is_seen_through() {
+        let cast = Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(from()),
+            crate::arrow::datatypes::DataType::Timestamp(
+                crate::arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+        ));
+        let r = time_range(&[cast.gt_eq(ts(T10))]);
+        assert_eq!(r.start(), Some(T10));
+    }
+
+    #[test]
+    fn timestamp_literals_in_other_units_are_understood() {
+        let secs = lit(ScalarValue::TimestampSecond(
+            Some(T10.unix_timestamp()),
+            None,
+        ));
+        assert_eq!(time_range(&[from().gt_eq(secs)]).start(), Some(T10));
+
+        let millis = lit(ScalarValue::TimestampMillisecond(
+            Some(T10.unix_timestamp() * 1_000),
+            None,
+        ));
+        assert_eq!(time_range(&[from().gt_eq(millis)]).start(), Some(T10));
+    }
+
+    #[test]
+    fn a_null_timestamp_yields_no_bound() {
+        let null = lit(ScalarValue::TimestampMicrosecond(None, None));
+        assert_eq!(time_range(&[from().gt_eq(null)]), TimeRange::unbounded());
+    }
+
+    #[test]
+    fn contradictory_bounds_produce_an_empty_range() {
+        let r = time_range(&[from().gt_eq(ts(T20)), from().lt(ts(T10))]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn every_recognised_shape_still_narrows_the_range() {
+        // The shapes that used to be reported `Exact`. Pushdown is now always
+        // `Inexact` — correctness must not rest on a dependency's silent
+        // conversion — but the *narrowing* is what skips files, and that is the
+        // optimisation worth having. It has to keep working.
+        for filter in [
+            from().gt_eq(ts(T10)),
+            from().lt(ts(T20)),
+            from().gt_eq(ts(T10)).and(from().lt(ts(T20))),
+            from().between(ts(T10), ts(T20)),
+        ] {
+            assert_ne!(
+                time_range(std::slice::from_ref(&filter)),
+                TimeRange::unbounded(),
+                "{filter} must still narrow the scan"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_shapes_widen_rather_than_narrow() {
+        // Failing to recognise a bound must cost a wider scan, never a lost row.
+        for filter in [
+            df_col(col::MALO_ID).eq(lit("x")),
+            from().gt_eq(ts(T10)).or(from().lt(ts(T20))),
+            from().is_null(),
+        ] {
+            assert_eq!(
+                time_range(std::slice::from_ref(&filter)),
+                TimeRange::unbounded(),
+                "{filter} must not be mistaken for a bound"
+            );
+        }
+    }
+}
