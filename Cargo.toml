@@ -20,6 +20,32 @@ rust-version = "1.94"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# Debug info, and why it is turned down rather than left at the default.
+#
+# This crate's dependency graph is DataFusion + Arrow + Iceberg + sqlx + tonic +
+# axum, and every one of ~20 integration test binaries links the whole of it
+# statically. At the default `debug = true` each binary is **~420 MB**, almost
+# all of it DWARF for code this crate did not write. Twenty of those exhaust a
+# CI runner's disk, and the failure is not a tidy "no space left": `rust-lld`
+# takes a **bus error** writing an output it cannot extend, which reads as a
+# linker bug and is not one.
+#
+# `line-tables-only` for this crate keeps `file:line` in a panic backtrace —
+# which is the whole of what a failing test needs — and dropping it entirely for
+# dependencies removes the bulk. Set `debug = true` locally when stepping
+# through a dependency in a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+# Dependencies are compiled once and executed constantly by the integration
+# suites, which drive a real PostgreSQL and a real Iceberg warehouse through
+# DataFusion. `opt-level = 1` on them alone leaves this crate unoptimised and
+# fully debuggable while removing the worst of the debug-build tax on the code
+# doing the actual work.
+opt-level = 1
+
 [lints.rust]
 # Large dependency trees (DataFusion + Iceberg) produce test binaries whose
 # unwind tables exceed the 16 MB the macOS linker can encode compactly. The

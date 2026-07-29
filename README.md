@@ -318,7 +318,7 @@ series.resolution = Some(IntervalResolution::from_seconds(60).unwrap()); // PT60
 ```
 
 Completeness, the DST calendar and the `meter_expected_intervals` UDF all read
-that declaration rather than assuming the settlement grain. `tests/sub_quarter_hour.rs`
+that declaration rather than assuming the settlement grain. `tests/it/sub_quarter_hour.rs`
 asserts this end to end, including the DST day and a sub-quarter-hour water series.
 
 ### Several tables in one session
@@ -646,7 +646,7 @@ keeps the schema keeps the boundary the figure was computed against.
 ### Is the output actually open?
 
 P2 — vendor-neutral, decade-retention storage — is the main procurement argument,
-and an untested argument is a hope. `tests/interop.rs` opens the written Parquet
+and an untested argument is a hope. `tests/it/interop.rs` opens the written Parquet
 **by path**, with a bare DataFusion session that has none of this crate's
 providers and no Iceberg catalog, and checks that:
 
@@ -662,7 +662,7 @@ providers and no Iceberg catalog, and checks that:
 
 That suite reads through DataFusion, which shares `arrow-rs` and `parquet-rs`
 with the writer — so a bug in that shared layer would be invisible to it.
-`tests/interop_duckdb.rs` closes the gap with **DuckDB** in a container: a
+`tests/it/interop_duckdb.rs` closes the gap with **DuckDB** in a container: a
 different language, a different Parquet reader, and its own reading of the
 Iceberg spec. It checks both levels — `read_parquet` over the files, and
 `iceberg_scan` over the manifests and snapshots — and confirms the published
@@ -802,7 +802,7 @@ Arrow is therefore sourced through `datafusion::arrow` rather than as a direct d
 | Production surface | ⬜ CLI, health/readiness endpoints, exporters, runbooks |
 | Published to crates.io | ⬜ deliberately not yet — packageable today, but the API has not met a real consumer |
 
-**494 tests** — 291 unit, plus 203 integration against real PostgreSQL and a real Iceberg warehouse, including a property suite that checks the whole store against an independently implemented reference.
+**509 tests** — 296 unit, plus 211 integration against real PostgreSQL and a real Iceberg warehouse, including a property suite that checks the whole store against an independently implemented reference.
 
 ### Writing
 

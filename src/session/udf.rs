@@ -11,7 +11,7 @@
 //! between Arrow arrays and the domain functions and nothing else. Their tests
 //! assert that the wrapper preserves the upstream answer, not that the answer is
 //! right — that is `metering`'s suite's job, plus the contract test in
-//! `tests/calendar_delegation.rs`.
+//! `tests/it/calendar_delegation.rs`.
 
 use std::any::Any;
 use std::sync::Arc;

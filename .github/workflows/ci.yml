@@ -15,6 +15,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # This graph is DataFusion + Arrow + Iceberg + sqlx + tonic + axum, and a
+      # debug build of it is tens of gigabytes of artifacts. A hosted runner has
+      # ~14 GB free, and running out does not fail tidily: `rust-lld` takes a
+      # **bus error** writing an output it cannot extend, which reads as a
+      # linker bug rather than as a full disk. Reclaiming the preinstalled
+      # toolchains this job never uses buys ~20 GB.
+      - name: Free runner disk
+        run: |
+          before=$(df -m --output=avail / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          after=$(df -m --output=avail / | tail -1)
+          echo "reclaimed $(( (after - before) / 1024 )) GiB; $(( after / 1024 )) GiB free"
+
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@v2
@@ -25,8 +40,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Every integration test starts its own PostgreSQL container, so the
+      # limit is Docker's rather than the CPU's. `cargo test` defaults to one
+      # thread per core; unbounded, the suite exhausts container slots and fails
+      # with `PortNotExposed` or a create timeout — which looks like a broken
+      # test and is not.
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --all-features -- --test-threads=4
 
       - name: Docs
         run: cargo doc --no-deps --all-features
