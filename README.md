@@ -79,13 +79,26 @@ Cloud SQL and Azure Postgres, where an extension-based approach is not.
 
 ```rust
 use meterstore::prelude::*;
-use meterstore::{cold::IcebergCold, hot::PostgresHot};
+use meterstore::hot::PostgresHot;
 use std::sync::Arc;
 
 let hot = Arc::new(PostgresHot::new(pool));
 hot.create_table("readings_versions").await?;
 
-let cold = Arc::new(IcebergCold::new(catalog, namespace, 512 * 1024 * 1024));
+// The cold tier — a SqlCatalog over PostgreSQL, object-store backend chosen from
+// the warehouse URI scheme. MeterStore builds the whole Iceberg catalog stack, so
+// the application depends on neither `iceberg-catalog-sql` nor
+// `iceberg-storage-opendal` directly.
+let cold_tier = IcebergSqlCatalog {
+    database_url: &db_url,
+    warehouse_uri: "s3://bucket/warehouse",   // or file:// / memory:// / gs:// / abfss://
+    catalog_name: "meterstore",
+    namespace: "metering",
+    file_target_bytes: 512 * 1024 * 1024,
+    metadata_pool_max_connections: 4,
+    auth: &WarehouseAuth { region: Some("eu-central-1".into()), ..Default::default() },
+}.build().await?;
+let cold = cold_tier.cold();
 cold.create_table("readings_versions").await?;
 
 let store = MeterStore::builder()
@@ -101,6 +114,8 @@ let store = MeterStore::builder()
 ```
 
 That registers the table as `readings` — the physical name carries a `_versions` suffix because it holds every version of every reading, and the provider resolves it — along with the calendar functions.
+
+`IcebergCold::new(catalog, …)` remains for a deployment that brings its own `Arc<dyn iceberg::Catalog>` (a REST catalog, Glue, …). `IcebergSqlCatalog` is the batteries-included path for the common case: `file://` and `memory://` warehouses work out of the box, while `s3://`, `gs://` and `abfss://` are behind the `object-store-s3` / `object-store-gcs` / `object-store-azure` features (or `object-store-all`) so a file-only build does not compile the cloud SDKs. `ColdTier::catalog_facade()` (feature `catalog-facade`) exposes the same catalog to Spark/Trino/DuckDB as a read-only Iceberg REST endpoint.
 
 ### Querying across both tiers
 
@@ -503,6 +518,8 @@ TableConfig::new("readings_versions")
 
 A tenant discriminator must be an identity column. As an attribute, two tenants reporting the same measuring point would share a merge key and one tenant's correction would supersede the other's reading. Identity columns must be non-nullable, and extra columns are `Utf8` today.
 
+An extra column whose values are a fixed vocabulary — an ingestion source, a delivery status — can be declared with `coded_column(name, &["…", "…"], nullable)`, which renders a DB `CHECK` on the hot table exactly like the built-in `sparte`/`unit`/`quality` columns. A value outside the set fails the write rather than being read back later as an unknown code. MeterStore stays domain-agnostic: it enforces whatever set the caller supplies, carried in the field's Arrow metadata so it does not disturb the type or the schema-evolution contract.
+
 `store.create_tables()` creates both tiers from one configuration — the schema, primary key, conflict target and resolution `PARTITION BY` all have to agree, and a mismatch shows up as readings that fail to supersede rather than as an error.
 
 ### Configuration that must agree
@@ -748,6 +765,7 @@ Arrow is therefore sourced through `datafusion::arrow` rather than as a direct d
 | Tiering watermark | ✅ atomic, inside the Iceberg snapshot summary |
 | Hot tier (PostgreSQL) | ✅ partitioned, detach/scan/drop, orphan recovery |
 | Cold tier (Iceberg) | ✅ Parquet with bloom filters and delta encoding |
+| Cold-tier construction | ✅ `IcebergSqlCatalog` builds the SqlCatalog + object-store backend; `file`/`memory` baseline, `s3`/`gcs`/`azure` behind features |
 | Archival job | ✅ crash-safe ordering, idempotent, integration tested |
 | Tier-split planning | ✅ predicate extraction, watermark split, version elision |
 | DST calendar | ✅ delegated to `metering::calendar`, contract-tested |
@@ -757,6 +775,7 @@ Arrow is therefore sourced through `datafusion::arrow` rather than as a direct d
 | Version resolution | ✅ `readings` resolves corrections; `readings_versions` keeps the history |
 | Routed writes | ✅ `store.append()` sends late corrections to the right tier |
 | Identity columns | ✅ tenant-safe merge keys, wired through both tiers |
+| Coded attribute columns | ✅ `coded_column(name, &[…])` renders a DB CHECK, like sparte/unit/quality |
 | Erasure | ✅ pseudonymous references, wired into writes, with a suppression list |
 | System tables | ✅ `system.tables`, `system.config`, `system.resolution`, `system.snapshots` |
 | Metrics | ✅ OpenTelemetry API — no-op until you install an SDK |

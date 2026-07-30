@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
@@ -71,7 +71,11 @@ arrow = { version = "58.4", default-features = false, features = ["json"] }
 iceberg = "0.10"
 iceberg-datafusion = "0.10"
 iceberg-catalog-sql = "0.10"
-iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs"] }
+# `file://` and `memory://` are the always-on baseline (local dev, tests, and a
+# single-node file warehouse). The cloud object stores are opt-in features so a
+# file-only deployment does not compile the AWS/GCS/Azure SDKs — see the
+# `object-store-*` features below.
+iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs", "opendal-memory"] }
 # REST catalog client, and the basis for the read-only catalog facade that lets
 # Spark/Trino/DuckDB/PyIceberg read the history directly from object storage,
 # without MeterStore in the data path.
@@ -157,6 +161,12 @@ tokio-stream = { version = "0.1", features = ["net"] }
 [features]
 default = ["rest-catalog"]
 rest-catalog = ["dep:iceberg-catalog-rest"]
+# Cold-tier object-store backends for `IcebergSqlCatalog`. `file://`/`memory://`
+# are always available; these add the cloud stores (and their SDKs) on demand.
+object-store-s3 = ["iceberg-storage-opendal/opendal-s3"]
+object-store-gcs = ["iceberg-storage-opendal/opendal-gcs"]
+object-store-azure = ["iceberg-storage-opendal/opendal-azdls"]
+object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 # Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
 catalog-facade = ["dep:axum"]
 # Arrow Flight SQL over the unified hot + cold view (§13.7.3). The one surface

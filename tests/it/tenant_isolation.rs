@@ -75,7 +75,12 @@ async fn store_with_tenant_identity() -> (
     let config = TableConfig::new(TABLE)
         .settlement_lag(Duration::days(1))
         .identity_column(Field::new("tenant", DataType::Utf8, false))
-        .attribute_column(Field::new("bilanzkreis", DataType::Utf8, true))
+        // A coded attribute column: its vocabulary is enforced by a DB CHECK.
+        .attribute_column(meterstore::coded_column(
+            "bilanzkreis",
+            &["BK-1", "BK-2"],
+            true,
+        ))
         .build()
         .expect("config");
 
@@ -360,4 +365,27 @@ async fn the_overlap_exclusion_is_scoped_to_a_tenant() {
         .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
         .value(0);
     assert_eq!(n, 2, "both tenants' readings survive");
+}
+
+#[tokio::test]
+async fn a_coded_attribute_column_refuses_a_value_outside_its_vocabulary() {
+    // `bilanzkreis` is declared with `coded_column(&["BK-1", "BK-2"])`, so a value
+    // outside that set must fail at the DB CHECK, not be stored and read back as an
+    // unknown code — the same guarantee sparte/unit/quality already carry.
+    let (store, _w, _c) = store_with_tenant_identity().await;
+
+    let bad = reading("a", 10, 20_260_720_000_001).with_extra(
+        "bilanzkreis",
+        ScalarValue::Utf8(Some("BK-BOGUS".to_string())),
+    );
+    assert!(
+        store.append(&[bad]).await.is_err(),
+        "a bilanzkreis outside the coded vocabulary must be rejected"
+    );
+
+    // An allowed value still writes.
+    store
+        .append(&[reading("a", 10, 20_260_720_000_001)])
+        .await
+        .expect("an allowed bilanzkreis must insert");
 }

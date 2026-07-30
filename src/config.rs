@@ -9,6 +9,36 @@ use time::Duration;
 use crate::arrow::datatypes::{DataType, Field};
 use crate::error::{Error, Result};
 
+/// Arrow field-metadata key under which an attribute column declares its
+/// allowed-value set. The hot-table DDL reads it to render a `CHECK … IN (…)`;
+/// it is inert everywhere else (schema evolution compares name/type/nullability
+/// only, and the cold tier ignores it), so a coded column stays a plain `Utf8`
+/// column with one extra constraint. See [`coded_column`].
+pub const CHECK_VALUES_KEY: &str = "meterstore.check_values";
+
+/// A `Utf8` attribute-column [`Field`] constrained to `allowed` values.
+///
+/// A deployment's coded columns — an ingestion source, a delivery status — get
+/// the same DB-layer enforcement meterstore already gives `sparte`/`unit`/
+/// `quality`: a value outside the set fails the write rather than being read back
+/// later as an unknown flag. meterstore stays domain-agnostic — it renders
+/// whatever set the caller supplies. Pass to
+/// [`TableConfig::attribute_column`](TableConfig::attribute_column).
+///
+/// Codes are the domain's stable strings (e.g. `"MSCONS"`); a code must not
+/// contain a comma, which delimits the set in the field metadata.
+#[must_use]
+pub fn coded_column(name: &str, allowed: &[&str], nullable: bool) -> Field {
+    debug_assert!(
+        allowed.iter().all(|c| !c.contains(',')),
+        "coded_column values must not contain a comma"
+    );
+    Field::new(name, DataType::Utf8, nullable).with_metadata(std::collections::HashMap::from([(
+        CHECK_VALUES_KEY.to_string(),
+        allowed.join(","),
+    )]))
+}
+
 /// Defaults chosen for German 15-minute metering at utility scale.
 pub mod defaults {
     use time::Duration;
@@ -429,6 +459,24 @@ mod tests {
 
     fn base() -> TableConfig {
         TableConfig::new("readings")
+    }
+
+    #[test]
+    fn coded_column_carries_its_vocabulary_in_metadata() {
+        let f = coded_column("source", &["MSCONS", "DIRECT_PUSH"], true);
+        assert_eq!(f.name(), "source");
+        assert_eq!(f.data_type(), &DataType::Utf8);
+        assert!(f.is_nullable());
+        assert_eq!(
+            f.metadata().get(CHECK_VALUES_KEY).map(String::as_str),
+            Some("MSCONS,DIRECT_PUSH")
+        );
+    }
+
+    #[test]
+    fn a_plain_attribute_column_declares_no_vocabulary() {
+        let f = Field::new("bilanzkreis", DataType::Utf8, true);
+        assert!(f.metadata().get(CHECK_VALUES_KEY).is_none());
     }
 
     #[test]

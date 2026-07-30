@@ -124,8 +124,8 @@ pub mod tiering;
 pub mod version;
 pub mod watermark;
 
-pub use cold::IcebergCold;
-pub use config::{TableConfig, ValidatedTableConfig};
+pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
+pub use config::{CHECK_VALUES_KEY, TableConfig, ValidatedTableConfig, coded_column};
 pub use encode::canonical_obis;
 pub use erasure::{ErasureRecord, SubjectRef, SubjectRegistry};
 pub use error::{Error, Result};
@@ -145,8 +145,8 @@ pub use watermark::{Tier, TieringWatermark};
 
 /// Common imports for working with MeterStore.
 pub mod prelude {
-    pub use crate::cold::IcebergCold;
-    pub use crate::config::{TableConfig, ValidatedTableConfig};
+    pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
+    pub use crate::config::{CHECK_VALUES_KEY, TableConfig, ValidatedTableConfig, coded_column};
     pub use crate::encode::StoredSeries;
     pub use crate::erasure::{ErasureRecord, SubjectRef, SubjectRegistry};
     pub use crate::error::{Error, Result};

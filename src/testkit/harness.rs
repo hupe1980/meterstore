@@ -14,22 +14,15 @@
 //! mock agrees with whatever the code does. So the harness starts the real
 //! thing, and the cost is a container per suite.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
-use iceberg_catalog_sql::{
-    SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
-    SqlCatalogBuilder,
-};
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use sqlx::PgPool;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use time::{Duration, OffsetDateTime};
 
-use crate::cold::IcebergCold;
+use crate::cold::{IcebergCold, IcebergSqlCatalog, WarehouseAuth};
 use crate::config::{TableConfig, ValidatedTableConfig};
 use crate::error::Result;
 use crate::hot::PostgresHot;
@@ -106,30 +99,21 @@ impl TestHarness {
 
         let warehouse = tempfile::tempdir()
             .map_err(|e| crate::Error::Storage(format!("temp warehouse: {e}")))?;
-        let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
-            .load(
-                "meterstore",
-                HashMap::from([
-                    (SQL_CATALOG_PROP_URI.to_string(), url.clone()),
-                    (
-                        SQL_CATALOG_PROP_WAREHOUSE.to_string(),
-                        format!("file://{}", warehouse.path().display()),
-                    ),
-                    (
-                        SQL_CATALOG_PROP_BIND_STYLE.to_string(),
-                        SqlBindStyle::DollarNumeric.to_string(),
-                    ),
-                ]),
-            )
-            .await
-            .map_err(|e| crate::Error::Storage(format!("sql catalog: {e}")))?;
-
-        let cold = Arc::new(IcebergCold::new(
-            Arc::new(catalog) as Arc<dyn Catalog>,
-            NamespaceIdent::new("metering".to_string()),
-            8 * 1024 * 1024,
-        ));
+        // Dogfood the public cold-tier constructor rather than wiring the
+        // SqlCatalog by hand — the same builder every deployment uses.
+        let warehouse_uri = format!("file://{}", warehouse.path().display());
+        let cold = IcebergSqlCatalog {
+            database_url: &url,
+            warehouse_uri: &warehouse_uri,
+            catalog_name: "meterstore",
+            namespace: "metering",
+            file_target_bytes: 8 * 1024 * 1024,
+            metadata_pool_max_connections: 10,
+            auth: &WarehouseAuth::default(),
+        }
+        .build()
+        .await?
+        .cold();
 
         let harness = Self {
             hot,

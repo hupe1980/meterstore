@@ -138,11 +138,29 @@ impl PostgresHot {
     ) -> Result<()> {
         let mut extra_ddl = String::new();
         for f in extra {
+            // A coded column (declared via `config::coded_column`) carries its
+            // allowed-value set in field metadata; render it as a CHECK so the
+            // deployment's vocabulary is enforced at the DB layer like sparte/
+            // unit/quality, not only by the application that writes the column.
+            let check = f
+                .metadata()
+                .get(crate::config::CHECK_VALUES_KEY)
+                .map(|vals| {
+                    let codes: Vec<&str> = vals.split(',').collect();
+                    format!(
+                        " CONSTRAINT {constraint:?} CHECK ({col:?} IN ({list}))",
+                        constraint = format!("{}_known", f.name()),
+                        col = f.name(),
+                        list = sql_code_list(&codes),
+                    )
+                })
+                .unwrap_or_default();
             extra_ddl.push_str(&format!(
-                "{:?} {} {},\n                ",
+                "{:?} {} {}{},\n                ",
                 f.name(),
                 pg_type(f.data_type())?,
-                if f.is_nullable() { "" } else { "NOT NULL" }
+                if f.is_nullable() { "" } else { "NOT NULL" },
+                check,
             ));
         }
 
@@ -176,7 +194,12 @@ impl PostgresHot {
                 -- by the column name.
                 unit          TEXT             NOT NULL
                     CONSTRAINT unit_known CHECK (unit IN ({unit_codes})),
-                quality       TEXT             NOT NULL,
+                -- Quality is checked against `metering`'s own code list, rendered
+                -- below like sparte/unit: the stored value is the resolved reading's
+                -- quality, and a drifting literal must fail the write, not read back
+                -- as an unknown flag on the authoritative store.
+                quality       TEXT             NOT NULL
+                    CONSTRAINT quality_known CHECK (quality IN ({quality_codes})),
                 resolution    TEXT,
                 source_kind   TEXT             NOT NULL,
                 source_detail TEXT,
@@ -200,6 +223,7 @@ impl PostgresHot {
             extra_ddl = extra_ddl,
             sparte_codes = sql_code_list(metering::Sparte::CODES),
             unit_codes = sql_code_list(metering::interval::MeasurementUnit::CODES),
+            quality_codes = sql_code_list(metering::QualityFlag::CODES),
             pk = merge_key
                 .iter()
                 .map(|c| format!("{c:?}"))
