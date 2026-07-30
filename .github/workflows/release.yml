@@ -125,4 +125,3 @@ jobs:
           body_path: notes.md
           # Any tag carrying a hyphen (v0.1.0-rc.1) is a pre-release.
           prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
-          fail_on_unmatched_files: true
