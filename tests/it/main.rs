@@ -1,16 +1,18 @@
 //! Every integration suite, as one test binary.
 //!
-//! Cargo compiles each top-level file in `tests/` into its own binary, and each
-//! one links this crate's whole dependency graph — DataFusion, Arrow, Iceberg,
-//! sqlx, tonic, axum — **statically**. At ~360 MB of unoptimised code per link,
-//! twenty-two of them is roughly 8 GB of binaries, which exhausts a CI runner's
-//! disk. The failure is not a tidy "no space left": `rust-lld` takes a **bus
-//! error** writing an output it cannot extend, which reads as a linker bug and
-//! is not one.
+//! Cargo compiles each top-level file in `tests/` into its own test binary.
+//! With this crate's dependency graph (DataFusion, Arrow, Iceberg, sqlx,
+//! tonic, axum), each linked executable is roughly 360 MB in a debug build,
+//! largely because of debug information. Twenty-two such binaries consume
+//! around 8 GB of disk, enough to exhaust a GitHub Actions runner.
 //!
-//! Living under `tests/it/` makes them modules of one binary instead. Nothing
-//! about a suite changes — each file keeps its own `#![cfg]` gates, fixtures and
-//! names — but the graph is linked once rather than per file.
+//! The resulting failure is not a tidy "no space left on device":
+//! `rust-lld` typically crashes with a bus error while extending the output
+//! file, which can easily be mistaken for a linker bug.
+//!
+//! Placing the suites under `tests/it/` makes them modules of a single
+//! integration test crate instead. Each suite keeps its own `#![cfg]` gates,
+//! fixtures, and test names, while the dependency graph is linked only once.
 
 mod archival_end_to_end;
 mod calendar_delegation;
