@@ -46,6 +46,36 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 
+    # `rsa` timing sidechannel (Marvin Attack). **No patched version exists** —
+    # upstream has no constant-time implementation yet — so this cannot be
+    # resolved by updating, and the crate cannot be swapped out from here.
+    #
+    # Reached only through the opt-in cloud object stores, and only two of them:
+    #   object-store-gcs   -> reqsign-google        -> rsa
+    #   object-store-azure -> reqsign-azure-storage -> rsa
+    # `object-store-s3` and the default build do not contain it. The `[bans]`
+    # entry below pins that: `rsa` may enter only through those two crates, so a
+    # dependency update introducing it anywhere else fails rather than silently
+    # widening what this exception covers.
+    #
+    # In both, the single use is signing a JWT assertion to obtain an OAuth
+    # token — a GCP service-account key, an Azure AD client certificate. It is
+    # therefore unreachable unless the deployment authenticates with such a key:
+    # workload identity, managed identity, instance metadata and (on S3-family
+    # stores) HMAC signing perform no RSA private-key operation. `WarehouseAuth`
+    # carries no GCP or Azure credentials, so meterstore never supplies such a
+    # key itself; it would come from the ambient environment through opendal's
+    # credential chain. The signature is made at token acquisition, cached for
+    # the token's lifetime, and sent outbound to the provider — not on the data
+    # path, and not driven by anything an attacker submits.
+    #
+    # Revisit: when RustCrypto/RSA ships the constant-time implementation
+    # (RustCrypto/RSA#626), or when reqsign stops depending on it. A deployment
+    # that cannot accept this should build without `object-store-gcs` and
+    # `object-store-azure` and pass a pre-built `Arc<dyn Catalog>` to
+    # `IcebergCold::new` instead.
+    "RUSTSEC-2023-0071",
+
     # `rustls-pemfile` is unmaintained, and `tokio-tar` mis-parses PAX extended
     # headers. Both arrive **only** through `testcontainers`, a dev-dependency:
     # neither is compiled into the library, and the tar files involved are
@@ -62,4 +92,13 @@ multiple-versions = "warn"
 # Single-sourced: see .github/workflows/ci.yml. A second `datafusion` major
 # gives mutually incompatible `TableProvider` types, which does not fail
 # obviously — a crate simply cannot be used with the other's types.
-deny = [{ name = "datafusion-table-providers" }]
+deny = [
+    { name = "datafusion-table-providers" },
+    # The accepted RUSTSEC-2023-0071 exception above rests on *where* `rsa`
+    # enters the graph: two credential signers, used only for OAuth token
+    # acquisition. Pinning the wrappers keeps that true — if an update pulls
+    # `rsa` in anywhere else, the exposure the exception describes no longer
+    # matches the graph, and this fails instead of the comment quietly going
+    # stale.
+    { name = "rsa", wrappers = ["reqsign-google", "reqsign-azure-storage", "reqsign-core"] },
+]

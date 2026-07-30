@@ -117,6 +117,8 @@ That registers the table as `readings` — the physical name carries a `_version
 
 `IcebergCold::new(catalog, …)` remains for a deployment that brings its own `Arc<dyn iceberg::Catalog>` (a REST catalog, Glue, …). `IcebergSqlCatalog` is the batteries-included path for the common case: `file://` and `memory://` warehouses work out of the box, while `s3://`, `gs://` and `abfss://` are behind the `object-store-s3` / `object-store-gcs` / `object-store-azure` features (or `object-store-all`) so a file-only build does not compile the cloud SDKs. `ColdTier::catalog_facade()` (feature `catalog-facade`) exposes the same catalog to Spark/Trino/DuckDB as a read-only Iceberg REST endpoint.
 
+> **`object-store-gcs` and `object-store-azure` carry an accepted advisory.** Both reach `rsa`, which has an unfixed timing sidechannel ([RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071); no patched release exists). `object-store-s3` and the default build do not. In both it is used for one thing — signing a JWT assertion to obtain an OAuth token (a GCP service-account key, an Azure AD client certificate) — so it is unreachable unless the deployment authenticates with such a key; workload identity, managed identity and instance metadata perform no RSA private-key operation, and `WarehouseAuth` never supplies one itself. If that trade is not acceptable, build without those two features and pass a pre-built `Arc<dyn Catalog>` to `IcebergCold::new`. `deny.toml` carries the full reasoning and pins where `rsa` may enter the graph.
+
 ### Querying across both tiers
 
 ```rust
