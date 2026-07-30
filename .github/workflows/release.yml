@@ -74,13 +74,6 @@ jobs:
       - name: Verify the packaged crate builds
         run: cargo publish --dry-run --all-features
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: crate
-          path: target/package/*.crate
-          if-no-files-found: error
-
   publish:
     needs: [verify, check]
     runs-on: ubuntu-latest
@@ -102,11 +95,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: crate
-          path: dist
 
       - name: Build release notes
         id: notes
@@ -135,7 +123,6 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: notes.md
-          files: dist/*.crate
           # Any tag carrying a hyphen (v0.1.0-rc.1) is a pre-release.
           prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
           fail_on_unmatched_files: true
