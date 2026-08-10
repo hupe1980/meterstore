@@ -57,6 +57,15 @@ pub fn version_ceiling(max: crate::version::Version) -> Expr {
     ))
 }
 
+/// A ceiling on the transaction-time axis, for an "as known at" read.
+///
+/// Where [`version_ceiling`] pins which *assertion* was in force, this pins what
+/// the store had been **told** — every row carries `recorded_at`, in both tiers,
+/// so this is the one reproducible read that can include the hot window.
+pub fn recorded_at_ceiling(at: OffsetDateTime) -> Expr {
+    datafusion::logical_expr::col(col::RECORDED_AT).lt_eq(timestamp_lit(at))
+}
+
 /// A timestamp literal in the unit and zone the storage schema uses.
 fn timestamp_lit(t: OffsetDateTime) -> Expr {
     datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(
@@ -410,6 +419,190 @@ mod tests {
                 TimeRange::unbounded(),
                 "{filter} must not be mistaken for a bound"
             );
+        }
+    }
+}
+
+/// The safety property, over generated expressions rather than chosen ones.
+///
+/// # Why this is a property test and not a table of cases
+///
+/// [`time_range`] is an *analysis*: it looks at an expression tree and claims a
+/// bound. The claim is used to skip a tier entirely, so the only thing that
+/// matters is the direction of its error. Too wide costs a scan. **Too narrow
+/// loses rows, silently**, and the rows it loses are exactly the ones whose
+/// expression shape nobody thought to write a case for.
+///
+/// The hand-written cases below cover the shapes someone thought of. This covers
+/// the shapes nobody did — nesting, operand order, `OR` beneath `AND`,
+/// unrecognised predicates mixed with recognised ones — by generating them and
+/// asserting the one thing that must never fail:
+///
+/// > if a row satisfies the filter, the extracted range must contain it.
+///
+/// The reference is an independent evaluator over the same generated tree, for
+/// the same reason the §17.3 oracle is: an evaluator that shared `range_of`'s
+/// reasoning would agree with it about its mistakes.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use datafusion::logical_expr::{col as df_col, lit};
+    use proptest::prelude::*;
+
+    /// A filter shape, buildable as a DataFusion expression *and* evaluable
+    /// directly — the two halves the property compares.
+    #[derive(Debug, Clone)]
+    enum Pred {
+        /// `from <op> t`, seconds since the epoch.
+        Cmp(Operator, i64),
+        /// `t <op> from` — the same bound with the operands the other way round,
+        /// which the analysis has to flip rather than ignore.
+        Flipped(Operator, i64),
+        /// `from BETWEEN lo AND hi`, inclusive at both ends.
+        Between(i64, i64),
+        /// A predicate on some other column. It constrains nothing about `from`,
+        /// so any instant can satisfy it — and the analysis must not read a
+        /// bound into it.
+        Foreign,
+        And(Box<Pred>, Box<Pred>),
+        Or(Box<Pred>, Box<Pred>),
+    }
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).expect("in range")
+    }
+
+    fn ts(seconds: i64) -> Expr {
+        lit(ScalarValue::TimestampMicrosecond(
+            Some(seconds * 1_000_000),
+            Some("UTC".into()),
+        ))
+    }
+
+    impl Pred {
+        fn to_expr(&self) -> Expr {
+            let from = df_col(col::FROM);
+            match self {
+                Self::Cmp(op, t) => binary(from, *op, ts(*t)),
+                Self::Flipped(op, t) => binary(ts(*t), *op, from),
+                Self::Between(lo, hi) => from.between(ts(*lo), ts(*hi)),
+                Self::Foreign => df_col(col::MALO_ID).eq(lit("12345678901")),
+                Self::And(a, b) => a.to_expr().and(b.to_expr()),
+                Self::Or(a, b) => a.to_expr().or(b.to_expr()),
+            }
+        }
+
+        /// Whether a row whose `from` is `t` satisfies this filter.
+        fn holds(&self, t: i64) -> bool {
+            match self {
+                Self::Cmp(op, v) => compare(t, *op, *v),
+                // `t <op> from` is `from <flipped op> t`.
+                Self::Flipped(op, v) => compare(*v, *op, t),
+                Self::Between(lo, hi) => t >= *lo && t <= *hi,
+                // Satisfiable at any instant.
+                Self::Foreign => true,
+                Self::And(a, b) => a.holds(t) && b.holds(t),
+                Self::Or(a, b) => a.holds(t) || b.holds(t),
+            }
+        }
+    }
+
+    fn binary(left: Expr, op: Operator, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
+    }
+
+    fn compare(left: i64, op: Operator, right: i64) -> bool {
+        match op {
+            Operator::Lt => left < right,
+            Operator::LtEq => left <= right,
+            Operator::Gt => left > right,
+            Operator::GtEq => left >= right,
+            Operator::Eq => left == right,
+            other => unreachable!("generator produces no {other:?}"),
+        }
+    }
+
+    fn contains(range: TimeRange, t: i64) -> bool {
+        let at = at(t);
+        range.start().is_none_or(|s| at >= s) && range.end().is_none_or(|e| at < e)
+    }
+
+    /// Instants are drawn from a small window so a generated bound and a
+    /// generated probe actually meet — over the whole `i64` range they never
+    /// would, and every case would pass vacuously.
+    const WINDOW: std::ops::Range<i64> = 0..40;
+
+    fn leaf() -> impl Strategy<Value = Pred> {
+        let op = prop_oneof![
+            Just(Operator::Lt),
+            Just(Operator::LtEq),
+            Just(Operator::Gt),
+            Just(Operator::GtEq),
+            Just(Operator::Eq),
+        ];
+        prop_oneof![
+            8 => (op.clone(), WINDOW).prop_map(|(o, t)| Pred::Cmp(o, t)),
+            4 => (op, WINDOW).prop_map(|(o, t)| Pred::Flipped(o, t)),
+            3 => (WINDOW, WINDOW).prop_map(|(a, b)| Pred::Between(a.min(b), a.max(b))),
+            1 => Just(Pred::Foreign),
+        ]
+    }
+
+    fn predicate() -> impl Strategy<Value = Pred> {
+        leaf().prop_recursive(4, 24, 2, |inner| {
+            prop_oneof![
+                inner
+                    .clone()
+                    .prop_flat_map(move |a| leaf()
+                        .prop_map(move |b| Pred::And(Box::new(a.clone()), Box::new(b)))),
+                inner
+                    .prop_flat_map(move |a| leaf()
+                        .prop_map(move |b| Pred::Or(Box::new(a.clone()), Box::new(b)))),
+            ]
+        })
+    }
+
+    proptest! {
+        /// **The property the tier split rests on.** A row the filter admits must
+        /// lie inside the range the planner extracted, or the scan that range
+        /// selects will not read it — and nothing downstream notices, because the
+        /// row simply is not there.
+        #[test]
+        fn an_admitted_row_is_never_outside_the_extracted_range(
+            pred in predicate(),
+            probe in WINDOW,
+        ) {
+            let range = time_range(&[pred.to_expr()]);
+            prop_assert!(
+                !pred.holds(probe) || contains(range, probe),
+                "{pred:?} admits {probe} but the extracted range {range:?} excludes it",
+            );
+        }
+
+        /// The same, for a list of filters — which DataFusion hands over
+        /// implicitly `AND`ed, so the bounds intersect and each intersection is
+        /// another chance to narrow too far.
+        #[test]
+        fn intersecting_several_filters_stays_conservative(
+            preds in prop::collection::vec(predicate(), 1..4),
+            probe in WINDOW,
+        ) {
+            let exprs: Vec<Expr> = preds.iter().map(Pred::to_expr).collect();
+            let range = time_range(&exprs);
+            let admitted = preds.iter().all(|p| p.holds(probe));
+            prop_assert!(
+                !admitted || contains(range, probe),
+                "{preds:?} admit {probe} but {range:?} excludes it",
+            );
+        }
+
+        /// A range narrowed by the tier split is handed to the cold scan as
+        /// filters, and must survive the round trip — otherwise Iceberg prunes
+        /// against bounds wider than the ones the planner chose, or narrower.
+        #[test]
+        fn range_filters_re_extract_to_the_same_bounds(a in WINDOW, b in WINDOW) {
+            let range = TimeRange::between(at(a.min(b)), at(a.max(b) + 1));
+            prop_assert_eq!(time_range(&range_filters(range)), range);
         }
     }
 }

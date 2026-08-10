@@ -1,0 +1,33 @@
+base_url = "https://hupe1980.github.io/meterstore"
+title = "MeterStore"
+description = "Hot/cold tiered storage for metering time series. PostgreSQL for the recent interval window, Apache Iceberg for the history, one SQL surface across both."
+default_language = "en"
+
+compile_sass = false
+build_search_index = false
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+# Internal links are checked at build time, so a rename cannot quietly leave a
+# 404 behind. External links are not: a third party being down should not fail
+# our build.
+[link_checker]
+internal_level = "error"
+external_level = "warn"
+
+[markdown]
+smart_punctuation = true
+github_alerts = true
+insert_anchor_links = "heading"
+
+[markdown.highlighting]
+enabled = true
+theme = "ayu-dark"
+
+[extra]
+repository = "https://github.com/hupe1980/meterstore"
+crate = "https://crates.io/crates/meterstore"
+api_docs = "https://docs.rs/meterstore"
+# Shown in the footer and in structured data.
+author = "Frank Hübner"
+tagline = "Metering time series at settlement scale, in an open format."

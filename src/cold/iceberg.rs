@@ -68,6 +68,16 @@ impl IcebergCold {
         }
     }
 
+    /// The catalogue this tier commits through.
+    ///
+    /// Exposed because the catalogue *is* the extension point: `new` takes any
+    /// `Arc<dyn Catalog>`, and a deployment that handed one in may need it back —
+    /// to serve the read-only façade over it, or to run an operation this crate
+    /// does not implement (§10.3.1) against the same tables.
+    pub fn catalog(&self) -> std::sync::Arc<dyn Catalog> {
+        std::sync::Arc::clone(&self.catalog)
+    }
+
     fn ident(&self, table: &str) -> TableIdent {
         TableIdent::new(self.namespace.clone(), table.to_string())
     }
@@ -114,7 +124,7 @@ impl IcebergCold {
         if self.catalog.table_exists(&ident).await.map_err(ice)? {
             let existing = self.catalog.load_table(&ident).await.map_err(ice)?;
             check_partition_spec(table, &existing, identity)?;
-            return Ok(existing);
+            return self.disable_library_commit_retry(existing).await;
         }
 
         let arrow_schema = schema::storage_schema(extra);
@@ -126,6 +136,10 @@ impl IcebergCold {
             .name(table.to_string())
             .partition_spec(partition_spec(&iceberg_schema, identity)?)
             .schema(iceberg_schema)
+            .properties(HashMap::from([(
+                COMMIT_RETRIES_PROPERTY.to_string(),
+                "0".to_string(),
+            )]))
             .build();
 
         let created = self
@@ -209,17 +223,80 @@ impl IcebergCold {
         retain_last: usize,
         now: OffsetDateTime,
     ) -> Result<usize> {
-        let loaded = self.load(table).await?;
-        let before = loaded.metadata().snapshots().count();
+        // **Before anything is expired**, put the boundary back on the current
+        // snapshot. The walk-back through the parent chain is what makes a
+        // foreign commit survivable, and a chain is exactly the thing expiry
+        // punches holes in — see the anchor comment below. Re-stamping first
+        // makes the walk unnecessary, which is a stronger guarantee than
+        // protecting the path it would have taken.
+        self.reassert_watermark(table).await?;
 
-        let cutoff = now - retain_for;
-        let cutoff_ms = cutoff.unix_timestamp() * 1_000;
+        let loaded = self.load(table).await?;
+        let metadata = loaded.metadata();
+        let before = metadata.snapshots().count();
+
+        let cutoff_ms = (now - retain_for).unix_timestamp() * 1_000;
+
+        // Chosen here rather than by `expire_older_than_ms`, because one snapshot
+        // has to survive that neither age nor count identifies.
+        let mut ordered: Vec<_> = metadata.snapshots().collect();
+        ordered.sort_by_key(|s| (s.timestamp_ms(), s.snapshot_id()));
+
+        // **The path from the current snapshot back to the boundary.**
+        //
+        // §10.3.1 has no native compaction and recommends running it out of band
+        // with Spark or PyIceberg. Such a commit is a valid Iceberg snapshot that
+        // knows nothing about tiering, so it carries no watermark and the lookup
+        // walks back the *parent chain* to find one.
+        //
+        // Expiring by age alone breaks that walk — and not only by removing the
+        // snapshot that carries the boundary. Removing any **intermediate**
+        // ancestor is enough: the chain then has a hole, the walk stops at a
+        // parent id that no longer resolves, and no boundary is found. A
+        // maintenance job following this design's own advice would have bricked
+        // the table, and the symptom is that every query fails at once.
+        //
+        // The re-stamp above normally makes this path one snapshot long. It is
+        // still computed, because `expire_snapshots` is public and a caller may
+        // reach it with a history this run did not create.
+        let mut protected: std::collections::HashSet<i64> = Default::default();
+        let mut walk = metadata.current_snapshot().cloned();
+        while let Some(snapshot) = walk {
+            protected.insert(snapshot.snapshot_id());
+            if snapshot
+                .summary()
+                .additional_properties
+                .contains_key(WATERMARK_PROPERTY)
+            {
+                break;
+            }
+            walk = snapshot
+                .parent_snapshot_id()
+                .and_then(|id| metadata.snapshot_by_id(id))
+                .cloned();
+        }
+
+        protected.extend(
+            ordered
+                .iter()
+                .rev()
+                .take(retain_last.max(1))
+                .map(|s| s.snapshot_id()),
+        );
+
+        let doomed: Vec<i64> = ordered
+            .iter()
+            .filter(|s| s.timestamp_ms() < cutoff_ms)
+            .map(|s| s.snapshot_id())
+            .filter(|id| !protected.contains(id))
+            .collect();
+
+        if doomed.is_empty() {
+            return Ok(0);
+        }
 
         let txn = Transaction::new(&loaded);
-        let action = txn
-            .expire_snapshots()
-            .expire_older_than_ms(cutoff_ms)
-            .retain_last(retain_last.max(1));
+        let action = txn.expire_snapshots().expire_snapshot_ids(doomed);
 
         let committed = action
             .apply(txn)
@@ -235,6 +312,57 @@ impl IcebergCold {
             info!(table, expired, retain_last, "snapshots expired");
         }
         Ok(expired)
+    }
+
+    /// Put the tiering boundary back on the **current** snapshot.
+    ///
+    /// Every MeterStore commit stamps the boundary into its own snapshot summary
+    /// (§6.2). A commit from anything else does not — and this design explicitly
+    /// recommends such commits, because compaction and orphan cleanup are blocked
+    /// upstream (§10.3.1, §10.5.1) and the documented answer is to run them out of
+    /// band with Spark or PyIceberg.
+    ///
+    /// After one, the boundary is still *findable*: the lookup walks back the
+    /// parent chain. But it is no longer where every reader expects it, which
+    /// costs a walk on every read and forces snapshot expiry to keep an ancestor
+    /// alive indefinitely to avoid stranding it. Re-stamping restores the
+    /// invariant that the current snapshot states the boundary.
+    ///
+    /// The value is **read from the history, never invented**: this republishes
+    /// what the table already said, so it cannot move the boundary. It commits an
+    /// empty append carrying the property, which is the same shape as an archival
+    /// window that held no rows.
+    ///
+    /// `Ok(None)` when the current snapshot already carries it — so this is
+    /// idempotent and cheap to run on a schedule.
+    pub async fn reassert_watermark(&self, table: &str) -> Result<Option<CommitInfo>> {
+        let loaded = self.load(table).await?;
+        let Some(current) = loaded.metadata().current_snapshot() else {
+            // Nothing has been committed, so there is no boundary to restate.
+            return Ok(None);
+        };
+        if current
+            .summary()
+            .additional_properties
+            .contains_key(WATERMARK_PROPERTY)
+        {
+            return Ok(None);
+        }
+
+        let watermark = watermark_of(&loaded)?;
+        info!(
+            table,
+            %watermark,
+            "current snapshot carries no boundary; restating it after an out-of-band commit"
+        );
+        self.append_with_summary(
+            table,
+            crate::tiering::store::stream_of(Vec::new()),
+            WriteHints::default(),
+            Summary::Preserve,
+        )
+        .await
+        .map(Some)
     }
 
     /// Per-file `version` bounds for every live data file overlapping `range`.
@@ -444,7 +572,7 @@ impl IcebergCold {
         let location = DefaultLocationGenerator::new(table.metadata()).map_err(ice)?;
         let names = DefaultFileNameGenerator::new(
             "data".to_string(),
-            Some(uuid_suffix()),
+            Some(file_suffix()),
             DataFileFormat::Parquet,
         );
 
@@ -535,33 +663,172 @@ impl IcebergCold {
         Ok((data_files, rows))
     }
 
-    /// Commit data files, attaching `properties` to the snapshot summary.
-    async fn commit_with_properties(
-        &self,
-        table: Table,
-        data_files: Vec<iceberg::spec::DataFile>,
-        properties: HashMap<String, String>,
-    ) -> Result<i64> {
+    /// Turn off the library's own commit retry, so ours can run instead.
+    ///
+    /// See [`IcebergCold::append_with_summary`] for why re-applying a *fixed*
+    /// snapshot summary against a refreshed base is wrong for this crate. Set at
+    /// creation for new tables; this handles one created before the property
+    /// existed, or by another tool.
+    async fn disable_library_commit_retry(&self, table: Table) -> Result<Table> {
+        if table.metadata().properties().get(COMMIT_RETRIES_PROPERTY) == Some(&"0".to_string()) {
+            return Ok(table);
+        }
         let txn = Transaction::new(&table);
         let action = txn
-            .fast_append()
-            .add_data_files(data_files)
-            .set_snapshot_properties(properties);
-
-        let committed = action
+            .update_table_properties()
+            .set(COMMIT_RETRIES_PROPERTY.to_string(), "0".to_string());
+        let updated = action
             .apply(txn)
             .map_err(ice)?
             .commit(self.catalog.as_ref())
             .await
             .map_err(ice)?;
+        debug!(
+            table = table.identifier().name(),
+            "library commit retry disabled; the watermark-preserving retry is ours"
+        );
+        Ok(updated)
+    }
 
-        Ok(committed
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .unwrap_or_default())
+    /// Write `batches` and commit them with a snapshot summary derived from the
+    /// base the commit actually lands on, retrying a lost race.
+    ///
+    /// # Why the retry cannot be left to the library
+    ///
+    /// `iceberg` 0.10 already retries a conflicting commit: it reloads the table
+    /// and re-applies the same action — including the snapshot summary the action
+    /// was **built with**, four times by default. For an ordinary append that is
+    /// exactly right, because an append's summary describes only itself.
+    ///
+    /// Ours does not. It carries the tiering watermark, which is a property of
+    /// the base the commit lands on, and re-publishing a stale one moves the
+    /// boundary **backwards**. The path that gets there is ordinary traffic: a
+    /// late-correction append reads the current watermark, an archival commit
+    /// lands first, and the correction's retry then republishes the older value.
+    /// Intervals PostgreSQL has already purged are claimed by the hot tier, which
+    /// does not hold them, and they vanish from every unified query with nothing
+    /// reporting a failure. That is the single failure §6.2 exists to make
+    /// impossible, reintroduced by a dependency being helpful.
+    ///
+    /// So library retry is off (`commit.retry.num-retries = 0`) and the loop is
+    /// here, where the summary — and the monotonicity assertion behind it — is
+    /// rebuilt from the refreshed base on every attempt. The data files are
+    /// written once and reused: they are independent of which snapshot they land
+    /// on, and re-writing them per attempt would rewrite the whole window.
+    async fn append_with_summary(
+        &self,
+        table: &str,
+        batches: BatchStream,
+        hints: WriteHints,
+        summary: Summary,
+    ) -> Result<CommitInfo> {
+        let mut base = self.load(table).await?;
+        let (data_files, rows) = self.write_data_files(&base, batches, hints).await?;
+
+        for attempt in 0..=COMMIT_ATTEMPTS {
+            let watermark = summary.watermark_for(table, &base)?;
+            let mut properties = HashMap::from([
+                (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
+                (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
+            ]);
+            if let Summary::Advance(window) = summary {
+                properties.insert(ARCHIVED_RANGE_PROPERTY.to_string(), window.to_property()?);
+            }
+
+            let txn = Transaction::new(&base);
+            let action = txn
+                .fast_append()
+                .add_data_files(data_files.clone())
+                .set_snapshot_properties(properties);
+
+            match action
+                .apply(txn)
+                .map_err(ice)?
+                .commit(self.catalog.as_ref())
+                .await
+            {
+                Ok(committed) => {
+                    let snapshot_id = committed
+                        .metadata()
+                        .current_snapshot()
+                        .map(|s| s.snapshot_id())
+                        .unwrap_or_default();
+                    debug!(table, rows, %watermark, snapshot_id, "cold commit");
+                    return Ok(CommitInfo {
+                        snapshot_id,
+                        rows,
+                        watermark,
+                    });
+                }
+                Err(e)
+                    if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts
+                        && attempt < COMMIT_ATTEMPTS =>
+                {
+                    // Someone else committed first. Reload and rebuild the
+                    // summary against what is now current — which is the whole
+                    // reason this loop is not the library's.
+                    debug!(
+                        table,
+                        attempt, "commit conflict; re-deriving against a fresh base"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6)))
+                        .await;
+                    base = self.load(table).await?;
+                }
+                Err(e) => return Err(ice(e)),
+            }
+        }
+
+        Err(Error::Storage(format!(
+            "{table}: {COMMIT_ATTEMPTS} commit attempts all lost the compare-and-swap; \
+             another writer is committing continuously"
+        )))
     }
 }
+
+/// What a commit's snapshot summary should say about the tier boundary.
+#[derive(Debug, Clone, Copy)]
+enum Summary {
+    /// Archival: advance the boundary to the window's exclusive end.
+    Advance(ArchivalWindow),
+    /// A late correction: restate whatever the base already published. The
+    /// boundary is about which tier owns a range, and a correction does not
+    /// change that.
+    Preserve,
+}
+
+impl Summary {
+    /// The watermark to publish, given the base this attempt will land on.
+    fn watermark_for(self, table: &str, base: &Table) -> Result<TieringWatermark> {
+        let current = watermark_of(base)?;
+        match self {
+            Self::Preserve => Ok(current),
+            Self::Advance(window) => {
+                let next = window.resulting_watermark();
+                // Asserted against the commit base, not only by the caller. An
+                // archiver that read a stale watermark, or a second archiver
+                // racing the first, would otherwise publish a boundary that moves
+                // backwards over rows PostgreSQL has already purged.
+                current
+                    .advance_to(next)
+                    .map_err(|_| Error::InvariantViolated {
+                        table: table.to_string(),
+                        detail: format!(
+                            "archiving [{}, {}) would move the watermark backwards from {current}",
+                            window.from(),
+                            window.to(),
+                        ),
+                    })
+            }
+        }
+    }
+}
+
+/// Table property switching off the library's own commit retry.
+const COMMIT_RETRIES_PROPERTY: &str = "commit.retry.num-retries";
+
+/// How many times a lost compare-and-swap is re-derived and retried.
+const COMMIT_ATTEMPTS: u32 = 4;
 
 /// A cold-tier provider that reads the table's current snapshot on every scan.
 ///
@@ -684,14 +951,22 @@ fn align(
 /// and under-sizing costs false positives; neither is a correctness matter.
 const DEFAULT_BLOOM_FILTER_NDV: u64 = 100_000;
 
-/// A short unique suffix so concurrent writers cannot collide on a file name.
-fn uuid_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{nanos:x}")
+/// A unique suffix so concurrent writers cannot collide on a data-file name.
+///
+/// **Random, not a clock.** A wall-clock reading is not unique across processes:
+/// an archival run and a late-correction append in another process can sample the
+/// same instant, and several platforms report far coarser than nanosecond
+/// resolution regardless. Two writers agreeing on a suffix would produce the same
+/// object key, and the second write would **overwrite a committed Parquet file** —
+/// silent data loss in the tier whose entire job is to be durable.
+///
+/// 64 bits from the OS CSPRNG puts a collision beyond reach at any commit rate
+/// this store will see, and it is the same entropy source §19.4 already requires
+/// for subject references.
+fn file_suffix() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
+    format!("{:016x}", u64::from_be_bytes(bytes))
 }
 
 /// The partition spec: identity columns first, then `month(from)`.
@@ -845,46 +1120,11 @@ impl ColdStore for IcebergCold {
         hints: WriteHints,
         window: ArchivalWindow,
     ) -> Result<CommitInfo> {
-        let loaded = self.load(table).await?;
-        let watermark = window.resulting_watermark();
-
-        // The monotonicity guarantee is enforced against the commit base, not
-        // only by the caller. An archiver that read a stale watermark, or a
-        // second archiver racing the first, would otherwise publish a boundary
-        // that moves backwards — and the rows below it are already gone from
-        // PostgreSQL, so nothing would return them.
-        watermark_of(&loaded)?
-            .advance_to(watermark)
-            .map_err(|_| Error::InvariantViolated {
-                table: table.to_string(),
-                detail: format!(
-                    "archiving [{}, {}) would move the watermark backwards from {}",
-                    window.from(),
-                    window.to(),
-                    watermark_of(&loaded).unwrap_or(TieringWatermark::empty()),
-                ),
-            })?;
-
-        let (data_files, rows) = self.write_data_files(&loaded, batches, hints).await?;
-
-        // The watermark rides along in the same commit as the data. This is the
-        // atomicity that makes recovery trivial.
-        let properties = HashMap::from([
-            (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
-            (ARCHIVED_RANGE_PROPERTY.to_string(), window.to_property()?),
-            (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
-        ]);
-
-        let snapshot_id = self
-            .commit_with_properties(loaded, data_files, properties)
-            .await?;
-
-        debug!(table, rows, %watermark, snapshot_id, "cold commit");
-        Ok(CommitInfo {
-            snapshot_id,
-            rows,
-            watermark,
-        })
+        // The watermark rides along in the same commit as the data. That is the
+        // atomicity that makes recovery trivial — and the reason the summary is
+        // derived from the commit base rather than fixed up front.
+        self.append_with_summary(table, batches, hints, Summary::Advance(window))
+            .await
     }
 
     async fn expire_snapshots(
@@ -903,6 +1143,10 @@ impl ColdStore for IcebergCold {
         range: (OffsetDateTime, OffsetDateTime),
     ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
         IcebergCold::version_stats(self, table, range).await
+    }
+
+    async fn reassert_watermark(&self, table: &str) -> Result<Option<CommitInfo>> {
+        IcebergCold::reassert_watermark(self, table).await
     }
 
     async fn snapshot_provider(
@@ -955,38 +1199,16 @@ impl ColdStore for IcebergCold {
         batches: BatchStream,
         hints: WriteHints,
     ) -> Result<CommitInfo> {
-        let loaded = self.load(table).await?;
-
         // A correction for an already-archived interval. It must not move the
-        // watermark: the boundary is about which tier owns a time range, and
-        // that has not changed.
-        //
-        // Read from **this** load rather than a second one. Every commit
-        // re-states the watermark in its own summary, so a fresh read racing an
-        // archival commit would carry a value older than the base this append is
-        // about to land on — and the new snapshot would publish it, moving the
-        // boundary backwards. Already-archived intervals would then be claimed
-        // by the hot tier, which does not hold them, and the rows would vanish
-        // from every unified query. Deriving it from the commit base means the
-        // only way to lose the race is a CAS conflict, which fails loudly.
-        let watermark = watermark_of(&loaded)?;
-        let (data_files, rows) = self.write_data_files(&loaded, batches, hints).await?;
-
-        let properties = HashMap::from([
-            (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
-            (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
-        ]);
-
-        let snapshot_id = self
-            .commit_with_properties(loaded, data_files, properties)
-            .await?;
-
-        debug!(table, rows, snapshot_id, "cold correction append");
-        Ok(CommitInfo {
-            snapshot_id,
-            rows,
-            watermark,
-        })
+        // watermark: the boundary is about which tier owns a time range, and that
+        // has not changed. It must not move it *backwards* either, which is the
+        // harder half — every commit re-states the watermark in its own summary,
+        // so a value read before an archival commit landed would republish an
+        // older boundary and make already-purged intervals vanish from every
+        // query. `Preserve` re-reads it from whichever base the commit lands on,
+        // including after a lost race.
+        self.append_with_summary(table, batches, hints, Summary::Preserve)
+            .await
     }
 }
 
@@ -1074,10 +1296,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_name_suffixes_differ_between_calls() {
-        assert_ne!(uuid_suffix(), {
-            std::thread::sleep(std::time::Duration::from_nanos(1));
-            uuid_suffix()
-        });
+    fn file_name_suffixes_do_not_depend_on_the_clock() {
+        // Sampled back to back, so a clock-derived suffix would repeat on any
+        // platform whose timer is coarser than the loop. A repeat is not a tidy
+        // collision error — it is one committed Parquet file overwriting another.
+        let suffixes: std::collections::HashSet<String> =
+            (0..1_000).map(|_| file_suffix()).collect();
+        assert_eq!(suffixes.len(), 1_000);
+        assert!(suffixes.iter().all(|s| s.len() == 16));
     }
 }

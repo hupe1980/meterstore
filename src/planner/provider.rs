@@ -352,17 +352,119 @@ impl TieredTableProvider {
         // it exists and would never re-apply it — and a settlement rerun that
         // quietly ignored its version ceiling would return today's corrections
         // under the heading of a past settlement.
-        //
-        // So the filter goes in explicitly. It has to sit below the projection,
-        // since the projection may not include `version`, and the limit has to
-        // move above it, since a limit applied before a filter counts rows the
-        // filter would have removed.
         let scanned = pinned.scan(state, None, &all, None).await?;
+        self.enforce(state, ceiling, scanned, projection, limit)
+    }
 
+    /// Scan both tiers against an already-read watermark.
+    ///
+    /// The scan half of [`split_at`](Self::split_at): a caller that decided
+    /// something from the split passes the same boundary here, so the decision
+    /// and the scan cannot be based on different views of the tier layout.
+    pub async fn scan_at(
+        &self,
+        state: &dyn Session,
+        watermark: TieringWatermark,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let started = std::time::Instant::now();
+        let split = self.split_at(watermark, filters);
+
+        debug!(
+            table = %self.table,
+            %watermark,
+            cold = split.cold.is_some(),
+            hot = split.hot.is_some(),
+            "tier split"
+        );
+
+        // A transaction-time read pins `recorded_at`, which lives on every row in
+        // *both* tiers — so unlike the version ceiling this one has to be applied
+        // to the union rather than to the pinned cold snapshot. And like that
+        // one it must be *applied*, not merely pushed down: the engine never saw
+        // it, so it will not re-apply it above the scan, and a read that quietly
+        // ignored its own ceiling would return rows learned after the instant it
+        // claims to reproduce.
+        //
+        // It therefore sits below the projection, since the projection need not
+        // include `recorded_at`, and the limit moves above it, since a limit
+        // applied first counts rows the filter would have removed.
+        let ceiling = self
+            .mode
+            .recorded_at_ceiling()
+            .map(predicate::recorded_at_ceiling);
+        let (tier_projection, tier_limit) = match ceiling {
+            Some(_) => (None, None),
+            None => (projection, limit),
+        };
+
+        // Handed to the tiers as an ordinary filter as well, so Iceberg can prune
+        // whole files whose `recorded_at` bounds lie entirely above the ceiling.
+        // That is the optimisation; the filter below is the correctness.
+        let mut tier_filters = filters.to_vec();
+        if let Some(expr) = &ceiling {
+            tier_filters.push(expr.clone());
+        }
+
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
+        if let Some(range) = split.cold {
+            plans.push(
+                self.scan_cold(state, range, tier_projection, &tier_filters, tier_limit)
+                    .await?,
+            );
+        }
+        if let Some(range) = split.hot {
+            plans.push(self.scan_hot(range, tier_projection, tier_limit)?);
+        }
+
+        // Planning latency, not scan latency: at this point nothing has been
+        // read. The two used to share one instrument, which made a slow scan
+        // invisible and a slow catalog look like a slow query.
+        crate::observe::metrics().plan_duration.record(
+            started.elapsed().as_secs_f64(),
+            &crate::observe::table(&self.table),
+        );
+
+        let scanned = match plans.len() {
+            // A provably empty range still needs a plan with the right schema.
+            0 => {
+                let empty = MemTable::try_new(self.schema.clone(), vec![vec![]])?;
+                empty
+                    .scan(state, tier_projection, &tier_filters, tier_limit)
+                    .await?
+            }
+            1 => plans.pop().expect("length checked"),
+            // Disjoint halves, so concatenation is the whole merge.
+            _ => UnionExec::try_new(plans)?,
+        };
+
+        match ceiling {
+            None => Ok(scanned),
+            Some(expr) => self.enforce(state, expr, scanned, projection, limit),
+        }
+    }
+
+    /// Apply `filter` to `input` below the projection, restoring `projection`
+    /// and `limit` above it.
+    ///
+    /// The shape every *enforced* — as opposed to merely pushed-down — predicate
+    /// needs: a filter DataFusion does not know about cannot be re-applied by
+    /// DataFusion, so this crate has to place it, and it has to place it where
+    /// the column it reads still exists.
+    fn enforce(
+        &self,
+        state: &dyn Session,
+        filter: Expr,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let df_schema = datafusion::common::DFSchema::try_from(self.schema.as_ref().clone())?;
-        let physical = state.create_physical_expr(ceiling, &df_schema)?;
+        let physical = state.create_physical_expr(filter, &df_schema)?;
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::filter::FilterExec::try_new(physical, scanned)?,
+            datafusion::physical_plan::filter::FilterExec::try_new(physical, input)?,
         );
 
         let projected: Arc<dyn ExecutionPlan> = match projection {
@@ -393,61 +495,6 @@ impl TieredTableProvider {
                 0,
                 Some(fetch),
             )),
-        })
-    }
-
-    /// Scan both tiers against an already-read watermark.
-    ///
-    /// The scan half of [`split_at`](Self::split_at): a caller that decided
-    /// something from the split passes the same boundary here, so the decision
-    /// and the scan cannot be based on different views of the tier layout.
-    pub async fn scan_at(
-        &self,
-        state: &dyn Session,
-        watermark: TieringWatermark,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let started = std::time::Instant::now();
-        let split = self.split_at(watermark, filters);
-
-        debug!(
-            table = %self.table,
-            %watermark,
-            cold = split.cold.is_some(),
-            hot = split.hot.is_some(),
-            "tier split"
-        );
-
-        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
-        if let Some(range) = split.cold {
-            plans.push(
-                self.scan_cold(state, range, projection, filters, limit)
-                    .await?,
-            );
-        }
-        if let Some(range) = split.hot {
-            plans.push(self.scan_hot(range, projection, limit)?);
-        }
-
-        // Planning latency, not scan latency: at this point nothing has been
-        // read. The two used to share one instrument, which made a slow scan
-        // invisible and a slow catalog look like a slow query.
-        crate::observe::metrics().plan_duration.record(
-            started.elapsed().as_secs_f64(),
-            &crate::observe::table(&self.table),
-        );
-
-        Ok(match plans.len() {
-            // A provably empty range still needs a plan with the right schema.
-            0 => {
-                let empty = MemTable::try_new(self.schema.clone(), vec![vec![]])?;
-                empty.scan(state, projection, filters, limit).await?
-            }
-            1 => plans.pop().expect("length checked"),
-            // Disjoint halves, so concatenation is the whole merge.
-            _ => UnionExec::try_new(plans)?,
         })
     }
 }

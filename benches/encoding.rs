@@ -54,7 +54,7 @@ fn delivery(meter: usize) -> StoredSeries {
                 to: from + Duration::minutes(15),
                 // Values that vary, so delta encoding and decimal handling do
                 // realistic work rather than compressing a constant away.
-                value_kwh: Decimal::new(100 + (i as i64 * 7) % 500, 2),
+                value: Decimal::new(100 + (i as i64 * 7) % 500, 2),
                 quality: QualityFlag::Measured,
                 obis_code: "1-0:1.8.0".parse().ok(),
             }

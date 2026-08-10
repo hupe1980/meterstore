@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<section class="hero">
+  <h1>Metering time series at settlement scale,<br>in an open format.</h1>
+  <p class="lead">
+    PostgreSQL holds the recent interval window at low latency. Apache Iceberg
+    holds the history at analytical scale. One explicit timestamp separates them,
+    and one SQL statement spans both.
+  </p>
+  <p class="cta">
+    <a class="button" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+    <a class="button ghost" href="{{ config.extra.repository }}">View on GitHub</a>
+  </p>
+<pre class="hero-code" aria-label="The tiering boundary"><code>  MeterInterval.from ─────────────────────────────────────▶
+
+  │◀──── Iceberg (cold, settled) ────▶│
+                                      │◀── Postgres (hot) ──▶│
+  epoch                       tiering_watermark            now</code></pre>
+</section>
+
+<div class="prose landing">
+{{ section.content | safe }}
+</div>
+
+<section class="band closing">
+  <h2>Start here</h2>
+  <p class="cta">
+    <a class="button" href="{{ get_url(path='@/docs/getting-started.md') }}">Getting started</a>
+    <a class="button ghost" href="{{ get_url(path='@/docs/architecture.md') }}">How tiering works</a>
+    <a class="button ghost" href="{{ config.extra.api_docs }}">API reference</a>
+  </p>
+</section>
+
+{% endblock %}

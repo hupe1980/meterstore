@@ -162,6 +162,21 @@ impl ArchivalWindow {
     }
 }
 
+/// Truncate an instant down to a multiple of `step`, measured from the Unix epoch.
+///
+/// Hot partition bounds and archival windows are aligned the same way, which is
+/// what makes a window correspond to exactly one partition (§7.2). Written once
+/// here rather than per tier, because two implementations that rounded
+/// differently would produce windows no partition holds — and the symptom would
+/// be an empty archival run, not an error.
+///
+/// `rem_euclid`, not `%`: a pre-epoch instant would otherwise round *up*.
+pub fn align_to_step(ts: OffsetDateTime, step: time::Duration) -> OffsetDateTime {
+    let secs = ts.unix_timestamp();
+    let step_s = step.whole_seconds().max(1);
+    OffsetDateTime::from_unix_timestamp(secs - secs.rem_euclid(step_s)).unwrap_or(ts)
+}
+
 /// Select the next archival window.
 ///
 /// Returns `None` when the horizon has not yet advanced past the watermark by a
@@ -338,6 +353,27 @@ mod tests {
             assert_eq!(pair[0].to(), pair[1].from());
         }
         assert_eq!(w.get(), now);
+    }
+
+    #[test]
+    fn alignment_matches_the_hot_tier_partition_bounds() {
+        assert_eq!(
+            align_to_step(datetime!(2026-07-20 13:47:03 UTC), DAY),
+            datetime!(2026-07-20 00:00 UTC)
+        );
+        assert_eq!(
+            align_to_step(datetime!(2026-07-20 00:00 UTC), DAY),
+            datetime!(2026-07-20 00:00 UTC)
+        );
+        assert_eq!(
+            align_to_step(datetime!(2026-07-20 13:47 UTC), Duration::hours(6)),
+            datetime!(2026-07-20 12:00 UTC)
+        );
+        // `rem_euclid`, not `%`: a pre-epoch instant must round down too.
+        assert_eq!(
+            align_to_step(datetime!(1969-12-31 13:00 UTC), DAY),
+            datetime!(1969-12-31 00:00 UTC)
+        );
     }
 
     #[test]

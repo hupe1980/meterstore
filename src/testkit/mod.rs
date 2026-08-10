@@ -41,6 +41,7 @@ use crate::error::{Error, Result};
 use crate::version::{ScopedVersion, Version, VersionScope};
 
 pub mod harness;
+pub mod postgres;
 
 pub use harness::TestHarness;
 
@@ -299,7 +300,7 @@ impl MeteringWorkload {
         MeterInterval {
             from,
             to: from + self.resolution,
-            value_kwh: kwh,
+            value: kwh,
             quality: QualityFlag::Measured,
             obis_code: "1-0:1.8.0".parse().ok(),
         }
@@ -376,22 +377,90 @@ fn malo_id(n: usize) -> String {
     format!("{:011}", 10_000_000_000u64 + n as u64)
 }
 
+/// What identifies one reading in the reference: the core key, plus whatever the
+/// deployment declared as identity.
+type OracleKey = (String, String, OffsetDateTime, Vec<String>);
+
 /// The reference implementation the store is checked against (§17.3).
 ///
 /// Holds every row the workload ever produced and resolves them independently:
 /// a fold over a map in Rust, rather than the window function the store plans.
 /// Two implementations that share code agree about their shared mistakes, which
 /// is the one thing an oracle must not do.
+///
+/// # Tell it the merge key
+///
+/// [`Oracle::new`] keys on `(malo_id, obis_code, from)`, which is right only for
+/// a table with no identity columns. A deployment that declares one — a tenant
+/// discriminator being the obvious case — has a *wider* notion of "the same
+/// reading", and an oracle using the narrower one folds two tenants' readings
+/// into a single key and picks a winner across them. It would then disagree with
+/// a store that is behaving correctly, which is the worst way for a reference to
+/// be wrong: it accuses the thing it exists to check.
+///
+/// [`Oracle::for_table`] takes the configuration the store was built with, so the
+/// two cannot disagree about what identifies a reading.
+///
+/// ```no_run
+/// # use meterstore::testkit::Oracle;
+/// # fn example(config: &meterstore::ValidatedTableConfig) {
+/// let oracle = Oracle::for_table(config);
+/// # let _ = oracle;
+/// # }
+/// ```
 #[derive(Debug, Default, Clone)]
 pub struct Oracle {
-    /// `(malo_id, obis_code, from)` → the winning row, per version scope.
-    rows: BTreeMap<(String, String, OffsetDateTime), (String, u128, Decimal)>,
+    /// The identity columns beyond the core key, in merge-key order.
+    identity: Vec<String>,
+    /// Key → (version scope, version, value in force).
+    rows: BTreeMap<OracleKey, (String, u128, Decimal)>,
 }
 
 impl Oracle {
-    /// An empty reference.
+    /// An empty reference over the core merge key.
+    ///
+    /// Correct for a table with no identity columns. Prefer
+    /// [`for_table`](Self::for_table), which cannot disagree with the store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty reference over the table's **actual** merge key.
+    ///
+    /// Reads the identity columns from the same validated configuration the
+    /// store was built with, so "the same reading" means one thing in both.
+    pub fn for_table(config: &crate::config::ValidatedTableConfig) -> Self {
+        Self {
+            identity: config
+                .identity_columns()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+            rows: BTreeMap::new(),
+        }
+    }
+
+    /// The identity values of a delivery, in merge-key order.
+    ///
+    /// A missing identity value is an error rather than a default: identity
+    /// columns are non-nullable by validation, so a series without one could not
+    /// have been written, and silently substituting an empty string would merge
+    /// it with every other series that is also missing one.
+    fn identity_of(&self, stored: &StoredSeries) -> Result<Vec<String>> {
+        self.identity
+            .iter()
+            .map(|name| match stored.extra.get(name) {
+                Some(datafusion::common::ScalarValue::Utf8(Some(value))) => Ok(value.clone()),
+                _ => Err(Error::encode(
+                    name,
+                    format!(
+                        "{} declares {name:?} as an identity column, but this series carries no \
+                         value for it — the store would have refused the write",
+                        stored.series.malo_id
+                    ),
+                )),
+            })
+            .collect()
     }
 
     /// Record everything a delivery asserted, applying latest-version-wins.
@@ -405,6 +474,7 @@ impl Oracle {
         for stored in series {
             let scope = stored.version.scope().as_str().to_string();
             let version = stored.version.version().get();
+            let identity = self.identity_of(stored)?;
 
             for interval in &stored.series.intervals {
                 let obis = interval
@@ -412,14 +482,24 @@ impl Oracle {
                     .or(stored.series.obis_code)
                     .ok_or_else(|| Error::encode("obis_code", "no channel on interval or series"))?
                     .to_string();
-                let key = (stored.series.malo_id.clone(), obis, interval.from);
+                let key = (
+                    stored.series.malo_id.clone(),
+                    obis,
+                    interval.from,
+                    identity.clone(),
+                );
 
                 match self.rows.get(&key) {
-                    // Same scope: the higher version is the value in force.
+                    // Same scope: a strictly higher version supersedes. Equal is
+                    // deliberately *not* an overwrite — the store inserts with
+                    // `ON CONFLICT DO NOTHING`, so the first value at a version
+                    // is the one that stays, and a divergent restatement under an
+                    // existing version is refused rather than accepted. An oracle
+                    // that took the last would disagree with a correct store.
                     Some((existing, seen, _)) if *existing == scope => {
-                        if version >= *seen {
+                        if version > *seen {
                             self.rows
-                                .insert(key, (scope.clone(), version, interval.value_kwh));
+                                .insert(key, (scope.clone(), version, interval.value));
                         }
                     }
                     // A different scope is not comparable. The generator never
@@ -433,7 +513,7 @@ impl Oracle {
                     }
                     None => {
                         self.rows
-                            .insert(key, (scope.clone(), version, interval.value_kwh));
+                            .insert(key, (scope.clone(), version, interval.value));
                     }
                 }
             }
@@ -445,7 +525,7 @@ impl Oracle {
     pub fn row_count(&self, from: OffsetDateTime, to: OffsetDateTime) -> u64 {
         self.rows
             .keys()
-            .filter(|(_, _, start)| *start >= from && *start < to)
+            .filter(|(_, _, start, _)| *start >= from && *start < to)
             .count() as u64
     }
 
@@ -453,7 +533,7 @@ impl Oracle {
     pub fn sum_kwh(&self, from: OffsetDateTime, to: OffsetDateTime) -> Decimal {
         self.rows
             .iter()
-            .filter(|((_, _, start), _)| *start >= from && *start < to)
+            .filter(|((_, _, start, _), _)| *start >= from && *start < to)
             .map(|(_, (_, _, value))| *value)
             .sum()
     }
@@ -462,14 +542,18 @@ impl Oracle {
     pub fn sum_kwh_for(&self, malo_id: &str, from: OffsetDateTime, to: OffsetDateTime) -> Decimal {
         self.rows
             .iter()
-            .filter(|((malo, _, start), _)| malo == malo_id && *start >= from && *start < to)
+            .filter(|((malo, _, start, _), _)| malo == malo_id && *start >= from && *start < to)
             .map(|(_, (_, _, value))| *value)
             .sum()
     }
 
     /// Every measuring point the reference knows about.
     pub fn malo_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.rows.keys().map(|(malo, _, _)| malo.clone()).collect();
+        let mut ids: Vec<String> = self
+            .rows
+            .keys()
+            .map(|(malo, _, _, _)| malo.clone())
+            .collect();
         ids.sort();
         ids.dedup();
         ids
@@ -492,6 +576,102 @@ mod tests {
     use time::macros::datetime;
 
     const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
+
+    #[test]
+    fn an_oracle_over_a_tenant_table_keeps_the_tenants_apart() {
+        use crate::arrow::datatypes::{DataType, Field};
+        use crate::config::TableConfig;
+        use datafusion::common::ScalarValue;
+
+        // Two tenants reporting the same measuring point at the same instant are
+        // two readings, not one. An oracle keyed on the core merge key folds them
+        // into a single row and picks a winner across them — then reports a
+        // mismatch against a store that is behaving correctly, which is the worst
+        // way for a reference to be wrong.
+        let config = TableConfig::new("readings_versions")
+            .identity_column(Field::new("tenant", DataType::Utf8, false))
+            .build()
+            .expect("config");
+
+        let base = MeteringWorkload::new(START).malo_ids(1).days(1);
+        let for_tenant = |tenant: &str| -> Vec<StoredSeries> {
+            base.clone()
+                .generate()
+                .expect("workload")
+                .into_iter()
+                .map(|s| s.with_extra("tenant", ScalarValue::Utf8(Some(tenant.into()))))
+                .collect()
+        };
+
+        let mut aware = Oracle::for_table(&config);
+        aware.record(&for_tenant("a")).expect("tenant a");
+        aware.record(&for_tenant("b")).expect("tenant b");
+
+        let mut naive = Oracle::new();
+        naive.record(&for_tenant("a")).expect("tenant a");
+        naive.record(&for_tenant("b")).expect("tenant b");
+
+        assert_eq!(
+            aware.len(),
+            naive.len() * 2,
+            "the tenant-aware reference holds both tenants' readings"
+        );
+    }
+
+    #[test]
+    fn a_missing_identity_value_is_refused_rather_than_defaulted() {
+        // Identity columns are non-nullable by validation, so a series without
+        // one could not have been written. Substituting a default would merge it
+        // with every other series that is also missing one.
+        use crate::arrow::datatypes::{DataType, Field};
+        use crate::config::TableConfig;
+
+        let config = TableConfig::new("readings_versions")
+            .identity_column(Field::new("tenant", DataType::Utf8, false))
+            .build()
+            .expect("config");
+
+        let series = MeteringWorkload::new(START)
+            .malo_ids(1)
+            .days(1)
+            .generate()
+            .expect("workload");
+
+        let err = Oracle::for_table(&config)
+            .record(&series)
+            .expect_err("a series with no tenant must be refused");
+        assert!(err.to_string().contains("tenant"), "{err}");
+    }
+
+    #[test]
+    fn a_redelivery_at_the_same_version_keeps_the_first_value() {
+        // The store inserts with `ON CONFLICT DO NOTHING`, so the first value at
+        // a version is the one that stays. An oracle that took the last would
+        // disagree with a correct store on every replayed batch.
+        let mut first = MeteringWorkload::new(START)
+            .malo_ids(1)
+            .days(1)
+            .generate()
+            .expect("workload");
+        let mut restated = first.clone();
+        for s in &mut restated {
+            for i in &mut s.series.intervals {
+                i.value += Decimal::ONE;
+            }
+        }
+
+        let mut oracle = Oracle::new();
+        oracle.record(&first).expect("first");
+        let before = oracle.sum_kwh(START, START + Duration::days(1));
+        oracle.record(&restated).expect("restated");
+
+        assert_eq!(
+            oracle.sum_kwh(START, START + Duration::days(1)),
+            before,
+            "an equal version must not overwrite"
+        );
+        first.clear();
+    }
 
     #[test]
     fn the_generator_is_reproducible_from_its_seed() {
@@ -577,7 +757,7 @@ mod tests {
         let mut corrected = base.clone();
         for stored in &mut corrected {
             for interval in &mut stored.series.intervals {
-                interval.value_kwh += Decimal::ONE;
+                interval.value += Decimal::ONE;
             }
             stored.version = ScopedVersion::new(
                 stored.version.scope().clone(),

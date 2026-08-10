@@ -97,4 +97,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `--all-features`, because the cloud object stores are opt-in and pull the
+      # credential signers. Auditing the default graph audits a graph nobody
+      # deploys, and silently exempts every dependency the features add.
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features

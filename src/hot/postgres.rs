@@ -242,99 +242,108 @@ impl PostgresHot {
         info!(table, "hot table ready");
         Ok(())
     }
+}
 
-    /// Refuse intervals that overlap another at the same version.
-    ///
-    /// Attached per partition, not to the parent: PostgreSQL rejects `EXCLUDE`
-    /// on a partitioned table unless the constraint compares the partition key
-    /// with `=`, and the partition key is `from` — which appears here inside a
-    /// range, not as an equality. An interval crossing a partition boundary is
-    /// already impossible, because a row lives in the partition of its `from`
-    /// and every archival window is one partition (§7.2).
-    ///
-    /// The equality columns are read from the parent's **primary key**, minus
-    /// `from`, so a deployment that extends the merge key with identity columns
-    /// gets an exclusion over the same notion of "the same reading" that
-    /// resolution uses. Deriving them rather than passing them in keeps the two
-    /// from disagreeing — the failure mode would be an exclusion that spans
-    /// tenants, rejecting one operator's reading because another reported the
-    /// same meter.
-    async fn add_integrity_constraints(&self, table: &str, partition: &str) -> Result<()> {
-        // Ships in contrib; supplies the GiST equality operators for text and
-        // numeric, without which the constraint cannot combine `=` with `&&`.
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                Error::config(format!(
-                    "overlap exclusion needs the btree_gist extension, and creating it \
+/// Refuse intervals that overlap another at the same version, and a reading that
+/// carries two network operators.
+///
+/// Attached per partition, not to the parent: PostgreSQL rejects `EXCLUDE` on a
+/// partitioned table unless the constraint compares the partition key with `=`,
+/// and the partition key is `from` — which appears here inside a range, not as an
+/// equality. An interval crossing a partition boundary is already impossible,
+/// because a row lives in the partition of its `from` and every archival window
+/// is one partition (§7.2).
+///
+/// The equality columns are read from the parent's **primary key**, minus `from`,
+/// so a deployment that extends the merge key with identity columns gets an
+/// exclusion over the same notion of "the same reading" that resolution uses.
+/// Deriving them rather than passing them in keeps the two from disagreeing — the
+/// failure mode would be an exclusion that spans tenants, rejecting one
+/// operator's reading because another reported the same meter.
+///
+/// Takes a connection rather than the pool so it runs inside the transaction that
+/// created the partition — outside it, the `ALTER TABLE` would target a relation
+/// no other session can see yet.
+async fn add_integrity_constraints(
+    conn: &mut sqlx::PgConnection,
+    table: &str,
+    partition: &str,
+) -> Result<()> {
+    // Ships in contrib; supplies the GiST equality operators for text and
+    // numeric, without which the constraint cannot combine `=` with `&&`.
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            Error::config(format!(
+                "overlap exclusion needs the btree_gist extension, and creating it \
                      failed ({e}). Install it as a superuser, or disable the check with \
                      PostgresHot::integrity_constraints(false) and accept that an \
                      overlapping delivery is then detected by completeness rather than \
                      refused"
-                ))
-            })?;
+            ))
+        })?;
 
-        let key = self.primary_key_columns(table).await?;
-        let equality: Vec<String> = key
-            .iter()
-            .filter(|c| c.as_str() != col::FROM)
-            .map(|c| format!("{c:?} WITH ="))
-            .collect();
-        if equality.is_empty() {
-            return Err(Error::config(format!(
-                "{table} has no primary key columns besides {:?}, so an overlap \
+    let key = primary_key_columns(&mut *conn, table).await?;
+    let equality: Vec<String> = key
+        .iter()
+        .filter(|c| c.as_str() != col::FROM)
+        .map(|c| format!("{c:?} WITH ="))
+        .collect();
+    if equality.is_empty() {
+        return Err(Error::config(format!(
+            "{table} has no primary key columns besides {:?}, so an overlap \
                  exclusion would compare every row against every other",
-                col::FROM
-            )));
-        }
-
-        let ddl = format!(
-            r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_no_overlap"
-               EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
-            equality.join(", "),
-        );
-        sqlx::query(&ddl).execute(&self.pool).await.map_err(pg)?;
-
-        // One network operator per reading.
-        //
-        // A version is comparable only within its `(operator, month)` scope, and
-        // resolution partitions by that scope — so two operators for one reading
-        // produce two winners, both of which survive into the resolved view and
-        // double every sum over them. The month half of the scope is guarded at
-        // encode time; this is the operator half, which can only be checked
-        // against what is already stored.
-        //
-        // Equality on the **whole** merge key, because the conflict is two rows
-        // for the same reading; `<>` on the operator, because the conflict is
-        // that they disagree about it. `version` is deliberately absent: a
-        // correction is a different version and must stay legal, but it must
-        // still come from the same operator.
-        //
-        // The operator is the part of `version_scope` before the separator,
-        // which is unambiguous because `VersionScope` refuses an operator
-        // containing one.
-        let key = self.primary_key_columns(table).await?;
-        let merge_key: Vec<String> = key
-            .iter()
-            .filter(|c| c.as_str() != col::VERSION)
-            .map(|c| format!("{c:?} WITH ="))
-            .collect();
-
-        let ddl = format!(
-            r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_one_operator"
-               EXCLUDE USING gist ({}, split_part(version_scope, ':', 1) WITH <>)"#,
-            merge_key.join(", "),
-        );
-        sqlx::query(&ddl).execute(&self.pool).await.map_err(pg)?;
-
-        Ok(())
+            col::FROM
+        )));
     }
 
-    /// The parent table's primary key columns, in key order.
-    async fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            r#"SELECT a.attname::text
+    let ddl = format!(
+        r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_no_overlap"
+               EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
+        equality.join(", "),
+    );
+    sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+
+    // One network operator per reading.
+    //
+    // A version is comparable only within its `(operator, month)` scope, and
+    // resolution partitions by that scope — so two operators for one reading
+    // produce two winners, both of which survive into the resolved view and
+    // double every sum over them. The month half of the scope is guarded at
+    // encode time; this is the operator half, which can only be checked
+    // against what is already stored.
+    //
+    // Equality on the **whole** merge key, because the conflict is two rows
+    // for the same reading; `<>` on the operator, because the conflict is
+    // that they disagree about it. `version` is deliberately absent: a
+    // correction is a different version and must stay legal, but it must
+    // still come from the same operator.
+    //
+    // The operator is the part of `version_scope` before the separator,
+    // which is unambiguous because `VersionScope` refuses an operator
+    // containing one.
+    let key = primary_key_columns(&mut *conn, table).await?;
+    let merge_key: Vec<String> = key
+        .iter()
+        .filter(|c| c.as_str() != col::VERSION)
+        .map(|c| format!("{c:?} WITH ="))
+        .collect();
+
+    let ddl = format!(
+        r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_one_operator"
+               EXCLUDE USING gist ({}, split_part(version_scope, ':', 1) WITH <>)"#,
+        merge_key.join(", "),
+    );
+    sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+
+    Ok(())
+}
+
+/// The parent table's primary key columns, in key order.
+async fn primary_key_columns(conn: &mut sqlx::PgConnection, table: &str) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        r#"SELECT a.attname::text
                FROM   pg_index i
                JOIN   pg_attribute a
                  ON   a.attrelid = i.indrelid
@@ -342,21 +351,22 @@ impl PostgresHot {
                WHERE  i.indrelid = $1::regclass
                 AND   i.indisprimary
                ORDER  BY array_position(i.indkey, a.attnum)"#,
-        )
-        .bind(format!("\"{table}\""))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(pg)?;
+    )
+    .bind(format!("\"{table}\""))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(pg)?;
 
-        if rows.is_empty() {
-            return Err(Error::config(format!(
-                "{table} has no primary key; the overlap exclusion derives its \
-                 equality columns from it"
-            )));
-        }
-        Ok(rows)
+    if rows.is_empty() {
+        return Err(Error::config(format!(
+            "{table} has no primary key; the overlap exclusion derives its \
+             equality columns from it"
+        )));
     }
+    Ok(rows)
+}
 
+impl PostgresHot {
     /// Insert one batch, skipping rows already present.
     ///
     /// **Idempotent by design.** Every ingest transport worth using delivers at
@@ -878,6 +888,71 @@ impl PostgresHot {
         })
     }
 
+    /// Create one partition if it is missing, returning whether it was created.
+    ///
+    /// # Why this is serialised
+    ///
+    /// Every writer ensures the partitions for the range it is about to write,
+    /// so the **first batch of a new day has every ingest worker creating the
+    /// same partition at the same moment** — and that is the ordinary topology
+    /// (§5.2), not an unusual one. Check-then-create loses that race outright:
+    /// `CREATE TABLE IF NOT EXISTS … PARTITION OF` does not suppress the
+    /// collision, so the losers get `relation "readings_2026_08_20_0000" already
+    /// exists` and the batch fails. Even where it did suppress it, the losers
+    /// would go on to `ADD CONSTRAINT` a constraint that now exists.
+    ///
+    /// A transaction-scoped advisory lock keyed to the partition makes the
+    /// creation atomic against other processes, and the **re-check inside it** is
+    /// what makes the loser a no-op rather than a duplicate. Transaction-scoped
+    /// rather than session-scoped so a creator that dies cannot wedge the write
+    /// frontier for everyone else.
+    ///
+    /// The fast path is unchanged: an existing partition costs one catalogue
+    /// lookup and never reaches the lock, which is every call after the first.
+    async fn create_partition(
+        &self,
+        table: &str,
+        id: &PartitionId,
+        step: Duration,
+    ) -> Result<bool> {
+        let name = id.relation_name()?;
+        if self.relation_exists(&name).await? {
+            return Ok(false);
+        }
+
+        let mut tx = self.pool.begin().await.map_err(pg)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key("partition", &name))
+            .execute(&mut *tx)
+            .await
+            .map_err(pg)?;
+
+        // Whoever held the lock before us may have created it. Without this the
+        // lock would only reorder the collision, not remove it.
+        if relation_exists_in(&mut tx, &name).await? {
+            return Ok(false);
+        }
+
+        let end = id.start() + step;
+        let ddl = format!(
+            r#"CREATE TABLE "{name}" PARTITION OF "{table}"
+               FOR VALUES FROM ('{}') TO ('{}')"#,
+            pg_timestamp(id.start())?,
+            pg_timestamp(end)?,
+        );
+        sqlx::query(&ddl).execute(&mut *tx).await.map_err(pg)?;
+
+        if self.integrity_constraints {
+            // In the same transaction, or the constraint would be added to a
+            // partition another process cannot see yet.
+            add_integrity_constraints(&mut tx, table, &name).await?;
+        }
+        tx.commit().await.map_err(pg)?;
+
+        debug!(table, partition = %name, "created hot partition");
+        Ok(true)
+    }
+
     /// Whether a relation exists.
     async fn relation_exists(&self, name: &str) -> Result<bool> {
         let row = sqlx::query_scalar::<_, bool>(
@@ -893,24 +968,47 @@ impl PostgresHot {
     }
 }
 
-/// The advisory-lock key for one table's archiver.
+/// An advisory-lock key in MeterStore's own namespace.
 ///
 /// PostgreSQL advisory locks are keyed by a 64-bit integer in a namespace shared
 /// by everything connected to the database, so the key has to be derived from
-/// something specific: a bare hash of the table name would collide with any
-/// other application that also hashes a string. The prefix makes the namespace
-/// MeterStore's.
-fn archive_lock_key(table: &str) -> i64 {
-    // FNV-1a, written out rather than taken from `DefaultHasher`: the standard
-    // hasher's output is explicitly not stable across releases, and a lock key
-    // that changes with the toolchain would let two processes on different
-    // builds both believe they hold the same table's lease.
+/// something specific: a bare hash of a name would collide with any other
+/// application that also hashes a string. `purpose` separates MeterStore's own
+/// uses from each other — an archiver's lease must not block a partition
+/// creation that happens to hash the same.
+///
+/// FNV-1a, written out rather than taken from `DefaultHasher`: the standard
+/// hasher's output is explicitly not stable across releases, and a lock key that
+/// changed with the toolchain would let two processes on different builds both
+/// believe they hold the same lock.
+fn lock_key(purpose: &str, name: &str) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in b"meterstore.archive:".iter().chain(table.as_bytes()) {
+    for byte in b"meterstore."
+        .iter()
+        .chain(purpose.as_bytes())
+        .chain(b":")
+        .chain(name.as_bytes())
+    {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash as i64
+}
+
+/// Whether a relation exists, on a caller-supplied connection.
+///
+/// Separate from [`PostgresHot::relation_exists`] because the check that matters
+/// for partition creation has to run **inside** the locking transaction.
+async fn relation_exists_in(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = $1 AND n.nspname = current_schema())",
+    )
+    .bind(name)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(pg)
 }
 
 /// A held PostgreSQL advisory lock over one table's archiver.
@@ -1256,14 +1354,59 @@ fn pg(e: sqlx::Error) -> Error {
     Error::Storage(e.to_string())
 }
 
-/// Truncate an instant down to a multiple of `step` from the Unix epoch.
+/// Which partitions a catalog lookup should return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    /// Attached and detached alike. A detached partition still holds rows, so
+    /// anything deciding whether a time range is empty has to see it.
+    Any,
+    /// Detached only — a standalone relation still carrying the naming
+    /// convention but with no parent in `pg_inherits`, which is what an
+    /// interrupted archival run leaves behind.
+    Detached,
+}
+
+/// Partition identifiers for one table, ascending.
 ///
-/// Partition bounds must be aligned or a window could span two partitions.
-fn floor_to_step(ts: OffsetDateTime, step: Duration) -> OffsetDateTime {
-    let secs = ts.unix_timestamp();
-    let step_s = step.whole_seconds();
-    OffsetDateTime::from_unix_timestamp(secs - secs.rem_euclid(step_s))
-        .expect("floored timestamp stays in range")
+/// The `LIKE` pattern escapes `_`, which is a wildcard in SQL and appears in
+/// every relation name this crate creates. Relations that merely share a prefix
+/// are skipped rather than failing the lookup, because the schema belongs to the
+/// deployment and may hold anything.
+async fn partitions_of(
+    pool: &PgPool,
+    table: &str,
+    attachment: Attachment,
+) -> Result<Vec<PartitionId>> {
+    let sql = format!(
+        r#"SELECT c.relname
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'r'
+              AND n.nspname = current_schema()
+              AND c.relname LIKE $1
+              {}
+            ORDER BY c.relname"#,
+        match attachment {
+            Attachment::Any => "",
+            Attachment::Detached =>
+                "AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)",
+        },
+    );
+
+    let rows = sqlx::query_scalar::<_, String>(&sql)
+        .bind(format!("{}\\_%", table.replace('_', "\\_")))
+        .fetch_all(pool)
+        .await
+        .map_err(pg)?;
+
+    let mut found: Vec<PartitionId> = rows
+        .iter()
+        .filter_map(|r| PartitionId::from_relation_name(table, r).ok())
+        .collect();
+    // Lexical relation order is chronological for a fixed-width suffix, but the
+    // ordering that matters is the one on the bound itself.
+    found.sort();
+    Ok(found)
 }
 
 #[async_trait]
@@ -1272,7 +1415,7 @@ impl HotStore for PostgresHot {
         &self,
         table: &str,
     ) -> Result<Option<Box<dyn crate::tiering::store::ArchiveLease>>> {
-        let key = archive_lock_key(table);
+        let key = lock_key("archive", table);
         let mut connection = self.pool.acquire().await.map_err(pg)?;
 
         // `try_` rather than the blocking form: a second scheduled archiver
@@ -1309,25 +1452,11 @@ impl HotStore for PostgresHot {
         }
 
         let mut created = Vec::new();
-        let mut start = floor_to_step(from, step);
+        let mut start = crate::watermark::align_to_step(from, step);
 
         while start < until {
             let id = PartitionId::new(table, start);
-            let name = id.relation_name()?;
-
-            if !self.relation_exists(&name).await? {
-                let end = start + step;
-                let ddl = format!(
-                    r#"CREATE TABLE IF NOT EXISTS "{name}" PARTITION OF "{table}"
-                       FOR VALUES FROM ('{}') TO ('{}')"#,
-                    pg_timestamp(start)?,
-                    pg_timestamp(end)?,
-                );
-                sqlx::query(&ddl).execute(&self.pool).await.map_err(pg)?;
-                if self.integrity_constraints {
-                    self.add_integrity_constraints(table, &name).await?;
-                }
-                debug!(table, partition = %name, "created hot partition");
+            if self.create_partition(table, &id, step).await? {
                 created.push(id);
             }
             start += step;
@@ -1463,30 +1592,17 @@ impl HotStore for PostgresHot {
     }
 
     async fn orphaned_partitions(&self, table: &str) -> Result<Vec<PartitionId>> {
-        // A detached partition is a standalone relation that still carries the
-        // naming convention but has no parent in pg_inherits.
-        let rows = sqlx::query_scalar::<_, String>(
-            r#"SELECT c.relname
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind = 'r'
-                  AND n.nspname = current_schema()
-                  AND c.relname LIKE $1
-                  AND NOT EXISTS (
-                        SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
-                ORDER BY c.relname"#,
-        )
-        .bind(format!("{}\\_%", table.replace('_', "\\_")))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(pg)?;
+        partitions_of(&self.pool, table, Attachment::Detached).await
+    }
 
-        // Relations that merely share a prefix are not ours; skip what does not
-        // parse rather than failing the whole run.
-        Ok(rows
-            .iter()
-            .filter_map(|r| PartitionId::from_relation_name(table, r).ok())
-            .collect())
+    async fn partition_starts(&self, table: &str) -> Result<Option<Vec<OffsetDateTime>>> {
+        Ok(Some(
+            partitions_of(&self.pool, table, Attachment::Any)
+                .await?
+                .into_iter()
+                .map(|p| p.start())
+                .collect(),
+        ))
     }
 
     async fn invariant_violations(&self, table: &str, watermark: TieringWatermark) -> Result<u64> {
@@ -1538,33 +1654,14 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
-    fn floor_aligns_to_daily_boundaries() {
-        let step = Duration::DAY;
+    fn partitions_are_created_on_the_shared_alignment() {
+        // The bound a partition is created at and the bound a window starts at
+        // have to come from one function, or a window lands between partitions
+        // and archives as empty (§7.2). This asserts the hot tier uses the
+        // shared one rather than a private copy.
         assert_eq!(
-            floor_to_step(datetime!(2026-07-20 13:47:03 UTC), step),
+            crate::watermark::align_to_step(datetime!(2026-07-20 13:47:03 UTC), Duration::DAY),
             datetime!(2026-07-20 00:00 UTC)
-        );
-        assert_eq!(
-            floor_to_step(datetime!(2026-07-20 00:00 UTC), step),
-            datetime!(2026-07-20 00:00 UTC)
-        );
-    }
-
-    #[test]
-    fn floor_aligns_to_sub_daily_boundaries() {
-        let step = Duration::hours(6);
-        assert_eq!(
-            floor_to_step(datetime!(2026-07-20 13:47 UTC), step),
-            datetime!(2026-07-20 12:00 UTC)
-        );
-    }
-
-    #[test]
-    fn floor_handles_pre_epoch_instants() {
-        // rem_euclid, not %, or negative timestamps round the wrong way.
-        assert_eq!(
-            floor_to_step(datetime!(1969-12-31 13:00 UTC), Duration::DAY),
-            datetime!(1969-12-31 00:00 UTC)
         );
     }
 

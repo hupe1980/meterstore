@@ -125,6 +125,26 @@ impl ScanSpec {
     }
 }
 
+/// How many partitions can still hold a row written now or later.
+///
+/// **This is the runway before inserts start failing**, and it has to be counted
+/// from the partitions that exist rather than derived from configuration. A
+/// figure computed as `settlement_lag + headroom / step` is a constant: it says
+/// what the runway *should* be, is unaffected by an archiver that stopped
+/// running, and can therefore never reach zero — which makes it worthless as the
+/// leading indicator for the one failure that stops writes outright.
+///
+/// A partition starting at or after the aligned current instant can hold a row
+/// with `from >= now`. Zero means the next insert has nowhere to land.
+pub fn partitions_ahead(
+    starts: &[OffsetDateTime],
+    now: OffsetDateTime,
+    step: time::Duration,
+) -> usize {
+    let frontier = crate::watermark::align_to_step(now, step);
+    starts.iter().filter(|start| **start >= frontier).count()
+}
+
 /// What the cold-tier writer needs to know before it sees any data.
 ///
 /// A streaming write cannot look at the whole batch first, so anything the
@@ -309,6 +329,23 @@ pub trait HotStore: Send + Sync {
     /// Whether a partition relation exists, attached or detached.
     async fn partition_exists(&self, partition: &PartitionId) -> Result<bool>;
 
+    /// Every partition lower bound this store holds for `table`, ascending,
+    /// attached or detached.
+    ///
+    /// The archiver uses it to step over a stretch that holds no partitions in
+    /// **one** commit rather than one per window. That is not a micro-
+    /// optimisation: a table that has never been archived reports the epoch
+    /// watermark, so without it a fresh deployment commits one empty Iceberg
+    /// snapshot per day since 1970 before it reaches any data.
+    ///
+    /// `None` means the store cannot enumerate them — deliberately distinct from
+    /// `Some(vec![])`, which means it can and there are none. The archiver keeps
+    /// the one-window-per-commit behaviour for the former and would otherwise
+    /// read "no partitions anywhere" out of "cannot say".
+    async fn partition_starts(&self, _table: &str) -> Result<Option<Vec<OffsetDateTime>>> {
+        Ok(None)
+    }
+
     /// Detach a partition, making it invisible to writers while remaining
     /// readable by the caller.
     ///
@@ -437,6 +474,21 @@ pub trait ColdStore: Send + Sync {
         batches: BatchStream,
         hints: WriteHints,
     ) -> Result<CommitInfo>;
+
+    /// Put the tiering boundary back on the current snapshot.
+    ///
+    /// A commit from anything other than MeterStore — the out-of-band compaction
+    /// §10.3.1 recommends — carries no watermark, so the boundary lookup has to
+    /// walk back the parent chain to find one. That works, and it makes snapshot
+    /// expiry dangerous: a hole anywhere in the chain strands the boundary and
+    /// every query fails at once.
+    ///
+    /// Re-stamping republishes what the history already says, so it cannot move
+    /// the boundary. `Ok(None)` when the current snapshot already carries it.
+    /// The default is a no-op, for a store whose snapshots are not Iceberg's.
+    async fn reassert_watermark(&self, _table: &str) -> Result<Option<CommitInfo>> {
+        Ok(None)
+    }
 
     /// Per-file `version` bounds for the data files overlapping `range`.
     ///
@@ -572,6 +624,10 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         (**self).partition_exists(partition).await
     }
 
+    async fn partition_starts(&self, table: &str) -> Result<Option<Vec<OffsetDateTime>>> {
+        (**self).partition_starts(table).await
+    }
+
     async fn detach_partition(&self, partition: &PartitionId) -> Result<()> {
         (**self).detach_partition(partition).await
     }
@@ -661,6 +717,10 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         range: (OffsetDateTime, OffsetDateTime),
     ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
         (**self).version_stats(table, range).await
+    }
+
+    async fn reassert_watermark(&self, table: &str) -> Result<Option<CommitInfo>> {
+        (**self).reassert_watermark(table).await
     }
 
     async fn append_only(

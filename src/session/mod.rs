@@ -14,7 +14,7 @@ pub use catalog::{MeterCatalog, MeterCatalogBuilder};
 pub use completeness::{Completeness, CompletenessFunction};
 pub use displacement::{Displacement, Effect, StoredValue};
 pub use maintenance::{Maintenance, MaintenanceOutcome};
-pub use query::QueryResult;
+pub use query::{QueryDescription, QueryResult};
 pub use series::{ResolvedSeries, SeriesQuery};
 pub use store::{AppendOutcome, HotWriter, MeterStore, MeterStoreBuilder};
 pub use system::{ConfigEntry, SystemTables, TableStatus, register_all as register_system_tables};

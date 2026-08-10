@@ -25,7 +25,7 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
                 from,
                 to: from + Duration::minutes(15),
                 // Deliberately six decimal places: this must survive exactly.
-                value_kwh: format!("0.2{:05}", i).parse().unwrap(),
+                value: format!("0.2{:05}", i).parse().unwrap(),
                 quality: QualityFlag::Measured,
                 obis_code: "1-0:1.8.0".parse().ok(),
             }
@@ -86,7 +86,7 @@ fn main() -> meterstore::Result<()> {
     assert_eq!(back.series.intervals.len(), 96);
     assert_eq!(back.series.malo_id, original.series.malo_id);
     for (a, b) in original.series.intervals.iter().zip(&back.series.intervals) {
-        assert_eq!(a.value_kwh, b.value_kwh, "decimal must round-trip exactly");
+        assert_eq!(a.value, b.value, "decimal must round-trip exactly");
         assert_eq!(a.from, b.from);
         assert_eq!(a.to, b.to, "interval end is stored, never recomputed");
         assert_eq!(a.quality, b.quality);

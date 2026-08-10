@@ -7,7 +7,7 @@ set shell := ["bash", "-uc"]
 # Single-sourced crates: two versions of any of these in one graph means
 # mutually incompatible types (a second `arrow` breaks `RecordBatch`, a second
 # `datafusion` breaks `TableProvider`). Checked by `just deps`.
-SINGLE_SOURCED := "datafusion|arrow|iceberg|parquet|metering|time|rust_decimal"
+SINGLE_SOURCED := "datafusion|arrow|iceberg|parquet|metering|time|rust_decimal|sqlx"
 
 _default:
     @just --list --unsorted
@@ -41,16 +41,26 @@ integration:
     cargo test --test '*' --all-features
 
 # The whole suite.
-# Concurrent test binaries. Each integration test starts its own PostgreSQL
-# container, so the limit is Docker's, not the CPU's — and `cargo test` defaults
-# to one thread per core. Unbounded, the suite exhausts container slots and fails
-# with `PortNotExposed` or a create timeout, which looks like a broken test and
-# is not. Override for a bigger machine: `just test-threads=8 test`.
-test-threads := "4"
+#
+# Unbounded. The old cap existed because every test started its own PostgreSQL
+# container, so the limit was Docker's rather than the CPU's. The suites now share
+# one container and take a database each (`testkit::postgres`), and that server is
+# started with a raised `max_connections` — without which sharing simply moves the
+# ceiling from container slots to backend slots, and the failure looks like a
+# broken test rather than an exhausted resource.
+#
+# Set a number to pin the degree on a constrained machine: `just test-threads=4 test`.
+test-threads := "0"
 
 test:
-    @just _require-docker
-    cargo test --all-features -- --test-threads={{test-threads}}
+    #!/usr/bin/env bash
+    set -uo pipefail
+    just _require-docker || exit 1
+    if [ "{{test-threads}}" = "0" ]; then
+      cargo test --all-features
+    else
+      cargo test --all-features -- --test-threads={{test-threads}}
+    fi
 
 # Run one test by name, with logs shown.
 test-one NAME:
@@ -115,8 +125,8 @@ features:
     check "rest-catalog"   --no-default-features --features rest-catalog
     check "flight"         --no-default-features --features flight
     check "catalog-facade" --no-default-features --features catalog-facade
+    check "s3tables"       --no-default-features --features s3tables
     check "testkit"        --no-default-features --features testkit
-    check "cdc"            --no-default-features --features cdc
     check "all"            --all-features
     if [ "$fail" -ne 0 ]; then
       echo "a feature combination does not build; a published crate's users can select it" >&2
@@ -143,6 +153,9 @@ deps:
     echo "single-sourced dependencies OK"
 
 # Licence and advisory policy. Every exception in deny.toml carries a reason.
+#
+# `--all-features`: the cloud object stores are opt-in and pull the credential
+# signers, so the default graph is one no deployment runs.
 deny:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -150,11 +163,17 @@ deny:
       echo "cargo-deny is not installed; CI still runs it. \`cargo install cargo-deny\`" >&2
       exit 0
     fi
-    cargo deny check
+    cargo deny --all-features check
 
-# Licence and advisory audit.
-audit:
-    cargo deny check
+# --- site -------------------------------------------------------------------
+
+# Serve the documentation site with live reload.
+site:
+    cd site && zola serve
+
+# Build it, failing on a dangling internal link.
+site-build:
+    cd site && zola check && zola build
 
 # --- examples ---------------------------------------------------------------
 

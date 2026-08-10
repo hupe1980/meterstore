@@ -13,6 +13,12 @@
 //! that used to reach for `iceberg-catalog-sql` and `iceberg-storage-opendal`
 //! directly needs neither once it calls [`IcebergSqlCatalog::build`].
 //!
+//! [`S3TablesCatalog`] does the same for AWS S3 Tables, behind the `s3tables`
+//! feature. It is a second constructor rather than a variant of the first because
+//! S3 Tables has no warehouse URI and no credential properties to forward: the
+//! table bucket *is* the warehouse, named by ARN, and the AWS SDK resolves
+//! credentials from the ambient chain.
+//!
 //! # Object-store backends are features
 //!
 //! `file://` and `memory://` are always available. The cloud backends are behind
@@ -224,6 +230,117 @@ impl IcebergSqlCatalog<'_> {
     }
 }
 
+/// The cold tier on **AWS S3 Tables**.
+///
+/// # Which of the two S3 Tables interfaces this is
+///
+/// S3 Tables can be reached two ways, and only one of them works from Rust today:
+///
+/// - Its **Iceberg REST endpoint**, which authenticates with SigV4. That signs
+///   each request over its method, path, query, headers, body hash and timestamp,
+///   and `iceberg-catalog-rest` neither signs nor offers a hook to — its
+///   `with_client` takes a concrete `reqwest::Client`, which has no per-request
+///   interceptor. Unavailable.
+/// - Its **native API**, through the AWS SDK, which signs for itself. That is
+///   this, via `iceberg-catalog-s3tables`.
+///
+/// The distinction matters because searching for SigV4 support in the REST
+/// catalogue finds nothing and suggests the whole target is blocked. It is not.
+///
+/// # Credentials
+///
+/// Taken from the ambient AWS chain — environment, profile, instance metadata,
+/// IRSA — like any other AWS SDK client. There is deliberately no credential
+/// field here: a store that accepted an access key would be a second place for
+/// one to live, and the chain already handles every deployment shape.
+///
+/// ```no_run
+/// # use meterstore::cold::S3TablesCatalog;
+/// # async fn example() -> meterstore::Result<()> {
+/// let cold = S3TablesCatalog {
+///     table_bucket_arn: "arn:aws:s3tables:eu-central-1:123456789012:bucket/edm",
+///     namespace: "metering",
+///     file_target_bytes: 512 * 1024 * 1024,
+///     endpoint_url: None,
+///     region: Some("eu-central-1"),
+/// }
+/// .build()
+/// .await?;
+/// # let _ = cold;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "s3tables")]
+#[derive(Debug)]
+pub struct S3TablesCatalog<'a> {
+    /// The table bucket, as its ARN.
+    ///
+    /// `arn:aws:s3tables:<region>:<account>:bucket/<name>`. This is the warehouse:
+    /// S3 Tables owns the object layout, so there is no warehouse URI to give.
+    pub table_bucket_arn: &'a str,
+    /// Iceberg namespace the tables live in.
+    pub namespace: &'a str,
+    /// Target Parquet file size in the cold tier, in bytes.
+    pub file_target_bytes: usize,
+    /// Override the service endpoint.
+    ///
+    /// For a local mock — LocalStack, MinIO's S3 Tables emulation. `None` uses
+    /// the real regional endpoint.
+    pub endpoint_url: Option<&'a str>,
+    /// AWS region, when the ambient configuration does not supply one.
+    pub region: Option<&'a str>,
+}
+
+#[cfg(feature = "s3tables")]
+impl S3TablesCatalog<'_> {
+    /// Build the cold tier over an S3 Tables table bucket.
+    pub async fn build(&self) -> Result<ColdTier> {
+        use iceberg_catalog_s3tables::{
+            S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+            S3TablesCatalogBuilder,
+        };
+
+        if !self.table_bucket_arn.starts_with("arn:") {
+            return Err(Error::config(format!(
+                "table_bucket_arn {:?} is not an ARN. S3 Tables names a warehouse by \
+                 bucket ARN rather than by URI: \
+                 arn:aws:s3tables:<region>:<account>:bucket/<name>",
+                self.table_bucket_arn
+            )));
+        }
+
+        let mut props = HashMap::from([(
+            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+            self.table_bucket_arn.to_string(),
+        )]);
+        if let Some(endpoint) = self.endpoint_url {
+            props.insert(
+                S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
+                endpoint.to_string(),
+            );
+        }
+        if let Some(region) = self.region {
+            // A literal because the constant behind it lives in the catalogue
+            // crate's private `utils` module; only the two above are exported.
+            props.insert("region_name".to_string(), region.to_string());
+        }
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            S3TablesCatalogBuilder::default()
+                .load("s3tables", props)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        );
+
+        let cold = Arc::new(IcebergCold::new(
+            Arc::clone(&catalog),
+            NamespaceIdent::new(self.namespace.to_string()),
+            self.file_target_bytes,
+        ));
+        Ok(ColdTier { cold, catalog })
+    }
+}
+
 /// A constructed Iceberg cold tier and the catalog handle behind it.
 ///
 /// [`cold`](Self::cold) is what a [`MeterStore`](crate::MeterStore) is built over;
@@ -255,6 +372,12 @@ impl ColdTier {
 
     /// A read-only Iceberg REST catalog façade over this tier, for external engines
     /// (Spark, Trino, DuckDB, PyIceberg).
+    ///
+    /// This is what a **SQL-catalog** deployment needs: the metadata pointer lives
+    /// in PostgreSQL and no `version-hint.text` is written beside the files, so an
+    /// engine pointed at the bare warehouse directory has to guess. A deployment
+    /// already on a REST catalogue or on S3 Tables has an endpoint engines
+    /// understand, and needs nothing here.
     #[cfg(feature = "catalog-facade")]
     #[must_use]
     pub fn catalog_facade(&self) -> crate::serve::CatalogFacade {
@@ -318,5 +441,30 @@ mod tests {
         let mut file = HashMap::new();
         apply_warehouse_auth(&mut file, "file:///tmp/wh", &auth);
         assert!(file.is_empty(), "no S3 props for a file warehouse");
+    }
+
+    /// A warehouse URI where an ARN belongs is the mistake this API invites:
+    /// every other catalogue here is configured with a URI, and S3 Tables is the
+    /// one that is not. Caught here it names the shape; passed through, it
+    /// surfaces as an opaque AWS SDK error several layers down.
+    #[cfg(feature = "s3tables")]
+    #[tokio::test]
+    async fn a_table_bucket_uri_is_rejected_as_the_arn_it_is_not() {
+        let err = S3TablesCatalog {
+            table_bucket_arn: "s3://edm/warehouse",
+            namespace: "metering",
+            file_target_bytes: 1024,
+            endpoint_url: None,
+            region: None,
+        }
+        .build()
+        .await
+        .expect_err("a URI is not an ARN");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("arn:aws:s3tables:"),
+            "must name the shape: {msg}"
+        );
     }
 }

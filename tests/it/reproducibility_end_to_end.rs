@@ -14,6 +14,11 @@
 //! prove nothing about the parts that actually fail — snapshot pinning, catalog
 //! CAS, advisory-lock scope.
 
+// Real infrastructure, so the fixtures live behind `testkit` like every other
+// suite that needs them: `testkit::postgres` is what shares one container
+// across the binary instead of starting one per test (§17.2.0.1).
+#![cfg(feature = "testkit")]
+
 use std::sync::Arc;
 
 use meterstore::cold::IcebergCold;
@@ -32,8 +37,6 @@ use iceberg_catalog_sql::{
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::MeasurementSource;
 use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -54,14 +57,13 @@ struct Harness {
     /// session-scoped, so genuine contention needs a separate pool.
     url: String,
     _warehouse: tempfile::TempDir,
-    _container: testcontainers::ContainerAsync<Postgres>,
 }
 
 impl Harness {
     async fn start() -> Self {
-        let container = Postgres::default().start().await.expect("start postgres");
-        let port = container.get_host_port_ipv4(5432).await.expect("map port");
-        let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+        let url = meterstore::testkit::postgres::fresh_database()
+            .await
+            .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
         let hot = Arc::new(PostgresHot::new(pool));
@@ -99,7 +101,6 @@ impl Harness {
             cold,
             url,
             _warehouse: warehouse,
-            _container: container,
         }
     }
 
@@ -593,10 +594,7 @@ async fn the_typed_read_returns_the_domain_type_across_both_tiers() {
     assert!(series.intervals.windows(2).all(|w| w[0].from < w[1].from));
     assert_eq!(series.intervals[0].from, D18);
     // The decimal survives the whole round trip.
-    assert_eq!(
-        series.intervals[0].value_kwh,
-        rust_decimal::Decimal::new(3, 0)
-    );
+    assert_eq!(series.intervals[0].value, rust_decimal::Decimal::new(3, 0));
 }
 
 #[tokio::test]
@@ -624,7 +622,7 @@ async fn the_typed_read_returns_the_corrected_value() {
         series
             .intervals
             .iter()
-            .all(|i| i.value_kwh == rust_decimal::Decimal::new(40, 0)),
+            .all(|i| i.value == rust_decimal::Decimal::new(40, 0)),
         "the correction must win"
     );
 }
@@ -867,9 +865,9 @@ async fn a_store_can_be_built_before_its_tables_exist() {
     // The documented order: build, then `create_tables`. The compatibility check
     // therefore runs before there is anything to check against, and must report
     // "unknown" rather than turning first-run into a failure.
-    let container = Postgres::default().start().await.expect("start postgres");
-    let port = container.get_host_port_ipv4(5432).await.expect("map port");
-    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
     let pool = PgPool::connect(&url).await.expect("connect");
     let hot = Arc::new(PostgresHot::new(pool));
 
@@ -964,7 +962,7 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
             MeterInterval {
                 from,
                 to: from + Duration::minutes(15),
-                value_kwh: rust_decimal::Decimal::new(40, 0),
+                value: rust_decimal::Decimal::new(40, 0),
                 quality: QualityFlag::Corrected,
                 obis_code: Some("1-0:1.8.0".parse().unwrap()),
             }
@@ -1134,7 +1132,7 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
             MeterInterval {
                 from,
                 to: from + Duration::minutes(15),
-                value_kwh: rust_decimal::Decimal::new(40, 0),
+                value: rust_decimal::Decimal::new(40, 0),
                 quality: QualityFlag::Corrected,
                 obis_code: Some("1-0:1.8.0".parse().unwrap()),
             }

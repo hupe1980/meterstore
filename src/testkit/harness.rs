@@ -12,14 +12,16 @@
 //! ones a fake cannot fail at. Catalog compare-and-swap, advisory-lock scope,
 //! partition detach visibility, Parquet round-tripping of a `Decimal128` — a
 //! mock agrees with whatever the code does. So the harness starts the real
-//! thing, and the cost is a container per suite.
+//! thing.
+//!
+//! What it does **not** do is start a container per harness. Isolation is a
+//! *database*, which costs milliseconds; a container costs seconds, and at a
+//! couple of hundred integration tests that was the wall clock. See
+//! [`postgres`](super::postgres) for the trade and for how to opt out.
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use testcontainers::ImageExt;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use time::{Duration, OffsetDateTime};
 
 use crate::cold::{IcebergCold, IcebergSqlCatalog, WarehouseAuth};
@@ -41,7 +43,6 @@ pub struct TestHarness {
     config: ValidatedTableConfig,
     url: String,
     _warehouse: tempfile::TempDir,
-    _container: testcontainers::ContainerAsync<Postgres>,
 }
 
 impl std::fmt::Debug for TestHarness {
@@ -55,12 +56,9 @@ impl std::fmt::Debug for TestHarness {
 impl TestHarness {
     /// The PostgreSQL image every suite runs against.
     ///
-    /// **Pinned, and not at the library default.** `testcontainers-modules`
-    /// defaults to `11-alpine`, which is four majors below the ≥ 14 this design
-    /// requires (§3.1) — so every suite would have been proving the store works
-    /// on a version it does not claim to support, and would have missed anything
-    /// that needs a newer one. 16 matches the §18 reference deployment.
-    pub const POSTGRES_IMAGE_TAG: &'static str = "16-alpine";
+    /// See [`postgres::IMAGE_TAG`](super::postgres::IMAGE_TAG), which is where it
+    /// is chosen; re-exported here because that is where suites look for it.
+    pub const POSTGRES_IMAGE_TAG: &'static str = super::postgres::IMAGE_TAG;
 
     /// The table name the harness creates.
     ///
@@ -81,16 +79,9 @@ impl TestHarness {
 
     /// Start both tiers with a specific table configuration.
     pub async fn with_config(config: ValidatedTableConfig) -> Result<Self> {
-        let container = Postgres::default()
-            .with_tag(Self::POSTGRES_IMAGE_TAG)
-            .start()
-            .await
-            .map_err(|e| crate::Error::Storage(format!("starting postgres: {e}")))?;
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .map_err(|e| crate::Error::Storage(format!("mapping postgres port: {e}")))?;
-        let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+        // A database of its own on the process-wide container: the same
+        // isolation for milliseconds instead of seconds.
+        let url = super::postgres::fresh_database().await?;
 
         let pool = PgPool::connect(&url)
             .await
@@ -121,7 +112,6 @@ impl TestHarness {
             config,
             url,
             _warehouse: warehouse,
-            _container: container,
         };
 
         // One entry point, exactly as a deployment should use (§7.3): the hot
@@ -248,20 +238,17 @@ impl TestHarness {
 
     /// Place the tier boundary at `at` without archiving anything.
     ///
-    /// Archival starts from the watermark, so a store that has never archived
-    /// begins at the Unix epoch and spends its window budget on empty 1970 days.
-    /// Seeding is how a test says "pretend everything before this is settled"
-    /// without generating six decades of nothing.
+    /// A test convenience, not a workaround: the archiver bootstraps its own
+    /// boundary on a table that has never archived, crossing the empty stretch
+    /// below the first partition in a single commit. What this adds is *exactly
+    /// where* the boundary sits, so a test can state "everything before this is
+    /// settled" rather than inferring it from where the fixture happens to start.
     pub async fn seed_watermark(&self, at: OffsetDateTime) -> Result<()> {
         self.seed_watermark_for(self.config.name(), at, self.config.archival_step())
             .await
     }
 
     /// Place another table's boundary, for a harness hosting more than one.
-    ///
-    /// Without it a second table starts at the epoch, and its first archival run
-    /// walks fifty years of empty windows before reaching any data — which is
-    /// correct and takes long enough to look like a hang.
     pub async fn seed_watermark_for(
         &self,
         table: &str,

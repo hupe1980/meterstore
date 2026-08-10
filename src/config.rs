@@ -293,6 +293,21 @@ impl TableConfig {
 
         let mut seen = std::collections::HashSet::new();
         for f in self.identity_columns.iter().chain(&self.attribute_columns) {
+            // A declared name reaches PostgreSQL DDL, the resolution SQL, the
+            // `unnest` alias and the scan projection — all as a quoted
+            // identifier, none of them parameterisable, because an identifier
+            // never is. Restricting the alphabet at the one place a name enters
+            // the system is what keeps every one of those sites from having to
+            // think about quoting, and it also refuses a name that would need
+            // quoting to be legible in the first place.
+            if !is_plain_identifier(f.name()) {
+                return Err(Error::config(format!(
+                    "column name {:?} must be a plain identifier — a letter or underscore \
+                     followed by letters, digits or underscores. Declared names are written \
+                     into DDL and SQL as identifiers, which cannot be parameterised",
+                    f.name()
+                )));
+            }
             if !seen.insert(f.name().clone()) {
                 return Err(Error::config(format!("duplicate column {:?}", f.name())));
             }
@@ -441,6 +456,20 @@ impl ValidatedTableConfig {
     }
 }
 
+/// Whether `name` is a bare SQL identifier needing no quoting or escaping.
+///
+/// ASCII-only on purpose. A non-ASCII identifier is legal in both PostgreSQL and
+/// Iceberg, but it has to survive DDL, Parquet field names, a `CHECK` rendered
+/// into a string, and whatever engine an operator later points at the warehouse —
+/// and the first place it goes wrong is the one nobody is watching.
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Render a duration the way the configuration file spells it.
 fn fmt_duration(d: Duration) -> String {
     let secs = d.whole_seconds();
@@ -566,6 +595,41 @@ mod tests {
     #[test]
     fn a_zero_row_chunk_is_rejected() {
         assert!(base().scan_chunk_rows(0).build().is_err());
+    }
+
+    #[test]
+    fn a_column_name_that_is_not_an_identifier_is_refused() {
+        // Declared names are written into DDL, the resolution SQL, the `unnest`
+        // alias and the scan projection as quoted identifiers — none of which can
+        // be parameterised. Restricting the alphabet once, here, is what lets
+        // every one of those sites stop thinking about quoting.
+        for bad in [
+            r#"tenant" ; DROP TABLE readings --"#,
+            "has space",
+            "1leading_digit",
+            "",
+            "dotted.name",
+            "kebab-case",
+        ] {
+            let err = base()
+                .attribute_column(Field::new(bad, DataType::Utf8, true))
+                .build()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("plain identifier"),
+                "{bad:?} was accepted: {err}"
+            );
+        }
+
+        for good in ["tenant", "_private", "bilanzkreis_2", "NetzGebiet"] {
+            assert!(
+                base()
+                    .attribute_column(Field::new(good, DataType::Utf8, true))
+                    .build()
+                    .is_ok(),
+                "{good:?} was refused"
+            );
+        }
     }
 
     #[test]

@@ -429,7 +429,7 @@ mod tests {
         MeterInterval {
             from,
             to: from + time::Duration::minutes(15),
-            value_kwh: Decimal::new(kwh, 0),
+            value: Decimal::new(kwh, 0),
             quality: QualityFlag::Measured,
             obis_code: Some("1-0:1.8.0".parse().unwrap()),
         }

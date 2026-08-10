@@ -17,9 +17,13 @@
 //! restructure ingestion". The trait costs a definition; discovering its absence
 //! costs a rewrite.
 //!
-//! It is feature-gated (`cdc`), unbuilt, and unscheduled. [`rustcdc`] implements
-//! this shape against PostgreSQL logical replication when the requirement
-//! arrives.
+//! Unbuilt and unscheduled, and **it carries no dependency**. An earlier draft
+//! put this behind a `cdc` feature that pulled in [`rustcdc`] — a crate nothing
+//! in the tree ever called, kept as a statement of intent. A feature flag whose
+//! only effect is to compile an unused dependency is not a seam, it is a
+//! liability: it went five majors stale without anything noticing, because
+//! nothing could. The trait is expressed in `futures::Stream` and `Result`, so
+//! it costs a definition and nothing else.
 //!
 //! [`rustcdc`]: https://github.com/hupe1980/rustcdc
 //!

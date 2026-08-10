@@ -1,0 +1,18 @@
+{%- set docs = get_section(path="docs/_index.md") -%}
+<nav class="sidebar" aria-label="Documentation">
+  <p class="sidebar-title"><a href="{{ docs.permalink }}">Documentation</a></p>
+  <ul>
+    {% for p in docs.pages %}
+    <li>
+      <a href="{{ p.permalink }}"
+         {% if page and page.permalink == p.permalink %}aria-current="page"{% endif %}>{{ p.title }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="sidebar-title">Reference</p>
+  <ul>
+    <li><a href="{{ config.extra.api_docs }}">API (docs.rs)</a></li>
+    <li><a href="{{ config.extra.repository }}">Source</a></li>
+    <li><a href="{{ config.extra.repository }}/blob/main/CHANGELOG.md">Changelog</a></li>
+  </ul>
+</nav>

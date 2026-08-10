@@ -5,6 +5,11 @@
 //! leaves no dead tuples, and that a detached partition really does survive a
 //! crash intact.
 
+// Real infrastructure, so the fixtures live behind `testkit` like every other
+// suite that needs them: `testkit::postgres` is what shares one container
+// across the binary instead of starting one per test (§17.2.0.1).
+#![cfg(feature = "testkit")]
+
 use meterstore::arrow::array::RecordBatch;
 use meterstore::encode::schema::col;
 use meterstore::hot::PostgresHot;
@@ -19,8 +24,6 @@ use meterstore::watermark::TieringWatermark;
 
 use metering::measurement_series::MeasurementSource;
 use sqlx::{PgPool, Row};
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -32,30 +35,19 @@ const D22: OffsetDateTime = datetime!(2026-07-22 00:00 UTC);
 /// A running Postgres plus a prepared hot table.
 struct Harness {
     hot: PostgresHot,
-    // Held so the container outlives the test.
-    _container: testcontainers::ContainerAsync<Postgres>,
 }
 
 impl Harness {
     async fn start() -> Self {
-        let container = Postgres::default()
-            .start()
+        let url = meterstore::testkit::postgres::fresh_database()
             .await
-            .expect("start postgres container");
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("map postgres port");
-        let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+            .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
         let hot = PostgresHot::new(pool);
         hot.create_table(TABLE).await.expect("create table");
 
-        Self {
-            hot,
-            _container: container,
-        }
+        Self { hot }
     }
 
     fn pool(&self) -> &PgPool {
@@ -316,7 +308,7 @@ async fn scan_returns_the_storage_schema_in_merge_key_order() {
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].series.intervals.len(), 3);
     assert_eq!(
-        decoded[0].series.intervals[0].value_kwh,
+        decoded[0].series.intervals[0].value,
         "1.234567".parse::<rust_decimal::Decimal>().unwrap(),
         "decimals must not lose precision through NUMERIC"
     );

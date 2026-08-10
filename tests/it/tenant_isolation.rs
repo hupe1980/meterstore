@@ -6,6 +6,11 @@
 //! would supersede the other's reading — a cross-tenant data leak with no error
 //! anywhere.
 
+// Real infrastructure, so the fixtures live behind `testkit` like every other
+// suite that needs them: `testkit::postgres` is what shares one container
+// across the binary instead of starting one per test (§17.2.0.1).
+#![cfg(feature = "testkit")]
+
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
@@ -25,8 +30,6 @@ use iceberg_catalog_sql::{
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::{MeasurementSeries, MeasurementSource};
 use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -35,14 +38,10 @@ const D20: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 const D21: OffsetDateTime = datetime!(2026-07-21 00:00 UTC);
 
 /// A store whose readings are identified by tenant as well as measuring point.
-async fn store_with_tenant_identity() -> (
-    MeterStore,
-    tempfile::TempDir,
-    testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default().start().await.expect("postgres");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
 
     let pool = PgPool::connect(&url).await.expect("connect");
     let hot = Arc::new(PostgresHot::new(pool));
@@ -114,7 +113,7 @@ async fn store_with_tenant_identity() -> (
         .await
         .expect("store");
 
-    (store, warehouse, container)
+    (store, warehouse)
 }
 
 /// A reading for one tenant at a given version and value.
@@ -122,7 +121,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     let interval = metering::interval::MeterInterval {
         from: D20,
         to: D20 + Duration::minutes(15),
-        value_kwh: rust_decimal::Decimal::new(kwh, 0),
+        value: rust_decimal::Decimal::new(kwh, 0),
         quality: metering::QualityFlag::Measured,
         obis_code: "1-0:1.8.0".parse().ok(),
     };
@@ -160,7 +159,7 @@ async fn sum_kwh(store: &MeterStore, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn one_tenants_correction_does_not_supersede_anothers_reading() {
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     // Same MaLo, same interval, two tenants. B's version is higher.
     store
@@ -182,7 +181,7 @@ async fn one_tenants_correction_does_not_supersede_anothers_reading() {
 #[tokio::test]
 async fn a_correction_within_one_tenant_still_supersedes() {
     // The identity column must not break resolution, only scope it.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
@@ -199,7 +198,7 @@ async fn a_correction_within_one_tenant_still_supersedes() {
 
 #[tokio::test]
 async fn a_query_can_filter_by_tenant() {
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
@@ -220,7 +219,7 @@ async fn a_query_can_filter_by_tenant() {
 
 #[tokio::test]
 async fn attribute_columns_round_trip_without_joining_the_identity() {
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
         .await
@@ -244,7 +243,7 @@ async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
     // hard-code the provenance back. `collect_resolved` folds the declared extra
     // columns from the newest contributing delivery and hands them back, so the
     // round-trip preserves them instead of guessing.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
         .await
@@ -275,7 +274,7 @@ async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
 #[tokio::test]
 async fn a_missing_identity_value_is_rejected_rather_than_defaulted() {
     // Silently writing a null tenant would merge readings across tenants.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     let mut incomplete = reading("a", 10, 20_260_720_000_001);
     incomplete.extra.remove("tenant");
@@ -294,7 +293,7 @@ async fn identity_columns_survive_archival_into_the_cold_tier() {
     // that carries them from PostgreSQL into Iceberg. A tenant discriminator
     // that vanishes on archival makes every historical row unattributable, and
     // merges two tenants' history into one merge key.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
@@ -346,7 +345,7 @@ async fn the_overlap_exclusion_is_scoped_to_a_tenant() {
     // actual primary key would produce: two operators reporting the same MaLo
     // and the same interval are two readings, and rejecting the second as an
     // overlap would be cross-tenant interference dressed up as data validation.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     for tenant in ["9900000000001", "9900000000002"] {
         store
@@ -372,7 +371,7 @@ async fn a_coded_attribute_column_refuses_a_value_outside_its_vocabulary() {
     // `bilanzkreis` is declared with `coded_column(&["BK-1", "BK-2"])`, so a value
     // outside that set must fail at the DB CHECK, not be stored and read back as an
     // unknown code — the same guarantee sparte/unit/quality already carry.
-    let (store, _w, _c) = store_with_tenant_identity().await;
+    let (store, _w) = store_with_tenant_identity().await;
 
     let bad = reading("a", 10, 20_260_720_000_001).with_extra(
         "bilanzkreis",

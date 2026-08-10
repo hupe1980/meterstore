@@ -27,6 +27,15 @@ use crate::encode::schema::{BLOOM_FILTER_COLUMNS, DELTA_ENCODED_COLUMNS, col};
 /// cheap miss.
 const BLOOM_FPP: f64 = 0.01;
 
+/// Declared cardinality of the `obis_code` bloom filter.
+///
+/// OBIS codes come from a standardised code list, and a deployment reads a
+/// handful of channels per measuring point — import, export, reactive, a few
+/// tariff registers. 256 is generous for that and costs about 300 bytes per
+/// file; the measuring-point count, which this column was previously sized with,
+/// costs ~120 KiB for the same information.
+const OBIS_CODE_NDV: u64 = 256;
+
 /// Rows per data page.
 ///
 /// Smaller pages make page-level pruning finer-grained at negligible metadata
@@ -67,12 +76,24 @@ pub fn writer_properties(expected_malo_ids: u64) -> WriterProperties {
         // columns actually used for equality lookups.
         .set_bloom_filter_enabled(false);
 
-    for name in BLOOM_FILTER_COLUMNS {
+    // Sized per column, not from one number. A bloom filter's size is driven by
+    // its declared cardinality — at 1 % false positives, roughly 9.6 bits per
+    // distinct value — so giving `obis_code` the *measuring point* count builds a
+    // ~120 KiB filter for a column that holds a few dozen values. §10.2 has
+    // always described it as low-ndv; the code sized both alike.
+    for (name, ndv) in [
+        (col::MALO_ID, expected_malo_ids.max(1)),
+        (col::OBIS_CODE, OBIS_CODE_NDV),
+    ] {
+        debug_assert!(
+            BLOOM_FILTER_COLUMNS.contains(&name),
+            "a sized column must be one the schema declares filterable"
+        );
         let path = ColumnPath::from(name);
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
             .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
-            .set_column_bloom_filter_ndv(path, expected_malo_ids.max(1));
+            .set_column_bloom_filter_ndv(path, ndv);
     }
 
     for name in DELTA_ENCODED_COLUMNS {
@@ -187,6 +208,29 @@ mod tests {
         let a = small.bloom_filter_properties(&path).unwrap().ndv;
         let b = large.bloom_filter_properties(&path).unwrap().ndv;
         assert!(a < b, "ndv must reflect the window's distinct meters");
+    }
+
+    #[test]
+    fn the_channel_filter_is_sized_for_channels_not_for_meters() {
+        // A bloom filter costs ~9.6 bits per declared distinct value at 1 % fpp,
+        // so sizing `obis_code` with the measuring-point count builds a ~120 KiB
+        // filter for a column holding a few dozen codes. Both columns were
+        // previously given the same number.
+        let props = writer_properties(1_000_000);
+        let obis = props
+            .bloom_filter_properties(&ColumnPath::from(col::OBIS_CODE))
+            .unwrap()
+            .ndv;
+        let malo = props
+            .bloom_filter_properties(&ColumnPath::from(col::MALO_ID))
+            .unwrap()
+            .ndv;
+
+        assert_eq!(obis, OBIS_CODE_NDV);
+        assert!(
+            obis < malo,
+            "a code list is not as wide as a meter population"
+        );
     }
 
     #[test]

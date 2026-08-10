@@ -1,10 +1,12 @@
 [package]
 name = "meterstore"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/meterstore"
+homepage = "https://hupe1980.github.io/meterstore"
+documentation = "https://docs.rs/meterstore"
 keywords = ["metering", "iceberg", "timeseries", "postgres"]
 categories = ["database", "data-structures"]
 readme = "README.md"
@@ -80,6 +82,11 @@ iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs", "opendal
 # Spark/Trino/DuckDB/PyIceberg read the history directly from object storage,
 # without MeterStore in the data path.
 iceberg-catalog-rest = { version = "0.10", optional = true }
+# AWS S3 Tables. Not the Iceberg REST endpoint — that one authenticates with
+# SigV4, which `iceberg-catalog-rest` cannot sign — but the **native** S3 Tables
+# API through the AWS SDK, which signs for itself. Optional because it pulls the
+# AWS SDK, which a non-AWS deployment has no reason to compile.
+iceberg-catalog-s3tables = { version = "0.10", optional = true }
 
 # --- Hot Tier: PostgreSQL ---
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal", "time"] }
@@ -89,7 +96,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # MeasurementUnit, IntervalResolution, DST-aware billing aggregation, gas
 # conversion, Ersatzwertbildung. MeterStore persists and queries those types —
 # it does not redefine them. Part of the mako platform (hupe1980/mako).
-metering = { version = "0.16", features = ["serde"] }
+metering = { version = "0.17", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is
@@ -105,24 +112,19 @@ rust_decimal = "1"
 # guess or recompute is a re-identification path that survives erasure. This is
 # the OS CSPRNG, not `std`'s hash seed, which is explicitly documented as not
 # cryptographically secure.
-getrandom = "0.3"
+getrandom = "0.4"
 # Keyed hash of an erased identifier, so a replaying pipeline can be refused
 # without the audit trail retaining the identifier it just erased.
 hmac = "0.12"
 sha2 = "0.10"
-subtle = "2"
 
 # --- Runtime ---
 tokio = { version = "1.0", features = ["full"] }
 futures-util = "0.3"
 
 # --- Optional ---
-# CDC seam. No v1 implementation — archival is the ingestion path, since
-# metering data arrives in batches and hours of lake latency is correct.
-# Present so a future latency requirement needs no restructure.
-rustcdc = { version = "0.7", optional = true }
-testcontainers = { version = "0.23", optional = true }
-testcontainers-modules = { version = "0.11", features = ["postgres"], optional = true }
+testcontainers = { version = "0.27", optional = true }
+testcontainers-modules = { version = "0.15", features = ["postgres"], optional = true }
 tempfile = { version = "3.27", optional = true }
 axum = { version = "0.8", optional = true }
 thiserror = "2.0.19"
@@ -136,7 +138,7 @@ parquet = { version = "58.4", default-features = false, features = ["arrow", "zs
 async-stream = "0.3.6"
 futures = "0.3.33"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
-toml = "0.9"
+toml = "1.1"
 # --- Serving: Flight SQL (§13.7.3) ---
 # Pinned to the same major as `arrow`, which is itself sourced via datafusion.
 # The duplicate-dependency gate covers `arrow`, so a Flight version pulling a
@@ -147,13 +149,16 @@ tonic = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 
 [dev-dependencies]
-proptest = "1.11.0"
+# The planner's safety properties (§17.1). `time_range` may only ever be wrong in
+# the widening direction and `split` must be exhaustive and disjoint; both are
+# silent when broken, and the shapes that break them are the ones nobody writes a
+# case for.
+proptest = "1.11"
 serde_json = "1.0.151"
 tempfile = "3.27.0"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
-tokio-test = "0.4.5"
-criterion = { version = "0.7", features = ["async_tokio"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 # Turns a bound `TcpListener` into the connection stream tonic serves, so the
 # Flight tests can take an ephemeral port instead of racing on a fixed one.
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -169,10 +174,18 @@ object-store-azure = ["iceberg-storage-opendal/opendal-azdls"]
 object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 # Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
 catalog-facade = ["dep:axum"]
+# AWS S3 Tables as the cold-tier catalogue (§12.1). Optional because it pulls the
+# AWS SDK, which a non-AWS deployment has no reason to compile.
+#
+# The `object-store-s3` implication is stated rather than relied upon:
+# `iceberg-catalog-s3tables` hard-enables `opendal-s3` today, so feature
+# unification already turns it on, but that is *its* implementation detail. A
+# table bucket's data files are in S3 either way, and a catalogue that compiled
+# but could not open a file would be a trap.
+s3tables = ["dep:iceberg-catalog-s3tables", "object-store-s3"]
 # Arrow Flight SQL over the unified hot + cold view (§13.7.3). The one surface
 # an external client cannot assemble for itself.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
-cdc = ["dep:rustcdc"]
 testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
 
 # Benchmarks run under `cargo bench`, not under `cargo test`: criterion's own

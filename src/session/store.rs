@@ -161,6 +161,50 @@ impl MeterStore {
         .await
     }
 
+    /// What a statement would produce, **without running it**.
+    ///
+    /// Plans the query — so a syntax error, an unknown column or an unknown
+    /// relation is reported here — and returns the schema it would produce, the
+    /// boundary it would run against and the tiers it would read, then stops.
+    ///
+    /// This is what a surface needing a schema before any row should call.
+    /// Answering such a request by executing the query makes an Arrow Flight
+    /// client's ordinary `GetFlightInfo` → `DoGet` sequence cost two full scans,
+    /// and makes "preparing" a statement run it.
+    ///
+    /// Planning still reads the tier boundary, and for the resolved table the
+    /// per-file statistics that decide elision — a catalogue read rather than a
+    /// scan, which is the right price for describing a statement.
+    pub async fn describe(&self, sql: &str) -> Result<super::QueryDescription> {
+        let watermark = match self.pinned_watermark {
+            Some(pinned) => pinned,
+            None => self.watermark().await?,
+        };
+        self.describe_with(sql, vec![(self.config.name().to_string(), watermark)])
+            .await
+    }
+
+    /// [`describe`](Self::describe), attributed to the given boundaries.
+    pub(crate) async fn describe_with(
+        &self,
+        sql: &str,
+        watermarks: Vec<(String, TieringWatermark)>,
+    ) -> Result<super::QueryDescription> {
+        let frame = self.sql(sql).await?;
+        let schema = Arc::new(frame.schema().as_arrow().clone());
+        let plan = frame
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        Ok(super::QueryDescription::new(
+            schema,
+            watermarks,
+            super::query::tiers_of(&plan),
+            self.mode,
+        ))
+    }
+
     /// Plan and execute, attributing the result to the given boundaries.
     ///
     /// Split out so a [`MeterCatalog`] can run a statement that mentions several
@@ -281,15 +325,22 @@ impl MeterStore {
 
         // The boundary the pinned snapshot published, so results from this
         // session report the state they actually ran against.
-        let pinned_watermark = self
-            .snapshots()
-            .await?
-            .into_iter()
-            .find(|s| match snapshot {
+        //
+        // Walked back from the pinned snapshot rather than read off it, for the
+        // same reason the cold tier's own lookup walks: a snapshot written out of
+        // band — the compaction §10.3.1 recommends, run with Spark or PyIceberg —
+        // is a valid Iceberg commit that carries no watermark. Reading only the
+        // pinned one would report the epoch for a settlement rerun that ran
+        // against a real boundary. The list is newest-first, so the suffix from
+        // the pinned snapshot is its own history.
+        let snapshots = self.snapshots().await?;
+        let pinned_watermark = snapshots
+            .iter()
+            .position(|s| match snapshot {
                 crate::planner::SnapshotSelector::Id(id) => s.snapshot_id == id,
                 crate::planner::SnapshotSelector::Timestamp(at) => s.committed_at <= at,
             })
-            .and_then(|s| s.watermark)
+            .and_then(|i| snapshots[i..].iter().find_map(|s| s.watermark))
             .unwrap_or_else(TieringWatermark::empty);
 
         let mut builder = MeterStoreBuilder::default()
@@ -385,6 +436,26 @@ impl MeterStore {
                 now,
             )
             .await
+    }
+
+    /// Put the tiering boundary back on the cold table's current snapshot.
+    ///
+    /// Run this after any out-of-band maintenance — the compaction or orphan
+    /// cleanup this crate cannot perform itself, done with Spark or PyIceberg
+    /// against the same table. Those produce valid Iceberg commits that carry no
+    /// watermark, and the boundary is then only findable by walking back the
+    /// parent chain, which snapshot expiry can punch a hole in.
+    ///
+    /// It republishes what the history already says, so it cannot move the
+    /// boundary, and it is a no-op when the current snapshot already carries one.
+    /// [`expire_snapshots`](Self::expire_snapshots) calls it first for that
+    /// reason, so a deployment on the maintenance schedule need not.
+    pub async fn reassert_watermark(&self) -> Result<bool> {
+        Ok(self
+            .cold
+            .reassert_watermark(self.config.name())
+            .await?
+            .is_some())
     }
 
     /// Assert that no row sits in the wrong tier.
@@ -646,6 +717,7 @@ impl MeterStore {
         Ok(HotWriter {
             store: self,
             watermark: self.watermark().await?,
+            ensured: Default::default(),
         })
     }
 
@@ -739,6 +811,120 @@ impl MeterStore {
         self.require_registry()?
             .erase(subject, reason, actor, now)
             .await
+    }
+
+    /// Anonymise every subject whose readings all predate `cutoff`.
+    ///
+    /// # This is a duty on a clock, not a request to wait for
+    ///
+    /// § 60 Abs. 6 MsbG obliges the Messstellenbetreiber to **erase or
+    /// anonymise** personenbezogene Messwerte as soon as storing them is no
+    /// longer necessary, *"spätestens jedoch nach drei Jahren ab dem Schluss des
+    /// Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*.
+    ///
+    /// Three years is a **ceiling**, and the operative trigger is earlier. That
+    /// is the opposite of a retention mandate, and it is worth stating because
+    /// this design — and `metering` before 0.17 — described the provision
+    /// backwards. A store built to keep personal metering values for three years
+    /// *because the law says so* has it inverted.
+    ///
+    /// [`erase_subject`](Self::erase_subject) answers an Article 17 request, one
+    /// subject at a time, when someone asks. This is the standing obligation:
+    /// nobody asks, and it comes due anyway.
+    ///
+    /// # Why anonymising is the whole of it
+    ///
+    /// The statute says *löschen **oder** anonymisieren*, and the second branch
+    /// is the one an immutable lake can take. Destroying the mapping leaves
+    /// quantities against an opaque token — anonymous data, outside the
+    /// Regulation by Recital 26 — while the settlement record stays reproducible,
+    /// which is what the Eichrecht documentation duties and every later audit
+    /// need. It is also `O(1)` per subject against a lake that cannot rewrite
+    /// files at all (§10.3.1), so the branch MeterStore can take is also the one
+    /// that costs nothing.
+    ///
+    /// # The trigger is the reading, not the registration
+    ///
+    /// A subject registered in 2020 may still be metered today, so a sweep keyed
+    /// to registration would erase a live customer. The cutoff is applied to the
+    /// **latest reading** attributed to each reference, over both tiers — a
+    /// subject is anonymised only once every value it explains has passed the
+    /// ceiling.
+    ///
+    /// `cutoff` is the caller's: the statutory ceiling is a calendar computation
+    /// over the year a value was *erhoben*, and the earlier "no longer necessary"
+    /// trigger is a business decision this crate has no view on.
+    ///
+    /// References the registry no longer resolves are skipped, so the sweep is
+    /// idempotent and a re-run writes no second audit row.
+    pub async fn anonymise_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+        reason: &str,
+        actor: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        let registry = self.require_registry()?;
+        let column = self.config.subject_column().ok_or_else(|| {
+            Error::config(
+                "no subject column is declared, so there is no linkage to destroy: \
+                 without one the stored readings carry no reference to a person and \
+                 § 60 Abs. 6 has nothing to act on here",
+            )
+        })?;
+
+        // The **raw** relation, not the resolved one. A superseded version is
+        // still a stored personal value, so a subject whose only recent row is a
+        // correction that lost resolution has not passed the ceiling.
+        let sql = format!(
+            r#"SELECT "{column}" FROM {raw}
+               WHERE "{column}" IS NOT NULL
+               GROUP BY "{column}"
+               HAVING max("{from}") < $1"#,
+            raw = raw_name(self.config.name()),
+            from = crate::encode::schema::col::FROM,
+        );
+        let due = self
+            .query_with_params(
+                &sql,
+                vec![datafusion::scalar::ScalarValue::TimestampMicrosecond(
+                    Some(micros(cutoff)),
+                    Some("UTC".into()),
+                )],
+            )
+            .await?;
+
+        let mut references = std::collections::BTreeSet::new();
+        for batch in due.batches() {
+            let values = column_str(batch, column)?;
+            for i in 0..batch.num_rows() {
+                if !crate::arrow::array::Array::is_null(values, i) {
+                    references.insert(values.value(i).to_string());
+                }
+            }
+        }
+
+        let mut erased = Vec::new();
+        for reference in references {
+            let subject = crate::erasure::SubjectRef::new(reference)?;
+            // Already anonymised — by an Article 17 request, or by an earlier
+            // sweep. Nothing left to destroy, and an audit row would claim an
+            // erasure that did not happen on this run.
+            if registry.resolve(&subject).await?.is_none() {
+                continue;
+            }
+            erased.push(registry.erase(&subject, reason, actor, now).await?);
+        }
+
+        if !erased.is_empty() {
+            warn!(
+                table = self.config.name(),
+                subjects = erased.len(),
+                %cutoff,
+                "anonymised subjects whose readings have passed the retention ceiling"
+            );
+        }
+        Ok(erased)
     }
 
     fn require_registry(&self) -> Result<&crate::erasure::SubjectRegistry> {
@@ -994,6 +1180,16 @@ impl AppendOutcome {
 pub struct HotWriter<'a> {
     store: &'a MeterStore,
     watermark: TieringWatermark,
+    /// Partition bounds this writer has already ensured exist.
+    ///
+    /// The boundary read was not the only per-batch round trip: ensuring
+    /// partitions costs one catalogue lookup **per partition per batch**, and a
+    /// service landing meter-days spends the whole run re-asking about the same
+    /// one or two. A partition cannot stop existing under a writer — only
+    /// archival drops one, and only below the watermark, which this writer
+    /// refuses to cross — so a bound confirmed once stays confirmed for the
+    /// writer's life.
+    ensured: std::sync::Mutex<std::collections::BTreeSet<OffsetDateTime>>,
 }
 
 impl HotWriter<'_> {
@@ -1039,22 +1235,41 @@ impl HotWriter<'_> {
             }
         }
 
-        if series.is_empty() {
+        // Nothing to write, including the case that is not `is_empty()`: a
+        // delivery of series that carry no intervals. `hot_bounds` has no answer
+        // for that, and the honest report is that zero rows were written.
+        if series.iter().all(|s| s.series.intervals.is_empty()) {
             return Ok(0);
         }
 
         let table = store.config.name();
+        let step = store.config.partition_step();
         let (first, last) = hot_bounds(series);
-        store
-            .hot
-            .ensure_partitions(
-                table,
-                first,
-                // Exclusive, so the partition holding `last` must be created.
-                last + store.config.partition_step(),
-                store.config.partition_step(),
-            )
-            .await?;
+
+        // Only the bounds this writer has not already confirmed. A run of
+        // meter-days touches the same one or two partitions over and over, and
+        // the catalogue lookup per partition per batch is pure repetition.
+        let (from, until) = {
+            let ensured = self.ensured.lock().expect("writer state");
+            let mut needed = crate::watermark::align_to_step(first, step);
+            let end = crate::watermark::align_to_step(last, step) + step;
+            while needed < end && ensured.contains(&needed) {
+                needed += step;
+            }
+            (needed, end)
+        };
+        if from < until {
+            store
+                .hot
+                .ensure_partitions(table, from, until, step)
+                .await?;
+            let mut ensured = self.ensured.lock().expect("writer state");
+            let mut confirmed = from;
+            while confirmed < until {
+                ensured.insert(confirmed);
+                confirmed += step;
+            }
+        }
 
         let batch = crate::encode::to_record_batch_with(series, &store.config.extra_columns())?;
         let rows = store

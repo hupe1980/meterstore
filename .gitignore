@@ -31,3 +31,6 @@ target
 # Custom
 CONCEPT.md
 .DS_Store
+
+# Built documentation site (see .github/workflows/site.yml).
+site/public/

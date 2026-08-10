@@ -5,6 +5,11 @@
 //! in particular that the watermark really does ride inside the Iceberg snapshot
 //! summary, and can be read back after the process that wrote it is gone.
 
+// Real infrastructure, so the fixtures live behind `testkit` like every other
+// suite that needs them: `testkit::postgres` is what shares one container
+// across the binary instead of starting one per test (§17.2.0.1).
+#![cfg(feature = "testkit")]
+
 use std::sync::Arc;
 
 use meterstore::cold::IcebergCold;
@@ -22,8 +27,6 @@ use iceberg_catalog_sql::{
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::MeasurementSource;
 use sqlx::PgPool;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -36,15 +39,16 @@ const NOW: OffsetDateTime = datetime!(2026-07-30 00:00 UTC);
 struct Harness {
     hot: PostgresHot,
     cold: Arc<IcebergCold>,
+    /// The raw catalogue, so a test can commit the way a *foreign* tool would.
+    catalog: Arc<dyn Catalog>,
     _warehouse: tempfile::TempDir,
-    _container: testcontainers::ContainerAsync<Postgres>,
 }
 
 impl Harness {
     async fn start() -> Self {
-        let container = Postgres::default().start().await.expect("start postgres");
-        let port = container.get_host_port_ipv4(5432).await.expect("map port");
-        let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+        let url = meterstore::testkit::postgres::fresh_database()
+            .await
+            .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
         let hot = PostgresHot::new(pool);
@@ -69,8 +73,9 @@ impl Harness {
             .await
             .expect("build sql catalog");
 
+        let catalog = Arc::new(catalog) as Arc<dyn Catalog>;
         let cold = Arc::new(IcebergCold::new(
-            Arc::new(catalog) as Arc<dyn Catalog>,
+            Arc::clone(&catalog),
             NamespaceIdent::new("metering".to_string()),
             8 * 1024 * 1024,
         ));
@@ -79,8 +84,8 @@ impl Harness {
         Self {
             hot,
             cold,
+            catalog,
             _warehouse: warehouse,
-            _container: container,
         }
     }
 
@@ -128,6 +133,33 @@ impl Harness {
             .unwrap()
     }
 
+    /// Commit a snapshot the way an out-of-band maintenance tool does: a valid
+    /// Iceberg commit that knows nothing about tiering, and therefore carries no
+    /// watermark. This is what compaction with Spark or PyIceberg produces, and
+    /// this design explicitly recommends running it.
+    async fn foreign_commit(&self) {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+        let table = self.cold.load(TABLE).await.expect("load");
+        let txn = Transaction::new(&table);
+        // Some property, deliberately not the watermark: a snapshot with neither
+        // files nor properties is refused, and what makes this commit *foreign*
+        // is that it says nothing about tiering.
+        let action = txn
+            .fast_append()
+            .add_data_files(Vec::new())
+            .set_snapshot_properties(std::collections::HashMap::from([(
+                "engine".to_string(),
+                "out-of-band-compaction".to_string(),
+            )]));
+        action
+            .apply(txn)
+            .expect("apply")
+            .commit(self.catalog.as_ref())
+            .await
+            .expect("a foreign commit is a perfectly valid Iceberg commit");
+    }
+
     fn archiver(&self) -> Archiver<PostgresHot, Arc<IcebergCold>> {
         Archiver::new(
             self.hot.clone(),
@@ -146,6 +178,47 @@ async fn a_new_table_reports_an_empty_watermark() {
     let h = Harness::start().await;
     let wm = h.cold.watermark(TABLE).await.unwrap();
     assert_eq!(wm, TieringWatermark::empty());
+}
+
+#[tokio::test]
+async fn a_fresh_table_reaches_its_first_real_window_in_one_commit() {
+    // The first run of a real deployment. With no snapshot the watermark is the
+    // Unix epoch, so stepping one day at a time would mean ~20 600 empty Iceberg
+    // commits — days of catch-up and a snapshot list that never recovers —
+    // before a single row is archived. The archiver crosses the empty stretch in
+    // one commit instead, stopping exactly at the first partition that exists.
+    //
+    // Every suite here used to seed the boundary by hand, which is what hid this.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D22, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 96, 20_260_727_000_001).await;
+
+    assert_eq!(
+        h.cold.watermark(TABLE).await.unwrap(),
+        TieringWatermark::empty()
+    );
+
+    let bootstrap = h.archiver().run_once(NOW).await.unwrap();
+    assert_eq!(bootstrap.rows, 0, "the skipped stretch holds nothing");
+    assert_eq!(
+        bootstrap.watermark.get(),
+        D20,
+        "the boundary stops at the first partition that holds rows"
+    );
+    assert_eq!(
+        h.cold.snapshots(TABLE).await.unwrap().len(),
+        1,
+        "one snapshot, not one per day since 1970"
+    );
+
+    // And the very next run archives that partition normally.
+    let archived = h.archiver().run_once(NOW).await.unwrap();
+    assert_eq!(archived.rows, 96);
+    assert_eq!(archived.watermark.get(), D21);
+    assert_eq!(h.hot_rows().await, 0);
 }
 
 #[tokio::test]
@@ -433,4 +506,83 @@ async fn expiry_never_removes_the_current_snapshot() {
         D21,
         "the watermark lives in the current snapshot and must survive"
     );
+}
+
+#[tokio::test]
+async fn expiry_cannot_strand_the_boundary_behind_a_foreign_commit() {
+    // The hazard this design creates for itself. Compaction and orphan cleanup
+    // are blocked upstream, and the documented workaround is to run them out of
+    // band with Spark or PyIceberg. Such a commit is a perfectly valid Iceberg
+    // snapshot that carries no watermark, so the boundary lookup walks back the
+    // parent chain to find one.
+    //
+    // Which works — until expiry removes the ancestor it was walking back to.
+    // Then no snapshot in the history carries a watermark, the lookup fails, and
+    // the table cannot answer *any* query. A maintenance job following the
+    // documentation would have bricked the table.
+    let h = Harness::start().await;
+    h.cold
+        .append_and_commit(
+            TABLE,
+            stream_of(Vec::new()),
+            WriteHints::default(),
+            ArchivalWindow::new(D20, D21).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Two foreign commits, so the watermark-carrying snapshot is neither current
+    // nor within a `retain_last` of 1.
+    h.foreign_commit().await;
+    h.foreign_commit().await;
+
+    h.cold
+        .expire_snapshots(TABLE, Duration::ZERO, 1, datetime!(2030-01-01 00:00 UTC))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        h.cold.watermark(TABLE).await.unwrap().get(),
+        D21,
+        "expiry must not remove the last snapshot that carries the boundary"
+    );
+}
+
+#[tokio::test]
+async fn the_boundary_can_be_restamped_onto_a_foreign_snapshot() {
+    // The durable fix rather than the guard. After out-of-band maintenance the
+    // current snapshot carries no watermark, so every reader pays a walk back
+    // through the parent chain and expiry has to keep an ancestor alive
+    // indefinitely. Re-stamping moves the boundary onto the current snapshot,
+    // which is where every other MeterStore commit puts it.
+    let h = Harness::start().await;
+    h.cold
+        .append_and_commit(
+            TABLE,
+            stream_of(Vec::new()),
+            WriteHints::default(),
+            ArchivalWindow::new(D20, D21).unwrap(),
+        )
+        .await
+        .unwrap();
+    h.foreign_commit().await;
+
+    let snapshots = h.cold.snapshots(TABLE).await.unwrap();
+    assert!(
+        snapshots[0].watermark.is_none(),
+        "the fixture must actually leave a foreign snapshot current"
+    );
+
+    let restamped = h.cold.reassert_watermark(TABLE).await.unwrap();
+    assert!(restamped.is_some(), "a foreign current snapshot needs one");
+
+    let snapshots = h.cold.snapshots(TABLE).await.unwrap();
+    assert_eq!(
+        snapshots[0].watermark.map(|w| w.get()),
+        Some(D21),
+        "the boundary is now on the current snapshot, unchanged in value"
+    );
+
+    // Idempotent: nothing to do when the current snapshot already carries it.
+    assert!(h.cold.reassert_watermark(TABLE).await.unwrap().is_none());
 }

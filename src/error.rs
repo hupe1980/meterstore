@@ -1,7 +1,8 @@
 //! Error types for MeterStore.
 //!
-//! One error enum for the whole crate. Callers match on variants; they never
-//! parse strings. See gap 6.
+//! One error enum for the whole crate, and it is `#[non_exhaustive]`: callers
+//! match on variants and never parse strings, so a new failure mode is an added
+//! arm rather than a broken `if err.to_string().contains(..)`.
 
 use std::result::Result as StdResult;
 
@@ -43,8 +44,10 @@ pub enum Error {
     /// PostgreSQL holds exactly `from >= watermark`, Iceberg exactly
     /// `from < watermark`.
     ///
-    /// Query results may be wrong while this is true. Surfaced as
-    /// `meterstore_invariant_violations_total` and alerted on.
+    /// Query results may be wrong while this is true. Surfaced as the
+    /// `meterstore.tiering.invariant_violations` gauge and as the
+    /// `invariant_violations` column of `system.tables` — **the one thing on
+    /// either list to alert on.** Everything else is degradation.
     #[error("tiering invariant violated for table {table}: {detail}")]
     InvariantViolated {
         /// Table the violation was detected on.

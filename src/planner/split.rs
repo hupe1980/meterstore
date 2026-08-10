@@ -344,3 +344,85 @@ mod tests {
         }
     }
 }
+
+/// The split's two properties, over generated inputs rather than chosen ones.
+///
+/// §6.3 is the whole correctness argument of the design, and it reduces to two
+/// statements about this function. Both are silent when broken: too inclusive
+/// and a row is counted twice, too exclusive and it vanishes. Neither shows up as
+/// an error anywhere downstream, so the case nobody wrote is the case that ships.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).expect("in range")
+    }
+
+    const WINDOW: std::ops::Range<i64> = 0..40;
+
+    fn covers(range: TimeRange, t: OffsetDateTime) -> bool {
+        range.start().is_none_or(|s| t >= s) && range.end().is_none_or(|e| t < e)
+    }
+
+    /// A bound, or none — so half-open and fully unbounded ranges are generated
+    /// too, which is what an unfiltered query produces.
+    fn bound() -> impl Strategy<Value = Option<i64>> {
+        prop_oneof![1 => Just(None), 4 => WINDOW.prop_map(Some)]
+    }
+
+    proptest! {
+        /// **Exhaustive and disjoint.** Every instant the query asked for lands in
+        /// exactly one half — never both (which double-counts) and never neither
+        /// (which loses the row). This is `UNION ALL` being correct, stated as a
+        /// property rather than as a paragraph.
+        #[test]
+        fn every_instant_lands_in_exactly_one_tier(
+            start in bound(),
+            end in bound(),
+            boundary in WINDOW,
+            probe in WINDOW,
+        ) {
+            let range = TimeRange::new(start.map(at), end.map(at));
+            let watermark = TieringWatermark::new(at(boundary));
+            let split = split(range, watermark);
+            let probe = at(probe);
+
+            // Only instants the query actually asked for are in scope: the split
+            // says nothing about the rest, and must not.
+            prop_assume!(covers(range, probe));
+
+            let cold = split.cold.is_some_and(|r| covers(r, probe));
+            let hot = split.hot.is_some_and(|r| covers(r, probe));
+            prop_assert!(
+                cold ^ hot,
+                "{probe} landed in {} halves of {split:?} at watermark {watermark}",
+                u8::from(cold) + u8::from(hot),
+            );
+        }
+
+        /// **The halves agree with the routing rule.** `tier_for` is the single
+        /// place a row's tier is decided (§6.1); a split that disagreed with it
+        /// would send a query to the tier that does not hold the row.
+        #[test]
+        fn each_half_holds_only_what_the_routing_rule_assigns_it(
+            start in bound(),
+            end in bound(),
+            boundary in WINDOW,
+            probe in WINDOW,
+        ) {
+            let range = TimeRange::new(start.map(at), end.map(at));
+            let watermark = TieringWatermark::new(at(boundary));
+            let split = split(range, watermark);
+            let probe = at(probe);
+
+            if split.cold.is_some_and(|r| covers(r, probe)) {
+                prop_assert_eq!(watermark.tier_for(probe), crate::watermark::Tier::Cold);
+            }
+            if split.hot.is_some_and(|r| covers(r, probe)) {
+                prop_assert_eq!(watermark.tier_for(probe), crate::watermark::Tier::Hot);
+            }
+        }
+    }
+}

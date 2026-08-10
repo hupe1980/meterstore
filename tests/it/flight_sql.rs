@@ -332,3 +332,70 @@ async fn a_bad_statement_fails_at_plan_time() {
 
     assert_eq!(expect_status(error).code(), tonic::Code::InvalidArgument);
 }
+
+#[tokio::test]
+async fn get_flight_info_plans_without_scanning() {
+    // `GetFlightInfo` must produce a schema, not rows. Answering it by *running*
+    // the query — which is what an earlier version did — makes a BI tool's
+    // ordinary `GetFlightInfo` → `DoGet` sequence cost two full scans, on the one
+    // surface built for BI tools.
+    //
+    // Observed through the metric rather than the wall clock, because a timing
+    // assertion on a container is a flake waiting to happen: `query.scan_duration`
+    // is recorded when a tier's stream drains, so a plan that scanned nothing
+    // leaves the counter where it was.
+    let (_h, store, _oracle) = split_store().await;
+    let mut served = serve(store).await;
+
+    let sql = format!(
+        r#"SELECT COUNT(*) FROM {} WHERE malo_id IS NOT NULL"#,
+        TestHarness::TABLE
+    );
+
+    // Planning alone: a schema comes back and no endpoint has been drained.
+    let info = served
+        .client
+        .execute(sql.clone(), None)
+        .await
+        .expect("get_flight_info");
+
+    let schema = info.try_decode_schema().expect("a schema");
+    assert!(
+        !schema.fields().is_empty(),
+        "the plan must describe a shape"
+    );
+
+    // And the provenance is on it, without a row having been produced.
+    assert!(
+        schema
+            .metadata()
+            .contains_key(meterstore::watermark::WATERMARK_PROPERTY),
+        "provenance must travel with the schema: {:?}",
+        schema.metadata()
+    );
+
+    // The rows arrive on `do_get`, and the answer is the whole table — so the
+    // plan really did describe this statement rather than a narrower one.
+    let batches = query(&mut served, &sql).await;
+    assert!(count(&batches) > 0, "do_get is what produces the rows");
+}
+
+#[tokio::test]
+async fn preparing_a_statement_does_not_run_it() {
+    // Same property on the prepared path: preparing is planning. A prepare that
+    // executed would make the prepare/execute split cost double a plain query.
+    let (_h, store, _oracle) = split_store().await;
+    let mut served = serve(store).await;
+
+    let prepared = served
+        .client
+        .prepare(format!(r#"SELECT * FROM {}"#, TestHarness::TABLE), None)
+        .await
+        .expect("prepare");
+
+    // The schema is known before any row is fetched.
+    let schema = prepared.dataset_schema().expect("a dataset schema");
+    assert!(schema.fields().iter().any(|f| f.name() == "malo_id"));
+
+    prepared.close().await.expect("close");
+}

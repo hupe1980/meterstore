@@ -102,10 +102,54 @@ impl FlightSqlServer {
         FlightServiceServer::new(self)
     }
 
-    /// Run a query and return its batches with the schema that describes them.
+    /// The provenance a response carries, as Arrow schema metadata (P1).
     ///
-    /// The schema carries the provenance (P1): the boundary the query ran
-    /// against, and which tiers produced rows.
+    /// A client on the far end of a socket needs the boundary as much as one
+    /// in-process: a number pulled over Flight is otherwise indistinguishable
+    /// from one pulled a minute later against a different boundary.
+    fn with_provenance(
+        schema: SchemaRef,
+        watermark: crate::watermark::TieringWatermark,
+        tiers: &[crate::watermark::Tier],
+        mode: crate::planner::ReadMode,
+    ) -> SchemaRef {
+        let tiers = tiers
+            .iter()
+            .map(|t| format!("{t:?}").to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let metadata = std::collections::HashMap::from([
+            (
+                crate::watermark::WATERMARK_PROPERTY.to_string(),
+                watermark.to_string(),
+            ),
+            ("meterstore.tiers_scanned".to_string(), tiers),
+            ("meterstore.read_mode".to_string(), format!("{mode:?}")),
+        ]);
+        Arc::new(schema.as_ref().clone().with_metadata(metadata))
+    }
+
+    /// Plan a statement and return the schema it would produce, **without
+    /// running it**.
+    async fn describe(&self, sql: &str) -> Result<SchemaRef, Status> {
+        debug!(%sql, "flight sql describe");
+
+        let described = self
+            .store
+            .describe(sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
+
+        Ok(Self::with_provenance(
+            described.schema(),
+            described.watermark(),
+            described.tiers_scanned(),
+            described.read_mode(),
+        ))
+    }
+
+    /// Run a query and return its batches with the schema that describes them.
     async fn run(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
         debug!(%sql, "flight sql query");
 
@@ -115,25 +159,12 @@ impl FlightSqlServer {
             .await
             .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
 
-        let tiers = result
-            .tiers_scanned()
-            .iter()
-            .map(|t| format!("{t:?}").to_lowercase())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert(
-            crate::watermark::WATERMARK_PROPERTY.to_string(),
-            result.watermark().to_string(),
+        let schema = Self::with_provenance(
+            result.schema(),
+            result.watermark(),
+            result.tiers_scanned(),
+            result.read_mode(),
         );
-        metadata.insert("meterstore.tiers_scanned".to_string(), tiers);
-        metadata.insert(
-            "meterstore.read_mode".to_string(),
-            format!("{:?}", result.read_mode()),
-        );
-
-        let schema = Arc::new(result.schema().as_ref().clone().with_metadata(metadata));
         Ok((schema, result.into_batches()))
     }
 
@@ -143,11 +174,15 @@ impl FlightSqlServer {
         batches: Vec<RecordBatch>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         // Re-stamped onto every batch so the provenance survives even a client
-        // that inspects a batch rather than the stream schema.
+        // that inspects a batch rather than the stream schema. Metadata does not
+        // change a column, so this cannot fail — and if it ever did, sending the
+        // batch anyway would drop the provenance silently, which is the one thing
+        // this is here to prevent.
         let batches: Vec<RecordBatch> = batches
             .into_iter()
-            .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).unwrap_or(b))
-            .collect();
+            .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| Status::internal(format!("attaching provenance to a batch: {e}")))?;
 
         let flight = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -159,17 +194,26 @@ impl FlightSqlServer {
 
     /// A `FlightInfo` whose ticket replays `sql` on `do_get`.
     ///
-    /// The query is planned now — so a client learns about a syntax error from
-    /// `GetFlightInfo` rather than halfway through a stream — and executed again
-    /// on `do_get`. Holding the result between the two calls would make the
-    /// server stateful for no benefit at metering result sizes, and a stateful
-    /// server is one that leaks when a client disconnects.
+    /// The query is **planned and not executed**. A client learns about a syntax
+    /// error, an unknown column or an unknown relation here rather than halfway
+    /// through a stream, and the rows are produced once, on `do_get`.
+    ///
+    /// That distinction is the difference between one scan and two. Answering
+    /// this by running the query — which is what an earlier version did, while
+    /// this comment claimed otherwise — makes a BI tool's ordinary
+    /// `GetFlightInfo` → `DoGet` sequence cost two full scans, on the one surface
+    /// built for BI tools.
+    ///
+    /// Holding the result between the two calls would fix the double scan and
+    /// introduce a worse problem: a stateful server needs eviction and leaks on a
+    /// disconnected client, and at metering result sizes the cost is the scan
+    /// rather than the parse.
     async fn info_for(
         &self,
         sql: String,
         descriptor: FlightDescriptor,
     ) -> Result<Response<FlightInfo>, Status> {
-        let (schema, _) = self.run(&sql).await?;
+        let schema = self.describe(&sql).await?;
 
         let ticket = Ticket::new(
             TicketStatementQuery {
@@ -257,9 +301,9 @@ impl FlightSqlService for FlightSqlServer {
         query: ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        // Planned here so a client learns about a bad statement at prepare time,
-        // which is what preparing is for.
-        let (schema, _) = self.run(&query.query).await?;
+        // Planned, not executed. "Preparing" a statement that ran it would make
+        // the prepare/execute split cost double what a plain query does.
+        let schema = self.describe(&query.query).await?;
 
         let message: IpcMessage = SchemaAsIpc::new(&schema, &Default::default())
             .try_into()

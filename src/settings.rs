@@ -224,7 +224,7 @@ impl TableSettings {
         let mut seen = BTreeMap::new();
         for column in &self.extra_columns {
             seen.insert(column.name.clone(), column.identity);
-            let field = Field::new(&column.name, column.data_type()?, !column.identity);
+            let field = column.field()?;
             config = if column.identity {
                 config.identity_column(field)
             } else {
@@ -371,6 +371,19 @@ pub struct ExtraColumn {
     /// point share a merge key — a cross-tenant leak with no error anywhere.
     #[serde(default)]
     pub identity: bool,
+    /// The fixed vocabulary this column accepts, if it has one.
+    ///
+    /// Renders a `CHECK … IN (…)` on the hot table, exactly as
+    /// [`coded_column`](crate::config::coded_column) does from Rust — an
+    /// ingestion source, a delivery status, a Zählzeit. A value outside the set
+    /// fails the write rather than being read back later as an unknown code.
+    ///
+    /// Present because §14's whole claim for this file is that it is a front end
+    /// over the *same* validated types, with no setting reachable from one and
+    /// not the other. Coded columns arrived on the builder and briefly made that
+    /// false.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
 }
 
 fn default_column_type() -> String {
@@ -378,6 +391,47 @@ fn default_column_type() -> String {
 }
 
 impl ExtraColumn {
+    /// The declared column as a schema field, vocabulary and all.
+    ///
+    /// Identity columns are non-nullable by construction: a null cannot identify
+    /// a reading, and in SQL it does not compare equal to itself.
+    fn field(&self) -> Result<Field> {
+        let nullable = !self.identity;
+        let Some(values) = &self.values else {
+            return Ok(Field::new(&self.name, self.data_type()?, nullable));
+        };
+
+        if self.data_type()? != DataType::Utf8 {
+            return Err(Error::config(format!(
+                "extra column {:?} declares `values` but is not a string column: a \
+                 vocabulary is a set of codes",
+                self.name
+            )));
+        }
+        if values.is_empty() {
+            return Err(Error::config(format!(
+                "extra column {:?} declares an empty `values` set, which no write could \
+                 satisfy; omit it to accept any string",
+                self.name
+            )));
+        }
+        // The set is rendered into a `CHECK … IN (…)` from field metadata, which
+        // is comma-delimited — so a code containing one would split into two.
+        if let Some(bad) = values.iter().find(|v| v.contains(',')) {
+            return Err(Error::config(format!(
+                "extra column {:?} has the code {bad:?}, which contains a comma — the \
+                 delimiter the allowed-value set is carried with",
+                self.name
+            )));
+        }
+
+        Ok(crate::config::coded_column(
+            &self.name,
+            &values.iter().map(String::as_str).collect::<Vec<_>>(),
+            nullable,
+        ))
+    }
+
     /// The Arrow type this column declares.
     fn data_type(&self) -> Result<DataType> {
         match self.r#type.as_str() {
@@ -728,6 +782,52 @@ settlment_lag = "7d"
         let shown = format!("{:?}", settings.hot);
         assert!(!shown.contains("db.internal"), "{shown}");
         assert!(shown.contains("postgresql://<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn a_coded_column_is_declarable_from_a_file() {
+        // §14's claim for this file is that it is a front end over the *same*
+        // validated types, with no setting reachable from one and not the other.
+        // Coded columns arrived on the builder and briefly made that false.
+        let toml = r#"
+[[tables]]
+name = "readings"
+extra_columns = [{ name = "ingest_source", values = ["MSCONS", "SMGW"] }]
+"#;
+        let config = Settings::from_toml(toml).unwrap().single_table().unwrap();
+        let column = config
+            .attribute_columns()
+            .iter()
+            .find(|f| f.name() == "ingest_source")
+            .expect("declared");
+
+        assert_eq!(
+            column
+                .metadata()
+                .get(crate::config::CHECK_VALUES_KEY)
+                .map(String::as_str),
+            Some("MSCONS,SMGW"),
+            "the vocabulary must reach the field the hot-table DDL reads"
+        );
+    }
+
+    #[test]
+    fn a_vocabulary_that_could_not_survive_the_ddl_is_refused() {
+        // The set is carried comma-delimited in field metadata, so a code
+        // containing one would silently become two codes.
+        for bad in [r#"values = ["A,B"]"#, "values = []"] {
+            let toml = format!(
+                r#"
+[[tables]]
+name = "readings"
+extra_columns = [{{ name = "ingest_source", {bad} }}]
+"#
+            );
+            assert!(
+                Settings::from_toml(&toml).unwrap().single_table().is_err(),
+                "{bad} was accepted"
+            );
+        }
     }
 
     #[test]

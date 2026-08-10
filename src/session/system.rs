@@ -35,8 +35,20 @@ pub struct TableStatus {
     pub watermark: OffsetDateTime,
     /// How far behind wall clock the watermark sits.
     pub watermark_lag_seconds: i64,
-    /// Rows in PostgreSQL.
-    pub hot_rows: i64,
+    /// Hot partitions that exist, attached or detached.
+    ///
+    /// Was `hot_rows`, which was **always `-1`** — counting the hot tier means
+    /// scanning it, so the column was declared, documented and never computed. A
+    /// diagnostic that reports a sentinel is worse than one that is absent,
+    /// because an operator reads it as a number. Partitions answer the questions
+    /// row counts were wanted for — is archival keeping up, is anything left
+    /// behind — and are a catalog lookup rather than a scan.
+    pub hot_partitions: i64,
+    /// Partitions that can still hold a row written now or later.
+    ///
+    /// **Reaching zero stops inserts outright.** The one number on this row that
+    /// predicts a hard failure rather than describing one.
+    pub partitions_ahead: i64,
     /// Rows below the watermark that are still in PostgreSQL.
     ///
     /// Must be zero. Anything else means a query can return wrong results,
@@ -56,7 +68,8 @@ fn status_schema() -> SchemaRef {
             false,
         ),
         Field::new("watermark_lag_seconds", DataType::Int64, false),
-        Field::new("hot_rows", DataType::Int64, false),
+        Field::new("hot_partitions", DataType::Int64, false),
+        Field::new("partitions_ahead", DataType::Int64, false),
         Field::new("invariant_violations", DataType::Int64, false),
         Field::new("healthy", DataType::Boolean, false),
     ]))
@@ -117,16 +130,33 @@ impl<'a> SystemTables<'a> {
             .invariant_violations
             .record(violations.max(0) as u64, &crate::observe::table(table));
 
+        // A catalog lookup, not a scan — which is the whole reason this replaced
+        // a row count. `None` means the store cannot enumerate its partitions, so
+        // the columns report `-1` for *that store* rather than inventing a
+        // plausible number; every store this crate ships can answer.
+        let partitions = self.hot.partition_starts(table).await?;
+        let (hot_partitions, partitions_ahead) = match &partitions {
+            Some(starts) => (
+                starts.len() as i64,
+                crate::tiering::store::partitions_ahead(starts, now, self.config.partition_step())
+                    as i64,
+            ),
+            None => (-1, -1),
+        };
+
         Ok(TableStatus {
             table: table.to_string(),
             watermark: watermark.get(),
             watermark_lag_seconds: (now - watermark.get()).whole_seconds(),
-            // Counting the hot tier means scanning it; the invariant count
-            // already tells us what matters, so this stays a cheap estimate of
-            // -1 rather than a table scan during an incident.
-            hot_rows: -1,
+            hot_partitions,
+            partitions_ahead,
             invariant_violations: violations,
-            healthy: violations == 0,
+            // Healthy is the absence of violations **and** a write frontier that
+            // still exists. A store whose partitions have run out is not
+            // returning wrong answers, but the next insert fails — and an
+            // operator reading one health column should not have to know that
+            // is tracked somewhere else.
+            healthy: violations == 0 && partitions_ahead != 0,
         })
     }
 
@@ -397,7 +427,10 @@ pub fn status_batch(rows: &[TableStatus]) -> Result<RecordBatch> {
                     .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
-                rows.iter().map(|r| r.hot_rows).collect::<Vec<_>>(),
+                rows.iter().map(|r| r.hot_partitions).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.partitions_ahead).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
                 rows.iter()
@@ -440,7 +473,8 @@ mod tests {
             table: "readings_versions".to_string(),
             watermark: datetime!(2026-07-20 00:00 UTC),
             watermark_lag_seconds: 86_400,
-            hot_rows: -1,
+            hot_partitions: 21,
+            partitions_ahead: 14,
             invariant_violations: violations,
             healthy: violations == 0,
         }
@@ -454,10 +488,41 @@ mod tests {
     }
 
     #[test]
-    fn health_is_exactly_the_absence_of_violations() {
-        // The one column an alert should fire on, so it must not be a heuristic.
+    fn health_covers_both_ways_a_table_stops_working() {
+        // Wrong answers now, and no answers shortly: a table with no partition
+        // ahead of the frontier rejects the next insert, and an operator reading
+        // one health column should not have to know that lives elsewhere.
         assert!(status(0).healthy);
         assert!(!status(1).healthy);
+    }
+
+    #[test]
+    fn the_write_runway_is_counted_from_partitions_that_exist() {
+        use crate::tiering::store::partitions_ahead;
+        use time::Duration;
+
+        let starts = [
+            datetime!(2026-07-18 00:00 UTC),
+            datetime!(2026-07-19 00:00 UTC),
+            datetime!(2026-07-20 00:00 UTC),
+            datetime!(2026-07-21 00:00 UTC),
+        ];
+        // Mid-day: the partition holding `now` counts, and so does every later
+        // one — those are where the next writes land.
+        assert_eq!(
+            partitions_ahead(&starts, datetime!(2026-07-20 13:47 UTC), Duration::DAY),
+            2
+        );
+        // Past the last one: the very next insert has nowhere to go. This is the
+        // value the old configuration-derived gauge could never produce.
+        assert_eq!(
+            partitions_ahead(&starts, datetime!(2026-07-22 00:00 UTC), Duration::DAY),
+            0
+        );
+        assert_eq!(
+            partitions_ahead(&[], datetime!(2026-07-20 00:00 UTC), Duration::DAY),
+            0
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn reading(intervals: &[(i64, QualityFlag)], version: u128) -> meterstore::encod
             MeterInterval {
                 from,
                 to: from + Duration::minutes(15),
-                value_kwh: Decimal::new(*kwh, 0),
+                value: Decimal::new(*kwh, 0),
                 quality: *quality,
                 obis_code: "1-0:1.8.0".parse().ok(),
             }
@@ -93,7 +93,7 @@ async fn latest_returns_the_newest_interval() {
         START + Duration::minutes(30),
         "the newest start"
     );
-    assert_eq!(latest.value_kwh, Decimal::new(30, 0));
+    assert_eq!(latest.value, Decimal::new(30, 0));
 }
 
 #[tokio::test]
@@ -158,7 +158,7 @@ async fn quality_in_filters_to_the_accepted_set() {
         .await
         .expect("intervals");
     assert_eq!(measured.len(), 1);
-    assert_eq!(measured[0].value_kwh, Decimal::new(10, 0));
+    assert_eq!(measured[0].value, Decimal::new(10, 0));
 }
 
 #[tokio::test]
@@ -206,5 +206,5 @@ async fn latest_respects_the_quality_filter() {
         .expect("latest")
         .expect("a measured reading exists");
     assert_eq!(last_good.from, START + Duration::minutes(15));
-    assert_eq!(last_good.value_kwh, Decimal::new(20, 0));
+    assert_eq!(last_good.value, Decimal::new(20, 0));
 }

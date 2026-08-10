@@ -217,3 +217,43 @@ async fn the_result_matches_what_the_routing_path_would_have_written() {
 
     drop(harness);
 }
+
+#[tokio::test]
+async fn concurrent_writers_can_open_the_same_new_partition() {
+    // The ordinary ingest topology: N stateless workers landing batches, all of
+    // which call `ensure_partitions` for the day they are writing. The first
+    // batch of a new day therefore has every worker trying to create the same
+    // partition at the same moment.
+    let harness = TestHarness::start().await.expect("harness");
+    let store = harness.store().await.expect("store");
+
+    // A day no partition covers yet, one worker per measuring point.
+    let fresh = START + Duration::days(30);
+    let mut tasks = Vec::new();
+    for worker in 0..8u32 {
+        let store = store.clone();
+        let batch = MeteringWorkload::new(fresh)
+            .seed(0xA11CE + u64::from(worker))
+            .malo_offset(200 + worker as usize)
+            .malo_ids(1)
+            .days(1)
+            .generate()
+            .expect("workload");
+        tasks.push(tokio::spawn(async move {
+            store
+                .hot_writer()
+                .await
+                .expect("writer")
+                .append(&batch)
+                .await
+        }));
+    }
+
+    for task in tasks {
+        let result = task.await.expect("join");
+        assert!(
+            result.is_ok(),
+            "a concurrent writer must not lose the partition-creation race: {result:?}"
+        );
+    }
+}

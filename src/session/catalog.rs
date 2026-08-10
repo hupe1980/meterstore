@@ -145,13 +145,39 @@ impl MeterCatalog {
             .next()
             .ok_or_else(|| Error::config("catalog hosts no tables"))?;
 
-        // Every store shares this session, so any of them can plan the
-        // statement — the catalog it resolves names against is the same one.
-        // What only the catalog knows is how many boundaries the answer spans.
+        // **The tables the statement actually reads, not every table hosted.**
+        //
+        // Reporting all of them looks harmless and is not: `watermark()` is the
+        // conservative boundary — the oldest of the reported ones — so a
+        // single-table query in a twenty-table catalog would be attributed to
+        // whichever unrelated table happens to archive least often. The figure
+        // would be reconciled against a boundary it was never computed against,
+        // which is precisely the confusion carrying provenance exists to prevent.
+        //
+        // Read off the logical plan, which is where relation names still exist:
+        // by the time the physical plan is built they have become scan nodes.
+        let plan = self
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let scanned = scanned_relations(&plan);
+
         let mut watermarks = Vec::with_capacity(self.stores.len());
         for (name, store) in &self.stores {
-            watermarks.push((name.clone(), store.watermark().await?));
+            // A store answers to both of the relations it registers (§13.7.2),
+            // and a caller may legitimately query either.
+            let touched =
+                scanned.contains(&store.raw_table()) || scanned.contains(&store.resolved_table());
+            if touched {
+                watermarks.push((name.clone(), store.watermark().await?));
+            }
         }
+
+        // A statement that reads no managed table — `SELECT 1`, or a query over
+        // `system.*` — has no tier boundary, and saying so beats attaching an
+        // arbitrary one.
         first.run(sql, params, watermarks).await
     }
 
@@ -227,6 +253,28 @@ impl MeterCatalog {
         }
         Ok(out)
     }
+}
+
+/// Every relation a logical plan scans, by name.
+///
+/// Unqualified: the store registers into the default catalog and schema, so the
+/// bare name is what identifies it, and a caller may write either
+/// `readings` or `datafusion.public.readings`.
+fn scanned_relations(
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> std::collections::HashSet<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::LogicalPlan;
+
+    let mut found = std::collections::HashSet::new();
+    // Infallible visitor, so the traversal cannot fail — the closure only reads.
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            found.insert(scan.table_name.table().to_string());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Builds a [`MeterCatalog`] from per-table builders.

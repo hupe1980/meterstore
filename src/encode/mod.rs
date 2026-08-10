@@ -324,7 +324,7 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
             sparte.push(s.sparte.as_str());
             from.push(to_micros(interval.from)?);
             to.push(to_micros(interval.to)?);
-            value.push(to_scaled_i128(interval.value_kwh)?);
+            value.push(to_scaled_i128(interval.value)?);
             unit.push(s.unit.as_str());
             quality.push(interval.quality.as_str());
             resolution.push(res.clone());
@@ -366,6 +366,13 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
     for field in extra {
         let mut values = Vec::with_capacity(rows);
         for s in stored {
+            // A series with no intervals contributes no rows, so it has nothing
+            // to label. Demanding a value for it would make a batch fail on a
+            // column that would never have been written — and the core columns
+            // above already skip it silently, so the two must agree.
+            if s.series.intervals.is_empty() {
+                continue;
+            }
             // A nullable column may simply be absent: a Bilanzkreis that is not
             // yet assigned, or a measuring point with no known occupant, is an
             // ordinary state rather than an encoding failure. Identity columns
@@ -404,7 +411,15 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
                 values.push(value.clone());
             }
         }
-        columns.push(ScalarValue::iter_to_array(values)?);
+        // `iter_to_array` refuses an empty iterator, so a zero-row batch has to
+        // build its extra columns another way. A zero-row batch is ordinary — a
+        // delivery whose series carry no intervals — and it must produce the same
+        // shape as any other, or a table with deployment columns would fail on
+        // exactly the input a table without them accepts.
+        columns.push(match values.is_empty() {
+            true => crate::arrow::array::new_empty_array(field.data_type()),
+            false => ScalarValue::iter_to_array(values)?,
+        });
     }
 
     Ok(RecordBatch::try_new(
@@ -444,11 +459,37 @@ fn column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<
         .ok_or_else(|| Error::decode(name, "unexpected array type"))
 }
 
+/// The columns that describe an individual reading rather than the delivery it
+/// arrived in.
+///
+/// Everything *else* in the batch is series-level, and therefore what a decoded
+/// run has to agree on — see [`from_record_batch`].
+pub const INTERVAL_COLUMNS: [&str; 4] = [col::FROM, col::TO, col::VALUE, col::QUALITY];
+
 /// Decode a [`RecordBatch`] back into [`StoredSeries`], one per contiguous run of
-/// rows sharing a (malo, melo, version scope, version, source) identity.
+/// rows agreeing on **every** series-level column.
 ///
 /// Rows are grouped, not merged: version resolution is a query-planner concern,
 /// not an encoding one.
+///
+/// # The run key is derived, not listed
+///
+/// A [`MeasurementSeries`] carries fields that describe the *delivery* — its
+/// `source`, its `provenance`, its declared `resolution` — and those are read
+/// once per run, from its first row. So a run must agree on them, or the decoded
+/// series attributes one delivery's values to another delivery's source. That is
+/// silent corruption of the audit trail this store exists to keep, and it is
+/// invisible afterwards: the series looks perfectly well-formed.
+///
+/// An earlier key listed six columns by hand and omitted `source_kind`,
+/// `source_detail`, `provenance`, `resolution` and `recorded_at`. Two deliveries
+/// that happened to share a version and scope — one MSCONS, one SMGW — folded
+/// into one series carrying the first one's origin for all of it.
+///
+/// So the key is everything that is not [`INTERVAL_COLUMNS`], which means a
+/// column added to the schema joins it automatically rather than having to be
+/// remembered. `obis_code` is in it deliberately: the MSCONS handbook defines a
+/// time series as one channel, so a decoded series is one channel.
 pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
     let core = schema::storage_schema(&[]);
     let extra_names: Vec<String> = batch
@@ -476,23 +517,31 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
     let version_scope = column::<StringArray>(batch, col::VERSION_SCOPE)?;
     let recorded_at = column::<TimestampMicrosecondArray>(batch, col::RECORDED_AT)?;
 
+    // Contiguous runs over every series-level column, found by Arrow rather than
+    // by a hand-rolled comparison: `partition` returns the ranges of consecutive
+    // rows that agree on all of them, which is precisely the definition above.
+    let key_columns: Vec<crate::arrow::array::ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !INTERVAL_COLUMNS.contains(&f.name().as_str()))
+        .map(|(i, _)| batch.column(i).clone())
+        .collect();
+    let starts: std::collections::HashSet<usize> = if batch.num_rows() == 0 {
+        Default::default()
+    } else {
+        crate::arrow::compute::partition(&key_columns)?
+            .ranges()
+            .iter()
+            .map(|r| r.start)
+            .collect()
+    };
+
     let mut out: Vec<StoredSeries> = Vec::new();
-    // Sparte and unit are part of the run key, not just carried along: a batch
-    // that switches commodity mid-run holds two series, and folding them into one
-    // would attach one series' unit to the other's numbers.
-    let mut current_key: Option<(String, Option<String>, String, i128, String, String)> = None;
 
     for i in 0..batch.num_rows() {
-        let key = (
-            malo.value(i).to_string(),
-            (!melo.is_null(i)).then(|| melo.value(i).to_string()),
-            version_scope.value(i).to_string(),
-            version.value(i),
-            sparte.value(i).to_string(),
-            unit.value(i).to_string(),
-        );
-
-        if current_key.as_ref() != Some(&key) {
+        if starts.contains(&i) {
             let source = decode_source(
                 source_kind.value(i),
                 (!source_detail.is_null(i)).then(|| source_detail.value(i)),
@@ -519,28 +568,32 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
                 extra.insert(name.clone(), ScalarValue::try_from_array(column, i)?);
             }
 
-            let sparte: Sparte = key
-                .4
+            let sparte: Sparte = sparte
+                .value(i)
                 .parse()
-                .map_err(|e| Error::decode(col::SPARTE, format!("{:?}: {e}", key.4)))?;
-            let unit = MeasurementUnit::parse(&key.5).ok_or_else(|| {
+                .map_err(|e| Error::decode(col::SPARTE, format!("{:?}: {e}", sparte.value(i))))?;
+            let unit = MeasurementUnit::parse(unit.value(i)).ok_or_else(|| {
                 Error::decode(
                     col::UNIT,
-                    format!("{:?} is not one of {:?}", key.5, MeasurementUnit::CODES),
+                    format!(
+                        "{:?} is not one of {:?}",
+                        unit.value(i),
+                        MeasurementUnit::CODES
+                    ),
                 )
             })?;
             // The same rule as on the write path. A row that reached storage
             // before the check existed, or through a writer that bypassed it,
             // must not be handed back as if its dimension were sound.
-            check_unit(sparte, unit, &key.0)?;
+            check_unit(sparte, unit, malo.value(i))?;
 
             out.push(StoredSeries {
                 extra,
                 sparte,
                 unit,
                 series: MeasurementSeries {
-                    malo_id: key.0.clone(),
-                    melo_id: key.1.clone(),
+                    malo_id: malo.value(i).to_string(),
+                    melo_id: (!melo.is_null(i)).then(|| melo.value(i).to_string()),
                     obis_code: obis.value(i).parse().ok(),
                     resolution: res,
                     source,
@@ -553,14 +606,13 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
                 ),
                 recorded_at: from_micros(recorded_at.value(i))?,
             });
-            current_key = Some(key);
         }
 
         let series = out.last_mut().expect("pushed above");
         series.series.intervals.push(MeterInterval {
             from: from_micros(from.value(i))?,
             to: from_micros(to.value(i))?,
-            value_kwh: from_scaled_i128(value.value(i)),
+            value: from_scaled_i128(value.value(i)),
             quality: quality
                 .value(i)
                 .parse()
@@ -717,6 +769,26 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_with_no_rows_keeps_its_declared_shape() {
+        // A delivery whose series carry no intervals is ordinary. Building the
+        // extra columns through `iter_to_array`, which refuses an empty
+        // iterator, made a table *with* deployment columns fail on exactly the
+        // input a table without them accepts.
+        let field = Field::new("tenant", DataType::Utf8, false);
+
+        let empty = to_record_batch_with(&[], std::slice::from_ref(&field)).unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(
+            empty.schema(),
+            schema::storage_schema(std::slice::from_ref(&field))
+        );
+
+        let no_intervals = series(vec![]);
+        let batch = to_record_batch_with(&[no_intervals], std::slice::from_ref(&field)).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[test]
     fn a_non_nullable_extra_column_must_be_supplied() {
         // Identity columns are validated non-nullable precisely so a missing
         // tenant cannot silently become a null that groups with everyone else.
@@ -752,7 +824,7 @@ mod tests {
         MeterInterval {
             from,
             to: from + time::Duration::minutes(15),
-            value_kwh: kwh.parse().unwrap(),
+            value: kwh.parse().unwrap(),
             quality: q,
             obis_code: "1-0:1.8.0".parse().ok(),
         }
@@ -791,7 +863,7 @@ mod tests {
             let input = series(vec![quarter(base, raw, QualityFlag::Measured)]);
             let batch = to_record_batch(std::slice::from_ref(&input)).unwrap();
             let out = from_record_batch(&batch).unwrap();
-            let got = out[0].series.intervals[0].value_kwh;
+            let got = out[0].series.intervals[0].value;
             assert_eq!(
                 got,
                 raw.parse::<Decimal>().unwrap(),
@@ -847,7 +919,7 @@ mod tests {
         let odd = MeterInterval {
             from: dst_back,
             to: dst_back + time::Duration::minutes(37), // deliberately not 15
-            value_kwh: "2.5".parse().unwrap(),
+            value: "2.5".parse().unwrap(),
             quality: QualityFlag::Measured,
             obis_code: "1-0:1.8.0".parse().ok(),
         };
@@ -909,7 +981,7 @@ mod tests {
         let bad = MeterInterval {
             from: base,
             to: base,
-            value_kwh: Decimal::ONE,
+            value: Decimal::ONE,
             quality: QualityFlag::Measured,
             obis_code: "1-0:1.8.0".parse().ok(),
         };
@@ -937,6 +1009,80 @@ mod tests {
                 assert_eq!(session_id, "S-1");
             }
             other => panic!("source variant lost: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_deliveries_sharing_a_version_do_not_merge_into_one_source() {
+        // The corruption a hand-listed run key produced. Two deliveries for one
+        // measuring point that happen to agree on version and scope — one MSCONS,
+        // one from the gateway — folded into a single series carrying whichever
+        // source sorted first, for *all* the intervals. The numbers stayed right
+        // and the audit trail lied, which is the harder failure to find.
+        let base = datetime!(2026-03-01 00:00 UTC);
+
+        let mut mscons = series(vec![quarter(base, "1.0", QualityFlag::Measured)]);
+        mscons.series.source = MeasurementSource::Mscons {
+            pid: 13_005,
+            message_ref: None,
+            sender_mp_id: "99".to_string(),
+        };
+
+        let mut gateway = series(vec![quarter(
+            base + time::Duration::minutes(15),
+            "2.0",
+            QualityFlag::Measured,
+        )]);
+        gateway.series.source = MeasurementSource::SmgwDirectPush {
+            device_id: "SMGW-42".to_string(),
+            session_id: "S-1".to_string(),
+        };
+        // Same version, same scope, same measuring point: everything the old key
+        // looked at agrees.
+        assert_eq!(mscons.version, gateway.version);
+
+        let batch = to_record_batch(&[mscons, gateway]).unwrap();
+        let out = from_record_batch(&batch).unwrap();
+
+        assert_eq!(out.len(), 2, "two deliveries, two series");
+        assert!(matches!(
+            out[0].series.source,
+            MeasurementSource::Mscons { .. }
+        ));
+        assert!(matches!(
+            out[1].series.source,
+            MeasurementSource::SmgwDirectPush { .. }
+        ));
+    }
+
+    #[test]
+    fn a_decoded_series_is_one_channel() {
+        // The MSCONS handbook defines a time series as one named series per OBIS
+        // code. A run spanning two channels would put both under one series-level
+        // `obis_code`, which claims a channel for values that are not on it.
+        let base = datetime!(2026-03-01 00:00 UTC);
+        let mut a = series(vec![quarter(base, "1.0", QualityFlag::Measured)]);
+        a.series.obis_code = "1-0:1.8.0".parse().ok();
+        a.series.intervals[0].obis_code = "1-0:1.8.0".parse().ok();
+
+        let mut b = series(vec![quarter(base, "2.0", QualityFlag::Measured)]);
+        b.series.obis_code = "1-0:2.8.0".parse().ok();
+        b.series.intervals[0].obis_code = "1-0:2.8.0".parse().ok();
+
+        let batch = to_record_batch(&[a, b]).unwrap();
+        let out = from_record_batch(&batch).unwrap();
+
+        assert_eq!(out.len(), 2);
+        for decoded in &out {
+            let channel = decoded.series.obis_code.expect("a channel");
+            assert!(
+                decoded
+                    .series
+                    .intervals
+                    .iter()
+                    .all(|i| i.obis_code == Some(channel)),
+                "every interval must be on the channel the series names"
+            );
         }
     }
 

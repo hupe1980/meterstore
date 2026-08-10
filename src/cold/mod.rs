@@ -4,5 +4,7 @@ pub mod catalog;
 pub mod iceberg;
 pub mod parquet;
 
+#[cfg(feature = "s3tables")]
+pub use catalog::S3TablesCatalog;
 pub use catalog::{ColdTier, IcebergSqlCatalog, WarehouseAuth};
 pub use iceberg::IcebergCold;

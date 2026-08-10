@@ -321,3 +321,55 @@ mod tests {
         );
     }
 }
+
+/// Elision's one property: it may only ever be *wrong in the slow direction*.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn stats() -> impl Strategy<Value = Option<VersionStats>> {
+        prop_oneof![
+            1 => Just(None),
+            6 => (0i128..4, 0i128..4)
+                .prop_map(|(a, b)| Some(VersionStats { min: a.min(b), max: a.max(b) })),
+        ]
+    }
+
+    proptest! {
+        /// **Statistics must prove absence; their absence proves nothing.**
+        /// Eliding resolution returns the raw rows, so eliding wrongly hands back
+        /// every superseded version of a corrected interval and every `SUM` over
+        /// them is overstated. The condition is therefore stated independently
+        /// here and compared against the planner's answer.
+        #[test]
+        fn resolution_is_skipped_only_when_one_version_is_provable(
+            files in prop::collection::vec(stats(), 0..8),
+        ) {
+            // Independently: every file must be readable, hold a single version,
+            // and agree with the others on which version that is.
+            let provable = files.iter().all(|f| f.is_some_and(|s| s.min == s.max))
+                && files
+                    .iter()
+                    .filter_map(|f| f.map(|s| s.min))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    <= 1;
+
+            prop_assert_eq!(plan(&files).is_elided(), provable, "{:?}", files);
+        }
+
+        /// Adding a file can only ever *remove* the right to elide. A scan that
+        /// widens to cover more files must not become cheaper.
+        #[test]
+        fn widening_a_scan_never_grants_elision(
+            files in prop::collection::vec(stats(), 1..6),
+            extra in stats(),
+        ) {
+            let before = plan(&files).is_elided();
+            let mut wider = files.clone();
+            wider.push(extra);
+            prop_assert!(before || !plan(&wider).is_elided());
+        }
+    }
+}

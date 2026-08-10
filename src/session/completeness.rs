@@ -61,13 +61,18 @@ pub struct Completeness {
     pub expected: u64,
     /// Intervals actually stored.
     pub actual: u64,
-    /// `expected - actual`, floored at zero.
+    /// Intervals the range should hold and does not, summed **per local day**.
     ///
-    /// More rows than expected is not a gap; it is a duplicate or a resolution
-    /// mismatch, and [`Completeness::surplus`] reports it separately so the two
-    /// are never confused.
+    /// Deliberately not `expected - actual` over the whole range. More rows than
+    /// expected is not a negative gap — it is a duplicate or a mis-declared
+    /// resolution, a different condition entirely — so a surplus on one day must
+    /// not cancel a shortfall on another. Computed over the totals it would: a
+    /// channel four intervals long on Tuesday and four short on Wednesday would
+    /// report as complete, which is the one answer a completeness report must
+    /// never give. [`Completeness::surplus`] carries the other direction.
     pub missing: u64,
-    /// Rows beyond the expectation — a duplicate or a mis-declared resolution.
+    /// Rows beyond the expectation, summed per local day — a duplicate or a
+    /// mis-declared resolution.
     pub surplus: u64,
     /// The first local day that is short, if any.
     pub first_gap: Option<Date>,
@@ -337,6 +342,7 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         resolution: Option<String>,
         expected: u64,
         actual: u64,
+        missing: u64,
         surplus: u64,
         first_gap: Option<Date>,
         substituted: u64,
@@ -357,6 +363,7 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
             resolution: row.resolution.clone(),
             expected: 0,
             actual: 0,
+            missing: 0,
             surplus: 0,
             first_gap: None,
             substituted: 0,
@@ -399,6 +406,13 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         if expected > actual {
             entry.first_gap = Some(entry.first_gap.map_or(day, |d| d.min(day)));
         }
+        // Both directions are summed **per day** and neither is derived from the
+        // channel totals. Over the totals a surplus on one day would net against
+        // a shortfall on another and the channel would report as complete —
+        // which is exactly the answer §9.6 says surplus must never be able to
+        // produce, since the two are different conditions rather than opposite
+        // signs of one.
+        entry.missing += expected.saturating_sub(actual);
         entry.surplus += actual.saturating_sub(expected);
     }
 
@@ -410,7 +424,7 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
             resolution: a.resolution,
             expected: a.expected,
             actual: a.actual,
-            missing: a.expected.saturating_sub(a.actual),
+            missing: a.missing,
             surplus: a.surplus,
             first_gap: a.first_gap,
             substituted: a.substituted,
@@ -702,6 +716,29 @@ mod tests {
         );
         assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 02)));
         assert_eq!(out[0].missing, 96 * 3 - (90 + 80 + 96));
+    }
+
+    #[test]
+    fn a_surplus_on_one_day_cannot_hide_a_gap_on_another() {
+        // The failure computing `missing` from the channel totals produced: four
+        // intervals too many on the 2nd and four short on the 3rd net to zero, so
+        // a channel with a real gap reported as complete. They are different
+        // conditions — a duplicate and a shortfall — not opposite signs of one.
+        let out = roll_up(
+            vec![
+                row(date!(2026 - 03 - 02), 100, "MEASURED"),
+                row(date!(2026 - 03 - 03), 92, "MEASURED"),
+            ],
+            FROM,
+            TO,
+        );
+
+        assert_eq!(out[0].expected, 192);
+        assert_eq!(out[0].actual, 192);
+        assert_eq!(out[0].missing, 4, "the 3rd is four intervals short");
+        assert_eq!(out[0].surplus, 4, "the 2nd holds four too many");
+        assert!(!out[0].is_complete());
+        assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 03)));
     }
 
     #[test]

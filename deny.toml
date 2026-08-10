@@ -46,45 +46,28 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 
-    # `rsa` timing sidechannel (Marvin Attack). **No patched version exists** —
-    # upstream has no constant-time implementation yet — so this cannot be
-    # resolved by updating, and the crate cannot be swapped out from here.
+    # `rsa` 0.9 leaks private-key information through timing (the Marvin Attack).
+    # **There is no patched version** — upstream says "no safe upgrade is
+    # available" and the constant-time rewrite is unfinished — so this cannot be
+    # resolved by updating, only by accepting or by dropping the features that
+    # reach it.
     #
-    # Reached only through the opt-in cloud object stores, and only two of them:
-    #   object-store-gcs   -> reqsign-google        -> rsa
-    #   object-store-azure -> reqsign-azure-storage -> rsa
-    # `object-store-s3` and the default build do not contain it. The `[bans]`
-    # entry below pins that: `rsa` may enter only through those two crates, so a
-    # dependency update introducing it anywhere else fails rather than silently
-    # widening what this exception covers.
+    # It enters only under the opt-in `object-store-gcs` / `object-store-azure`
+    # features, through `reqsign-{core,google,azure-storage}`, and its single use
+    # there is **signing** — a JWT assertion exchanged for an OAuth token, and
+    # GCS signed URLs — with `RandomizedSigner`, i.e. blinded PKCS#1 v1.5.
     #
-    # In both, the single use is signing a JWT assertion to obtain an OAuth
-    # token — a GCP service-account key, an Azure AD client certificate. It is
-    # therefore unreachable unless the deployment authenticates with such a key:
-    # workload identity, managed identity, instance metadata and (on S3-family
-    # stores) HMAC signing perform no RSA private-key operation. `WarehouseAuth`
-    # carries no GCP or Azure credentials, so meterstore never supplies such a
-    # key itself; it would come from the ambient environment through opendal's
-    # credential chain. The signature is made at token acquisition, cached for
-    # the token's lifetime, and sent outbound to the provider — not on the data
-    # path, and not driven by anything an attacker submits.
+    # The attack needs an oracle whose timing the attacker can observe over the
+    # network while influencing the input. Here the client holds the key and does
+    # the signing locally, at token-refresh cadence, over input it chose itself;
+    # there is no remote party timing our operation. That is the "local use on a
+    # non-compromised computer" case the advisory names as acceptable.
     #
-    # Revisit: when RustCrypto/RSA ships the constant-time implementation
-    # (RustCrypto/RSA#626), or when reqsign stops depending on it. A deployment
-    # that cannot accept this should build without `object-store-gcs` and
-    # `object-store-azure` and pass a pre-built `Arc<dyn Catalog>` to
-    # `IcebergCold::new` instead.
+    # This went unrecorded until the audit ran with `--all-features`: the gate had
+    # been reading a graph that contained no `rsa` at all.
+    # Revisit: when `rsa` 0.10 ships a constant-time implementation, or when
+    # opendal's signers move off it.
     "RUSTSEC-2023-0071",
-
-    # `rustls-pemfile` is unmaintained, and `tokio-tar` mis-parses PAX extended
-    # headers. Both arrive **only** through `testcontainers`, a dev-dependency:
-    # neither is compiled into the library, and the tar files involved are
-    # container images this repository's own tests pull. `tokio-tar` is archived
-    # with no safe upgrade available.
-    # Revisit: when testcontainers moves off bollard's TLS stack and off
-    # tokio-tar, or when a maintained fork is adopted upstream.
-    "RUSTSEC-2025-0134",
-    "RUSTSEC-2025-0111",
 ]
 
 [bans]
@@ -94,11 +77,19 @@ multiple-versions = "warn"
 # obviously — a crate simply cannot be used with the other's types.
 deny = [
     { name = "datafusion-table-providers" },
-    # The accepted RUSTSEC-2023-0071 exception above rests on *where* `rsa`
-    # enters the graph: two credential signers, used only for OAuth token
-    # acquisition. Pinning the wrappers keeps that true — if an update pulls
-    # `rsa` in anywhere else, the exposure the exception describes no longer
-    # matches the graph, and this fails instead of the comment quietly going
-    # stale.
-    { name = "rsa", wrappers = ["reqsign-google", "reqsign-azure-storage", "reqsign-core"] },
+    # `rsa` carries an unpatched timing sidechannel (see the advisory ignore
+    # above). It enters only under the opt-in GCS/Azure features, through three
+    # credential signers, where its use is signing a JWT assertion to obtain an
+    # OAuth token — outbound, cached for the token's lifetime, off the data path.
+    #
+    # Pinning the wrappers keeps that true: an update that pulled `rsa` in
+    # somewhere else would put a private-key operation somewhere nobody has
+    # reasoned about, and this fails rather than letting it pass. `reqsign-google`
+    # was missing from this list and nothing noticed, because the audit ran
+    # without the features that reach it.
+    { name = "rsa", wrappers = [
+        "reqsign-azure-storage",
+        "reqsign-core",
+        "reqsign-google",
+    ] },
 ]

@@ -3,20 +3,25 @@
 //! Column names match `metering`'s field names deliberately, so the mapping
 //! needs no lookup table.
 //!
-//! # The one deliberate deviation: `value`, not `value_kwh`
+//! # Why the quantity column is `value`, and carries its own dimension
 //!
-//! [`MeterInterval::value_kwh`] is named for electricity, and the name is only
-//! true for three of the four Sparten. Water is metered **and billed** in m³
+//! A field named for kilowatt-hours is true for three of the four Sparten and
+//! false for the fourth. Water is metered **and billed** in m³
 //! ([`Sparte::billing_unit`]), and gas registers m³ of Betriebsvolumen before the
 //! Brennwert conversion. A column called `value_kwh` holding a volume is a lie an
-//! analyst reads straight past, so the column is `value` and the unit that
+//! analyst reads straight past, so the column is [`col::VALUE`] and the unit that
 //! qualifies it is stored beside it.
 //!
 //! That is why [`col::SPARTE`] and [`col::UNIT`] are core columns rather than
 //! deployment-declared extras: a number whose dimension is configuration is a
 //! number no query can safely sum.
 //!
-//! [`MeterInterval::value_kwh`]: metering::interval::MeterInterval::value_kwh
+//! This was a deliberate *deviation* from `metering` until 0.17, which renamed
+//! [`MeterInterval::value`] for the same reason. The names agree again, which is
+//! §4.1.1's rule working in the direction it is supposed to: the argument was
+//! made here, reported upstream, and settled there.
+//!
+//! [`MeterInterval::value`]: metering::interval::MeterInterval::value
 //! [`Sparte::billing_unit`]: metering::Sparte::billing_unit
 //!
 //! Arrow types here are the *logical* ones. Dictionary encoding is applied by the
@@ -70,8 +75,8 @@ pub mod col {
     pub const TO: &str = "to";
     /// The measured quantity, in [`UNIT`].
     ///
-    /// Not `value_kwh`: water is m³ and gas may be either side of the Brennwert
-    /// conversion. See the module docs.
+    /// Never named for a unit: water is m³ and gas may be either side of the
+    /// Brennwert conversion. See the module docs.
     pub const VALUE: &str = "value";
     /// The dimension of [`VALUE`], as `metering::MeasurementUnit`'s stable code:
     /// `KWH` or `M3`.

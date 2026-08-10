@@ -179,8 +179,9 @@ async fn a_result_carries_every_table_boundary_not_one() {
         .await
         .expect("archive");
 
+    // A statement that genuinely spans both, so both boundaries govern it.
     let result = catalog
-        .query("SELECT COUNT(*) FROM readings")
+        .query("SELECT COUNT(*) FROM readings UNION ALL SELECT COUNT(*) FROM esa_typ2")
         .await
         .expect("query");
 
@@ -203,6 +204,56 @@ async fn a_result_carries_every_table_boundary_not_one() {
     // The scalar `watermark()` is the conservative one — below it every table
     // involved is settled — which for these two is the unarchived table's.
     assert_eq!(result.watermark(), secondary.1.min(primary.1));
+}
+
+#[tokio::test]
+async fn a_result_is_attributed_only_to_the_tables_it_read() {
+    // The other half of P1, and the one a naive implementation gets wrong:
+    // `watermark()` is the *conservative* boundary — the oldest reported — so
+    // attributing every hosted table to every query means a single-table figure
+    // is reconciled against whichever unrelated table archives least often.
+    // Twenty tables would make the scalar meaningless.
+    let (_h, catalog) = two_tables().await;
+    catalog
+        .table(TestHarness::TABLE)
+        .expect("primary")
+        .archive(START + Duration::days(2), 1)
+        .await
+        .expect("archive");
+
+    let one = catalog
+        .query("SELECT COUNT(*) FROM readings")
+        .await
+        .expect("query");
+    assert_eq!(
+        one.watermarks().len(),
+        1,
+        "only the table the statement read: {:?}",
+        one.watermarks()
+    );
+    assert_eq!(one.watermarks()[0].0, TestHarness::TABLE);
+    assert_eq!(
+        one.watermark(),
+        catalog
+            .table(TestHarness::TABLE)
+            .expect("primary")
+            .watermark()
+            .await
+            .expect("watermark"),
+        "and the scalar is that table's own boundary"
+    );
+
+    // The raw versioned relation names the same table.
+    let raw = catalog
+        .query("SELECT COUNT(*) FROM readings_versions")
+        .await
+        .expect("query");
+    assert_eq!(raw.watermarks().len(), 1);
+
+    // A statement reading no managed table has no tier boundary to report, and
+    // inventing one would be worse than reporting none.
+    let none = catalog.query("SELECT 1").await.expect("query");
+    assert!(none.watermarks().is_empty(), "{:?}", none.watermarks());
 }
 
 #[tokio::test]

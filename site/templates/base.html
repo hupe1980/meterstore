@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Zola exposes `page` or `section`, never a bare `title`. Resolving them here
+    rather than in each template keeps every page's metadata in one place — and
+    a page that forgets a description falls back to the site's rather than
+    shipping an empty tag. -#}
+{%- if page -%}
+  {%- set page_title = page.title -%}
+  {%- set page_desc = page.description | default(value=config.description) -%}
+{%- elif section and section.title != config.title -%}
+  {%- set page_title = section.title -%}
+  {%- set page_desc = section.description | default(value=config.description) -%}
+{%- else -%}
+  {%- set page_title = false -%}
+  {%- set page_desc = config.description -%}
+{%- endif -%}
+{%- set canonical = current_url | default(value=config.base_url) -%}
+
+<title>{% if page_title %}{{ page_title }} · {{ config.title }}{% else %}{{ config.title }} — {{ config.extra.tagline }}{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{% if page_title %}{{ page_title }}{% else %}{{ config.title }}{% endif %}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:locale" content="en">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{% if page_title %}{{ page_title }}{% else %}{{ config.title }}{% endif %}">
+<meta name="twitter:description" content="{{ page_desc }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml') }}">
+<link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "MeterStore",
+  "description": {{ config.description | json_encode | safe }},
+  "codeRepository": {{ config.extra.repository | json_encode | safe }},
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} },
+  "url": {{ config.base_url | json_encode | safe }}
+}
+</script>
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site">
+  <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+    <span class="mark" aria-hidden="true"></span> MeterStore
+  </a>
+  <nav aria-label="Primary">
+    <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+    <a href="{{ config.extra.api_docs }}">API</a>
+    <a href="{{ config.extra.repository }}">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="site">
+  <p>
+    <strong>MeterStore</strong> — {{ config.extra.tagline }}<br>
+    Dual-licensed MIT / Apache-2.0. Part of the
+    <a href="https://github.com/hupe1980/mako">mako</a> platform.
+  </p>
+  <p class="muted">Pre-alpha. The API is still settling; see the repository for current status.</p>
+</footer>
+
+</body>
+</html>

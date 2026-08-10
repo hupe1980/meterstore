@@ -185,13 +185,19 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             .await?
             .len();
 
-        // Not the count created — the count that exists ahead of the frontier.
-        // Reaching zero stops writes, so it is a leading indicator rather than a
-        // record of work done.
-        crate::observe::metrics().hot_partitions_ahead.record(
-            self.config.expected_hot_partitions().max(0) as u64,
-            &crate::observe::table(table),
-        );
+        // Not the count created, and **not** the configured expectation — the
+        // partitions that actually exist ahead of the write frontier. This was
+        // `expected_hot_partitions()`, which is a pure function of configuration:
+        // a constant, unaffected by an archiver that stopped creating partitions,
+        // and therefore a gauge that could never reach the zero it is alerted on.
+        // Reaching zero stops writes, so it has to be counted from reality.
+        if let Some(starts) = self.hot.partition_starts(table).await? {
+            crate::observe::metrics().hot_partitions_ahead.record(
+                crate::tiering::store::partitions_ahead(&starts, now, self.config.partition_step())
+                    as u64,
+                &crate::observe::table(table),
+            );
+        }
 
         // 3. Pick a closed window, if one is due.
         let watermark = self.cold.watermark(table).await?;
@@ -213,6 +219,11 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             });
         };
 
+        // 4. A window with no partition holds nothing, and there may be a great
+        //    many of them in a row. Absorb the whole empty stretch into one
+        //    commit rather than one per step.
+        let window = self.widen_over_empty(table, window, now).await?;
+
         let rows = self.archive_window(table, window).await?;
         let watermark = watermark.advance_to(window.resulting_watermark())?;
 
@@ -233,6 +244,87 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             partitions_created,
             lease_contended: false,
         })
+    }
+
+    /// Extend a window that holds no partition over the whole empty stretch.
+    ///
+    /// # The problem this solves is the first run, not a rare one
+    ///
+    /// A table that has never been archived has no snapshot, so its watermark is
+    /// the **Unix epoch** — and [`next_window`] starts from the watermark. Left
+    /// one step at a time, a deployment created in 2026 therefore commits one
+    /// empty Iceberg snapshot per day since 1970 before it reaches a single real
+    /// row: some twenty thousand commits, capped at a few dozen per maintenance
+    /// cycle, and twenty thousand snapshots retained for the ten years §10.5
+    /// keeps them. The store is unusable for days and its metadata never
+    /// recovers. Every integration suite used to hide this by seeding the
+    /// boundary by hand, which is the tell that it was a production gap rather
+    /// than a test convenience.
+    ///
+    /// The same shape recurs whenever a table is idle for a stretch — a
+    /// deployment that stops receiving one commodity, a backfill that starts in
+    /// the middle of the history.
+    ///
+    /// # Why widening is safe
+    ///
+    /// Rows live in partitions. A range with no partition therefore holds no
+    /// rows, so a window covering it archives nothing and the watermark may pass
+    /// over it in one move: the §6.3 invariant is about *which tier owns a range*
+    /// and both tiers own nothing here.
+    ///
+    /// The widened window still stops at the archival horizon, so it never
+    /// reaches into the settlement lag, and it stays a whole multiple of
+    /// `archival_step`, so a window still maps to exactly one partition when
+    /// there is one.
+    ///
+    /// A store that cannot enumerate its partitions
+    /// ([`HotStore::partition_starts`] returning `None`) keeps the
+    /// one-window-per-commit behaviour, because "cannot say" must not be read as
+    /// "nothing anywhere".
+    async fn widen_over_empty(
+        &self,
+        table: &str,
+        window: ArchivalWindow,
+        now: OffsetDateTime,
+    ) -> Result<ArchivalWindow> {
+        if self
+            .hot
+            .partition_exists(&PartitionId::for_window(table, window))
+            .await?
+        {
+            return Ok(window);
+        }
+        let Some(starts) = self.hot.partition_starts(table).await? else {
+            return Ok(window);
+        };
+
+        let horizon = now - self.config.settlement_lag();
+        // The next partition that does exist bounds the gap; with none, the
+        // horizon does. Never past the horizon either way.
+        let target = starts
+            .into_iter()
+            .filter(|start| *start >= window.to())
+            .min()
+            .unwrap_or(horizon)
+            .min(horizon);
+
+        let from = window.from();
+        let step = self.config.archival_step().whole_seconds().max(1);
+        // `next_window` already established that one whole step fits below the
+        // horizon, so this is at least 1 and the window never shrinks.
+        let steps = ((target - from).whole_seconds() / step).max(1);
+        let widened = ArchivalWindow::new(from, from + time::Duration::seconds(steps * step))?;
+
+        if widened != window {
+            info!(
+                table,
+                from = %widened.from(),
+                to = %widened.to(),
+                steps,
+                "no partition holds this range; advancing the watermark over it in one commit"
+            );
+        }
+        Ok(widened)
     }
 
     /// Archive one window: detach, scan, commit, drop.
@@ -436,6 +528,8 @@ mod tests {
         fail_at: FailAt,
         /// Stands in for another process already holding the archive lease.
         lease_held_elsewhere: bool,
+        /// Whether this store can answer `partition_starts`.
+        enumerates_partitions: bool,
     }
 
     impl FakeHot {
@@ -448,6 +542,7 @@ mod tests {
                 inner: Mutex::new(inner),
                 fail_at: FailAt::Never,
                 lease_held_elsewhere: false,
+                enumerates_partitions: true,
             }
         }
 
@@ -458,6 +553,13 @@ mod tests {
 
         fn lease_held_elsewhere(mut self) -> Self {
             self.lease_held_elsewhere = true;
+            self
+        }
+
+        /// A store that cannot enumerate its partitions, like a third-party
+        /// `HotStore` that takes the trait's default.
+        fn without_partition_listing(mut self) -> Self {
+            self.enumerates_partitions = false;
             self
         }
 
@@ -566,6 +668,22 @@ mod tests {
             let inner = self.inner.lock().unwrap();
             Ok(inner.live.contains_key(&partition.start())
                 || inner.detached.contains_key(&partition.start()))
+        }
+
+        async fn partition_starts(&self, _table: &str) -> Result<Option<Vec<OffsetDateTime>>> {
+            if !self.enumerates_partitions {
+                return Ok(None);
+            }
+            let inner = self.inner.lock().unwrap();
+            let mut starts: Vec<OffsetDateTime> = inner
+                .live
+                .keys()
+                .chain(inner.detached.keys())
+                .copied()
+                .collect();
+            starts.sort();
+            starts.dedup();
+            Ok(Some(starts))
         }
 
         async fn detach_partition(&self, partition: &PartitionId) -> Result<()> {
@@ -852,6 +970,7 @@ mod tests {
             inner: Mutex::new(archiver.hot.inner.into_inner().unwrap()),
             fail_at: FailAt::Never,
             lease_held_elsewhere: false,
+            enumerates_partitions: true,
         };
         let cold = FakeCold {
             watermark: Mutex::new(*archiver.cold.watermark.lock().unwrap()),
@@ -883,6 +1002,7 @@ mod tests {
             inner: Mutex::new(archiver.hot.inner.into_inner().unwrap()),
             fail_at: FailAt::Never,
             lease_held_elsewhere: false,
+            enumerates_partitions: true,
         };
         let archiver = Archiver::new(hot, FakeCold::new(D20), config());
 
@@ -922,10 +1042,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_window_still_advances_the_watermark() {
-        // A day with no readings is normal — a meter can simply not report.
-        // If an empty window did not advance the watermark, archival would
-        // stall on that gap forever and the hot tier would grow without bound.
+    async fn an_empty_stretch_is_crossed_in_one_commit() {
+        // A day with no readings is normal — a meter can simply not report — and
+        // an empty window must still advance the watermark, or archival stalls on
+        // the gap forever and the hot tier grows without bound.
+        //
+        // But it must not advance one step at a time: nothing is there, so the
+        // whole stretch up to the archival horizon is one commit.
         let hot = FakeHot::with_rows(&[]);
         let cold = FakeCold::new(D20);
         let archiver = Archiver::new(hot, cold, config());
@@ -937,7 +1060,76 @@ mod tests {
 
         assert!(out.archived_anything());
         assert_eq!(out.rows, 0);
-        assert_eq!(out.watermark.get(), D21);
+        // now - settlement_lag, not one step past the old boundary.
+        assert_eq!(out.watermark.get(), datetime!(2026-07-23 00:00 UTC));
+        assert_eq!(archiver.cold.commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_table_that_has_never_archived_reaches_the_present_in_one_commit() {
+        // The first run of a fresh deployment, which is the case this exists for.
+        // With no snapshot the watermark is the Unix epoch, so stepping one day
+        // at a time would mean ~20 600 empty Iceberg commits — days of catch-up
+        // and a snapshot list that never recovers — before a single real row.
+        let hot = FakeHot::with_rows(&[(D20, 96)]);
+        let cold = FakeCold::new(OffsetDateTime::UNIX_EPOCH);
+        let archiver = Archiver::new(hot, cold, config());
+
+        let out = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .unwrap();
+
+        assert_eq!(archiver.cold.commits().len(), 1, "one commit, not 20 600");
+        assert_eq!(out.rows, 0, "the skipped stretch holds nothing");
+        // Stops exactly at the first partition that does hold rows, so the next
+        // run archives it normally rather than skipping over it.
+        assert_eq!(out.watermark.get(), D20);
+
+        let next = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(next.rows, 96);
+        assert_eq!(next.watermark.get(), D21);
+    }
+
+    #[tokio::test]
+    async fn the_skip_never_reaches_into_the_settlement_lag() {
+        // The whole point of the lag: a window newer than the horizon is still
+        // receiving corrections, so the boundary must not pass it however empty
+        // the range looks.
+        let hot = FakeHot::with_rows(&[]);
+        let cold = FakeCold::new(OffsetDateTime::UNIX_EPOCH);
+        let archiver = Archiver::new(hot, cold, config());
+
+        let now = datetime!(2026-07-30 12:00 UTC);
+        let out = archiver.run_once(now).await.unwrap();
+
+        assert!(out.watermark.get() <= now - Duration::days(7));
+        // Still a whole multiple of the step, measured from the epoch, so a
+        // window keeps mapping to exactly one partition.
+        assert_eq!(
+            out.watermark.get(),
+            crate::watermark::align_to_step(out.watermark.get(), Duration::DAY)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_list_partitions_keeps_stepping() {
+        // `partition_starts` returning `None` means "cannot say", which must not
+        // be read as "no partitions anywhere" — that would advance the boundary
+        // over rows the store simply could not describe.
+        let hot = FakeHot::with_rows(&[]).without_partition_listing();
+        let cold = FakeCold::new(D20);
+        let archiver = Archiver::new(hot, cold, config());
+
+        let out = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .unwrap();
+
+        assert_eq!(out.watermark.get(), D21, "one step, as before");
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ fn reading(kwh: i64, version: u128, quality: QualityFlag) -> meterstore::encode:
         vec![MeterInterval {
             from: START,
             to: START + Duration::minutes(15),
-            value_kwh: Decimal::new(kwh, 0),
+            value: Decimal::new(kwh, 0),
             quality,
             obis_code: "1-0:1.8.0".parse().ok(),
         }],

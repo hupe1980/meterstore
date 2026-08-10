@@ -171,6 +171,91 @@ impl QueryResult {
     }
 }
 
+/// What a statement *would* produce, without running it.
+///
+/// The provenance half of a [`QueryResult`] — the schema, the boundary and the
+/// tiers a scan would touch — obtained by planning and stopping there.
+///
+/// # Why this is a separate call rather than an empty result
+///
+/// A `QueryResult` with no batches means *the query returned nothing*, which is
+/// a real and different answer. Describing a statement is not executing it, and
+/// conflating the two is how a surface ends up paying for a scan it never wanted:
+/// Arrow Flight's `GetFlightInfo` and `CreatePreparedStatement` both need a
+/// schema before any row is fetched, and answering them by running the query
+/// makes a client's ordinary `GetFlightInfo` → `DoGet` sequence cost **two full
+/// scans**.
+///
+/// Planning is not free either — it reads the tier boundary, and for the
+/// resolved table the per-file statistics that decide elision — but that is a
+/// catalogue read rather than a scan, which is what describing a statement
+/// should cost.
+#[derive(Debug, Clone)]
+pub struct QueryDescription {
+    schema: SchemaRef,
+    watermark: TieringWatermark,
+    watermarks: Vec<(String, TieringWatermark)>,
+    tiers: Vec<Tier>,
+    read_mode: ReadMode,
+}
+
+impl QueryDescription {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        watermarks: Vec<(String, TieringWatermark)>,
+        tiers: Vec<Tier>,
+        read_mode: ReadMode,
+    ) -> Self {
+        let watermark = watermarks
+            .iter()
+            .map(|(_, w)| *w)
+            .min()
+            .unwrap_or_else(TieringWatermark::empty);
+        Self {
+            schema,
+            watermark,
+            watermarks,
+            tiers,
+            read_mode,
+        }
+    }
+
+    /// The schema the statement would produce.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// The tier boundary the statement would run against.
+    pub fn watermark(&self) -> TieringWatermark {
+        self.watermark
+    }
+
+    /// Every boundary involved, in name order.
+    pub fn watermarks(&self) -> &[(String, TieringWatermark)] {
+        &self.watermarks
+    }
+
+    /// Which tiers the plan would read from, cold first.
+    pub fn tiers_scanned(&self) -> &[Tier] {
+        &self.tiers
+    }
+
+    /// Whether the statement would cross the boundary.
+    pub fn spans_tiers(&self) -> bool {
+        self.tiers.contains(&Tier::Cold) && self.tiers.contains(&Tier::Hot)
+    }
+
+    /// Whether the statement would read PostgreSQL.
+    pub fn touched_hot_tier(&self) -> bool {
+        self.tiers.contains(&Tier::Hot)
+    }
+
+    /// The read mode it would run under.
+    pub fn read_mode(&self) -> ReadMode {
+        self.read_mode
+    }
+}
+
 /// Which tiers a physical plan reads from.
 ///
 /// Cold first, matching the order the tier split builds the union in, so the

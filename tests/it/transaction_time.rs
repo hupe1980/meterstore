@@ -37,7 +37,7 @@ fn stored(
         vec![MeterInterval {
             from,
             to: from + Duration::minutes(15),
-            value_kwh: Decimal::new(kwh, 0),
+            value: Decimal::new(kwh, 0),
             quality: QualityFlag::Measured,
             obis_code: "1-0:1.8.0".parse().ok(),
         }],
@@ -77,7 +77,7 @@ async fn value_at(store: &meterstore::MeterStore, from: OffsetDateTime) -> Optio
         .collect()
         .await
         .expect("collect");
-    series.and_then(|s| s.intervals.first().map(|i| i.value_kwh))
+    series.and_then(|s| s.intervals.first().map(|i| i.value))
 }
 
 #[tokio::test]
@@ -176,6 +176,43 @@ async fn as_known_at_reads_the_same_after_archival_to_cold() {
     );
     let after = store.as_known_at(T2).await.expect("as_known_at");
     assert_eq!(value_at(&after, START).await, Some(Decimal::new(42, 0)));
+}
+
+#[tokio::test]
+async fn the_ceiling_reaches_the_raw_versions_relation_too() {
+    // The ceiling used to live only inside the resolution plan, so `readings`
+    // honoured it and `readings_versions` — the audit relation, and the one a
+    // correction history is read from — did not. A session that says it
+    // reproduces a past state must not hand back rows it had not yet been told
+    // about, whichever of its two relations is queried.
+    let (_h, store) = store().await;
+    store
+        .append(&[stored(START, 10, 20_260_726_060_000, T1)])
+        .await
+        .expect("append original");
+    store
+        .append(&[stored(START, 42, 20_260_727_060_000, T2)])
+        .await
+        .expect("append correction");
+
+    let raw = store.raw_table();
+    let count = |s: meterstore::MeterStore, sql: String| async move {
+        let result = s.query(&sql).await.expect("query");
+        result.batches().iter().map(|b| b.num_rows()).sum::<usize>()
+    };
+
+    // Current knowledge holds both versions of the interval.
+    assert_eq!(
+        count(store.clone(), format!("SELECT version FROM {raw}")).await,
+        2
+    );
+
+    let mid = store.as_known_at(T_MID).await.expect("as_known_at");
+    assert_eq!(
+        count(mid, format!("SELECT version FROM {raw}")).await,
+        1,
+        "only the version recorded by T_MID was known then"
+    );
 }
 
 #[tokio::test]

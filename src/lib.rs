@@ -61,8 +61,11 @@
 //! streaming archival, tier-split query
 //! execution, reproducible reads, completeness, multi-table sessions and both
 //! serving surfaces are implemented, and checked against an independently
-//! implemented reference over generated workloads ([`testkit`], §17.3) on real
-//! PostgreSQL and a real Iceberg warehouse.
+//! implemented reference over generated workloads ([`testkit`]) on real
+//! PostgreSQL and a real Iceberg warehouse. The planner's safety properties —
+//! that an extracted range never excludes a row the filter admits, and that
+//! every instant lands in exactly one tier — are asserted over generated inputs
+//! rather than chosen ones.
 //!
 //! The output is checked to be readable **without this crate** — the files
 //! opened by a bare Parquet reader, the published resolution SQL verified
@@ -77,9 +80,16 @@
 //! SQL-catalog deployments, and Flight SQL (`flight`) for the one thing an
 //! external client cannot assemble for itself — the unified hot + cold view.
 //!
-//! Not yet done: interop against Spark, Trino and PyIceberg, and the
-//! query-latency benchmarks, so the p99 targets remain aspirational. Compaction
-//! and orphan-file cleanup are blocked on the upstream `iceberg` crate.
+//! The cold tier accepts any `Arc<dyn Catalog>`; two are built for you —
+//! [`IcebergSqlCatalog`] over the same PostgreSQL as the hot tier, and
+//! [`cold::S3TablesCatalog`] over an AWS S3 Tables table bucket
+//! (`s3tables`).
+//!
+//! Not yet done: interop against Spark and Trino, and the query-latency
+//! benchmarks, so the p99 targets remain aspirational. Compaction and
+//! orphan-file cleanup are blocked on the upstream `iceberg` crate.
+//!
+//! Full documentation: <https://hupe1980.github.io/meterstore>
 //!
 //! [`MeterStore::sql`]: crate::session::MeterStore::sql
 //! [`MeterStore::query`]: crate::session::MeterStore::query
@@ -88,12 +98,12 @@
 //! [`MeterStore::completeness`]: crate::session::MeterStore::completeness
 //! [`MeterCatalog`]: crate::session::MeterCatalog
 
-// Doc comments throughout cite `§N` — sections of `CONCEPT.md`, the design
-// document that lives in the repository and records *why* each decision was
-// made. It is not published with the crate, so on docs.rs those citations read
-// as pointers into the source repository rather than as links. Everything a
-// caller needs to use the crate is here; the citations exist so a maintainer
-// changing a behaviour can find the argument it was based on.
+// Doc comments throughout cite `§N`. Those are cross-references between the
+// design notes this crate's maintainers keep, not links a reader needs to
+// follow: everything required to *use* the crate is in the documentation here,
+// and the reasoning behind each decision is written out at
+// <https://hupe1980.github.io/meterstore>. The markers exist so that changing a
+// behaviour is traceable to the argument it rested on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
@@ -124,6 +134,8 @@ pub mod tiering;
 pub mod version;
 pub mod watermark;
 
+#[cfg(feature = "s3tables")]
+pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
 pub use config::{CHECK_VALUES_KEY, TableConfig, ValidatedTableConfig, coded_column};
 pub use encode::canonical_obis;
@@ -136,7 +148,7 @@ pub use planner::{
 };
 pub use session::{
     Completeness, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder,
-    MeterStore, MeterStoreBuilder, QueryResult, ResolvedSeries, SeriesQuery,
+    MeterStore, MeterStoreBuilder, QueryDescription, QueryResult, ResolvedSeries, SeriesQuery,
 };
 pub use settings::Settings;
 pub use tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
@@ -145,6 +157,8 @@ pub use watermark::{Tier, TieringWatermark};
 
 /// Common imports for working with MeterStore.
 pub mod prelude {
+    #[cfg(feature = "s3tables")]
+    pub use crate::cold::S3TablesCatalog;
     pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
     pub use crate::config::{CHECK_VALUES_KEY, TableConfig, ValidatedTableConfig, coded_column};
     pub use crate::encode::StoredSeries;
@@ -157,8 +171,8 @@ pub mod prelude {
     };
     pub use crate::session::{
         Completeness, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog,
-        MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryResult, ResolvedSeries,
-        SeriesQuery,
+        MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryDescription, QueryResult,
+        ResolvedSeries, SeriesQuery,
     };
     pub use crate::settings::Settings;
     pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
