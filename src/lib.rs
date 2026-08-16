@@ -69,8 +69,7 @@
 //! arithmetic — so the answer is stored. Every row carries a `balancing_day`
 //! column derived once by the encoder, and reading the Iceberg files directly
 //! needs a `GROUP BY` and no calendar reasoning. It is the single derived value
-//! this crate persists; [`encode::schema`](crate::encode::schema) argues the
-//! exception.
+//! this crate persists; [`encode::schema`] argues the exception.
 //!
 //! Identifiers are parsed rather than trusted. `malo_id` and `melo_id` are
 //! `metering`'s [`MaloId`] and [`MeloId`] on both sides of the encoding: a
