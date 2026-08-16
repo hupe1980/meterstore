@@ -24,6 +24,33 @@
 //! [`MeterInterval::value`]: metering::interval::MeterInterval::value
 //! [`Sparte::billing_unit`]: metering::Sparte::billing_unit
 //!
+//! # Why `balancing_day` is stored, when derived values are not
+//!
+//! This crate refuses to persist anything it can compute: `worst_quality` is
+//! derived on demand precisely so there is no second copy to disagree with the
+//! intervals. [`col::BALANCING_DAY`] is the one deliberate exception, and the
+//! reason is not convenience.
+//!
+//! The rule is: the Berlin calendar day for electricity, heat and water, and the
+//! **Gastag** — 06:00 to 06:00 local — for gas. Deriving it needs a zone
+//! conversion and a **wall-clock** (not absolute) six-hour shift, and SQL
+//! dialects differ on exactly that, so no single published expression is right
+//! everywhere.
+//!
+//! Reading the Iceberg files directly is the *intended* access path, so a rule an
+//! external engine cannot express is a rule that will be got wrong — silently,
+//! in a daily total that still looks plausible. Storing the answer removes the
+//! derivation from every reader instead of publishing four spellings of it and
+//! hoping.
+//!
+//! The usual objection — a second source of truth that can drift — is answered by
+//! there being exactly one writer: [`to_record_batch_with`] derives it from
+//! `metering`'s calendar, and nothing else sets it. It also earns its 4 bytes
+//! back: a day's rows share one value, so it dictionary-encodes to nearly
+//! nothing, and it is the natural grouping key for every daily aggregate.
+//!
+//! [`to_record_batch_with`]: super::to_record_batch_with
+//!
 //! Arrow types here are the *logical* ones. Dictionary encoding is applied by the
 //! Parquet writer, not by using Arrow `Dictionary` types — Parquet's
 //! `RLE_DICTIONARY` applies to plain string/int columns just as well, and keeping
@@ -101,6 +128,13 @@ pub mod col {
     pub const VERSION_SCOPE: &str = "version_scope";
     /// Transaction time — when we learned the value.
     pub const RECORDED_AT: &str = "recorded_at";
+    /// The **balancing day** this reading is booked on, as a local `Date32`.
+    ///
+    /// The Berlin calendar day for electricity, heat and water; the *Gastag* —
+    /// 06:00 to 06:00 local — for gas. Derived from [`FROM`] and [`SPARTE`] by
+    /// `metering`'s calendar at encode time, and stored because **no external
+    /// engine can derive it portably**. See the module documentation.
+    pub const BALANCING_DAY: &str = "balancing_day";
 }
 
 /// The timestamp type used by all time columns.
@@ -139,6 +173,7 @@ pub fn storage_schema(extra: &[Field]) -> SchemaRef {
         ),
         Field::new(col::VERSION_SCOPE, DataType::Utf8, false),
         Field::new(col::RECORDED_AT, timestamp_type(), false),
+        Field::new(col::BALANCING_DAY, DataType::Date32, false),
     ];
     fields.extend_from_slice(extra);
     Arc::new(Schema::new(fields))
@@ -182,9 +217,10 @@ mod tests {
     #[test]
     fn schema_has_expected_core_columns() {
         let s = storage_schema(&[]);
-        assert_eq!(s.fields().len(), 16);
+        assert_eq!(s.fields().len(), 17);
         assert_eq!(s.field(0).name(), col::MALO_ID);
         assert_eq!(s.field(15).name(), col::RECORDED_AT);
+        assert_eq!(s.field(16).name(), col::BALANCING_DAY);
     }
 
     #[test]
@@ -225,7 +261,7 @@ mod tests {
             assert_eq!(extended.field(i).name(), f.name());
             assert_eq!(extended.field(i).data_type(), f.data_type());
         }
-        assert_eq!(extended.fields().len(), 18);
+        assert_eq!(extended.fields().len(), 19);
     }
 
     #[test]

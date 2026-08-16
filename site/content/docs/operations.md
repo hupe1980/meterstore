@@ -61,8 +61,24 @@ hand:
 ```sql
 SELECT * FROM system.config;                                       -- settings that interact
 SELECT value FROM system.resolution WHERE setting = 'resolution_sql';
+SELECT value FROM system.resolution WHERE setting = 'balancing_day_column';
 SELECT snapshot_id, committed_at, watermark FROM system.snapshots;
 ```
+
+> **The `system` schema is not a stored table.** These are in-memory relations
+> registered into the DataFusion session, computed when `refresh_system_tables`
+> is called and refreshed only by calling it again — deliberately, so a query
+> never silently pays for a round trip to both tiers. They live in the MeterStore
+> process: nothing in PostgreSQL or in the Iceberg warehouse corresponds to them,
+> and an external engine pointed at the warehouse cannot see them.
+
+`system.resolution` carries the two rules an engine reading the Iceberg files
+directly needs and cannot derive: version resolution, without which a corrected
+interval is counted twice, and the balancing day, without which a gas Lastgang is
+grouped six hours out of phase. The first is delivered as SQL to paste; the second
+as the *name of a column*, because the Gastag has no portable SQL — so the rule is
+applied at write time and every engine just groups on the answer. Both are
+[explained in full](@/docs/interop.md#the-gas-day-trap).
 
 `system.config` exists because the settings that matter *interact*: a
 `partition_step` that disagrees with `archival_step`, or a `settlement_lag`
@@ -112,7 +128,7 @@ point rather than a side effect: the rows stay in PostgreSQL, where they can sti
 be corrected, instead of being archived into a layout nobody has agreed on.
 Silent corruption is never traded for uptime.
 
-Two details worth knowing:
+Two details:
 
 - **A decimal's precision may widen; its scale may not.** Precision adds
   representable digits; changing scale reinterprets every stored integer by a
@@ -145,7 +161,7 @@ cold queries fail loudly rather than silently returning only the hot window.
 
 ## Maintenance that is not implemented
 
-Two jobs are blocked upstream rather than deferred, and it is worth knowing which:
+Two jobs are blocked upstream rather than deferred:
 
 - **Compaction.** `iceberg-rust` has no public way to land a snapshot that
   *removes* files: there is no rewrite action, and both `TransactionAction` and
@@ -158,11 +174,10 @@ Two jobs are blocked upstream rather than deferred, and it is worth knowing whic
 Neither costs correctness. Compaction would recover version elision for the few
 partitions that lose it; orphans cost storage and arise only from commits that
 failed after writing data files, which the compare-and-swap protocol makes rare.
-An operator who needs either today can run it out of band with Spark or PyIceberg
-against the same standard table — which is precisely why the layout is standard,
-and which is [demonstrated rather than assumed](@/docs/interop.md): PyIceberg
-reads the schema, the partition spec, the format version and the tiering watermark
-out of these tables in the test suite.
+An operator who needs either can run it out of band with Spark or PyIceberg
+against the same standard table. The [interop suite](@/docs/interop.md) checks
+that this works: PyIceberg reads the schema, the partition spec, the format
+version and the tiering watermark out of these tables.
 
 ### The one rule an out-of-band tool must not break
 
@@ -177,7 +192,7 @@ walk stops at a parent id that no longer resolves, and no boundary is found. Eve
 query then fails at once, on a table that is otherwise perfectly healthy. A
 maintenance job following the advice above would have done that.
 
-Two things now prevent it, and you do not have to remember either:
+Two things prevent it:
 
 - **`expire_snapshots` re-stamps the boundary first**, onto the current snapshot,
   so the walk is one snapshot long and there is no chain to punch a hole in. It

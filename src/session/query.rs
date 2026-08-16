@@ -360,7 +360,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["11111111111", "22222222222"])),
+                Arc::new(StringArray::from(vec!["11111111115", "22222222220"])),
                 Arc::new(Int64Array::from(vec![42, 7])),
             ],
         )
@@ -378,8 +378,8 @@ mod tests {
 
         let rows = result.to_json().unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["malo_id"], "11111111111");
+        assert_eq!(rows[0]["malo_id"], "11111111115");
         assert_eq!(rows[0]["total_kwh"], 42);
-        assert_eq!(rows[1]["malo_id"], "22222222222");
+        assert_eq!(rows[1]["malo_id"], "22222222220");
     }
 }

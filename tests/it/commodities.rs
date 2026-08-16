@@ -230,3 +230,210 @@ async fn a_mixed_portfolio_sums_per_unit_and_never_across_them() {
     assert!(rendered.contains("KWH"), "{rendered}");
     assert!(rendered.contains("M3"), "{rendered}");
 }
+
+// ── the Gastag ───────────────────────────────────────────────────────────────
+//
+// Gas is the one commodity here that is not balanced on the calendar day. The
+// German gas market runs 06:00–06:00 local (GaBi Gas), so a gas Lastgang
+// grouped by `meter_local_day` books its 00:00–06:00 draw into the neighbouring
+// Bilanzierungstag — six hours a day, with totals that still look plausible.
+// The tests below are the end-to-end counterpart of the unit tests in
+// `planner::calendar`: they check that the day survives storage, the resolved
+// view and the completeness report, not merely the arithmetic.
+
+/// One gas quarter-hour, valued so a mis-bucketed interval is arithmetically
+/// visible rather than merely miscounted.
+fn gas_quarter(from: OffsetDateTime, value: i64) -> metering::interval::MeterInterval {
+    metering::interval::MeterInterval {
+        from,
+        to: from + Duration::minutes(15),
+        value: rust_decimal::Decimal::new(value, 0),
+        quality: metering::QualityFlag::Measured,
+        obis_code: "7-1:99.33.0".parse().ok(),
+    }
+}
+
+/// A gas delivery covering `[from, to)` at the quarter-hour.
+fn gas_series(malo: &str, from: OffsetDateTime, to: OffsetDateTime, value: i64) -> StoredSeries {
+    let intervals: Vec<_> = std::iter::successors(Some(from), |t| Some(*t + Duration::minutes(15)))
+        .take_while(|t| *t < to)
+        .map(|t| gas_quarter(t, value))
+        .collect();
+
+    let mut series = metering::measurement_series::MeasurementSeries::new(
+        malo.parse().expect("a valid MaLo-ID"),
+        "7-1:99.33.0".parse().ok(),
+        intervals,
+        metering::measurement_series::MeasurementSource::Mscons {
+            pid: 13_005,
+            message_ref: None,
+            sender_mp_id: "9900000000001".to_string(),
+        },
+        to,
+    );
+    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+
+    StoredSeries::of(
+        Sparte::Gas,
+        series,
+        meterstore::ScopedVersion::new(
+            meterstore::VersionScope::for_interval("9900000000001", from).expect("scope"),
+            meterstore::Version::new(20_261_001_000_001).expect("version"),
+        ),
+        to,
+    )
+}
+
+#[tokio::test]
+async fn a_gas_lastgang_groups_onto_the_gastag_not_the_calendar_day() {
+    // Two full Gastage in July, each 96 quarter-hours from 06:00 local. Grouped
+    // by the gas day they are 96 and 96; grouped by the calendar day they are
+    // 72, 96 and 24 — three buckets, two of them fractions of a day, and every
+    // one of them a number a Bilanzkreis would be settled on.
+    let first = datetime!(2026-07-15 4:00 UTC); // 06:00 CEST
+    let last = first + Duration::days(2);
+
+    let harness = TestHarness::start().await.expect("harness");
+    harness
+        .ensure_partitions(first, last + Duration::days(1))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(first).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+
+    harness
+        .ingest(&store, &[gas_series("10000000009", first, last, 4)])
+        .await
+        .expect("ingest");
+
+    let rendered = |batches: &[meterstore::arrow::array::RecordBatch]| {
+        meterstore::arrow::util::pretty::pretty_format_batches(batches)
+            .expect("render")
+            .to_string()
+    };
+
+    let gas = store
+        .query(
+            r#"SELECT meter_gas_day("from") AS d, COUNT(*) AS n
+               FROM readings GROUP BY 1 ORDER BY 1"#,
+        )
+        .await
+        .expect("query");
+    let gas = rendered(gas.batches());
+    assert!(gas.contains("2026-07-15"), "{gas}");
+    assert!(gas.contains("2026-07-16"), "{gas}");
+    assert!(
+        !gas.contains("2026-07-17"),
+        "two whole Gastage must be two buckets: {gas}"
+    );
+
+    // `meter_balancing_day` must reach the same answer from the stored Sparte,
+    // without the statement having to know which commodity it is reading.
+    let balanced = store
+        .query(
+            r#"SELECT meter_balancing_day("from", sparte) AS d, COUNT(*) AS n
+               FROM readings GROUP BY 1 ORDER BY 1"#,
+        )
+        .await
+        .expect("query");
+    assert_eq!(
+        rendered(balanced.batches()),
+        gas,
+        "dispatch must not differ"
+    );
+
+    // And the calendar day is the wrong answer, visibly: three buckets.
+    let calendar = store
+        .query(
+            r#"SELECT meter_local_day("from") AS d, COUNT(*) AS n
+               FROM readings GROUP BY 1 ORDER BY 1"#,
+        )
+        .await
+        .expect("query");
+    let calendar = rendered(calendar.batches());
+    assert!(
+        calendar.contains("2026-07-17"),
+        "the calendar day spills into a third bucket, which is the bug: {calendar}"
+    );
+}
+
+#[tokio::test]
+async fn gas_completeness_puts_the_long_day_on_the_saturday() {
+    // The autumn transition, which is where the two calendars disagree about
+    // *which* day is long. The clocks go back at 03:00 local on Sunday 25
+    // October — inside the Gastag that began Saturday at 06:00 — so the
+    // 100-interval gas day is the 24th while the 100-interval calendar day is
+    // the 25th. A report on calendar days would call the Saturday four in
+    // surplus and the Sunday four short: two findings, on a channel with
+    // nothing wrong with it.
+    let first = datetime!(2026-10-24 4:00 UTC); // 06:00 CEST, Saturday
+    let last = datetime!(2026-10-26 5:00 UTC); // 06:00 CET, Monday
+
+    let harness = TestHarness::start().await.expect("harness");
+    harness
+        .ensure_partitions(first, last + Duration::days(1))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(first).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+
+    harness
+        .ingest(&store, &[gas_series("10000000009", first, last, 4)])
+        .await
+        .expect("ingest");
+
+    let report = store.completeness(first, last).await.expect("completeness");
+    assert_eq!(report.len(), 1, "one channel: {report:?}");
+    let row = &report[0];
+
+    assert_eq!(row.sparte, Sparte::Gas);
+    // 100 + 96 = 196 quarter-hours across the two Gastage.
+    assert_eq!(row.actual, 196);
+    assert_eq!(row.expected, 196);
+    assert!(
+        row.is_complete(),
+        "a complete pair of Gastage must report complete: {row:?}"
+    );
+    assert_eq!(row.missing, 0);
+    assert_eq!(row.surplus, 0, "the Saturday is 25 hours long, not 24");
+    assert_eq!(row.first_gap, None);
+}
+
+#[tokio::test]
+async fn a_gap_in_a_gas_day_is_still_found() {
+    // The other direction: the Gastag boundary must not become a place gaps hide.
+    let first = datetime!(2026-10-24 4:00 UTC);
+    let last = datetime!(2026-10-26 5:00 UTC);
+
+    let harness = TestHarness::start().await.expect("harness");
+    harness
+        .ensure_partitions(first, last + Duration::days(1))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(first).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+
+    // Everything except the last hour of the long Saturday Gastag — four
+    // intervals that end at 06:00 local on the Sunday.
+    let cut = datetime!(2026-10-25 4:00 UTC);
+    harness
+        .ingest(
+            &store,
+            &[
+                gas_series("10000000009", first, cut, 4),
+                gas_series("10000000009", datetime!(2026-10-25 5:00 UTC), last, 4),
+            ],
+        )
+        .await
+        .expect("ingest");
+
+    let report = store.completeness(first, last).await.expect("completeness");
+    let row = &report[0];
+    assert_eq!(row.missing, 4, "the missing hour must be reported: {row:?}");
+    assert_eq!(row.surplus, 0);
+    assert_eq!(
+        row.first_gap,
+        Some(time::macros::date!(2026 - 10 - 24)),
+        "and attributed to the Gastag that began on the Saturday"
+    );
+}

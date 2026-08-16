@@ -32,7 +32,7 @@ fn stored(
     recorded_at: OffsetDateTime,
 ) -> meterstore::encode::StoredSeries {
     let series = MeasurementSeries::new(
-        "12345678901",
+        "12345678905".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         vec![MeterInterval {
             from,
@@ -72,7 +72,8 @@ async fn store() -> (TestHarness, meterstore::MeterStore) {
 /// Read the single interval's value from the resolved series.
 async fn value_at(store: &meterstore::MeterStore, from: OffsetDateTime) -> Option<Decimal> {
     let series = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .range(from, from + Duration::minutes(15))
         .collect()
         .await

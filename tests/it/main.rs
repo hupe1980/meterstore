@@ -18,6 +18,7 @@ mod archival_end_to_end;
 mod calendar_delegation;
 mod cold_partitioning;
 mod commodities;
+mod containers;
 mod displacement;
 mod erasure;
 mod flight_sql;

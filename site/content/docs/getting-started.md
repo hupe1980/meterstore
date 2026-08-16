@@ -10,7 +10,7 @@ weight = 1
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
 | PostgreSQL | **14 or later** | Declarative range partitioning, so purging an archived window is `DETACH` + `DROP TABLE` rather than a row-wise `DELETE`. The test suite pins 16 |
-| `metering` | 0.17 or later | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | 0.18 or later | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs only `SELECT` plus ownership of its own tables. No server
@@ -127,8 +127,7 @@ The warehouse is the table bucket itself, identified by ARN rather than by URI,
 because S3 Tables owns the object layout. Everything downstream — archival,
 watermark, resolution, queries — is unchanged; a catalogue is a catalogue.
 
-**One thing worth knowing**, because searching for it finds the wrong answer:
-S3 Tables has two front doors. Its *Iceberg REST endpoint* authenticates with
+S3 Tables has two front doors, and searching for it finds the wrong one. Its *Iceberg REST endpoint* authenticates with
 SigV4, and `iceberg-catalog-rest` cannot sign — `with_client` takes a concrete
 `reqwest::Client`, which has no per-request interceptor, and a static
 `Authorization` header cannot carry a per-request signature. Its *native API*
@@ -163,7 +162,7 @@ store.append(&[stored_series]).await?;
 let result = store.query("SELECT SUM(value) FROM readings WHERE …").await?;
 
 // Or as the domain type, version-resolved and ordered.
-let series = store.series("12345678901")
+let series = store.series("41373559241")?     // the check digit is verified here
     .obis("1-0:1.8.0")?
     .range(from, to)
     .collect()

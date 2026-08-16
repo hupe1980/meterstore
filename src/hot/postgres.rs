@@ -216,6 +216,13 @@ impl PostgresHot {
                         version_scope ~ '^[^:]+:[0-9]{{4}}-(0[1-9]|1[0-2])$'
                     ),
                 recorded_at   TIMESTAMPTZ      NOT NULL,
+                -- The day this reading is balanced on: the Berlin calendar day,
+                -- or the 06:00-06:00 Gastag for gas. Derived by the encoder from
+                -- `from` and `sparte` and stored because no portable SQL
+                -- expresses the rule — see `encode::schema`. Not checked here:
+                -- PostgreSQL would need the Gastag rule to check it, which is
+                -- the very thing being avoided.
+                balancing_day DATE             NOT NULL,
                 {extra_ddl}
                 PRIMARY KEY ({pk})
             ) PARTITION BY RANGE ("from")
@@ -367,27 +374,17 @@ async fn primary_key_columns(conn: &mut sqlx::PgConnection, table: &str) -> Resu
 }
 
 impl PostgresHot {
-    /// Insert one batch, skipping rows already present.
-    ///
-    /// **Idempotent by design.** Every ingest transport worth using delivers at
-    /// least once — Kafka redelivers after a failed commit, webhooks retry on a
-    /// timeout — so a replayed batch is ordinary traffic. `ON CONFLICT DO
-    /// NOTHING` makes replay a no-op, and unlike `DO UPDATE` it writes no row
-    /// version, so redelivery creates no dead tuples for autovacuum.
-    ///
-    /// Rows are sent as arrays and expanded with `unnest`, one statement per
-    /// batch rather than one per reading. At 96 values per meter per day that
-    /// difference is the whole write path.
-    ///
-    /// A conflict means the same `(malo_id, obis_code, from, version)` already
-    /// exists. That is only legitimate when the row is *identical*: a version
-    /// identifies an assertion, so a different value under the same version is a
-    /// producer error and is reported rather than quietly dropped.
     /// Insert one batch and report what each row did to the current value.
     ///
     /// The prior state and the insert run in **one transaction**. Reading the
     /// prior state separately would race the write — and be wrong precisely when
     /// two corrections arrive together, which is when an audit trail matters.
+    ///
+    /// What the rows *do* on their way in — deduplication, and the refusal to
+    /// restate a value under an existing version — is [`insert_rows`]'s, which
+    /// this shares with the plain append path.
+    ///
+    /// [`insert_rows`]: Self::insert_rows
     async fn insert_reporting(
         &self,
         table: &str,
@@ -576,8 +573,26 @@ impl PostgresHot {
     /// The one insert implementation, so the plain and reporting paths cannot
     /// diverge in what they accept or how they deduplicate.
     ///
+    /// **Idempotent by design.** Every ingest transport worth using delivers at
+    /// least once — Kafka redelivers after a failed commit, webhooks retry on a
+    /// timeout — so a replayed batch is ordinary traffic. `ON CONFLICT DO
+    /// NOTHING` makes replay a no-op, and unlike `DO UPDATE` it writes no row
+    /// version, so redelivery creates no dead tuples for autovacuum.
+    ///
+    /// Rows are sent as arrays and expanded with `unnest`, one statement per
+    /// batch rather than one per reading. At 96 values per meter per day that
+    /// difference is the whole write path.
+    ///
+    /// A conflict means the same `(merge key, version)` already exists. That is
+    /// only legitimate when the row is *identical*: a version identifies one
+    /// assertion, so a different value under the same version is a producer
+    /// error, and the skipped rows are checked for exactly that rather than
+    /// being trusted as a replay.
+    ///
     /// Takes a connection rather than the pool so the reporting path can run it
-    /// inside the same transaction as the prior-state read.
+    /// inside the same transaction as the prior-state read — and so **every**
+    /// statement it issues, the divergence check included, stays on that one
+    /// connection.
     async fn insert_rows(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -618,6 +633,7 @@ impl PostgresHot {
         let mut version = Vec::with_capacity(n);
         let mut version_scope = Vec::with_capacity(n);
         let mut recorded_at = Vec::with_capacity(n);
+        let mut balancing_day = Vec::with_capacity(n);
 
         for row in 0..n {
             let r = RowView::new(batch, row)?;
@@ -637,6 +653,7 @@ impl PostgresHot {
             version.push(r.version);
             version_scope.push(r.version_scope.to_string());
             recorded_at.push(r.recorded_at);
+            balancing_day.push(r.balancing_day);
         }
 
         // Extra column values, as text arrays. Config validation restricts
@@ -662,18 +679,19 @@ impl PostgresHot {
 
         let extra_cols = extra.iter().map(|c| format!(", {c:?}")).collect::<String>();
         let extra_params = (0..extra.len())
-            .map(|i| format!(", ${}::text[]", CORE_COLUMN_COUNT + 1 + i))
+            .map(|i| format!(", ${}::text[]", core_column_count() + 1 + i))
             .collect::<String>();
 
         let sql = format!(
-            r#"INSERT INTO "{table}" ({SCAN_COLUMNS}{extra_cols})
+            r#"INSERT INTO "{table}" ({core_cols}{extra_cols})
                SELECT * FROM unnest(
                    $1::text[], $2::text[], $3::text[], $4::text[],
                    $5::timestamptz[], $6::timestamptz[], $7::numeric[], $8::text[],
                    $9::text[], $10::text[], $11::text[], $12::text[], $13::text[],
-                   $14::numeric[], $15::text[], $16::timestamptz[]{extra_params}
+                   $14::numeric[], $15::text[], $16::timestamptz[], $17::date[]{extra_params}
                )
-               ON CONFLICT ({conflict}) DO NOTHING"#
+               ON CONFLICT ({conflict}) DO NOTHING"#,
+            core_cols = scan_columns(),
         );
 
         let mut query = sqlx::query(&sql)
@@ -692,7 +710,8 @@ impl PostgresHot {
             .bind(&provenance)
             .bind(&version)
             .bind(&version_scope)
-            .bind(&recorded_at);
+            .bind(&recorded_at)
+            .bind(&balancing_day);
 
         for values in &extra_values {
             query = query.bind(values);
@@ -760,7 +779,22 @@ impl PostgresHot {
                 query = query.bind(&extra_values[index]);
             }
 
-            let diverged = query.fetch_one(&self.pool).await.map_err(pg)?;
+            // On **this** connection, never `self.pool`.
+            //
+            // `insert_rows` is handed a connection that is already checked out —
+            // and on the reporting path it is a connection inside an open
+            // transaction. Reaching back to the pool for a second one from here
+            // is a pool-exhaustion deadlock rather than a slow path: with a pool
+            // of `n`, `n` concurrent writers each hold one connection and each
+            // wait for an `n+1`th that can only free up when one of them
+            // finishes. Nothing times out, and the symptom is a write path that
+            // stops entirely under exactly the concurrency it was built for.
+            //
+            // It is also the only spelling that is *correct*. The check has to
+            // see the same snapshot as the insert it is checking, and a separate
+            // connection sees neither the transaction's own rows nor a
+            // consistent view of a concurrent writer's.
+            let diverged = query.fetch_one(&mut *conn).await.map_err(pg)?;
 
             if diverged > 0 {
                 return Err(Error::InvariantViolated {
@@ -827,7 +861,10 @@ impl PostgresHot {
 
             loop {
                 let mut sql =
-                    format!(r#"SELECT {SCAN_COLUMNS}{extra_select} FROM "{relation}" WHERE true"#);
+                    format!(
+                        r#"SELECT {}{extra_select} FROM "{relation}" WHERE true"#,
+                        scan_columns()
+                    );
                 let mut n = 0;
                 if range.start().is_some() {
                     n += 1;
@@ -1121,7 +1158,7 @@ enum CursorValue {
 impl CursorValue {
     /// Read the value at a projected position, choosing the type by column.
     ///
-    /// Positions are fixed by [`SCAN_COLUMNS`] for the core columns; anything
+    /// Positions are fixed by [`scan_columns`] for the core columns; anything
     /// beyond them is a deployment column, which configuration restricts to text
     /// (§7.3).
     ///
@@ -1149,7 +1186,7 @@ impl CursorValue {
     }
 }
 
-/// Where a column sits in the projection `SCAN_COLUMNS` plus `extra` produces.
+/// Where a column sits in the projection `scan_columns()` plus `extra` produces.
 fn projection_index(column: &str, extra: &[String]) -> Result<usize> {
     if let Ok(index) = crate::encode::schema::storage_schema(&[]).index_of(column) {
         return Ok(index);
@@ -1157,17 +1194,36 @@ fn projection_index(column: &str, extra: &[String]) -> Result<usize> {
     extra
         .iter()
         .position(|c| c == column)
-        .map(|i| CORE_COLUMN_COUNT + i)
+        .map(|i| core_column_count() + i)
         .ok_or_else(|| Error::config(format!("column {column:?} is not projected by the scan")))
 }
 
 /// Core columns in the storage schema, and therefore in every projection.
-const CORE_COLUMN_COUNT: usize = 16;
+///
+/// Derived rather than written down. As a literal it was a second copy of the
+/// schema's length, and adding a core column left it silently one short — which
+/// surfaces as a `sqlx` decode error naming a column *number*, several layers
+/// from the edit that caused it.
+fn core_column_count() -> usize {
+    schema::storage_schema(&[]).fields().len()
+}
 
 /// The column list every scan selects, in storage-schema order.
-const SCAN_COLUMNS: &str = r#"malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
-                              quality, resolution, source_kind, source_detail, provenance,
-                              version, version_scope, recorded_at"#;
+///
+/// Generated from the schema for the same reason as [`core_column_count`]: a
+/// hand-maintained list and a schema that disagree produce an `unnest` with the
+/// wrong arity, and the message names neither the column nor the file.
+///
+/// Every name is quoted — `from` and `to` are reserved words, and quoting the
+/// rest costs nothing.
+fn scan_columns() -> String {
+    schema::storage_schema(&[])
+        .fields()
+        .iter()
+        .map(|f| format!("{:?}", f.name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Convert Postgres rows into a single batch in the storage schema.
 fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result<Vec<RecordBatch>> {
@@ -1192,6 +1248,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
     let mut version = Vec::with_capacity(n);
     let mut version_scope = Vec::with_capacity(n);
     let mut recorded_at = Vec::with_capacity(n);
+    let mut balancing_day = Vec::with_capacity(n);
 
     for row in &rows {
         malo.push(row.try_get::<String, _>(0).map_err(pg)?);
@@ -1218,6 +1275,9 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
         )?);
         version_scope.push(row.try_get::<String, _>(14).map_err(pg)?);
         recorded_at.push(micros(row.try_get::<OffsetDateTime, _>(15).map_err(pg)?)?);
+        balancing_day.push(days_since_epoch(
+            row.try_get::<time::Date, _>(16).map_err(pg)?,
+        ));
     }
 
     let tz: std::sync::Arc<str> = "UTC".into();
@@ -1243,6 +1303,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
         ),
         std::sync::Arc::new(StringArray::from(version_scope)),
         std::sync::Arc::new(TimestampMicrosecondArray::from(recorded_at).with_timezone(tz)),
+        std::sync::Arc::new(crate::arrow::array::Date32Array::from(balancing_day)),
     ];
 
     let mut columns = columns;
@@ -1250,7 +1311,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
     for (i, name) in extra.iter().enumerate() {
         let values: Vec<Option<String>> = rows
             .iter()
-            .map(|r| r.try_get::<Option<String>, _>(CORE_COLUMN_COUNT + i))
+            .map(|r| r.try_get::<Option<String>, _>(core_column_count() + i))
             .collect::<std::result::Result<_, _>>()
             .map_err(pg)?;
         columns.push(std::sync::Arc::new(StringArray::from(values)));
@@ -1285,6 +1346,8 @@ struct RowView<'a> {
     version: Decimal,
     version_scope: &'a str,
     recorded_at: OffsetDateTime,
+    /// Derived by the encoder, never here — this only carries it across.
+    balancing_day: time::Date,
 }
 
 impl<'a> RowView<'a> {
@@ -1313,6 +1376,19 @@ impl<'a> RowView<'a> {
                 .value(row);
             OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000)
                 .map_err(|e| Error::encode(name, e.to_string()))
+        }
+        fn date(batch: &RecordBatch, name: &str, row: usize) -> Result<time::Date> {
+            let days = batch
+                .column_by_name(name)
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::arrow::array::Date32Array>()
+                })
+                .ok_or_else(|| Error::encode(name, "expected a date column"))?
+                .value(row);
+            epoch_date()
+                .checked_add(Duration::days(i64::from(days)))
+                .ok_or_else(|| Error::encode(name, format!("{days} is out of Date range")))
         }
         fn dec(batch: &RecordBatch, name: &str, row: usize, scale: i8) -> Result<Decimal> {
             let raw = batch
@@ -1345,6 +1421,7 @@ impl<'a> RowView<'a> {
             version: dec(batch, col::VERSION, row, VERSION_SCALE)?,
             version_scope: text(batch, col::VERSION_SCOPE, row)?,
             recorded_at: ts(batch, col::RECORDED_AT, row)?,
+            balancing_day: date(batch, col::BALANCING_DAY, row)?,
         })
     }
 }
@@ -1614,6 +1691,16 @@ impl HotStore for PostgresHot {
             .map_err(pg)?;
         Ok(count as u64)
     }
+}
+
+/// The Unix epoch as a date, the origin `Date32` counts from.
+fn epoch_date() -> time::Date {
+    time::Date::from_ordinal_date(1970, 1).expect("epoch is a valid date")
+}
+
+/// Days between the Unix epoch and a date, the `Date32` encoding.
+fn days_since_epoch(date: time::Date) -> i32 {
+    (date - epoch_date()).whole_days() as i32
 }
 
 /// Microseconds since the Unix epoch.

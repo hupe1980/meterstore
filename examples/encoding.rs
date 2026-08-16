@@ -33,7 +33,10 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
         .collect();
 
     let mut series = MeasurementSeries::new(
-        "12345678901",
+        // Parsed, not asserted: `MaloId` verifies the check digit, so a
+        // transposition in the identifier fails here rather than filing a day of
+        // readings against a measuring point that does not exist.
+        "12345678905".parse().expect("a valid MaLo-ID"),
         "1-0:1.8.0".parse().ok(),
         intervals,
         MeasurementSource::Mscons {

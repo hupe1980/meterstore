@@ -62,7 +62,7 @@ count. Peak memory is the chunk size, not the window.
 let result = store.query(r#"
     SELECT meter_local_day("from") AS day, SUM(value) AS kwh
     FROM readings
-    WHERE malo_id = '12345678901'
+    WHERE malo_id = '41373559241'
       AND "from" >= '2025-01-01' AND "from" < '2026-01-01'
     GROUP BY 1 ORDER BY 1
 "#).await?;
@@ -84,13 +84,23 @@ transitions. The calendar arithmetic is
 [`metering`](https://crates.io/crates/metering)'s, so there is exactly one
 implementation of it.
 
+And for **gas it is the wrong function**, because the German gas market does not
+balance on the calendar day. A *Gastag* runs 06:00 to 06:00 local, so a gas
+Lastgang grouped by the calendar day books six hours a day into the neighbouring
+Bilanzierungstag. `meter_balancing_day("from", sparte)` reads the commodity per
+row and picks the day that commodity is actually settled on.
+
+An external engine has neither function, and the Gastag has no single portable
+SQL spelling, so every row also stores its `balancing_day`. Reading the Iceberg
+files directly needs a `GROUP BY` and no calendar arithmetic.
+
 ## What you get that a general lakehouse does not
 
 **An open format for regulated data.** Standard Iceberg v2 on object storage,
 readable by Spark, Trino, DuckDB, Snowflake and PyIceberg with MeterStore nowhere
 in the data path. For data under a decade-long retention obligation, avoiding
 format lock-in is the whole procurement argument — and it is
-[tested against a real DuckDB](@/docs/interop.md), not asserted.
+[tested against real engines](@/docs/interop.md), not asserted.
 
 **Time travel as compliance.** MaBiS settlement must be reproducible. Pin an
 Iceberg snapshot plus a version ceiling to reconstruct what was known at a point

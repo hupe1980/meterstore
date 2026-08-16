@@ -49,6 +49,10 @@ integration:
 # ceiling from container slots to backend slots, and the failure looks like a
 # broken test rather than an exhausted resource.
 #
+# The foreign-engine suites (DuckDB, PyIceberg) do still start a container
+# each, and are bounded on their own in `tests/it/containers.rs` — which is why
+# this needs no cap.
+#
 # Set a number to pin the degree on a constrained machine: `just test-threads=4 test`.
 test-threads := "0"
 

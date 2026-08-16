@@ -101,8 +101,13 @@ async fn duckdb(warehouse: &Path, script: &str) -> Vec<String> {
         format!("SELECT '{SENTINEL}' AS done;"),
     ];
 
+    // Held until the container has been read and dropped: releasing earlier
+    // would let the next test race this one for the network it is still using.
+    let _slot = crate::containers::engine_slot().await;
+
     let container = GenericImage::new(DUCKDB_IMAGE.0, DUCKDB_IMAGE.1)
         .with_wait_for(WaitFor::message_on_stdout(SENTINEL))
+        .with_startup_timeout(crate::containers::STARTUP_TIMEOUT)
         // Mounted at its own path, so the absolute locations inside the Iceberg
         // metadata resolve exactly as written.
         .with_mount(Mount::bind_mount(mount.clone(), mount))
@@ -367,5 +372,99 @@ async fn duckdb_sees_the_values_as_themselves() {
         parts[3].starts_with("TIMESTAMP"),
         "from must stay a timestamp, got {}",
         parts[3]
+    );
+}
+
+#[tokio::test]
+async fn duckdb_grouping_a_gas_lastgang_agrees_with_the_gastag() {
+    // The second rule that has to leave this crate for the open-format claim to
+    // hold. An engine reading the files directly has no `meter_gas_day`, and the
+    // obvious `date_trunc('day', "from")` is wrong twice over for gas — UTC
+    // rather than Berlin, and calendar day rather than the 06:00 Gastag. Both
+    // errors produce plausible numbers.
+    //
+    // It leaves as a **column**, not as an expression: SQL dialects differ on
+    // timestamp arithmetic, so the encoder applies the rule once and every reader
+    // groups on the answer. This asserts that the answer stored in the files is
+    // the one MeterStore's own calendar gives.
+    //
+    // The workload spans the autumn transition deliberately: that is where the
+    // two calendars disagree about *which* day is long, so an expression that
+    // merely shifted by a fixed six hours would pass everywhere else and fail
+    // here.
+    let workload = MeteringWorkload::new(datetime!(2026-10-23 00:00 UTC))
+        .seed(0x9A5)
+        .sparte(metering::interval::Sparte::Gas)
+        .malo_ids(2)
+        .days(4);
+    let (harness, store, _oracle) = archived(workload).await;
+
+    let table = table_path(&harness);
+    let column = store.balancing_day_column();
+
+    // Every stored row, bucketed both ways: by MeterStore's own calendar inside
+    // the engine that has the domain crate, and by the plain stored column
+    // inside one that has never heard of it. Compared as a whole histogram
+    // rather than as a total — a total is identical under any bucketing, so it
+    // would assert nothing at all.
+    let theirs = duckdb(
+        harness.warehouse(),
+        &format!(
+            "SELECT {column} AS day, COUNT(*) AS n \
+             FROM iceberg_scan('{table}') GROUP BY 1 ORDER BY 1;"
+        ),
+    )
+    .await;
+
+    let ours = store
+        .query(
+            r#"SELECT meter_balancing_day("from", sparte) AS day, COUNT(*) AS n
+               FROM readings GROUP BY 1 ORDER BY 1"#,
+        )
+        .await
+        .expect("query");
+    let ours = meterstore::arrow::util::pretty::pretty_format_batches(ours.batches())
+        .expect("render")
+        .to_string();
+
+    assert!(theirs.len() > 2, "several gas days expected: {theirs:?}");
+    for row in theirs.iter().skip(1) {
+        let (day, n) = row.split_once(',').expect("a csv pair");
+        assert!(
+            ours.contains(day) && ours.contains(n.trim()),
+            "DuckDB bucketed {day} into {n} rows; MeterStore disagreed:\n{ours}"
+        );
+    }
+
+    // And an independent computation of the same day, in the foreign engine,
+    // agrees with the stored column on every row — including across the
+    // transition. That is what makes the stored value trustworthy rather than
+    // merely present.
+    let disagreements = duckdb(
+        harness.warehouse(),
+        &format!(
+            r#"SELECT COUNT(*) FROM iceberg_scan('{table}') WHERE CAST(("from" AT TIME ZONE 'Europe/Berlin') - CASE WHEN sparte = 'GAS' THEN INTERVAL '6' HOUR ELSE INTERVAL '0' HOUR END AS DATE) <> balancing_day;"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        disagreements.last().map(String::as_str),
+        Some("0"),
+        "the bare expression must reproduce the stored column in DuckDB"
+    );
+
+    // And the naive grouping really is different, so the assertion above is not
+    // passing for the trivial reason that every bucketing agrees.
+    let naive = duckdb(
+        harness.warehouse(),
+        &format!(
+            "SELECT CAST(\"from\" AS DATE) AS day, COUNT(*) AS n \
+             FROM iceberg_scan('{table}') GROUP BY 1 ORDER BY 1;"
+        ),
+    )
+    .await;
+    assert_ne!(
+        naive, theirs,
+        "if the naive UTC grouping agreed, this test would prove nothing"
     );
 }

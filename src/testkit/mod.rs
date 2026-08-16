@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 
+use metering::ids::MaloId;
 use metering::interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte};
 use metering::measurement_series::{MeasurementSeries, MeasurementSource};
 use metering::resolution::IntervalResolution;
@@ -372,9 +373,21 @@ const FIRST_VERSION: u128 = 20_260_101_000_001;
 /// The version a correction carries. Higher, so it supersedes within its scope.
 const CORRECTION_VERSION: u128 = 20_260_201_000_002;
 
-/// A synthetic 11-digit Marktlokations-ID.
-fn malo_id(n: usize) -> String {
-    format!("{:011}", 10_000_000_000u64 + n as u64)
+/// A synthetic Marktlokations-ID, `n` places into a contiguous block.
+///
+/// The check digit is **computed**, not padded onto ten digits and hoped for:
+/// `MaloId` enforces the Bildungsvorschrift at the parse, so a generator that
+/// emitted eleven arbitrary digits would fail to build a single row of workload.
+/// Deriving it from `metering`'s own [`MaloId::compute_check_digit`] also means
+/// the fixture cannot disagree with the validator it is checked by.
+fn malo_id(n: usize) -> MaloId {
+    // Ten digits with a leading `1`, which is a DVGW Vergabestelle — inside the
+    // `1`–`9` the scheme allows, and stable for every `n` a test will use.
+    let prefix = format!("{:010}", 1_000_000_000u64 + n as u64);
+    let check = MaloId::compute_check_digit(&prefix).expect("ten ASCII digits");
+    format!("{prefix}{check}")
+        .parse()
+        .expect("a computed check digit is the one the parser recomputes")
 }
 
 /// What identifies one reading in the reference: the core key, plus whatever the
@@ -483,7 +496,7 @@ impl Oracle {
                     .ok_or_else(|| Error::encode("obis_code", "no channel on interval or series"))?
                     .to_string();
                 let key = (
-                    stored.series.malo_id.clone(),
+                    stored.series.malo_id.to_string(),
                     obis,
                     interval.from,
                     identity.clone(),
@@ -784,7 +797,7 @@ mod tests {
                 s.series
                     .intervals
                     .iter()
-                    .map(|i| (s.series.malo_id.clone(), i.from))
+                    .map(|i| (s.series.malo_id, i.from))
             })
             .collect::<std::collections::BTreeSet<_>>()
             .len();
@@ -823,14 +836,24 @@ mod tests {
     }
 
     #[test]
-    fn generated_malo_ids_are_eleven_digits() {
+    fn generated_malo_ids_carry_a_valid_check_digit() {
         // The hot table's OBIS constraint is not the only shape that matters; a
-        // MaLo is 11 digits and a fixture that ignored that would not be
-        // exercising the real key width.
-        for n in [0, 1, 42, 999] {
-            assert_eq!(malo_id(n).len(), 11);
-            assert!(malo_id(n).chars().all(|c| c.is_ascii_digit()));
+        // MaLo is 11 digits *whose last one is derived from the other ten*, and a
+        // fixture that ignored that would not be exercising the real key — nor
+        // would it survive the round trip, since decoding parses the column back.
+        for n in [0, 1, 42, 999, 123_456] {
+            let id = malo_id(n);
+            let text = id.to_string();
+            assert_eq!(text.len(), 11);
+            assert!(text.chars().all(|c| c.is_ascii_digit()));
+            // Re-parsing is the check: `MaloId`'s `FromStr` recomputes the digit.
+            assert_eq!(text.parse::<MaloId>().unwrap(), id);
         }
+
+        // Distinct offsets are distinct measuring points, which the workload's
+        // per-MaLo grouping depends on.
+        let ids: std::collections::BTreeSet<_> = (0..64).map(malo_id).collect();
+        assert_eq!(ids.len(), 64);
     }
 
     #[test]

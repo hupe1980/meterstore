@@ -255,9 +255,32 @@ impl MeterStore {
     /// The typed path (§13.4): rows come back version-resolved and tier-split, as
     /// a [`MeasurementSeries`] the `metering` crate computes with directly.
     ///
+    /// # The identifier is parsed, not taken on trust
+    ///
+    /// A MaLo-ID carries a check digit, so a transposition in the one thing that
+    /// selects *whose* readings come back is detectable — and this is the last
+    /// place it can still be detected, because past here a wrong-but-plausible
+    /// identifier simply returns an empty series and no error. Accepts either a
+    /// string, which is checked here, or a [`MaloId`] already parsed at the
+    /// caller's own boundary, which costs nothing:
+    ///
+    /// ```no_run
+    /// # async fn f(store: &meterstore::MeterStore) -> meterstore::Result<()> {
+    /// let series = store.series("41373559241")?.collect().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
     /// [`MeasurementSeries`]: metering::measurement_series::MeasurementSeries
-    pub fn series(&self, malo_id: impl Into<String>) -> super::SeriesQuery<'_> {
-        super::SeriesQuery::new(self, malo_id)
+    /// [`MaloId`]: metering::ids::MaloId
+    pub fn series<M>(&self, malo_id: M) -> Result<super::SeriesQuery<'_>>
+    where
+        M: TryInto<metering::ids::MaloId>,
+        M::Error: std::fmt::Display,
+    {
+        Ok(super::SeriesQuery::new(
+            self,
+            crate::encode::parse_malo(malo_id)?,
+        ))
     }
 
     /// Completeness of every channel over a range (§9.6).
@@ -976,22 +999,22 @@ impl MeterStore {
         // the message names both scopes so the caller can tell.
         let mut incoming: std::collections::BTreeMap<(String, String, OffsetDateTime), String> =
             Default::default();
-        let mut malo_ids = std::collections::BTreeSet::new();
+        let mut malo_ids: std::collections::BTreeSet<String> = Default::default();
         let (mut lo, mut hi) = (None::<OffsetDateTime>, None::<OffsetDateTime>);
 
         for stored in cold {
             let operator = stored.version.scope().operator().to_string();
+            // The key is compared against the stored column, which is text, so
+            // the identifier is rendered once per series rather than per row.
+            let malo = stored.series.malo_id.to_string();
             for interval in &stored.series.intervals {
                 let obis = interval
                     .obis_code
                     .or(stored.series.obis_code)
                     .map(|o| o.to_string())
                     .unwrap_or_default();
-                incoming.insert(
-                    (stored.series.malo_id.clone(), obis, interval.from),
-                    operator.clone(),
-                );
-                malo_ids.insert(stored.series.malo_id.clone());
+                incoming.insert((malo.clone(), obis, interval.from), operator.clone());
+                malo_ids.insert(malo.clone());
                 lo = Some(lo.map_or(interval.from, |v: OffsetDateTime| v.min(interval.from)));
                 hi = Some(hi.map_or(interval.from, |v: OffsetDateTime| v.max(interval.from)));
             }
@@ -1115,6 +1138,24 @@ impl MeterStore {
             // transaction-time ceiling is a per-read concern, not part of it.
             None,
         )
+    }
+
+    /// The column an external engine must group a daily aggregate by.
+    ///
+    /// The second rule that has to leave this crate for the open-format claim to
+    /// hold, after [`resolution_sql`](Self::resolution_sql) — except that this
+    /// one leaves as **data** rather than as an expression, which is the whole
+    /// point. Gas is balanced on the 06:00–06:00 Gastag, and no SQL expresses
+    /// that portably (see [`encode::schema`]), so the rule is applied once at
+    /// write time and every reader groups on the answer:
+    ///
+    /// ```sql
+    /// SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+    /// ```
+    ///
+    /// [`encode::schema`]: crate::encode::schema
+    pub const fn balancing_day_column(&self) -> &'static str {
+        crate::encode::schema::col::BALANCING_DAY
     }
 }
 

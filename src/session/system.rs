@@ -232,12 +232,27 @@ impl<'a> SystemTables<'a> {
                     None,
                 ),
             },
+            // The second rule an external engine needs — and unlike the first
+            // it is answered with a column rather than an expression. Gas
+            // balances on the 06:00–06:00 Gastag, and SQL dialects differ on the
+            // timestamp arithmetic that computes it, so the rule is applied at
+            // write time and published as the name of the column holding its
+            // answer.
+            ConfigEntry {
+                table: table.clone(),
+                setting: "balancing_day_column".to_string(),
+                value: crate::encode::schema::col::BALANCING_DAY.to_string(),
+            },
             ConfigEntry {
                 table,
                 setting: "warning".to_string(),
                 value: format!(
                     "{raw_table} holds every version of every reading. Summing it without \
-                     the SQL above double-counts every corrected interval."
+                     the resolution SQL above double-counts every corrected interval. And \
+                     group daily aggregates by the {} column, never by date_trunc('day', \
+                     \"from\"): that is UTC rather than Berlin for every commodity, and gas \
+                     is balanced on the 06:00-06:00 Gastag rather than the calendar day.",
+                    crate::encode::schema::col::BALANCING_DAY,
                 ),
             },
         ]

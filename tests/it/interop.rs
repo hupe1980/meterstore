@@ -18,10 +18,13 @@
 //! - and, decisively, **the published resolution SQL turns the raw versioned
 //!   rows into the same answer MeterStore gives** (§13.7.2).
 //!
-//! It does *not* run Spark, Trino, DuckDB or PyIceberg. That needs a Docker
-//! matrix with network access and remains open (§20.3). What it rules out is the
-//! failure mode that matters most and is entirely within reach: output that only
-//! this crate's own reader can make sense of.
+//! It does *not* start a container. The suites that do are siblings —
+//! `interop_duckdb` and `interop_pyiceberg` run the real engines, and
+//! `interop_trino` pins the SQL semantics that decided how the balancing day is
+//! stored. This one is the hermetic floor beneath them: it needs no Docker, so
+//! it still rules out the failure mode that matters most — output only this
+//! crate's own reader can make sense of — on a machine that cannot run the rest.
+//! Spark remains open (§20.3).
 //!
 //! # Why the naive query is asserted to be *wrong*
 //!

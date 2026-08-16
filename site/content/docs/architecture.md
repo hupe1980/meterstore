@@ -41,11 +41,15 @@ MeterStore closes that window by storing the watermark in the Iceberg **snapshot
 summary**:
 
 ```rust
-txn.set_snapshot_summary_property("meterstore.tiering_watermark", …)
-   .set_snapshot_summary_property("meterstore.archived_range", …)
-   .set_snapshot_summary_property("meterstore.row_count", …)
-   .commit()
-   .await?;
+let action = txn.fast_append()
+    .add_data_files(data_files)
+    .set_snapshot_properties(HashMap::from([
+        ("meterstore.tiering_watermark".into(), watermark.to_property()?),
+        ("meterstore.archived_range".into(),    window.to_property()?),
+        ("meterstore.row_count".into(),         rows.to_string()),
+    ]));
+
+action.apply(txn)?.commit(catalog).await?;
 ```
 
 Iceberg commits are a compare-and-swap on the catalogue's metadata pointer, so
@@ -58,11 +62,11 @@ everything below it is durable, resume from there. A crash mid-archival
 re-archives a range that was never purged — idempotent, because the commit either
 happened or did not.
 
-### The retry that had to be taken back
+### Library commit retry is disabled
 
-Worth knowing if you build on `iceberg-rust` yourself. The library retries a
-conflicting commit by refreshing the base and **re-applying the same action** —
-including the snapshot summary it was built with. For an ordinary append that is
+`iceberg-rust` retries a conflicting commit by refreshing the base and
+**re-applying the same action** — including the snapshot summary it was built
+with. For an ordinary append that is
 right. For a summary that describes the base it lands on, it is not: a late
 correction losing a race to an archival commit would republish its own older
 watermark, over intervals PostgreSQL had already purged, with nothing reporting a
@@ -111,8 +115,8 @@ connection that goes back to the pool would be released the moment another calle
 checked it out.
 
 Every replica can therefore run the same schedule: one wins, the others report
-`lease_contended` and stop. That is not a failure and should not page anyone. The
-alert that still fires if *nobody* is winning is watermark lag.
+`lease_contended` and stop. That is not a failure and should not be alerted on;
+watermark lag is the alert that fires if *nobody* is winning.
 
 Query processes are unrestricted and hold no mutable state at all.
 
@@ -145,15 +149,15 @@ lineage, `VARIANT` and nanosecond timestamps; evaluated one at a time:
 
 | v3 feature | Value here |
 |---|---|
-| Deletion vectors | **None.** Append-only. We never issue a delete. |
+| Deletion vectors | **None.** The store is append-only; it issues no deletes. |
 | Row lineage | **Negative.** It would duplicate `version`, which is the better identifier: assigned by the network operator, meaningful to an auditor, stable across re-ingestion. |
 | Default column values | Real but small — would make an added column free instead of needing a backfill. |
-| Nanosecond timestamps | None. Fifteen-minute intervals at microsecond precision are absurdly sufficient. |
+| Nanosecond timestamps | None. Fifteen-minute intervals are stored at microsecond precision. |
 
 The deciding argument is reader support. Athena — among the most widely deployed
 SQL engines in AWS estates — does not read v3. For data under a ten-year
 retention obligation, writing a format a significant share of engines cannot read
-would directly undermine the openness that is the point of using Iceberg at all.
+would undermine the openness Iceberg is chosen for.
 
 The version is **verified after table creation** rather than requested, because
 `format-version` is a reserved property. A future library default moving to v3

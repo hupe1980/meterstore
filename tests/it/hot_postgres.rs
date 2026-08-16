@@ -73,10 +73,11 @@ impl Harness {
                 r#"INSERT INTO readings
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
-                    version, version_scope, recorded_at)
-                   VALUES ($1,$2,$3,'STROM',$4,$5,$6,'KWH',$7,$8,$9,$10,$11,$12,$13,$14)"#,
+                    version, version_scope, recorded_at, balancing_day)
+                   VALUES ($1,$2,$3,'STROM',$4,$5,$6,'KWH',$7,$8,$9,$10,$11,$12,$13,$14,
+                           CAST(($4 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
             )
-            .bind("12345678901")
+            .bind("12345678905")
             .bind(Some("DE0001234567890123456789012345678"))
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
             .bind(from)
@@ -205,9 +206,9 @@ async fn insert_fails_when_no_partition_covers_the_interval() {
     let result = sqlx::query(
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-            source_kind, version, version_scope, recorded_at)
+            source_kind, version, version_scope, recorded_at, balancing_day)
            VALUES ('1','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED','mscons',1,
-                   '99:2026-07',$1)"#,
+                   '99:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D22)
     .bind(D22 + Duration::minutes(15))
@@ -401,9 +402,9 @@ async fn a_non_canonical_obis_code_is_rejected_at_the_write() {
         let result = sqlx::query(
             r#"INSERT INTO readings
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-                source_kind, version, version_scope, recorded_at)
+                source_kind, version, version_scope, recorded_at, balancing_day)
                VALUES ('1',$1,'STROM',$2,$3,1.0,'KWH','MEASURED','mscons',1,
-                       '99:2026-07',$2)"#,
+                       '99:2026-07',$2,CAST(($2 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(bad)
         .bind(D20)
@@ -428,9 +429,9 @@ async fn a_storage_group_that_carries_information_is_accepted() {
     sqlx::query(
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-            source_kind, version, version_scope, recorded_at)
+            source_kind, version, version_scope, recorded_at, balancing_day)
            VALUES ('1','1-0:1.8.0*1','STROM',$1,$2,1.0,'KWH','MEASURED','mscons',1,
-                   '99:2026-07',$1)"#,
+                   '99:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D20)
     .bind(D20 + Duration::minutes(15))
@@ -485,7 +486,7 @@ fn batch(start: OffsetDateTime, count: usize, kwh: i64, version: i64) -> RecordB
     let tos: Vec<i64> = froms.iter().map(|f| f + 15 * 60 * 1_000_000).collect();
 
     let columns: Vec<meterstore::arrow::array::ArrayRef> = vec![
-        Arc::new(StringArray::from(vec!["11111111111"; count])),
+        Arc::new(StringArray::from(vec!["11111111115"; count])),
         Arc::new(StringArray::from(vec![None::<&str>; count])),
         Arc::new(StringArray::from(vec![obis.as_str(); count])),
         Arc::new(StringArray::from(vec!["STROM"; count])),
@@ -509,6 +510,18 @@ fn batch(start: OffsetDateTime, count: usize, kwh: i64, version: i64) -> RecordB
         ),
         Arc::new(StringArray::from(vec!["99:2026-07"; count])),
         Arc::new(TimestampMicrosecondArray::from(vec![micros(D20); count]).with_timezone("UTC")),
+        // The balancing day, as the encoder would derive it. STROM, so the
+        // Berlin calendar day rather than the Gastag.
+        Arc::new(meterstore::arrow::array::Date32Array::from(
+            (0..count)
+                .map(|i| {
+                    let at = start + Duration::minutes(15 * i as i64);
+                    let day =
+                        meterstore::planner::balancing_day(at, metering::interval::Sparte::Strom);
+                    (day - time::Date::from_ordinal_date(1970, 1).unwrap()).whole_days() as i32
+                })
+                .collect::<Vec<i32>>(),
+        )),
     ];
     RecordBatch::try_new(schema_ref, columns).unwrap()
 }
@@ -706,9 +719,10 @@ async fn corrections_coexist_with_the_values_they_supersede() {
     sqlx::query(
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-            source_kind, version, version_scope, recorded_at)
-           VALUES ('12345678901','1-0:1.8.0','STROM',$1,$2,9.9,'KWH','CORRECTED','mscons',
-                   20260728000002,'99:2026-07',$3)"#,
+            source_kind, version, version_scope, recorded_at, balancing_day)
+           VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,9.9,'KWH','CORRECTED','mscons',
+                   20260728000002,'99:2026-07',$3,
+                   CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D20)
     .bind(D20 + Duration::minutes(15))
@@ -760,11 +774,12 @@ async fn a_chunk_boundary_inside_a_tie_does_not_drop_rows() {
                 r#"INSERT INTO readings
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
-                    version, version_scope, recorded_at)
+                    version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,1,'KWH','MEASURED','PT15M','mscons',
-                           $5,'[]',$6,'99:2026-07',$7)"#,
+                           $5,'[]',$6,'99:2026-07',$7,
+                           CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
             )
-            .bind("12345678901")
+            .bind("12345678905")
             .bind(meterstore::canonical_obis(obis).unwrap())
             .bind(D20)
             .bind(D20 + Duration::minutes(15))
@@ -866,9 +881,10 @@ async fn overlapping_intervals_in_one_version_are_refused() {
         sqlx::query(
             r#"INSERT INTO readings
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-                source_kind, version, version_scope, recorded_at)
-               VALUES ('12345678901','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
-                       'mscons',$3,'99:2026-07',$1)"#,
+                source_kind, version, version_scope, recorded_at, balancing_day)
+               VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
+                       'mscons',$3,'99:2026-07',$1,
+                       CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(from)
         .bind(to)
@@ -919,9 +935,9 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
         sqlx::query(
             r#"INSERT INTO readings
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
-                source_kind, version, version_scope, recorded_at)
-               VALUES ('12345678901','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
-                       'mscons',1,$3,$1)"#,
+                source_kind, version, version_scope, recorded_at, balancing_day)
+               VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
+                       'mscons',1,$3,$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(D20)
         .bind(D20 + Duration::minutes(15))

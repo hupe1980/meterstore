@@ -18,7 +18,7 @@ let then = store.as_of(
     Some(max_version),
 ).await?;
 
-let series = then.series("12345678901").range(from, to).collect().await?;
+let series = then.series("41373559241")?.range(from, to).collect().await?;
 ```
 
 An Iceberg snapshot is a state of the whole cold table, so this reconstructs what
@@ -108,8 +108,7 @@ Three details the implementation forced:
 ## What is not guaranteed
 
 **Cross-table consistency.** Each table archives independently, so a query joining
-two runs against two boundaries. That is a design position, not a limitation
-waiting to be fixed: a cross-table commit would mean a distributed transaction
+two runs against two boundaries. A cross-table commit would mean a distributed transaction
 between PostgreSQL and an Iceberg catalogue, which is the machinery this design
 exists without. It is *exposed* rather than hidden —
 `QueryResult::watermarks()` lists every boundary involved.

@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use datafusion::common::ScalarValue;
+use metering::ids::{MaloId, MeloId};
 use metering::interval::QualityFlag;
 use metering::interval::Sparte;
 use metering::measurement_series::{MeasurementSeries, MeasurementSource, ProvenanceEntry};
@@ -53,7 +54,7 @@ pub struct ResolvedSeries {
 #[derive(Debug, Clone)]
 pub struct SeriesQuery<'a> {
     store: &'a crate::session::MeterStore,
-    malo_id: String,
+    malo_id: MaloId,
     obis_code: Option<String>,
     from: Option<OffsetDateTime>,
     to: Option<OffsetDateTime>,
@@ -64,10 +65,10 @@ pub struct SeriesQuery<'a> {
 
 impl<'a> SeriesQuery<'a> {
     /// Start a read for one measuring point.
-    pub(crate) fn new(store: &'a crate::session::MeterStore, malo_id: impl Into<String>) -> Self {
+    pub(crate) fn new(store: &'a crate::session::MeterStore, malo_id: MaloId) -> Self {
         Self {
             store,
-            malo_id: malo_id.into(),
+            malo_id,
             obis_code: None,
             from: None,
             to: None,
@@ -238,7 +239,7 @@ impl<'a> SeriesQuery<'a> {
     /// provenance the public collectors each project a subset of.
     async fn resolve(self) -> Result<(Option<ResolvedSeries>, super::QueryResult)> {
         let mut conditions = vec![format!(r#""{}" = $1"#, col::MALO_ID)];
-        let mut params: Vec<ScalarValue> = vec![ScalarValue::Utf8(Some(self.malo_id.clone()))];
+        let mut params: Vec<ScalarValue> = vec![ScalarValue::Utf8(Some(self.malo_id.to_string()))];
 
         if let Some(obis) = &self.obis_code {
             conditions.push(format!(r#""{}" = ${}"#, col::OBIS_CODE, params.len() + 1));
@@ -300,7 +301,7 @@ impl<'a> SeriesQuery<'a> {
         }
 
         Ok((
-            merge(&self.malo_id, self.obis_code.as_deref(), stored)?,
+            merge(self.malo_id, self.obis_code.as_deref(), stored)?,
             result,
         ))
     }
@@ -326,7 +327,7 @@ fn timestamp(t: OffsetDateTime) -> ScalarValue {
 /// that is the one whose `source` and `provenance` describe the values that
 /// survived resolution.
 fn merge(
-    malo_id: &str,
+    malo_id: MaloId,
     obis_code: Option<&str>,
     mut stored: Vec<crate::encode::StoredSeries>,
 ) -> Result<Option<ResolvedSeries>> {
@@ -340,7 +341,7 @@ fn merge(
     let mut intervals = Vec::new();
     let mut source: Option<MeasurementSource> = None;
     let mut provenance: Vec<ProvenanceEntry> = Vec::new();
-    let mut melo_id: Option<String> = None;
+    let mut melo_id: Option<MeloId> = None;
     let mut resolution = None;
     let mut recorded_at: Option<OffsetDateTime> = None;
     // A measuring point has one commodity, so every delivery agrees on it; taking
@@ -386,8 +387,7 @@ fn merge(
         return Ok(None);
     };
 
-    let mut series =
-        MeasurementSeries::new(malo_id.to_string(), obis, intervals, source, recorded_at);
+    let mut series = MeasurementSeries::new(malo_id, obis, intervals, source, recorded_at);
     series.melo_id = melo_id;
     series.resolution = resolution;
     // `new` seeds a provenance entry of its own; the stored trail is the record
@@ -435,6 +435,12 @@ mod tests {
         }
     }
 
+    /// The MaLo-ID these tests read: check digit included, because `MaloId`
+    /// verifies it and eleven arbitrary digits would not parse.
+    fn malo() -> MaloId {
+        "12345678905".parse().unwrap()
+    }
+
     fn source() -> MeasurementSource {
         MeasurementSource::Mscons {
             pid: 13_005,
@@ -447,7 +453,7 @@ mod tests {
         let scope = VersionScope::for_interval("99", intervals[0].from).unwrap();
         StoredSeries::new(
             MeasurementSeries::new(
-                "12345678901".to_string(),
+                malo(),
                 Some("1-0:1.8.0".parse().unwrap()),
                 intervals,
                 source(),
@@ -471,11 +477,11 @@ mod tests {
             datetime!(2026-07-22 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } = merge("12345678901", Some("1-0:1.8.0"), vec![b, a])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![b, a])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.intervals.len(), 2);
-        assert_eq!(series.malo_id, "12345678901");
+        assert_eq!(series.malo_id, malo());
     }
 
     #[test]
@@ -491,10 +497,9 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } =
-            merge("12345678901", Some("1-0:1.8.0"), vec![later, earlier])
-                .unwrap()
-                .expect("rows were supplied");
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![later, earlier])
+            .unwrap()
+            .expect("rows were supplied");
         assert_eq!(series.intervals[0].from, datetime!(2026-07-20 00:00 UTC));
         assert_eq!(series.intervals[1].from, datetime!(2026-07-20 12:00 UTC));
     }
@@ -505,7 +510,7 @@ mod tests {
         // there is nobody to name, and inventing one would put a delivery in the
         // audit trail that never happened.
         assert!(
-            merge("12345678901", Some("1-0:1.8.0"), Vec::new())
+            merge(malo(), Some("1-0:1.8.0"), Vec::new())
                 .unwrap()
                 .is_none()
         );
@@ -526,7 +531,7 @@ mod tests {
         );
         new.series.resolution = Some(metering::IntervalResolution::QuarterHour);
 
-        let ResolvedSeries { series, .. } = merge("12345678901", Some("1-0:1.8.0"), vec![new, old])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![new, old])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(
@@ -545,7 +550,7 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } = merge("12345678901", None, vec![mixed])
+        let ResolvedSeries { series, .. } = merge(malo(), None, vec![mixed])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.obis_code, None);
@@ -557,7 +562,7 @@ mod tests {
             vec![interval(datetime!(2026-07-20 00:00 UTC), 1)],
             datetime!(2026-07-21 00:00 UTC),
         );
-        let ResolvedSeries { series, .. } = merge("12345678901", None, vec![one])
+        let ResolvedSeries { series, .. } = merge(malo(), None, vec![one])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.obis_code, Some("1-0:1.8.0".parse().unwrap()));
@@ -575,7 +580,7 @@ mod tests {
         assert!(!trail.is_empty(), "the fixture must carry a trail");
         s.series.provenance = trail.clone();
 
-        let ResolvedSeries { series, .. } = merge("12345678901", Some("1-0:1.8.0"), vec![s])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![s])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.provenance, trail);
@@ -591,7 +596,7 @@ mod tests {
         let gas = StoredSeries::of(
             Sparte::Gas,
             MeasurementSeries::new(
-                "12345678901".to_string(),
+                malo(),
                 Some("7-1:3.0.0".parse().unwrap()),
                 vec![interval(datetime!(2026-07-20 00:00 UTC), 1)],
                 source(),
@@ -601,7 +606,7 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { sparte, .. } = merge("12345678901", None, vec![gas])
+        let ResolvedSeries { sparte, .. } = merge(malo(), None, vec![gas])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(sparte, Sparte::Gas);

@@ -100,6 +100,14 @@ impl Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Displacement {
     /// Marktlokation.
+    ///
+    /// The stored column text, not a parsed
+    /// [`MaloId`](metering::ids::MaloId) — the same rule as
+    /// [`Completeness::malo_id`](crate::session::Completeness::malo_id). The
+    /// domain payload is typed on both sides of the encoding; the storage
+    /// layer's *report* structs key on what the column holds, so a malformed
+    /// value shows up in the audit trail as itself rather than failing the write
+    /// that would have recorded it.
     pub malo_id: String,
     /// The measured channel, canonical.
     pub obis_code: String,
@@ -198,7 +206,7 @@ mod tests {
         written: StoredValue,
     ) -> Displacement {
         Displacement {
-            malo_id: "12345678901".into(),
+            malo_id: "12345678905".into(),
             obis_code: "1-0:1.8.0".into(),
             from: datetime!(2026-07-20 00:00 UTC),
             to: datetime!(2026-07-20 00:15 UTC),

@@ -134,7 +134,7 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
         obis_code: "1-0:1.8.0".parse().ok(),
     };
     let series = MeasurementSeries::new(
-        "11111111111",
+        "11111111115".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         vec![interval],
         MeasurementSource::ManualEntry {

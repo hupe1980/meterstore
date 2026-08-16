@@ -126,7 +126,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
         obis_code: "1-0:1.8.0".parse().ok(),
     };
     let series = MeasurementSeries::new(
-        "11111111111",
+        "11111111115".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         vec![interval],
         MeasurementSource::ManualEntry {
@@ -250,7 +250,8 @@ async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
         .unwrap();
 
     let resolved = store
-        .series("11111111111")
+        .series("11111111115")
+        .unwrap()
         .column_eq("tenant", ScalarValue::Utf8(Some("a".to_string())))
         .range(D20, D21)
         .collect_resolved()

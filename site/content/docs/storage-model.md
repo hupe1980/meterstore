@@ -12,7 +12,7 @@ mapping needs no lookup table.
 
 | Column | Arrow | Iceberg | Source |
 |---|---|---|---|
-| `malo_id` | `Utf8` | `string` | 11-digit Marktlokation |
+| `malo_id` | `Utf8` | `string` | 11-digit Marktlokation, check digit verified |
 | `melo_id` | `Utf8`, nullable | `string` | 33-char Messlokation |
 | `obis_code` | `Utf8` | `string` | Canonical form only |
 | `sparte` | `Utf8` | `string` | `STROM`, `GAS`, `WAERME`, `WASSER` |
@@ -28,9 +28,30 @@ mapping needs no lookup table.
 | `version` | `Decimal128(20,0)` | `decimal(20,0)` | MSCONS correction version |
 | `version_scope` | `Utf8` | `string` | `<operator>:<YYYY-MM>` |
 | `recorded_at` | `Timestamp(µs, UTC)` | `timestamptz` | Transaction time |
+| `balancing_day` | `Date32` | `date` | The local day this reading is booked on |
 
 **Merge key:** `(malo_id, obis_code, from)` · **winner:** `max(version)` within
 the same `version_scope`.
+
+### `balancing_day` is derived, and stored anyway
+
+The one place the crate persists something it can compute. The rule — Berlin
+calendar day for electricity, heat and water, the **Gastag** (06:00 to 06:00
+local) for gas — needs a zone conversion and a wall-clock six-hour shift, and SQL
+dialects differ on that, so no single published expression is right everywhere.
+Reading the Iceberg files directly is the intended access path, so the rule is
+applied once at write time instead:
+
+```sql
+SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+```
+
+There is exactly one writer, so it cannot drift: the encoder derives it from
+`metering`'s calendar and nothing else sets it, asserted against that calendar
+over every commodity across a DST weekend. A day's rows share one value, so it
+dictionary-encodes to nearly nothing. The column is `NOT NULL` with no default,
+so a hand-written `INSERT` that omits it fails at the write rather than storing a
+wrong day.
 
 ### `to` is stored, not computed
 
@@ -61,6 +82,27 @@ Neither `sparte` nor `unit` joins the merge key: a Marktlokation belongs to one
 commodity, so the Sparte is functionally determined by `malo_id`. In the key, a
 correction that spelled it differently would silently fail to supersede rather
 than fail loudly.
+
+`sparte` earns its keep a second time on the read path. It is what tells the
+store **which calendar a row is balanced on** — gas runs on the 06:00 Gastag and
+everything else on the Berlin calendar day — so `meter_balancing_day` and
+completeness can be right for a mixed table without the caller saying which is
+which. See [the gas-day trap](@/docs/interop.md#the-gas-day-trap).
+
+### The identifiers are parsed, not carried
+
+`malo_id` is a `Utf8` column because Parquet, Arrow and PostgreSQL have no
+eleven-digit-with-check-digit type — but the *value* is `metering`'s `MaloId`, on
+both sides of the encoding. A MaLo-ID carries a check digit precisely so that a
+transposed digit is detectable, and a store that read the column back without
+checking would discard that protection at the last moment it could still be used:
+past the decoder, a wrong-but-plausible identifier is simply a different
+measuring point, with no error anywhere.
+
+So decoding parses, and a failure is an error rather than a filtered row —
+silently dropping readings whose key looks wrong would understate a settlement,
+which is the failure direction this crate refuses everywhere else. `melo_id` is
+checked structurally; the Zählpunktbezeichnung has no check digit to verify.
 
 ### Stored values are `metering`'s own strings
 
@@ -123,7 +165,7 @@ hot table's primary key, the `ON CONFLICT` target that makes redelivery
 idempotent, and the resolution view's `PARTITION BY`. `create_tables` is the
 single entry point for exactly that reason.
 
-Extra columns are `Utf8` today, and a declared name must be a plain identifier:
+Extra columns are `Utf8` only, and a declared name must be a plain identifier:
 names are written into DDL and SQL as identifiers, which cannot be parameterised,
 so the alphabet is restricted once rather than quoted carefully in five places.
 

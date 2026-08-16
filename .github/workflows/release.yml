@@ -64,6 +64,9 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The same gate CI runs, verbatim. A tag must not be able to skip it.
+      # Container concurrency is bounded inside the suite itself
+      # (`tests/it/containers.rs`), so neither job needs a thread cap.
       - run: cargo test --all-features
       - run: cargo doc --no-deps --all-features
         env:

@@ -361,7 +361,7 @@ const fn default_min_snapshots() -> usize {
 pub struct ExtraColumn {
     /// Column name.
     pub name: String,
-    /// Storage type. Only `string` is supported today (§7.3).
+    /// Storage type. Only `string` is supported (§7.3).
     #[serde(default = "default_column_type")]
     pub r#type: String,
     /// Whether this column is part of a reading's **identity**.
@@ -437,7 +437,7 @@ impl ExtraColumn {
         match self.r#type.as_str() {
             "string" | "utf8" | "text" => Ok(DataType::Utf8),
             other => Err(Error::config(format!(
-                "extra column {:?} declares type {other:?}; only \"string\" is supported today — \
+                "extra column {:?} declares type {other:?}; only \"string\" is supported — \
                  every attribute deployments have wanted (tenant, Bilanzkreis, grid area) is a \
                  string, and supporting more needs a bind arm per type",
                 self.name

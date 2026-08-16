@@ -273,7 +273,7 @@ impl TableConfig {
         for f in self.identity_columns.iter().chain(&self.attribute_columns) {
             if !matches!(f.data_type(), DataType::Utf8) {
                 return Err(Error::config(format!(
-                    "extra column {:?} is {:?}; only Utf8 is supported today — every \
+                    "extra column {:?} is {:?}; only Utf8 is supported — every \
                      attribute deployments have wanted (tenant, Bilanzkreis, grid area) \
                      is a string, and supporting more needs a bind arm per type",
                     f.name(),

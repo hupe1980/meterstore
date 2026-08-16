@@ -23,13 +23,20 @@
 //! Only when the scan is **historical** — entirely below the tiering watermark —
 //! and every cold file in range provably holds one version.
 //!
-//! The tier restriction is not conservatism, it is what makes per-tier reasoning
-//! sound. Hot and cold hold disjoint interval ranges, so every version of a
-//! given reading lives in one tier; but the hot tier keeps no per-file
-//! statistics, and proving it correction-free would cost a full scan of exactly
-//! the rows the query was trying to avoid touching. The hot window is one
-//! settlement lag wide and is where corrections actually arrive, so it always
-//! resolves, and it is small enough that this does not matter.
+//! Two separate things are going on there, and it is worth not conflating them.
+//!
+//! What makes reasoning about one tier *sound* is that the tiers hold disjoint
+//! interval ranges and `append` routes a late correction to the tier that owns
+//! its interval — so **every version of a given reading lives in the same
+//! tier**. Without that, "no corrections among the cold files" would say nothing
+//! about the reading as a whole, because a competing version could sit in the
+//! other tier.
+//!
+//! Why the *hot* tier is excluded is then merely practical: PostgreSQL keeps no
+//! per-file statistics, so proving the hot window correction-free would cost a
+//! full scan of exactly the rows the optimisation exists to avoid. The hot
+//! window is one settlement lag wide and is where corrections actually arrive,
+//! so it always resolves — and it is small enough that this does not matter.
 
 use std::any::Any;
 use std::sync::Arc;

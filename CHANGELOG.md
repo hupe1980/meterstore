@@ -7,6 +7,149 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.4.0] — 2026-08-16
+
+`metering` 0.18 typed two identifiers and named a second kind of day. Both were
+gaps here, and the second one was silently wrong for a whole commodity.
+
+The crate stored `malo_id` and `melo_id` as unvalidated strings while validating
+OBIS codes to the digit — so a transposed digit in the one column that selects
+*whose* readings come back was undetectable, even though the MaLo-ID carries a
+check digit precisely to make it detectable. And it grouped every daily
+aggregate and every completeness report on the **Berlin calendar day**, which is
+right for electricity, heat and water and wrong for gas: the German gas market
+balances on the Gastag, 06:00 to 06:00 local.
+
+Naming the gas day was only half of it. The rule then has to reach an engine that
+has never heard of this crate — and it turns out not to survive being written as
+SQL, so the answer is **stored** as a `balancing_day` column instead of published
+as an expression.
+
+**Breaking throughout**, as every pre-1.0 release here is: `MeterStore::series`
+now returns `Result`, `Completeness` carries a `sparte`, the completeness result
+schema has a column more, and the storage schema gains `balancing_day` in both
+tiers.
+
+### Added
+
+- **The Gastag.** `meter_gas_day(ts)` is the 06:00–06:00 local day the German
+  gas market balances on (GaBi Gas, following Art. 3 Nr. 6 VO (EU) 312/2014);
+  `meter_balancing_day(ts, sparte)` picks between it and the calendar day from
+  the row's commodity, reading `sparte` **per row** so one statement is correct
+  across a mixed portfolio. `meter_expected_intervals` takes an optional third
+  `sparte` argument giving the count for the day that commodity is actually
+  balanced on.
+
+  In Rust: `planner::balancing_day`, `balancing_day_bounds`,
+  `balancing_day_length`, `gas_day_length`, `intervals_in_gas_day` and
+  `expected_intervals_in_balancing_day`, plus re-exports of `metering`'s
+  `gas_day_start_utc`, `gas_day_end_utc`, `local_gas_day`, `day_end_utc` and
+  `shift_back_days`. Each composes `metering`'s primitives; none re-derives a
+  calendar rule (P5).
+
+  The DST anomaly is the part that stays wrong even after switching to gas days,
+  so it is pinned by test in three places. The clocks change at 02:00/03:00
+  local — *before* the 06:00 boundary — so the 23- and 25-hour gas days are the
+  ones named after the **Saturday**, the mirror image of the calendar day:
+
+  | 2026 | Calendar day | Gastag |
+  |---|---|---|
+  | Sat 24 Oct | 96 | **100** |
+  | Sun 25 Oct | **100** | 96 |
+
+  Heat and water stay on the calendar day. The rule is *gas*, not *everything
+  that is not electricity*, and that is asserted rather than assumed.
+- **`encode::parse_malo`** — the counterpart of `canonical_obis` for the other
+  half of the merge key. Generic over `TryInto<MaloId>`, so a caller already
+  holding a parsed identifier passes it through at no cost.
+
+- **`balancing_day` is now a stored column**, and the balancing-day rule no longer
+  leaves this crate as SQL. **Breaking: the storage schema gains a column**, in
+  both tiers.
+
+  The rule — Berlin calendar day for electricity, heat and water; the 06:00–06:00
+  **Gastag** for gas — needs a zone conversion and a wall-clock six-hour shift,
+  and SQL dialects differ on exactly that. No single published expression is right
+  everywhere, so the encoder applies `metering`'s calendar once, per row, at write
+  time and every reader groups on the answer:
+
+  ```sql
+  SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+  ```
+
+  This is the only derived value the crate persists, against its own rule that
+  derived data is computed rather than stored. The objection that answers — a
+  second source of truth that drifts — is met by there being exactly one writer,
+  asserted against the calendar over every commodity across a whole DST weekend at
+  quarter-hour grain. The column is `NOT NULL` with no default, so a hand-written
+  `INSERT` that omits it fails at the write rather than storing a wrong day.
+
+  Completeness now groups on the stored column instead of invoking a UDF per row,
+  and the DuckDB interop suite checks the stored answer against MeterStore's own
+  calendar across the autumn transition, histogram for histogram.
+
+### Fixed
+
+- **A gas Lastgang grouped by `meter_local_day` booked six hours a day into the
+  wrong Bilanzierungstag.** Not at the transitions — every day of the year, with
+  totals that still looked plausible. This is the same class of error as
+  `date_trunc('day', …)` over an electricity series, which this crate already
+  refused; it simply had no name for the gas case until `metering` 0.18 supplied
+  one.
+- **Documentation examples used a MaLo-ID whose check digit is wrong.** Every
+  `12345678901` in the README, the site and the tests is now an identifier the
+  Bildungsvorschrift actually admits.
+- **The integration suite was flaky, and not because of the code.** The two
+  foreign-engine suites start a container per test, and both do real network work
+  before printing anything — DuckDB runs `INSTALL iceberg`, Python runs
+  `pip install pyiceberg`. Cargo starts one test thread per core, so a dozen of
+  those landed at once, starved each other, and whichever lost the race reported
+  `WaitContainer(StartupTimeout)`. The failing *set* changed every run, which is
+  the worst kind of red: it says nothing about the code, and a suite nobody can act
+  on is a suite nobody reads.
+
+  Fixed with a bound (`tests/it/containers.rs`) on how many foreign-engine
+  containers exist at once, not merely a longer timeout — an unbounded suite scales
+  its own load with the host's core count, so a bigger CI runner makes it *worse*.
+  The full suite now passes in parallel, repeatedly, with no thread cap in CI.
+
+- **The hot-tier write path could deadlock itself under concurrency.** After an
+  insert skipped rows (an ordinary redelivery), the check that a skipped row is a
+  true replay rather than a changed value under an existing version reached back
+  to the *pool* for a second connection — while already holding one, and on the
+  reporting path holding one inside an open transaction. With a pool of `n`, `n`
+  concurrent writers each held one connection and each waited for an `n+1`th that
+  could only free up when one of them finished. Nothing timed out; the write path
+  simply stopped, under exactly the concurrency it was built for.
+
+  The check now runs on the connection it was given. That is also the only
+  spelling that is *correct*: it has to see the same snapshot as the insert it is
+  checking, which a separate connection does not.
+
+- **Predicate extraction could narrow a scan and lose rows.** `time_range` saw
+  through *any* cast around `from`, so a truncating one — `CAST("from" AS DATE)`,
+  or a cast down to seconds — was read as a bound on the column itself. A
+  whole-day predicate then extracted a one-microsecond range and the other 95
+  intervals were dropped from the scan, silently, because the rows simply were not
+  there. It now sees through only casts that preserve every stored instant
+  (microsecond and nanosecond timestamps); anything else leaves the range
+  unbounded, which costs a wider scan and never a row. This restores the module's
+  stated invariant that the analysis may only ever be wrong in the widening
+  direction.
+
+### Documentation
+
+- Corrected the explanation of why resolution elision is cold-only, which
+  contradicted itself in both the rustdoc and the querying guide. Tier
+  disjointness is what makes per-tier reasoning *sound*; excluding the hot tier is
+  a separate and merely *practical* point (PostgreSQL keeps no per-file
+  statistics). The old wording asserted the first and then argued the second.
+- The architecture guide's snapshot-summary sample showed an API that does not
+  exist; it now shows the `fast_append` / `set_snapshot_properties` call the code
+  actually makes.
+- Repaired a doc comment on the hot writer that had two summary lines merged into
+  one block, and a truncated sentence in the encoder.
+
 ## [0.3.0] — 2026-08-10
 
 A correctness release, and a large one. A fresh table could not reach the present.

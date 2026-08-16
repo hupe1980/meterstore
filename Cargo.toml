@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
@@ -96,7 +96,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # MeasurementUnit, IntervalResolution, DST-aware billing aggregation, gas
 # conversion, Ersatzwertbildung. MeterStore persists and queries those types —
 # it does not redefine them. Part of the mako platform (hupe1980/mako).
-metering = { version = "0.17", features = ["serde"] }
+metering = { version = "0.18", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is

@@ -156,16 +156,44 @@ fn exclusive_after(t: OffsetDateTime) -> OffsetDateTime {
     t + time::Duration::microseconds(1)
 }
 
-/// Whether an expression refers to the `from` column.
+/// Whether an expression is the `from` column, or a **lossless** cast of it.
+///
+/// DataFusion routinely inserts a cast around a timestamp comparison — it
+/// unifies the two sides on the finer unit, which for this column means
+/// `Timestamp(Microsecond)` widened to `Timestamp(Nanosecond)` — and refusing to
+/// see through that would give up the bound on ordinary queries.
+///
+/// But only a cast that **preserves the ordering of every value** may be seen
+/// through, and that is the narrower rule this implements. A lossy cast
+/// truncates: `CAST("from" AS DATE) = …` matches a whole day, and treating it as
+/// a bound on `from` itself would extract a one-microsecond range and drop the
+/// other 95 intervals — silently, since the rows simply are not in the scan. The
+/// module's whole contract (§17.1) is that the analysis may only ever be wrong in
+/// the widening direction, and an unrestricted cast breaks it.
+///
+/// So: the column itself, or a cast to a timestamp no coarser than the column's
+/// own microseconds. Anything else is not recognised, the range stays unbounded,
+/// and the query is merely slower.
 fn is_from_column(expr: &Expr) -> bool {
-    // `CAST(from AS ...)` still refers to the same column, and DataFusion
-    // frequently inserts casts around timestamp comparisons.
     match expr {
         Expr::Column(c) => c.name == col::FROM,
-        Expr::Cast(cast) => is_from_column(&cast.expr),
-        Expr::TryCast(cast) => is_from_column(&cast.expr),
+        Expr::Cast(cast) if is_lossless_target(&cast.data_type) => is_from_column(&cast.expr),
+        Expr::TryCast(cast) if is_lossless_target(&cast.data_type) => is_from_column(&cast.expr),
         _ => false,
     }
+}
+
+/// Whether casting `from` to this type keeps every stored instant distinct.
+///
+/// The stored column is `Timestamp(Microsecond, UTC)`, so microseconds and
+/// nanoseconds round-trip and everything else — a coarser unit, a date, a string
+/// — collapses instants that the predicate then cannot tell apart.
+fn is_lossless_target(ty: &crate::arrow::datatypes::DataType) -> bool {
+    use crate::arrow::datatypes::{DataType, TimeUnit};
+    matches!(
+        ty,
+        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
+    )
 }
 
 /// Read a literal timestamp, whatever unit it was written in.
@@ -335,7 +363,7 @@ mod tests {
 
     #[test]
     fn predicates_on_other_columns_are_ignored() {
-        let r = time_range(&[df_col(col::MALO_ID).eq(lit("12345678901"))]);
+        let r = time_range(&[df_col(col::MALO_ID).eq(lit("12345678905"))]);
         assert_eq!(r, TimeRange::unbounded());
     }
 
@@ -346,17 +374,65 @@ mod tests {
         assert_eq!(r, TimeRange::unbounded());
     }
 
+    /// `CAST(from AS <ty>)`, the shape DataFusion inserts around a comparison.
+    fn cast_from(ty: crate::arrow::datatypes::DataType) -> Expr {
+        Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(from()), ty))
+    }
+
+    fn timestamp(unit: crate::arrow::datatypes::TimeUnit) -> crate::arrow::datatypes::DataType {
+        crate::arrow::datatypes::DataType::Timestamp(unit, Some("UTC".into()))
+    }
+
     #[test]
-    fn a_cast_around_the_column_is_seen_through() {
-        let cast = Expr::Cast(datafusion::logical_expr::Cast::new(
-            Box::new(from()),
-            crate::arrow::datatypes::DataType::Timestamp(
-                crate::arrow::datatypes::TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ),
+    fn a_lossless_cast_around_the_column_is_seen_through() {
+        use crate::arrow::datatypes::TimeUnit;
+
+        // The column's own unit, and the finer one DataFusion unifies on when
+        // the other side is a nanosecond literal. Both keep every stored instant
+        // distinct, so the bound they carry is the column's bound.
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let r = time_range(&[cast_from(timestamp(unit)).gt_eq(ts(T10))]);
+            assert_eq!(r.start(), Some(T10), "{unit:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncating_cast_is_not_mistaken_for_a_bound_on_the_column() {
+        use crate::arrow::datatypes::{DataType, TimeUnit};
+
+        // The failure this prevents. `CAST("from" AS DATE) = <an instant>` is
+        // satisfied by every reading of that day, but read as a bound on `from`
+        // itself it extracts a one-microsecond range — and the other 95 intervals
+        // are dropped from the scan with nothing to notice it. Same for a cast
+        // down to seconds or milliseconds, which collapses sub-unit instants.
+        //
+        // Widening is the only legal direction here (§17.1), so an unrecognised
+        // shape must cost a scan rather than a row.
+        for ty in [
+            DataType::Date32,
+            timestamp(TimeUnit::Second),
+            timestamp(TimeUnit::Millisecond),
+        ] {
+            assert_eq!(
+                time_range(&[cast_from(ty.clone()).eq(ts(T10))]),
+                TimeRange::unbounded(),
+                "{ty:?} truncates, so it cannot bound `from`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lossless_cast_over_a_truncating_one_is_still_refused() {
+        use crate::arrow::datatypes::{DataType, TimeUnit};
+
+        // Nesting must not launder the truncation: casting the *day* back up to
+        // microseconds restores the type but not the instant.
+        let inner = cast_from(DataType::Date32);
+        let outer = Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(inner),
+            timestamp(TimeUnit::Microsecond),
         ));
-        let r = time_range(&[cast.gt_eq(ts(T10))]);
-        assert_eq!(r.start(), Some(T10));
+        assert_eq!(time_range(&[outer.eq(ts(T10))]), TimeRange::unbounded());
     }
 
     #[test]
@@ -486,7 +562,7 @@ mod properties {
                 Self::Cmp(op, t) => binary(from, *op, ts(*t)),
                 Self::Flipped(op, t) => binary(ts(*t), *op, from),
                 Self::Between(lo, hi) => from.between(ts(*lo), ts(*hi)),
-                Self::Foreign => df_col(col::MALO_ID).eq(lit("12345678901")),
+                Self::Foreign => df_col(col::MALO_ID).eq(lit("12345678905")),
                 Self::And(a, b) => a.to_expr().and(b.to_expr()),
                 Self::Or(a, b) => a.to_expr().or(b.to_expr()),
             }

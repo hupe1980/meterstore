@@ -27,7 +27,7 @@ const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 /// One reading, at a chosen value, version and quality.
 fn reading(kwh: i64, version: u128, quality: QualityFlag) -> meterstore::encode::StoredSeries {
     let mut series = MeasurementSeries::new(
-        "12345678901",
+        "12345678905".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         vec![MeterInterval {
             from: START,

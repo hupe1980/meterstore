@@ -103,8 +103,9 @@ impl Harness {
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     resolution, source_kind, source_detail, provenance,
-                    version, version_scope, recorded_at)
-                   VALUES ($1,$2,$3,'STROM',$4,$5,$6,'KWH',$7,$8,$9,$10,$11,$12,$13,$14)"#
+                    version, version_scope, recorded_at, balancing_day)
+                   VALUES ($1,$2,$3,'STROM',$4,$5,$6,'KWH',$7,$8,$9,$10,$11,$12,$13,$14,
+                           CAST(($4 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
             .bind(format!("1234567890{}", i % 3))
             .bind(None::<String>)

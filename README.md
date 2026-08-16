@@ -120,7 +120,7 @@ store.append(&[stored_series]).await?;
 let result = store.query(r#"
     SELECT meter_local_day("from") AS day, SUM(value) AS kwh
     FROM readings
-    WHERE malo_id = '12345678901'
+    WHERE malo_id = '41373559241'
       AND "from" >= '2025-01-01' AND "from" < '2026-01-01'
     GROUP BY 1 ORDER BY 1
 "#).await?;
@@ -134,6 +134,34 @@ naming is load-bearing — see
 [the version-resolution trap](https://hupe1980.github.io/meterstore/docs/interop/#the-version-resolution-trap)
 before pointing an external engine at the warehouse.
 
+`meter_local_day` is not a convenience, and for **gas it is the wrong function**.
+`Europe/Berlin` observes daylight saving, so the UTC day boundary sits at 01:00
+or 02:00 local and grouping on UTC days is wrong every day of the year — but the
+German gas market does not balance on the calendar day either. A *Gastag* runs
+06:00 to 06:00 local, so a gas Lastgang grouped by the calendar day books six
+hours a day into the neighbouring Bilanzierungstag, with totals that still look
+plausible. `meter_balancing_day("from", sparte)` reads the commodity per row and
+picks the right one:
+
+```sql
+SELECT sparte, meter_balancing_day("from", sparte) AS day, SUM(value)
+FROM readings GROUP BY 1, 2;
+```
+
+The DST anomaly moves with the boundary: the clocks change *before* 06:00, so the
+25-hour gas day is the one named after the **Saturday** while the 25-hour
+calendar day is the Sunday.
+
+**An external engine does not get that function — so it gets the answer instead.**
+SQL dialects differ on timestamp arithmetic, so no single published expression is
+right everywhere. The encoder applies the calendar once, at write time, and stores
+the answer:
+
+```sql
+-- Every engine. No zone conversion, no DST reasoning, no dialect.
+SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+```
+
 [Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
 ## Requirements
@@ -142,7 +170,7 @@ before pointing an external engine at the warehouse.
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **14 or later** | Declarative range partitioning, so a purge is `DETACH` + `DROP TABLE` |
-| `metering` | 0.17 or later | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | 0.18 or later | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
@@ -194,25 +222,17 @@ archival, tier-split queries, version resolution with statistics-based elision,
 reproducible reads on both time axes, completeness, multi-table sessions, routed
 writes, erasure, schema quarantine, and both serving surfaces.
 
-**554 tests** — unit, property, and integration against real PostgreSQL 16 and a
+**587 tests** — unit, property, and integration against real PostgreSQL 16 and a
 real Iceberg warehouse, plus an independently implemented correctness oracle over
-generated workloads. The open-format claim is checked by two foreign engines:
-**DuckDB** reads the Parquet and the Iceberg metadata, and **PyIceberg** — the
-Iceberg project's own implementation — reads the schema with its field ids, the
-partition spec, the format version, and the tiering watermark out of the snapshot
-summary.
+generated workloads. **DuckDB** and **PyIceberg** read the output and agree with
+it.
 
-Two claims are measured rather than targeted:
-
-- **Compression vs PostgreSQL row storage: ~109×** (457 B/row against 4.2 B/row),
-  measured over the whole partition tree including indexes. Read it with the
-  caveats in the measurement suite — the fixture's low cardinality flatters it —
-  but the >10× target is met with room to spare.
-- **Archival memory is bounded by the chunk, not the window**, structurally: no
-  stage on the path holds one.
+Measured rather than targeted: **~109× compression** against PostgreSQL row
+storage (457 B/row against 4.2 B/row — the measurement suite carries the
+caveats), and archival memory bounded by the chunk, not the window.
 
 Not yet done: query-latency benchmarks on reference hardware, so the p99 targets
-remain aspirational; interop against Spark and Trino; a CLI. Compaction
+remain aspirational; Spark and Trino interop; a CLI. Compaction
 and orphan-file cleanup are
 [blocked upstream](https://hupe1980.github.io/meterstore/docs/operations/#maintenance-that-is-not-implemented)
 rather than deferred.

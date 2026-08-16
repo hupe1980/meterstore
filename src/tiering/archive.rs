@@ -864,6 +864,9 @@ mod tests {
                     crate::arrow::datatypes::DataType::UInt8 => {
                         Arc::new(crate::arrow::array::UInt8Array::from(vec![0u8; n])) as _
                     }
+                    crate::arrow::datatypes::DataType::Date32 => {
+                        Arc::new(crate::arrow::array::Date32Array::from(vec![0i32; n])) as _
+                    }
                     crate::arrow::datatypes::DataType::Timestamp(_, _) => Arc::new(
                         crate::arrow::array::TimestampMicrosecondArray::from(vec![0i64; n])
                             .with_timezone("UTC"),

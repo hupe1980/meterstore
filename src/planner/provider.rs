@@ -924,6 +924,9 @@ mod tests {
                 crate::arrow::datatypes::DataType::UInt8 => {
                     Arc::new(UInt8Array::from(vec![0u8; rows])) as _
                 }
+                crate::arrow::datatypes::DataType::Date32 => {
+                    Arc::new(crate::arrow::array::Date32Array::from(vec![0i32; rows])) as _
+                }
                 crate::arrow::datatypes::DataType::Timestamp(_, _) => {
                     Arc::new(TimestampMicrosecondArray::from(vec![0i64; rows]).with_timezone("UTC"))
                         as _
@@ -1120,7 +1123,7 @@ mod tests {
         // made — see `supports_filters_pushdown`.
         let p = provider(1, 1);
         let time = df_col(schema::col::FROM).gt_eq(ts(BOUNDARY));
-        let other = df_col(schema::col::MALO_ID).eq(lit("12345678901"));
+        let other = df_col(schema::col::MALO_ID).eq(lit("12345678905"));
 
         let got = p.supports_filters_pushdown(&[&time, &other]).unwrap();
         assert!(

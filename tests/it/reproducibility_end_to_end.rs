@@ -139,9 +139,10 @@ impl Harness {
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
-                    version, version_scope, recorded_at)
+                    version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'mscons',
-                           $6,'[]',$7,'99:2026-07',$8)"#
+                           $6,'[]',$7,'99:2026-07',$8,
+                           CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
             .bind(malo)
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
@@ -222,8 +223,8 @@ async fn every_result_carries_the_boundary_it_was_computed_against() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
-    h.insert("11111111111", D20, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
+    h.insert("11111111115", D20, 96, 1, V1).await;
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -247,8 +248,8 @@ async fn a_reporting_query_can_prove_it_never_touched_postgres() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
-    h.insert("11111111111", D20, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
+    h.insert("11111111115", D20, 96, 1, V1).await;
     h.archive_through(D21).await;
 
     let result = h
@@ -277,7 +278,7 @@ async fn a_pinned_snapshot_reproduces_what_was_known_then() {
     // One day, one meter, 10 kWh per interval. Archived through D20 so the
     // horizon reaches D19 and the whole of D18 lands in the cold tier — the
     // correction below is only a *late* correction if its interval is archived.
-    h.insert("11111111111", D18, 96, 10, V1).await;
+    h.insert("11111111115", D18, 96, 10, V1).await;
     h.archive_through(D20).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -328,7 +329,7 @@ async fn a_version_ceiling_pins_the_domain_axis_independently() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 10, V1).await;
+    h.insert("11111111115", D18, 96, 10, V1).await;
     h.archive_through(D20).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -389,8 +390,8 @@ async fn a_reproducible_read_never_touches_the_mutable_tier() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 10, V1).await;
-    h.insert("11111111111", D20, 96, 10, V1).await; // stays hot
+    h.insert("11111111115", D18, 96, 10, V1).await;
+    h.insert("11111111115", D20, 96, 10, V1).await; // stays hot
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -462,9 +463,9 @@ async fn completeness_reports_a_gap_across_both_tiers() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 1, V1).await; // complete, archived
-    h.insert("11111111111", D19, 90, 1, V1).await; // short, archived
-    h.insert("11111111111", D20, 96, 1, V1).await; // complete, hot
+    h.insert("11111111115", D18, 96, 1, V1).await; // complete, archived
+    h.insert("11111111115", D19, 90, 1, V1).await; // short, archived
+    h.insert("11111111115", D20, 96, 1, V1).await; // complete, hot
     h.archive_through(D21).await;
 
     let rows = h
@@ -498,8 +499,8 @@ async fn completeness_uses_each_series_own_resolution() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 1, V1).await;
-    h.insert_with("22222222222", D18, 24, 1, V1, "MEASURED", "PT1H")
+    h.insert("11111111115", D18, 96, 1, V1).await;
+    h.insert_with("22222222220", D18, 24, 1, V1, "MEASURED", "PT1H")
         .await;
 
     let mut rows = h
@@ -525,8 +526,8 @@ async fn completeness_counts_a_corrected_interval_once() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 10, V1).await;
-    h.insert("11111111111", D18, 96, 40, V2).await; // a correction, same intervals
+    h.insert("11111111115", D18, 96, 10, V1).await;
+    h.insert("11111111115", D18, 96, 40, V2).await; // a correction, same intervals
 
     let rows = h
         .store(ReadMode::Unified)
@@ -548,14 +549,14 @@ async fn completeness_is_reachable_from_sql() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 90, 1, V1).await;
+    h.insert("11111111115", D18, 90, 1, V1).await;
 
     let result = h
         .store(ReadMode::Unified)
         .await
         .query(
             "SELECT missing FROM meter_completeness('2026-07-18', '2026-07-19') \
-             WHERE malo_id = '11111111111'",
+             WHERE malo_id = '11111111115'",
         )
         .await
         .expect("completeness through SQL");
@@ -572,14 +573,15 @@ async fn the_typed_read_returns_the_domain_type_across_both_tiers() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 3, V1).await;
-    h.insert("11111111111", D20, 96, 3, V1).await;
+    h.insert("11111111115", D18, 96, 3, V1).await;
+    h.insert("11111111115", D20, 96, 3, V1).await;
     h.archive_through(D21).await;
 
     let series = h
         .store(ReadMode::Unified)
         .await
-        .series("11111111111")
+        .series("11111111115")
+        .unwrap()
         .obis("1-0:1.8.0")
         .unwrap()
         .range(D18, D21)
@@ -588,7 +590,7 @@ async fn the_typed_read_returns_the_domain_type_across_both_tiers() {
         .expect("typed read")
         .expect("rows exist");
 
-    assert_eq!(series.malo_id, "11111111111");
+    assert_eq!(series.malo_id.as_str(), "11111111115");
     assert_eq!(series.intervals.len(), 192);
     // Ordered, so the domain layer's arithmetic sees a series that runs forwards.
     assert!(series.intervals.windows(2).all(|w| w[0].from < w[1].from));
@@ -604,13 +606,14 @@ async fn the_typed_read_returns_the_corrected_value() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 10, V1).await;
-    h.insert("11111111111", D18, 96, 40, V2).await;
+    h.insert("11111111115", D18, 96, 10, V1).await;
+    h.insert("11111111115", D18, 96, 40, V2).await;
 
     let series = h
         .store(ReadMode::Unified)
         .await
-        .series("11111111111")
+        .series("11111111115")
+        .unwrap()
         .range(D18, D19)
         .collect()
         .await
@@ -633,7 +636,8 @@ async fn a_typed_read_of_a_meter_with_no_data_is_absence_not_zero() {
     let series = h
         .store(ReadMode::Unified)
         .await
-        .series("99999999999")
+        .series("99999999995")
+        .unwrap()
         .range(D18, D21)
         .collect()
         .await
@@ -643,19 +647,37 @@ async fn a_typed_read_of_a_meter_with_no_data_is_absence_not_zero() {
 
 #[tokio::test]
 async fn a_malo_id_from_a_message_never_reaches_the_sql_text() {
-    // §19.7: user values are bound, never concatenated. A quote in the input
-    // must produce no rows rather than a syntax error or a wider scan.
+    // §19.7: user values are bound, never concatenated. Since 0.4 the
+    // identifier is also *parsed* before it is bound, so an injection attempt is
+    // refused one layer earlier than it used to be — it is not a MaLo-ID, so
+    // there is no query to run. Both layers are asserted here: the parse
+    // rejects the quote, and a well-formed identifier that happens not to exist
+    // still produces no rows rather than a syntax error.
     let h = Harness::start().await;
     h.hot
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
 
-    let series = h
-        .store(ReadMode::Unified)
-        .await
-        .series("' OR '1'='1")
+    let store = h.store(ReadMode::Unified).await;
+
+    let refused = store.series("' OR '1'='1");
+    assert!(
+        refused.is_err(),
+        "a quoted injection attempt is not a MaLo-ID and never becomes a query"
+    );
+
+    // The eleven digits of 11111111115 with the check digit deliberately wrong:
+    // well-formed enough to reach the parser, refused by it.
+    assert!(
+        store.series("11111111111").is_err(),
+        "a wrong check digit is caught before it silently selects nothing"
+    );
+
+    let series = store
+        .series("22222222220")
+        .expect("a well-formed MaLo-ID")
         .range(D18, D21)
         .collect()
         .await
@@ -706,7 +728,7 @@ async fn a_contended_archiver_does_nothing_rather_than_racing() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
     h.cold
         .append_and_commit(
             TABLE,
@@ -778,13 +800,63 @@ async fn the_resolution_sql_is_reachable_from_a_sql_client() {
 }
 
 #[tokio::test]
+async fn the_balancing_day_column_is_reachable_from_a_sql_client() {
+    // The second rule an external engine needs and cannot derive: gas is
+    // balanced on the 06:00 Gastag, so a daily aggregate grouped on the calendar
+    // day is six hours out of phase. Delivered as the *name of a column* rather
+    // than as an expression, because the Gastag has no portable SQL — and the
+    // column has to actually be there, which is what this checks.
+    let h = Harness::start().await;
+    h.archive_through(D19).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    store
+        .refresh_system_tables(D21)
+        .await
+        .expect("refresh system tables");
+
+    let result = store
+        .query("SELECT value FROM system.resolution WHERE setting = 'balancing_day_column'")
+        .await
+        .expect("query");
+
+    use datafusion::arrow::array::AsArray;
+    let name = result.batches()[0]
+        .column(0)
+        .as_string::<i32>()
+        .value(0)
+        .to_string();
+    assert_eq!(
+        name,
+        store.balancing_day_column(),
+        "one definition, not two"
+    );
+
+    // And it names a column that exists and is a date — the whole delivery
+    // mechanism is worthless if the name does not resolve. Asked of the plan
+    // rather than of the rows, so this asserts the schema whether or not the
+    // fixture happens to hold data in range.
+    let described = store
+        .describe(&format!(
+            "SELECT {name}, COUNT(*) FROM readings GROUP BY 1 ORDER BY 1"
+        ))
+        .await
+        .expect("the published column must resolve");
+    assert_eq!(
+        described.schema().field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Date32,
+        "the published name must be the date column, not something coincidental"
+    );
+}
+
+#[tokio::test]
 async fn system_snapshots_lists_what_a_reproducible_read_can_pin() {
     let h = Harness::start().await;
     h.hot
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
     h.archive_through(D19).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -970,7 +1042,7 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
         .collect();
 
     let mut series = MeasurementSeries::new(
-        "11111111111".to_string(),
+        "11111111115".parse().unwrap(),
         Some("1-0:1.8.0".parse().unwrap()),
         intervals,
         MeasurementSource::Mscons {
@@ -1012,8 +1084,8 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1, V1).await;
-    h.insert("11111111111", D19, 96, 1, V1).await;
+    h.insert("11111111115", D18, 96, 1, V1).await;
+    h.insert("11111111115", D19, 96, 1, V1).await;
 
     h.cold
         .append_and_commit(
@@ -1075,7 +1147,7 @@ async fn writes_during_archival_are_never_stranded_below_the_watermark() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 10, V1).await;
+    h.insert("11111111115", D18, 96, 10, V1).await;
     h.cold
         .append_and_commit(
             TABLE,
@@ -1140,7 +1212,7 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
         .collect();
 
     let mut series = MeasurementSeries::new(
-        "11111111111".to_string(),
+        "11111111115".parse().unwrap(),
         Some("1-0:1.8.0".parse().unwrap()),
         intervals,
         MeasurementSource::Mscons {

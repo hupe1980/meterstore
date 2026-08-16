@@ -10,55 +10,24 @@ history *directly from object storage*. MeterStore is then in the metadata path
 only — never the data path — so readers scale in parallel and MeterStore is
 neither a bottleneck nor a single point of failure.
 
-That is the whole point of storing regulated data in an open format, and it is
-tested rather than asserted, in two engines:
+Two engines read the output in the test suite:
 
-- **DuckDB** — a different language, a different Parquet reader and its own C++
-  reading of the Iceberg spec — reads both the Parquet and the table metadata and
-  agrees with MeterStore about which files belong to the table, what the values
-  are, and how many snapshots exist.
-- **PyIceberg**, the Iceberg project's own implementation, reads the schema *with
-  its field ids* (Iceberg resolves columns by id, so a writer that assigned them
-  differently produces a table that opens and returns the wrong column), the
-  partition spec, the sort order, the format version, and the tiering watermark
-  out of the snapshot summary.
+| Engine | What it reads |
+|---|---|
+| **DuckDB** | The Parquet files and the Iceberg metadata. Agrees with MeterStore on which files belong to the table, on the values, and on the snapshot count. Groups a gas Lastgang across a DST transition by `balancing_day` and matches MeterStore's own histogram. |
+| **PyIceberg** | The schema with its field ids, the partition spec, the sort order, the format version, and the tiering watermark from the snapshot summary. |
 
-That second one matters beyond format portability: PyIceberg is the engine this
-documentation tells you to use for the maintenance MeterStore cannot do itself,
-so it needs to be demonstrated rather than assumed.
 
-## The version-resolution trap {#the-version-resolution-trap}
+Field ids matter because Iceberg resolves columns by id, not by name: a writer
+that assigned them differently produces a table that opens and returns the wrong
+column. PyIceberg is also the engine this documentation recommends for the
+[maintenance MeterStore cannot do itself](@/docs/operations.md), so it is checked
+rather than assumed.
 
-**This is a correctness bug, not an ergonomic one.** Read the tail of this section
-before pointing any engine at the warehouse.
+## Resolving corrections {#the-version-resolution-trap}
 
-An external engine reading the Iceberg table sees **raw versioned rows**, with no
-knowledge of latest-version-wins. A naive `SELECT SUM(value)` **double-counts
-every corrected interval** — silently, in a number someone will bill from.
-
-Worse: compaction collapses superseded versions, so most partitions converge to
-one version per key and the naive query becomes *incidentally* correct. It works
-in testing and fails after a correction lands.
-
-Three mitigations, in the order they are actually available:
-
-**1. The raw table is named honestly.** It is `readings_versions`, not `readings`.
-The name that looks like the obvious thing to query must not be the one returning
-wrong answers.
-
-**2. The resolution SQL is published.** One definition, two surfaces:
-
-```rust
-let sql = store.resolution_sql();
-```
-
-```sql
-SELECT value FROM system.resolution WHERE setting = 'resolution_sql';
-```
-
-Paste it into a Trino, Spark or DuckDB session. The derived table is aliased, so
-the same text also runs in PostgreSQL — which rejects an unaliased subquery, and
-is a likely place for an operator to paste it.
+`readings_versions` is a versioned table: a correction is a new row with a higher
+`version`, never an update. Take the highest per reading.
 
 ```sql
 SELECT malo_id, obis_code, "from", value, … FROM (
@@ -70,20 +39,44 @@ SELECT malo_id, obis_code, "from", value, … FROM (
 ) AS _meterstore_resolved WHERE _meterstore_rank = 1
 ```
 
-Note the `version_scope` in the partition: MSCONS assigns versions per network
-operator per month, so versions from different scopes are not comparable and must
-not be ranked against each other.
+Two parts of that are not guessable:
 
-**3. An Iceberg View named `readings`** would make this automatic for view-aware
-engines. It is **blocked**: `iceberg-rust` exposes `ViewCreation` and `ViewUpdate`
-types but no `create_view` on the `Catalog` trait. Tracked for when upstream lands
-it — until then, (1) is the primary defence and the naming is load-bearing.
+- **`version_scope` is in the `PARTITION BY`.** MSCONS assigns versions per
+  network operator per month, so versions from different scopes are not
+  comparable and must not be ranked against each other.
+- **Identity columns widen the merge key.** If the deployment declares any
+  ([storage model](@/docs/storage-model.md)), add them to the `PARTITION BY` —
+  omitting one resolves *across* it, so with a `tenant` column one tenant's
+  correction supersedes another's reading.
 
-The interop suites assert that the naive sum really *is* wrong before asserting
-that the published rule fixes it — in DuckDB as SQL, and in PyIceberg over the
-Arrow table it returns, which is what a maintenance script would actually do. A
-mitigation for a hazard nobody has demonstrated is one nobody will bother to
-apply.
+## Gas is not on the calendar day {#the-gas-day-trap}
+
+Every row carries a **`balancing_day`** column — the Berlin calendar day for
+electricity, heat and water, the **Gastag** (06:00 to 06:00 local, GaBi Gas,
+Art. 3 Nr. 6 VO (EU) 312/2014) for gas. Group by it:
+
+```sql
+SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+```
+
+`date_trunc('day', "from")` is wrong twice over: `"from"` is UTC, so the Berlin
+day boundary sits at 22:00 or 23:00 UTC; and gas is not balanced on the calendar
+day at all. Neither error raises anything — both produce a plausible daily curve.
+
+The column is computed at write time because SQL dialects differ on timestamp
+arithmetic, so no single published expression is right everywhere.
+
+At a DST transition the long and short gas days are the ones named after the
+**Saturday**, because the clocks change before the 06:00 boundary:
+
+| 2026 | Calendar day | Gastag |
+|---|---|---|
+| Sat 24 Oct | 96 | **100** |
+| Sun 25 Oct | **100** | 96 |
+
+The DuckDB suite groups a gas workload across that transition by the stored
+column, matches MeterStore's own histogram, and checks that the naive UTC
+grouping disagrees.
 
 ## Which catalogue you are on matters
 

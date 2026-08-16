@@ -40,13 +40,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # Every integration test starts its own PostgreSQL container, so the
-      # limit is Docker's rather than the CPU's. `cargo test` defaults to one
-      # thread per core; unbounded, the suite exhausts container slots and fails
-      # with `PortNotExposed` or a create timeout — which looks like a broken
-      # test and is not.
+      # Full parallelism. The blanket `--test-threads=4` this used to carry
+      # predated two changes: PostgreSQL is now one shared container per test
+      # binary rather than one per test, and the only remaining per-test
+      # containers — the foreign engines — are bounded directly by
+      # `tests/it/containers.rs`. Capping every test to throttle a dozen of them
+      # slowed the other 228 for nothing.
       - name: Test
-        run: cargo test --all-features -- --test-threads=4
+        run: cargo test --all-features
 
       - name: Docs
         run: cargo doc --no-deps --all-features

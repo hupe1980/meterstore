@@ -10,7 +10,7 @@ weight = 5
 let df = store.sql(r#"
     SELECT meter_local_day("from") AS day, SUM(value) AS kwh
     FROM readings
-    WHERE malo_id = '12345678901'
+    WHERE malo_id = '41373559241'
       AND "from" >= '2025-01-01' AND "from" < '2026-01-01'
     GROUP BY 1 ORDER BY 1
 "#).await?;
@@ -113,13 +113,18 @@ Corrections are rare and concentrated in recent months, so most historical
 partitions take the direct path. Elision is conservative: statistics must *prove*
 absence, and a missing statistic counts as proof of nothing.
 
-It applies only to scans entirely below the watermark. That is not caution — it is
-what makes per-tier reasoning sound. Both versions of a corrected reading always
-live in the same tier, because the tiers hold disjoint ranges and `append` routes
-a late correction to the tier that owns its interval. The hot tier is excluded for
-a practical reason instead: PostgreSQL keeps no per-file statistics, and proving
-the hot window correction-free would mean scanning exactly the rows the
-optimisation was meant to avoid.
+It applies only to scans entirely below the watermark, and two separate things are
+going on there.
+
+What makes it *sound* to reason about one tier at a time is that every version of
+a corrected reading lives in the **same** tier — the tiers hold disjoint ranges,
+and `append` routes a late correction to the tier that owns its interval. Without
+that, "no corrections among the cold files" would say nothing about the reading as
+a whole.
+
+Why the *hot* tier is excluded is then merely practical: PostgreSQL keeps no
+per-file statistics, so proving the hot window correction-free would mean scanning
+exactly the rows the optimisation was meant to avoid.
 
 `EXPLAIN` shows the split, and whether resolution was elided.
 
@@ -130,13 +135,23 @@ The unit of work is `metering`'s `MeasurementSeries`, so a caller that wants
 
 ```rust
 let series: Option<MeasurementSeries> = store
-    .series("12345678901")
+    .series("41373559241")?          // check digit verified on the way in
     .obis("1-0:1.8.0")?              // canonicalised on the way in
     .range(from, to)
     .quality_in(&[QualityFlag::Measured, QualityFlag::Substituted])
     .collect()
     .await?;
 ```
+
+`.series()` accepts either a string, which it parses, or a `metering::MaloId`
+already parsed at the caller's own boundary, which costs nothing. **The parse is
+the point.** A MaLo-ID carries a check digit precisely so that a transposition is
+detectable, and this is the last place it can still be detected: past here, a
+wrong-but-plausible identifier returns an empty series and no error at all. The
+same reasoning applies on the way out — the decoder parses `malo_id` and
+`melo_id` back into `MaloId`/`MeloId`, so a row that reached storage through a
+bulk load or a hand-run `INSERT` cannot enter the typed path as an identifier it
+is not.
 
 | Terminal | Returns |
 |---|---|
@@ -147,7 +162,7 @@ let series: Option<MeasurementSeries> = store
 | `.intervals()` | Just the intervals, empty when the range holds none |
 | `.collect_with_provenance()` | The series and the `QueryResult` |
 
-**`collect` returns `Option`, and that is not an oversight.** A
+**`collect` returns `Option`.** A
 `MeasurementSeries` asserts a `source` — who reported these values — and with no
 values there is nobody to name. Fabricating one would put a delivery in the audit
 trail that never happened. Use `.intervals()` when an empty range genuinely means
@@ -176,19 +191,59 @@ SELECT meter_local_day("from") AS day, SUM(value) FROM readings GROUP BY 1;
 | Function | Returns |
 |---|---|
 | `meter_local_day(ts)` | The Berlin calendar day, as `Date32` |
+| `meter_gas_day(ts)` | The **Gastag** — 06:00 to 06:00 local |
+| `meter_balancing_day(ts, sparte)` | Whichever of the two the commodity uses |
 | `meter_local_month(ts)` | The Berlin month, as its first day |
-| `meter_expected_intervals(day, resolution)` | 96 normally, 92 in spring, 100 in autumn |
+| `meter_expected_intervals(day, resolution[, sparte])` | 96 normally, 92 in spring, 100 in autumn |
 
-MeterStore does not implement any of this. The arithmetic is
-`metering::calendar`'s, and these are thin wrappers whose tests assert that the
-wrapper preserves the upstream answer — not that the answer is right, which is the
-domain library's job.
+Every row also stores its balancing day, so `GROUP BY balancing_day` gives the
+same buckets without a function call — and is what an engine reading the Iceberg
+files directly uses ([external engines](@/docs/interop.md#the-gas-day-trap)).
+
+The arithmetic is `metering::calendar`'s; these are thin wrappers over it.
+
+### Gas is balanced on a different day
+
+The German gas market does not balance on the calendar day. A **Gastag** runs
+06:00 to 06:00 local time (GaBi Gas, following Art. 3 Nr. 6 VO (EU) 312/2014),
+so `meter_local_day` over a gas Lastgang is wrong in precisely the way
+`date_trunc('day', …)` is wrong over an electricity one: it books the
+00:00–06:00 draw into the neighbouring Bilanzierungstag, six hours a day, every
+day, and the totals still look plausible.
+
+```sql
+-- Right for a mixed table, and for a single-commodity one.
+SELECT sparte, meter_balancing_day("from", sparte) AS day, SUM(value)
+FROM readings
+GROUP BY 1, 2;
+```
+
+`meter_balancing_day` reads `sparte` **per row**, so one statement is correct
+across a portfolio. `meter_gas_day` is the direct form for a query already
+restricted to gas.
+
+The clocks change at 02:00/03:00 local — *before* 06:00 — so the 23- and 25-hour
+gas days are the ones named after the **Saturday**, not the transition Sunday:
+
+| 2026 | Calendar day | Gastag |
+|---|---|---|
+| Sat 24 Oct | 96 | **100** |
+| Sun 25 Oct | **100** | 96 |
+| Sat 28 Mar | 96 | **92** |
+| Sun 29 Mar | **92** | 96 |
+
+Passing `sparte` to `meter_expected_intervals` gives the count for the day that
+commodity is actually balanced on. Pair it with `meter_balancing_day`: the
+bucketing and the expectation have to describe the same day, and mixing them
+reports a surplus on one day and a gap on the next.
+
+Heat and water stay on the calendar day. The rule is *gas*, not
+*everything that is not electricity*.
 
 ## Several tables in one session
 
 Each table owns its own watermark, archiver and lease; nothing is transactional
-across them, and that is a design position rather than a limitation. What
-`MeterCatalog` adds is the ability to *express* a question spanning two of them:
+across them. What `MeterCatalog` adds is the ability to *express* a question spanning two of them:
 
 ```rust
 let catalog = MeterCatalog::builder()

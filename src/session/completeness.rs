@@ -16,6 +16,18 @@
 //! this module does not re-derive it: the aggregate below reports what was
 //! *found*, and the expectation is asked of the domain per (day, resolution).
 //!
+//! # And why the day is not always the calendar day
+//!
+//! Gas balances on the **Gastag**, 06:00 to 06:00 local, so a gas channel's day
+//! is not the day electricity's is. Both the bucketing and the expected count
+//! follow the row's `sparte` ([`crate::planner::balancing_day`]), which matters
+//! twice over at a DST transition: the clocks change at 02:00/03:00 local,
+//! *before* the 06:00 boundary, so the 100-interval gas day is the one named
+//! after the **Saturday** while the 100-interval calendar day is the Sunday.
+//! Using calendar days for gas would report the Sunday four short and the
+//! Saturday four in surplus — two findings, neither real, in the one report an
+//! operator is meant to be able to trust.
+//!
 //! # Where the work happens
 //!
 //! The heavy half — group a range by measuring point, channel and local day — is
@@ -37,8 +49,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use metering::IntervalResolution;
-use metering::calendar;
+use metering::interval::Sparte;
 use time::{Date, OffsetDateTime};
+
+use crate::planner::calendar as balancing;
 
 use crate::arrow::array::{Array, AsArray, Date32Array, Int64Array, RecordBatch, StringArray};
 use crate::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -49,9 +63,18 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completeness {
     /// Marktlokation.
+    ///
+    /// Deliberately the stored string rather than a parsed
+    /// [`MaloId`](metering::ids::MaloId): completeness is the report an operator
+    /// runs *to find out what is wrong*, and a single malformed identifier
+    /// anywhere in the range must not take the other hundred thousand rows down
+    /// with it. The typed read path parses; this one reports.
     pub malo_id: String,
     /// The measured channel.
     pub obis_code: String,
+    /// The commodity, which decides **which day** the channel is balanced on:
+    /// the Gastag for [`Sparte::Gas`], the Berlin calendar day for the rest.
+    pub sparte: Sparte,
     /// The declared resolution, or `None` when the series does not carry one.
     ///
     /// Without it there is no expectation to compare against, and the row says
@@ -61,7 +84,7 @@ pub struct Completeness {
     pub expected: u64,
     /// Intervals actually stored.
     pub actual: u64,
-    /// Intervals the range should hold and does not, summed **per local day**.
+    /// Intervals the range should hold and does not, summed **per balancing day**.
     ///
     /// Deliberately not `expected - actual` over the whole range. More rows than
     /// expected is not a negative gap — it is a duplicate or a mis-declared
@@ -71,10 +94,10 @@ pub struct Completeness {
     /// report as complete, which is the one answer a completeness report must
     /// never give. [`Completeness::surplus`] carries the other direction.
     pub missing: u64,
-    /// Rows beyond the expectation, summed per local day — a duplicate or a
+    /// Rows beyond the expectation, summed per balancing day — a duplicate or a
     /// mis-declared resolution.
     pub surplus: u64,
-    /// The first local day that is short, if any.
+    /// The first balancing day that is short, if any.
     pub first_gap: Option<Date>,
     /// Intervals carrying a substitute value (Ersatzwert).
     pub substituted: u64,
@@ -103,6 +126,7 @@ impl Completeness {
 struct DailyRow {
     malo_id: String,
     obis_code: String,
+    sparte: Sparte,
     resolution: Option<String>,
     day: Date,
     actual: u64,
@@ -115,6 +139,7 @@ pub fn completeness_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("malo_id", DataType::Utf8, false),
         Field::new("obis_code", DataType::Utf8, false),
+        Field::new("sparte", DataType::Utf8, false),
         Field::new("resolution", DataType::Utf8, true),
         Field::new("expected", DataType::Int64, false),
         Field::new("actual", DataType::Int64, false),
@@ -144,6 +169,9 @@ pub fn completeness_batch(rows: &[Completeness]) -> Result<RecordBatch> {
                 rows.iter()
                     .map(|r| r.obis_code.as_str())
                     .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.sparte.as_str()).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
                 rows.iter()
@@ -205,10 +233,12 @@ fn is_billable(quality: &str) -> bool {
 
 /// The aggregate that produces the daily grain.
 ///
-/// Grouped by the **local** day, because that is the unit the expectation is
+/// Grouped by the **balancing** day, because that is the unit the expectation is
 /// defined over. Grouping by UTC day would put 22:00–24:00 local in the wrong
 /// bucket every day of the year, and the resulting counts would be short by two
 /// hours at one end and long at the other — the exact error §9.5 exists to stop.
+/// Grouping gas by the *calendar* day is the same error six hours wide, so the
+/// bucket follows the row's Sparte.
 fn daily_plan(
     resolved: Arc<dyn TableProvider>,
     table: &str,
@@ -216,9 +246,7 @@ fn daily_plan(
     to: OffsetDateTime,
 ) -> DfResult<datafusion::logical_expr::LogicalPlan> {
     use datafusion::functions_aggregate::expr_fn::count;
-    use datafusion::logical_expr::ScalarUDF;
 
-    let local_day = ScalarUDF::from(super::udf::LocalDay::default());
     let ts = |t: OffsetDateTime| {
         lit(ScalarValue::TimestampMicrosecond(
             Some((t.unix_timestamp_nanos() / 1_000) as i64),
@@ -245,8 +273,18 @@ fn daily_plan(
         vec![
             col(column::MALO_ID),
             col(column::OBIS_CODE),
+            // Grouped on, not merely selected: the roll-up needs it to ask for
+            // the right expected count. A measuring point has one commodity, so
+            // this adds no cardinality.
+            col(column::SPARTE),
             col(column::RESOLUTION),
-            local_day.call(vec![col(column::FROM)]).alias("day"),
+            // The **stored** balancing day, not a UDF over `from` and `sparte`.
+            // The encoder already asked `metering`'s calendar for it, once, at
+            // the point the row was written; recomputing it here would be a
+            // second derivation to keep in step. It is also plainly faster — a
+            // column the engine can group on and collect statistics for, rather
+            // than a scalar function it must invoke per row.
+            col(column::BALANCING_DAY).alias("day"),
             col(column::QUALITY),
         ],
         vec![count(lit(1i64)).alias("actual")],
@@ -293,6 +331,7 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
 
     let malo = text(column::MALO_ID)?;
     let obis = text(column::OBIS_CODE)?;
+    let sparte = text(column::SPARTE)?;
     let resolution = text(column::RESOLUTION)?;
     let quality = text(column::QUALITY)?;
     let day = batch
@@ -316,6 +355,12 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
         out.push(DailyRow {
             malo_id: malo.value(i).to_string(),
             obis_code: obis.value(i).to_string(),
+            // The commodity decides which day the row was bucketed into and
+            // which expectation it is measured against, so an unrecognised one
+            // is an error rather than an assumed `STROM`.
+            sparte: sparte.value(i).parse().map_err(|e| {
+                Error::decode(column::SPARTE, format!("{:?}: {e}", sparte.value(i)))
+            })?,
             resolution: (!resolution.is_null(i)).then(|| resolution.value(i).to_string()),
             day: epoch
                 .checked_add(time::Duration::days(i64::from(day.value(i))))
@@ -330,15 +375,30 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
 
 /// Aggregate daily rows into per-channel completeness.
 ///
-/// The expectation is asked of `metering` once per (day, resolution). A day
-/// partly outside the queried range is expected to hold only the part inside it,
-/// which is what makes a range that is not day-aligned report honestly rather
+/// The expectation is asked of `metering` once per (day, resolution, sparte). A
+/// day partly outside the queried range is expected to hold only the part inside
+/// it, which is what makes a range that is not day-aligned report honestly rather
 /// than claiming a gap at each end.
+///
+/// The channel key carries the Sparte. A measuring point has one commodity, so
+/// this normally changes nothing — but if a channel ever held two, folding them
+/// into one row would measure gas rows against the electricity day, and the
+/// resulting report would be wrong without saying so. Two rows is the honest
+/// answer.
 fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Vec<Completeness> {
     use std::collections::BTreeMap;
 
+    /// `(malo_id, obis_code, sparte)` — what one reported row describes.
+    ///
+    /// The Sparte enters as its canonical code rather than as the enum, because
+    /// the maps are ordered — a `BTreeMap` keeps the report deterministic — and
+    /// `Sparte` is deliberately not `Ord`. The enum itself rides in the
+    /// accumulator, so nothing has to parse the code back.
+    type ChannelKey = (String, String, &'static str);
+
     // Key by channel; within a channel, days are folded together.
     struct Accumulator {
+        sparte: Sparte,
         resolution: Option<String>,
         expected: u64,
         actual: u64,
@@ -349,17 +409,22 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         not_billable: u64,
     }
 
-    let mut by_channel: BTreeMap<(String, String), Accumulator> = BTreeMap::new();
+    let mut by_channel: BTreeMap<ChannelKey, Accumulator> = BTreeMap::new();
     // Days are visited once per quality flag, so the expectation must only be
     // added the first time a (channel, day) pair is seen.
-    let mut counted: std::collections::BTreeSet<(String, String, Date)> = Default::default();
+    let mut counted: std::collections::BTreeSet<(ChannelKey, Date)> = Default::default();
     // A day is short only once every flag for it has been folded in, so gaps are
     // decided after the fold rather than per row.
-    let mut per_day: BTreeMap<(String, String, Date), (u64, u64)> = BTreeMap::new();
+    let mut per_day: BTreeMap<(ChannelKey, Date), (u64, u64)> = BTreeMap::new();
 
     for row in daily {
-        let key = (row.malo_id.clone(), row.obis_code.clone());
+        let key: ChannelKey = (
+            row.malo_id.clone(),
+            row.obis_code.clone(),
+            row.sparte.as_str(),
+        );
         let entry = by_channel.entry(key.clone()).or_insert(Accumulator {
+            sparte: row.sparte,
             resolution: row.resolution.clone(),
             expected: 0,
             actual: 0,
@@ -376,9 +441,9 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
             entry.resolution = row.resolution.clone();
         }
 
-        let day_key = (row.malo_id, row.obis_code, row.day);
+        let day_key = (key, row.day);
         let expected = if counted.insert(day_key.clone()) {
-            let n = expected_in_day(row.day, row.resolution.as_deref(), from, to);
+            let n = expected_in_day(row.day, row.resolution.as_deref(), row.sparte, from, to);
             entry.expected += n;
             n
         } else {
@@ -390,8 +455,8 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         slot.1 += expected;
     }
 
-    for ((malo, obis, day), (actual, expected)) in per_day {
-        let Some(entry) = by_channel.get_mut(&(malo, obis)) else {
+    for ((channel, day), (actual, expected)) in per_day {
+        let Some(entry) = by_channel.get_mut(&channel) else {
             continue;
         };
         // Zero expected means the day is unmeasurable — no declared resolution,
@@ -418,9 +483,10 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
 
     by_channel
         .into_iter()
-        .map(|((malo_id, obis_code), a)| Completeness {
+        .map(|((malo_id, obis_code, _), a)| Completeness {
             malo_id,
             obis_code,
+            sparte: a.sparte,
             resolution: a.resolution,
             expected: a.expected,
             actual: a.actual,
@@ -433,28 +499,32 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         .collect()
 }
 
-/// How many intervals a local day should hold, clipped to the queried range.
+/// How many intervals a balancing day should hold, clipped to the queried range.
 ///
 /// Zero when the resolution is absent or is a calendar one — there is no fixed
 /// count within a day for `P1M`, and inventing 96 would report a month-resolution
 /// series as 95 intervals short every day.
+///
+/// The day's identity, length and interval count all come from `sparte`: for gas
+/// that is the 06:00–06:00 Gastag, and taking its bounds from the calendar day
+/// instead would clip the wrong six hours at each end of the range.
 fn expected_in_day(
     day: Date,
     resolution: Option<&str>,
+    sparte: Sparte,
     from: OffsetDateTime,
     to: OffsetDateTime,
 ) -> u64 {
     let Some(parsed) = resolution.and_then(|r| r.parse::<IntervalResolution>().ok()) else {
         return 0;
     };
-    let Some(full) = calendar::intervals_in_day(day, parsed) else {
+    let Some(full) = balancing::expected_intervals_in_balancing_day(day, parsed, sparte) else {
         return 0;
     };
     let full = u64::from(full);
 
-    let start = calendar::day_start_utc(day);
-    let length = calendar::day_length(day);
-    let end = start + length;
+    let (start, end) = balancing::balancing_day_bounds(day, sparte);
+    let length = end - start;
 
     // Fully inside the range: the common case, and the only one where the day's
     // own length is the whole answer.
@@ -659,9 +729,14 @@ mod tests {
     const TO: OffsetDateTime = datetime!(2026-04-01 00:00 UTC);
 
     fn row(day: Date, actual: u64, quality: &str) -> DailyRow {
+        sparte_row(Sparte::Strom, day, actual, quality)
+    }
+
+    fn sparte_row(sparte: Sparte, day: Date, actual: u64, quality: &str) -> DailyRow {
         DailyRow {
-            malo_id: "12345678901".into(),
+            malo_id: "12345678905".into(),
             obis_code: "1-0:1.8.0".into(),
+            sparte,
             resolution: Some("PT15M".into()),
             day,
             actual,
@@ -858,17 +933,131 @@ mod tests {
     #[test]
     fn expected_in_day_knows_the_dst_days() {
         assert_eq!(
-            expected_in_day(date!(2026 - 03 - 29), Some("PT15M"), FROM, TO),
+            expected_in_day(
+                date!(2026 - 03 - 29),
+                Some("PT15M"),
+                Sparte::Strom,
+                FROM,
+                TO
+            ),
             92
         );
         assert_eq!(
             expected_in_day(
                 date!(2026 - 10 - 25),
                 Some("PT15M"),
+                Sparte::Strom,
                 datetime!(2026-10-01 00:00 UTC),
                 datetime!(2026-11-01 00:00 UTC)
             ),
             100
         );
+    }
+
+    // ── gas balances on the Gastag ───────────────────────────────────────────
+
+    #[test]
+    fn a_gas_channels_dst_day_is_the_saturday_not_the_sunday() {
+        // The clocks go back at 03:00 local on Sunday 25 October, which is
+        // inside the Gastag that began Saturday 06:00. So the 100-interval gas
+        // day is the 24th — the mirror image of the calendar day, which is what
+        // makes using the wrong one produce two findings instead of none.
+        let october = (
+            datetime!(2026-10-01 00:00 UTC),
+            datetime!(2026-11-01 00:00 UTC),
+        );
+        for (day, gas, strom) in [
+            (date!(2026 - 10 - 24), 100, 96),
+            (date!(2026 - 10 - 25), 96, 100),
+        ] {
+            assert_eq!(
+                expected_in_day(day, Some("PT15M"), Sparte::Gas, october.0, october.1),
+                gas,
+                "gas {day}"
+            );
+            assert_eq!(
+                expected_in_day(day, Some("PT15M"), Sparte::Strom, october.0, october.1),
+                strom,
+                "strom {day}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_gastag_is_complete_and_the_calendar_day_would_not_be() {
+        // 100 intervals on the long Gastag is exactly right. Measured against
+        // the calendar day it would read as four in surplus — a duplicate
+        // finding, on a channel with no duplicates.
+        let out = roll_up(
+            vec![sparte_row(
+                Sparte::Gas,
+                date!(2026 - 10 - 24),
+                100,
+                "MEASURED",
+            )],
+            datetime!(2026-10-01 00:00 UTC),
+            datetime!(2026-11-01 00:00 UTC),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sparte, Sparte::Gas);
+        assert_eq!(out[0].expected, 100);
+        assert!(out[0].is_complete());
+        assert_eq!(out[0].surplus, 0);
+    }
+
+    #[test]
+    fn heat_and_water_keep_the_calendar_day() {
+        // Only gas moved. A blanket "not electricity" rule would shift Wärme and
+        // Wasser onto a 06:00 day nothing in the market uses.
+        for sparte in [Sparte::Waerme, Sparte::Wasser] {
+            assert_eq!(
+                expected_in_day(
+                    date!(2026 - 10 - 25),
+                    Some("PT15M"),
+                    sparte,
+                    datetime!(2026-10-01 00:00 UTC),
+                    datetime!(2026-11-01 00:00 UTC),
+                ),
+                100,
+                "{sparte}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gas_day_clipped_by_the_range_expects_only_the_covered_part() {
+        // A range that starts at 00:00 local reaches into the Gastag that began
+        // 06:00 the *previous* morning, and covers only its last six hours —
+        // 00:00 to 06:00 local. Expecting a whole day there would report 72
+        // intervals missing on the leading day of every gas query, which is the
+        // false alarm the clipping exists to prevent.
+        let from = datetime!(2026-07-14 22:00 UTC); // 00:00 local, 15 July
+        let to = datetime!(2026-07-21 22:00 UTC);
+        assert_eq!(
+            expected_in_day(date!(2026 - 07 - 14), Some("PT15M"), Sparte::Gas, from, to),
+            24,
+            "the 00:00–06:00 tail of the Gastag that began on the 14th"
+        );
+        assert_eq!(
+            expected_in_day(date!(2026 - 07 - 15), Some("PT15M"), Sparte::Gas, from, to),
+            96,
+            "wholly inside the range"
+        );
+    }
+
+    #[test]
+    fn two_commodities_on_one_channel_are_reported_separately() {
+        // Not an expected state, but folding them would measure the gas rows
+        // against the electricity day and say nothing about it.
+        let out = roll_up(
+            vec![
+                sparte_row(Sparte::Strom, date!(2026 - 03 - 02), 96, "MEASURED"),
+                sparte_row(Sparte::Gas, date!(2026 - 03 - 02), 96, "MEASURED"),
+            ],
+            FROM,
+            TO,
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(Completeness::is_complete));
     }
 }

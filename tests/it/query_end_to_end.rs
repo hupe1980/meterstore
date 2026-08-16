@@ -154,9 +154,10 @@ impl Harness {
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     resolution, source_kind, source_detail, provenance,
-                    version, version_scope, recorded_at)
+                    version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH','MEASURED','PT15M','mscons',
-                           $6,'[]',$7,$9,$8)"#
+                           $6,'[]',$7,$9,$8,
+                           CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
             .bind(malo)
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
@@ -249,9 +250,9 @@ async fn a_query_spanning_the_watermark_counts_each_row_once() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 1).await;
-    h.insert("11111111111", D19, 96, 1).await;
-    h.insert("11111111111", D20, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
 
     h.archive_through(ARCHIVE_AS_OF).await;
 
@@ -280,8 +281,8 @@ async fn a_sum_across_the_boundary_is_correct() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 4, 10).await;
-    h.insert("11111111111", D20, 6, 10).await;
+    h.insert("11111111115", D18, 4, 10).await;
+    h.insert("11111111115", D20, 6, 10).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let total = h
@@ -301,8 +302,8 @@ async fn a_time_filter_restricts_to_one_tier() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 1).await;
-    h.insert("11111111111", D20, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     // Entirely below the watermark: cold only.
@@ -329,8 +330,8 @@ async fn historical_mode_sees_only_archived_data() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 96, 1).await;
-    h.insert("11111111111", D20, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let unified = h
@@ -361,9 +362,9 @@ async fn a_group_by_spans_both_tiers() {
         .await
         .unwrap();
 
-    h.insert("11111111111", D18, 4, 1).await;
-    h.insert("22222222222", D18, 4, 1).await;
-    h.insert("11111111111", D20, 4, 1).await;
+    h.insert("11111111115", D18, 4, 1).await;
+    h.insert("22222222220", D18, 4, 1).await;
+    h.insert("11111111115", D20, 4, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -389,7 +390,7 @@ async fn nothing_archived_yet_still_answers_from_the_hot_tier() {
         .ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D20, 12, 1).await;
+    h.insert("11111111115", D20, 12, 1).await;
 
     // No archival: the watermark is at the epoch and there is no cold scan.
     assert_eq!(
@@ -408,8 +409,8 @@ async fn the_store_handle_registers_everything_needed_for_a_query() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 8, 3).await;
-    h.insert("11111111111", D20, 8, 3).await;
+    h.insert("11111111115", D18, 8, 3).await;
+    h.insert("11111111115", D20, 8, 3).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let store = meterstore::MeterStore::builder()
@@ -487,7 +488,7 @@ fn correction(
         .collect();
 
     let mut series = metering::measurement_series::MeasurementSeries::new(
-        malo,
+        malo.parse().expect("a valid MaLo-ID"),
         "1-0:1.8.0".parse().ok(),
         intervals,
         MeasurementSource::Mscons {
@@ -522,10 +523,10 @@ async fn a_corrected_interval_is_counted_once_at_its_latest_version() {
         .unwrap();
 
     // Original: 4 intervals at 10 kWh.
-    h.insert_versioned("11111111111", D20, 4, 10, 20_260_720_000_001)
+    h.insert_versioned("11111111115", D20, 4, 10, 20_260_720_000_001)
         .await;
     // Correction: the same 4 intervals, restated as 25 kWh.
-    h.insert_versioned("11111111111", D20, 4, 25, 20_260_725_000_002)
+    h.insert_versioned("11111111115", D20, 4, 25, 20_260_725_000_002)
         .await;
 
     // Both rows are present in storage.
@@ -563,7 +564,7 @@ async fn a_correction_spanning_the_tier_boundary_resolves_correctly() {
         .await
         .unwrap();
 
-    h.insert_versioned("11111111111", D18, 2, 10, 20_260_718_000_001)
+    h.insert_versioned("11111111115", D18, 2, 10, 20_260_718_000_001)
         .await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
@@ -572,7 +573,7 @@ async fn a_correction_spanning_the_tier_boundary_resolves_correctly() {
     // no query looks — so the store routes it to Iceberg instead.
     let store = h.store(ReadMode::Unified).await;
     let outcome = store
-        .append(&[correction("11111111111", D18, 2, 99, 20_260_726_000_002)])
+        .append(&[correction("11111111115", D18, 2, 99, 20_260_726_000_002)])
         .await
         .expect("append correction");
 
@@ -612,7 +613,7 @@ async fn a_filter_cutting_inside_a_cold_file_is_applied_exactly() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     // Half of one archived day: 48 of the 96 quarter-hours.
@@ -645,9 +646,9 @@ async fn a_correction_delivered_in_a_later_month_still_supersedes() {
     // Both rows carry the scope of the *interval's* month, which is what makes
     // their versions comparable — even though the correction was delivered in
     // August.
-    h.insert_scoped("11111111111", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
+    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
         .await;
-    h.insert_scoped("11111111111", D20, 2, 40, 20_260_820_000_002, "99:2026-07")
+    h.insert_scoped("11111111115", D20, 2, 40, 20_260_820_000_002, "99:2026-07")
         .await;
 
     let total = h
@@ -676,9 +677,9 @@ async fn versions_in_different_scopes_do_not_resolve_against_each_other() {
         .await
         .unwrap();
 
-    h.insert_scoped("11111111111", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
+    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
         .await;
-    h.insert_scoped("11111111111", D20, 2, 40, 20_260_820_000_002, "99:2026-08")
+    h.insert_scoped("11111111115", D20, 2, 40, 20_260_820_000_002, "99:2026-08")
         .await;
 
     let total = h
@@ -701,8 +702,8 @@ async fn system_tables_answer_the_questions_an_incident_asks() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 8, 1).await;
-    h.insert("11111111111", D20, 8, 1).await;
+    h.insert("11111111115", D18, 8, 1).await;
+    h.insert("11111111115", D20, 8, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -817,8 +818,8 @@ async fn a_correction_free_history_scan_skips_resolution_entirely() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_versioned("11111111111", D18, 4, 10, 1).await;
-    h.insert_versioned("11111111111", D19, 4, 10, 1).await;
+    h.insert_versioned("11111111115", D18, 4, 10, 1).await;
+    h.insert_versioned("11111111115", D19, 4, 10, 1).await;
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -843,8 +844,8 @@ async fn a_corrected_history_scan_still_resolves() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_versioned("11111111111", D18, 4, 10, 1).await;
-    h.insert_versioned("11111111111", D18, 4, 25, 2).await;
+    h.insert_versioned("11111111115", D18, 4, 10, 1).await;
+    h.insert_versioned("11111111115", D18, 4, 25, 2).await;
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -872,8 +873,8 @@ async fn a_scan_touching_the_hot_tier_always_resolves() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_versioned("11111111111", D18, 4, 10, 1).await;
-    h.insert_versioned("11111111111", D20, 4, 10, 1).await;
+    h.insert_versioned("11111111115", D18, 4, 10, 1).await;
+    h.insert_versioned("11111111115", D20, 4, 10, 1).await;
     h.archive_through(D20).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -893,8 +894,8 @@ async fn eliding_returns_the_same_rows_as_resolving() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_versioned("11111111111", D18, 4, 10, 1).await;
-    h.insert_versioned("22222222222", D18, 4, 7, 1).await;
+    h.insert_versioned("11111111115", D18, 4, 10, 1).await;
+    h.insert_versioned("22222222220", D18, 4, 7, 1).await;
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
@@ -928,9 +929,9 @@ async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1).await;
-    h.insert("11111111111", D19, 96, 1).await;
-    h.insert("11111111111", D20, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
 
     // Built *before* anything is archived, and used throughout.
     let store = h.store(ReadMode::Unified).await;
@@ -995,7 +996,7 @@ async fn an_exact_filter_is_honoured_on_the_raw_table_too() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1).await;
+    h.insert("11111111115", D18, 96, 1).await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let half = h
@@ -1022,9 +1023,9 @@ async fn an_exact_filter_is_honoured_across_the_boundary_on_the_raw_table() {
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert("11111111111", D18, 96, 1).await; // archived
-    h.insert("11111111111", D19, 96, 1).await; // archived
-    h.insert("11111111111", D20, 96, 1).await; // stays hot
+    h.insert("11111111115", D18, 96, 1).await; // archived
+    h.insert("11111111115", D19, 96, 1).await; // archived
+    h.insert("11111111115", D20, 96, 1).await; // stays hot
     h.archive_through(ARCHIVE_AS_OF).await;
 
     // Noon on the last archived day through noon on the hot day: 48 cold + 48 hot.
@@ -1064,12 +1065,12 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
         .await
         .unwrap();
 
-    h.insert_scoped("11111111111", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
+    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
         .await;
 
     // Same interval, same month, *different* operator.
     let second = h
-        .try_insert_scoped("11111111111", D20, 2, 40, 20_260_720_000_002, "88:2026-07")
+        .try_insert_scoped("11111111115", D20, 2, 40, 20_260_720_000_002, "88:2026-07")
         .await;
 
     assert!(
@@ -1091,7 +1092,7 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_scoped("11111111111", D18, 2, 10, 20_260_718_000_001, "99:2026-07")
+    h.insert_scoped("11111111115", D18, 2, 10, 20_260_718_000_001, "99:2026-07")
         .await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
@@ -1105,7 +1106,7 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
 
     // Same reading, different operator, below the watermark — so it routes cold.
     let store = h.store(ReadMode::Unified).await;
-    let mut other = correction("11111111111", D18, 2, 40, 20_260_718_000_002);
+    let mut other = correction("11111111115", D18, 2, 40, 20_260_718_000_002);
     other.version = meterstore::ScopedVersion::new(
         meterstore::VersionScope::for_interval("88", D18).unwrap(),
         meterstore::Version::new(20_260_718_000_002).unwrap(),

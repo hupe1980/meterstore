@@ -6,7 +6,11 @@
 //! kept here as a contract test against the upstream crate.
 
 use metering::IntervalResolution;
-use metering::calendar::{DayKind, day_kind, day_length, intervals_in_day, local_day};
+use metering::calendar::{
+    DayKind, day_kind, day_length, gas_day_end_utc, gas_day_start_utc, intervals_in_day, local_day,
+    local_gas_day,
+};
+use meterstore::planner::{balancing_day, gas_day_length, intervals_in_gas_day};
 use time::Duration;
 use time::macros::{date, datetime};
 
@@ -70,6 +74,100 @@ fn a_march_of_quarter_hours_is_four_short() {
         .map(|d| {
             let day = time::Date::from_calendar_date(2026, time::Month::March, d).unwrap();
             intervals_in_day(day, IntervalResolution::QuarterHour).unwrap()
+        })
+        .sum();
+    assert_eq!(total, 2_976 - 4);
+}
+
+// ── the Gastag ───────────────────────────────────────────────────────────────
+//
+// Gas is balanced on a 06:00–06:00 day, so the properties above have a second
+// set that MeterStore's completeness reporting and `meter_balancing_day` rely
+// on. Same principle: asserted against `metering`, not against a copy.
+
+#[test]
+fn the_gas_day_runs_from_0600_to_0600_local() {
+    // Winter: 06:00 CET is 05:00 UTC. Summer: 06:00 CEST is 04:00 UTC. The
+    // boundary is a *local* time, so it moves with the offset — which is why it
+    // cannot be written as a fixed UTC hour.
+    assert_eq!(
+        gas_day_start_utc(date!(2026 - 01 - 15)),
+        datetime!(2026-01-15 5:00 UTC)
+    );
+    assert_eq!(
+        gas_day_start_utc(date!(2026 - 07 - 15)),
+        datetime!(2026-07-15 4:00 UTC)
+    );
+    assert_eq!(
+        gas_day_end_utc(date!(2026 - 07 - 15)),
+        gas_day_start_utc(date!(2026 - 07 - 16))
+    );
+}
+
+#[test]
+fn the_long_and_short_gas_days_are_named_after_the_saturday() {
+    // The clocks change at 02:00/03:00 local, which lies *before* the 06:00 gas
+    // boundary — so the 23- and 25-hour Gastage are the ones that began on the
+    // Saturday, not the transition Sunday. This is the property that makes a
+    // completeness check on calendar days wrong in both directions at once.
+    assert_eq!(gas_day_length(date!(2026 - 10 - 24)).whole_hours(), 25);
+    assert_eq!(gas_day_length(date!(2026 - 10 - 25)).whole_hours(), 24);
+    assert_eq!(gas_day_length(date!(2026 - 03 - 28)).whole_hours(), 23);
+    assert_eq!(gas_day_length(date!(2026 - 03 - 29)).whole_hours(), 24);
+
+    // Mirror image of the calendar day, quarter-hour by quarter-hour.
+    let q = IntervalResolution::QuarterHour;
+    assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 24), q), Some(100));
+    assert_eq!(intervals_in_day(date!(2026 - 10 - 24), q), Some(96));
+    assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 25), q), Some(96));
+    assert_eq!(intervals_in_day(date!(2026 - 10 - 25), q), Some(100));
+}
+
+#[test]
+fn a_gas_reading_before_0600_belongs_to_the_previous_gastag() {
+    // The six hours a day a calendar-day grouping books into the wrong
+    // Bilanzierungstag, with totals that still look plausible.
+    let just_after_local_midnight = datetime!(2026-07-14 22:15 UTC);
+    assert_eq!(
+        local_day(just_after_local_midnight),
+        date!(2026 - 07 - 15),
+        "calendar day"
+    );
+    assert_eq!(
+        local_gas_day(just_after_local_midnight),
+        date!(2026 - 07 - 14),
+        "Gastag"
+    );
+}
+
+#[test]
+fn balancing_day_delegates_to_whichever_calendar_the_commodity_uses() {
+    // MeterStore's own contribution is only the dispatch; both answers are
+    // `metering`'s, and this asserts the wrapper did not invent a third.
+    let at = datetime!(2026-07-14 22:15 UTC);
+    assert_eq!(
+        balancing_day(at, metering::interval::Sparte::Gas),
+        local_gas_day(at)
+    );
+    for sparte in [
+        metering::interval::Sparte::Strom,
+        metering::interval::Sparte::Waerme,
+        metering::interval::Sparte::Wasser,
+    ] {
+        assert_eq!(balancing_day(at, sparte), local_day(at), "{sparte}");
+    }
+}
+
+#[test]
+fn a_march_of_gas_days_is_also_four_short() {
+    // The month total is the same either way — the transition moves *which* day
+    // is long, not how much time March holds. A check that only ever compares
+    // monthly totals would therefore never notice the difference, which is why
+    // the per-day assertions above are the ones that matter.
+    let total: u32 = (1..=31)
+        .map(|d| {
+            let day = time::Date::from_calendar_date(2026, time::Month::March, d).unwrap();
+            intervals_in_gas_day(day, IntervalResolution::QuarterHour).unwrap()
         })
         .sum();
     assert_eq!(total, 2_976 - 4);

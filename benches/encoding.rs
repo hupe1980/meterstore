@@ -61,8 +61,13 @@ fn delivery(meter: usize) -> StoredSeries {
         })
         .collect();
 
+    // Ten digits plus the check digit `MaloId` recomputes at the parse; padding
+    // eleven arbitrary ones would not build a single row of input.
+    let prefix = format!("{:010}", 1_000_000_000u64 + meter as u64);
+    let check = metering::MaloId::compute_check_digit(&prefix).expect("ten digits");
+
     let series = MeasurementSeries::new(
-        format!("{:011}", 10_000_000_000u64 + meter as u64),
+        format!("{prefix}{check}").parse().expect("valid MaLo-ID"),
         "1-0:1.8.0".parse().ok(),
         intervals,
         MeasurementSource::Mscons {
@@ -161,7 +166,7 @@ fn bench_predicate(c: &mut Criterion) {
     let filters = vec![
         col("from").gt_eq(ts(START)),
         col("from").lt(ts(START + Duration::days(30))),
-        col("malo_id").eq(lit("12345678901")),
+        col("malo_id").eq(lit("12345678905")),
     ];
 
     c.bench_function("planner/time_range", |b| {

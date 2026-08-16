@@ -234,7 +234,7 @@ impl IcebergSqlCatalog<'_> {
 ///
 /// # Which of the two S3 Tables interfaces this is
 ///
-/// S3 Tables can be reached two ways, and only one of them works from Rust today:
+/// S3 Tables can be reached two ways, and only one of them works from Rust:
 ///
 /// - Its **Iceberg REST endpoint**, which authenticates with SigV4. That signs
 ///   each request over its method, path, query, headers, body hash and timestamp,

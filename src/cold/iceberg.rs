@@ -980,7 +980,7 @@ fn file_suffix() -> String {
 /// and prunes by row filter — correct, and linear in the number of tenants.
 ///
 /// It also gives erasure a bounded set of files to rewrite. §12.4 pseudonymises
-/// rather than rewriting, so this is not on the critical path today, but a
+/// rather than rewriting, so this is not on the critical path, but a
 /// tenant-scoped rewrite is the difference between touching one operator's data
 /// and touching the warehouse.
 ///

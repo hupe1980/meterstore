@@ -493,7 +493,7 @@ async fn a_cross_table_query_takes_bound_parameters() {
         .query_with_params(
             "SELECT COUNT(*) FROM readings WHERE malo_id = $1",
             vec![datafusion::scalar::ScalarValue::Utf8(Some(
-                "10000000000".to_string(),
+                "10000000009".to_string(),
             ))],
         )
         .await

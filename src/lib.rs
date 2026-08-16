@@ -25,7 +25,10 @@
 //!
 //! [`planner`] re-exports `metering::calendar` for convenience, so callers get
 //! DST-correct local days without depending on both crates directly. The
-//! implementation is upstream and there is only one of it.
+//! implementation is upstream and there is only one of it. The one thing
+//! [`planner::calendar`] adds is not calendar arithmetic but a storage fact:
+//! a stored row carries its `sparte`, so the store knows *which* of `metering`'s
+//! two day definitions applies to it.
 //!
 //! ## The five things a caller usually wants
 //!
@@ -53,6 +56,30 @@
 //! Any declared resolution, not only the quarter-hour: completeness asks
 //! `metering`'s calendar per day, so one-minute data expects 1 440 intervals on
 //! an ordinary day and 1 500 on the 25-hour autumn one.
+//!
+//! And **two kinds of day**. Electricity, heat and water are balanced on the
+//! Berlin calendar day; gas is balanced on the *Gastag*, 06:00 to 06:00 local.
+//! Grouping a gas Lastgang by the calendar day books its 00:00–06:00 draw into
+//! the neighbouring Bilanzierungstag — six hours a day, every day — so the
+//! bucketing and the expected interval count both follow the row's Sparte, in
+//! SQL through `meter_balancing_day` and in Rust through
+//! [`planner::balancing_day`].
+//!
+//! An external engine has neither function, and SQL dialects differ on timestamp
+//! arithmetic — so the answer is stored. Every row carries a `balancing_day`
+//! column derived once by the encoder, and reading the Iceberg files directly
+//! needs a `GROUP BY` and no calendar reasoning. It is the single derived value
+//! this crate persists; [`encode::schema`](crate::encode::schema) argues the
+//! exception.
+//!
+//! Identifiers are parsed rather than trusted. `malo_id` and `melo_id` are
+//! `metering`'s [`MaloId`] and [`MeloId`] on both sides of the encoding: a
+//! MaLo-ID carries a check digit so that a transposition is detectable, and a
+//! store that accepted eleven arbitrary digits would throw that away at the one
+//! point it still mattered.
+//!
+//! [`MaloId`]: metering::ids::MaloId
+//! [`MeloId`]: metering::ids::MeloId
 //!
 //! ## Status
 //!
@@ -85,8 +112,8 @@
 //! [`cold::S3TablesCatalog`] over an AWS S3 Tables table bucket
 //! (`s3tables`).
 //!
-//! Not yet done: interop against Spark and Trino, and the query-latency
-//! benchmarks, so the p99 targets remain aspirational. Compaction and
+//! Not yet done: Spark and Trino interop, and the query-latency benchmarks, so
+//! the p99 targets remain aspirational. Compaction and
 //! orphan-file cleanup are blocked on the upstream `iceberg` crate.
 //!
 //! Full documentation: <https://hupe1980.github.io/meterstore>
@@ -138,13 +165,14 @@ pub mod watermark;
 pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
 pub use config::{CHECK_VALUES_KEY, TableConfig, ValidatedTableConfig, coded_column};
-pub use encode::canonical_obis;
+pub use encode::{canonical_obis, parse_malo};
 pub use erasure::{ErasureRecord, SubjectRef, SubjectRegistry};
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
 pub use hot::PostgresHot;
 pub use planner::{
     ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
+    balancing_day, intervals_in_gas_day,
 };
 pub use session::{
     Completeness, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder,
@@ -168,6 +196,7 @@ pub mod prelude {
     pub use crate::hot::PostgresHot;
     pub use crate::planner::{
         ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
+        balancing_day, intervals_in_gas_day,
     };
     pub use crate::session::{
         Completeness, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog,

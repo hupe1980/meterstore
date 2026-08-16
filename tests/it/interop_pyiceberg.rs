@@ -78,8 +78,13 @@ PYEOF
 "#
     );
 
+    // Held until the container has been read and dropped: releasing earlier
+    // would let the next test race this one for the network it is still using.
+    let _slot = crate::containers::engine_slot().await;
+
     let container = GenericImage::new(PYTHON_IMAGE.0, PYTHON_IMAGE.1)
         .with_wait_for(WaitFor::message_on_stdout(SENTINEL))
+        .with_startup_timeout(crate::containers::STARTUP_TIMEOUT)
         // Mounted at its own path: Iceberg metadata records absolute locations,
         // so mounting elsewhere would test a relocation fallback rather than the
         // paths MeterStore actually wrote.

@@ -35,7 +35,7 @@ fn reading(intervals: &[(i64, QualityFlag)], version: u128) -> meterstore::encod
         })
         .collect();
     let series = MeasurementSeries::new(
-        "12345678901",
+        "12345678905".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         ivs,
         MeasurementSource::Mscons {
@@ -82,7 +82,8 @@ async fn latest_returns_the_newest_interval() {
         .expect("append");
 
     let latest = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .latest()
         .await
         .expect("latest")
@@ -100,7 +101,8 @@ async fn latest_returns_the_newest_interval() {
 async fn latest_on_an_empty_range_is_absence() {
     let (_h, store) = store().await;
     let latest = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .range(START + Duration::days(1), START + Duration::days(2))
         .latest()
         .await
@@ -125,7 +127,8 @@ async fn quality_in_filters_to_the_accepted_set() {
 
     // Billable-only: exclude FAULTY (and UNKNOWN, absent here).
     let billable = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .quality_in(&[
             QualityFlag::Measured,
             QualityFlag::Estimated,
@@ -152,7 +155,8 @@ async fn quality_in_filters_to_the_accepted_set() {
 
     // Measured only.
     let measured = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .quality_in(&[QualityFlag::Measured])
         .intervals()
         .await
@@ -173,7 +177,8 @@ async fn an_empty_quality_filter_is_a_no_op() {
         .expect("append");
 
     let all = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .quality_in(&[])
         .intervals()
         .await
@@ -199,7 +204,8 @@ async fn latest_respects_the_quality_filter() {
         .expect("append");
 
     let last_good = store
-        .series("12345678901")
+        .series("12345678905")
+        .unwrap()
         .quality_in(&[QualityFlag::Measured])
         .latest()
         .await
