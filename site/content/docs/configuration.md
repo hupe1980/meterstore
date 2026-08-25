@@ -1,7 +1,7 @@
 +++
 title = "Configuration"
 description = "The builder is the API and TOML is a front end over the same validated types, so a file and a hand-built configuration pass through identical checks."
-weight = 11
+weight = 12
 +++
 
 The builder is the API. TOML is a **serde front end over the same validated
@@ -10,8 +10,9 @@ reachable from one and not the other.
 
 ```toml
 [hot]
-url = "${DATABASE_URL}"          # ${VAR} is interpolated; a missing one is an error
+url = "${DATABASE_URL}"          # interpolated from the environment; a missing one is an error
 max_connections = 16
+ddl_lock_timeout = "3s"          # how long DDL waits for a lock before giving up
 
 [cold]
 catalog = "rest"                 # or "sql"
@@ -56,6 +57,30 @@ min_snapshots_to_keep = 20
 let settings = Settings::from_path("meterstore.toml")?;
 let config = settings.single_table()?;   // fully validated
 ```
+
+`meterstore check` validates the same file from a shell, connecting to nothing —
+which is what makes it a CI step rather than a deployment-time surprise. See
+[the CLI](@/docs/cli.md).
+
+## Environment interpolation
+
+A `${DATABASE_URL}`-style placeholder in any **value** is replaced from the
+environment. A missing variable is an error rather than an empty string: a
+connection URL that silently became `postgresql://@/` would fail somewhere far
+from the typo.
+
+Comments are left alone, so a file can document its own placeholders — which the
+one `meterstore init` writes does. A `#` inside a quoted value is not a comment
+either, because a password may contain one.
+
+## `ddl_lock_timeout`
+
+The only `[hot]` setting that is not about the pool. A DDL statement that cannot
+get its lock within it gives up having changed nothing, and archival reports the
+cycle as `deferred`; `"0s"` restores PostgreSQL's own behaviour, where the same
+condition is an ingest outage. Raise it where the hot table carries long
+transactions by design — every second added is a second the table can stall for.
+[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) has the argument.
 
 ## Interval or point
 
@@ -158,8 +183,8 @@ secret in a log. A deployment that genuinely needs explicit keys builds the tier
 from `IcebergSqlCatalog` directly, where `WarehouseAuth` has fields for them.
 
 **No compaction or orphan-cleanup settings**, for a different reason: neither is
-implementable against the published `iceberg` crate. See
-[Operations](@/docs/operations.md#maintenance-that-is-not-implemented).
+implementable against the published `iceberg` crate. Both run out of band — see
+[Operations](@/docs/operations.md#compaction).
 
 ## Defaults
 

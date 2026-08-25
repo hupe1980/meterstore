@@ -73,6 +73,23 @@ carry most of the weight:
 
 ## Quick start
 
+Without writing a program:
+
+```bash
+cargo install meterstore --features cli
+
+meterstore init      # a commented starter configuration
+meterstore check     # full validation — no database needed
+meterstore create    # both tiers, every declared table
+meterstore status    # boundary, lag, write runway, health
+```
+
+`meterstore query` runs SQL across both tiers and prints the boundary the answer
+was computed against; `meterstore maintain` is the archival loop as a foreground
+process. [The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
+
+As a library:
+
 ```bash
 cargo add meterstore
 ```
@@ -153,6 +170,15 @@ belongs to the *meter*, so it joins the merge key — by default on a point tabl
 `identify_by_melo` either way. Keyed wrongly, two meters that agree on a number
 store as one reading.
 
+A `MeasurementSeries` holds one `obis_code`, so a typed read describes **one
+channel** — folding import and export together sums to twice the truth. A
+measuring point is a set of them, so there is a read for that too, in one scan:
+
+```rust
+store.series(malo)?.obis("1-0:1.8.0")?.range(from, to).collect().await?;   // one channel
+store.series(malo)?.range(from, to).collect_by_channel().await?;          // all of them
+```
+
 `readings` is version-resolved; `readings_versions` is the raw audit trail. The
 naming is load-bearing — see
 [the version-resolution trap](https://hupe1980.github.io/meterstore/docs/interop/#the-version-resolution-trap)
@@ -198,9 +224,15 @@ SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
 | | Version | Why |
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
-| PostgreSQL | **14 or later** | Declarative range partitioning, so a purge is `DETACH` + `DROP TABLE` |
+| PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
 | `metering` | 0.19 or later | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
+
+Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
+takes `ACCESS EXCLUSIVE` on the parent — which, since PostgreSQL grants locks in
+arrival order, lets one long query stall every subsequent insert. Partitions are
+built standalone and *attached* instead.
+[Locks →](https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up)
 
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
 Glue — and that seam is driven end to end by the test suite rather than asserted.
@@ -241,7 +273,8 @@ drift.
 | [Querying](https://hupe1980.github.io/meterstore/docs/querying/) | SQL across tiers, provenance, the typed series API |
 | [Reproducibility](https://hupe1980.github.io/meterstore/docs/reproducibility/) | Settlement reruns on two independent time axes |
 | [Completeness](https://hupe1980.github.io/meterstore/docs/completeness/) | DST-aware gap detection as a first-class query |
-| [Operations](https://hupe1980.github.io/meterstore/docs/operations/) | Scheduling, system tables, metrics, failure matrix |
+| [Operations](https://hupe1980.github.io/meterstore/docs/operations/) | Scheduling, locks, system tables, metrics, failure matrix |
+| [The CLI](https://hupe1980.github.io/meterstore/docs/cli/) | `meterstore` — check, create, status, archive, query, serve |
 | [External engines](https://hupe1980.github.io/meterstore/docs/interop/) | Spark, Trino, DuckDB — and the trap to avoid |
 | [Privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/) | Pseudonymisation and the three-year duty |
 | [Configuration](https://hupe1980.github.io/meterstore/docs/configuration/) | TOML over the same validated types |
@@ -252,17 +285,19 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**734 tests**: unit, property, and integration against real PostgreSQL 16 and a
+**778 tests**: unit, property, and integration against real PostgreSQL 16 and a
 real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
-read the output and agree with it. Compression against PostgreSQL row storage is
-**measured** rather than targeted — ~109× (457 B/row against 4.2 B/row; the
-measurement suite carries the caveats).
+read the output and agree with it, down to the audit trail's timestamps. The lock
+behaviour is asserted against a real server holding a real conflicting lock, not
+argued. Compression against PostgreSQL row storage is **measured** rather than
+targeted — ~109× (457 B/row against 4.2 B/row; the measurement suite carries the
+caveats).
 
 Missing: query-latency benchmarks on reference hardware, so the p99 targets remain
-aspirational; Spark and Trino interop; a CLI. Compaction and general orphan-file
-cleanup are
-[blocked upstream](https://hupe1980.github.io/meterstore/docs/operations/#maintenance-that-is-not-implemented).
+aspirational; Spark and Trino interop. Compaction and general orphan-file cleanup
+[run out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
+because `iceberg-rust` exposes neither.
 
 ## Development
 
@@ -273,6 +308,7 @@ just            # list all recipes
 just dev        # format + unit tests (no Docker)
 just test       # full suite
 just check      # everything CI runs
+just cli status # run the command-line tool from source
 just site       # serve the documentation site
 ```
 

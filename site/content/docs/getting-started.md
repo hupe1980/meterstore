@@ -9,7 +9,7 @@ weight = 1
 | | Version | Why |
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
-| PostgreSQL | **14 or later** | Declarative range partitioning, so purging an archived window is `DETACH` + `DROP TABLE` rather than a row-wise `DELETE`. The test suite pins 16 |
+| PostgreSQL | **12 or later** | See below. The test suite pins 16 |
 | `metering` | 0.19 or later | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
@@ -17,6 +17,21 @@ MeterStore needs only `SELECT` plus ownership of its own tables. No server
 configuration, no restart, no `CREATE EXTENSION` for the core path — which is what
 makes it deployable on RDS, Cloud SQL and Azure Postgres, where an
 extension-based approach is not.
+
+### Why 12 and not 10
+
+Range partitioning arrived in 10 and a partitioned primary key in 11; neither is
+the floor. **12 is, because of a lock.** `CREATE TABLE … PARTITION OF` takes
+`ACCESS EXCLUSIVE` on the parent, and PostgreSQL grants locks in arrival order —
+so a statement waiting for it blocks every reader and writer behind it. Partition
+creation runs on the **write path**, so that spelling lets one long query stall
+every subsequent insert. MeterStore builds the relation standalone and *attaches*
+it, which from 12 takes only `SHARE UPDATE EXCLUSIVE` — a lock that conflicts with
+no read and no write.
+
+Older servers still work; they just do not have the property documented here.
+[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) covers the other half —
+the detach that does need the strong lock.
 
 ## Install
 
@@ -29,31 +44,54 @@ Optional features, all off unless you need them:
 | Feature | What it adds |
 |---|---|
 | `rest-catalog` *(default)* | `IcebergRestCatalog` — the cold tier on a REST catalogue |
-| `object-store-s3` / `-gcs` / `-azure` | Cloud object stores. `file://` and `memory://` are always available |
+| `object-store-s3` / `-gcs` / `-azure` / `-all` | Cloud object stores. `file://` and `memory://` are always available |
 | `catalog-facade` | A read-only Iceberg REST endpoint, for deployments on the SQL catalog |
 | `s3tables` | AWS S3 Tables as the cold-tier catalogue (implies `object-store-s3`) |
 | `flight` | Arrow Flight SQL over the unified hot + cold view |
+| `cli` | The `meterstore` command-line tool (implies `flight` and `catalog-facade`) |
 | `testkit` | The real-infrastructure harness, workload generator and correctness oracle |
+
+## The shortest path: no Rust at all
+
+```bash
+cargo install meterstore --features cli
+
+meterstore init            # a commented starter configuration
+meterstore check           # validate it — no database needed
+meterstore create          # both tiers, every declared table
+meterstore status          # boundary, lag, runway, health
+```
+
+That is a working deployment. [The CLI](@/docs/cli.md) covers the rest —
+archival on a schedule, queries with their provenance, Flight SQL on a socket.
+
+Ingest is the one thing it does not do, and deliberately: a reading arrives as an
+MSCONS message, an SMGW push or a CSV a utility exports its own way, and mapping
+one to a `MeasurementSeries` is an application's job rather than a flag's.
 
 ## A store over both tiers
 
-The shortest path is a [configuration file](@/docs/configuration.md), which builds
-both tiers and every validated table:
+The shortest path in Rust is the same [configuration file](@/docs/configuration.md),
+which builds both tiers, every validated table, and the store or catalog over
+them:
 
 ```rust
 let deployment = Settings::from_path("meterstore.toml")?.connect().await?;
-let cold = deployment.cold.cold();
-let config = deployment.tables[0].clone();
 
-let store = MeterStore::builder()
-    .hot(deployment.hot.clone())
-    .cold(cold.clone(), cold.table_provider(config.name()).await?)
-    .table(config)
-    .build()
-    .await?;
+// One declared table — creates both tiers' relations on the way.
+let store = deployment.store().await?;
+
+// Or every declared table in one session, so a statement can mention two.
+let catalog = deployment.catalog().await?;
 ```
 
-The longer one is the same thing spelled out, and it is what an application that
+`connect` stops at the tiers and `store`/`catalog` go the last step, because that
+step is not field access: a cold table provider cannot be opened over a table the
+catalogue does not hold yet. `deployment.table(config)` returns the builder if you
+want to add what a file cannot name — a subject registry, a read mode, a session
+you already own.
+
+The longer path is the same thing spelled out, and it is what an application that
 owns its own pool writes:
 
 ```rust

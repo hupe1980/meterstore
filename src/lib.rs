@@ -40,7 +40,10 @@
 //!   they were computed against (P1), and [`MeterStore::stream`] returns that
 //!   boundary *before* the rows, for a result too large to hold.
 //! - [`MeterStore::series`] — one measuring point as a `metering`
-//!   `MeasurementSeries`, version-resolved and tier-split.
+//!   `MeasurementSeries`, version-resolved and tier-split. `collect` describes
+//!   **one channel**, because a `MeasurementSeries` holds one `obis_code`;
+//!   [`collect_by_channel`] describes the whole measuring point, splitting one
+//!   scan into a series per channel rather than reading each in turn.
 //! - [`MeterStore::as_of`] — the same queries against a pinned Iceberg snapshot
 //!   and an optional version ceiling, for a settlement rerun.
 //! - [`MeterStore::completeness`] — whether a range holds what the DST-aware
@@ -127,7 +130,34 @@
 //! serves any [`SqlSurface`], so a whole [`MeterCatalog`] goes on a socket as
 //! readily as one table.
 //!
+//! And a command line, behind `cli`: [`cli`] is `meterstore init`, `check`,
+//! `create`, `status`, `archive`, `maintain`, `query` and `serve` over the same
+//! public API, for the questions an operator asks during an incident and the
+//! archival loop a deployment has to run somewhere.
+//!
 //! [`Settings::connect`]: crate::settings::Settings::connect
+//!
+//! ## Errors carry what to do about them
+//!
+//! [`Error`] is `#[non_exhaustive]` and callers match on variants rather than
+//! parsing strings. [`Error::is_retryable`] is the split that matters most: a
+//! lost connection and a lock a statement declined to wait for are worth
+//! retrying, and a refused delivery, an invalid configuration and a statement
+//! that will not plan are not — retrying those is a loop on a message that will
+//! never change.
+//!
+//! Two are deliberately distinct and are the pair most often conflated.
+//! [`Error::IntegrityViolation`] means the store **stopped something from
+//! becoming true**: an overlapping delivery, two network operators for one
+//! reading, a value restated under an existing version. The producer has to
+//! change. [`Error::InvariantViolated`] means something **already is true that
+//! should not be** — rows below the watermark still in PostgreSQL, two version
+//! scopes for one reading. An operator has to look, and whoever is paged for the
+//! second must not be woken by the first.
+//!
+//! [`Error::is_retryable`]: crate::error::Error::is_retryable
+//! [`Error::IntegrityViolation`]: crate::error::Error::IntegrityViolation
+//! [`Error::InvariantViolated`]: crate::error::Error::InvariantViolated
 //!
 //! ## Status
 //!
@@ -152,6 +182,7 @@
 //! [`MeterStore::append_authoritative`]: crate::session::MeterStore::append_authoritative
 //! [`SqlSurface`]: crate::session::SqlSurface
 //! [`TimeModel`]: crate::config::TimeModel
+//! [`collect_by_channel`]: crate::session::SeriesQuery::collect_by_channel
 
 // Doc comments throughout cite `§N`. Those are cross-references between the
 // design notes this crate's maintainers keep, not links a reader needs to
@@ -171,6 +202,8 @@
 /// `crate::arrow`, never a direct `arrow::` path.
 pub use datafusion::arrow;
 
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod cold;
 pub mod config;
 pub mod encode;

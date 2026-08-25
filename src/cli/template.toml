@@ -1,0 +1,107 @@
+# MeterStore — deployment configuration.
+#
+# `meterstore check` validates this file without connecting to anything, and it
+# runs the same cross-field checks the Rust builder does. There is no setting
+# reachable from one and not the other.
+#
+# A `${DATABASE_URL}`-style placeholder in any value is interpolated from the
+# environment. A missing variable is an error, not an empty string: a connection
+# URL that silently became `postgresql://@/` would fail somewhere far from the
+# typo. Comments are left alone, which is why this one can say so.
+
+# --- The hot tier: PostgreSQL holds the recent interval window. ---
+[hot]
+url = "${DATABASE_URL}"
+max_connections = 16
+
+# How long a DDL statement waits for a lock before giving up.
+#
+# PostgreSQL grants locks in arrival order, so a statement waiting for an
+# ACCESS EXCLUSIVE lock blocks every reader and writer that arrives behind it.
+# Archival detaches a partition on its own schedule, and a detach that queued
+# would take ingest down for as long as whatever it waits on runs. With this it
+# gives up having changed nothing, and the cycle is reported as deferred.
+#
+# Raise it on a deployment that reports out of the same tables it writes; every
+# second added is a second the whole table can stall for. `0s` disables it,
+# which is PostgreSQL's own default and this crate's advice against.
+ddl_lock_timeout = "3s"
+
+# --- The cold tier: Apache Iceberg holds the history. ---
+[cold]
+# "rest" for Polaris, Lakekeeper, Nessie or Gravitino — what every engine
+# already speaks, so an external reader needs nothing extra. "sql" for a
+# PostgreSQL-backed catalogue on the same database as the hot tier, which is one
+# fewer service to run and needs the JDBC catalogue implementation on the far
+# side.
+catalog = "sql"
+uri = "${DATABASE_URL}"
+
+# file:// and memory:// are always available. s3://, gs:// and abfss:// need the
+# matching `object-store-*` feature, and a scheme whose feature was not compiled
+# in is a configuration error rather than a surprise on the first commit.
+warehouse = "file:///var/lib/meterstore/warehouse"
+namespace = "metering"
+
+# Target size for a data file. Larger files mean less manifest to plan against
+# and better compression; smaller ones mean finer pruning.
+file_target_bytes = 536870912
+metadata_pool_max_connections = 4
+
+# --- One entry per managed table. ---
+[[tables]]
+# The physical table holds *every version* of every reading — the audit trail.
+# The `_versions` suffix is load-bearing: queries read `readings`, a view that
+# keeps only the value currently in force, and summing the physical table
+# double-counts every corrected interval.
+name = "readings_versions"
+
+# "interval" for a Lastgang — energy over [from, to). "point" for a
+# Zählerstandsgang — a cumulative register value at an instant.
+#
+# Never the same table: `value` means two different things, and summing the two
+# together gives a number with no meaning that looks exactly like a consumption
+# total.
+time_model = "interval"
+
+[tables.hot]
+# The purge of an archived window is DROP TABLE, not DELETE, and that only holds
+# when a window is exactly one partition. `partition_step` must therefore equal
+# `archival_step` below — each is valid alone and wrong when they disagree, so
+# they are written next to each other and checked against each other.
+partition_step = "1d"
+
+# How far ahead partitions are pre-created. Running out makes inserts fail
+# outright, so `partitions_ahead` in `meterstore status` is the number that
+# predicts a failure rather than describing one.
+partition_headroom = "7d"
+
+[tables.archival]
+# How far behind wall clock archival stays, so a late correction still finds its
+# interval in the hot tier where it can be superseded cheaply.
+settlement_lag = "7d"
+
+# One window per commit. Must equal `partition_step`.
+archival_step = "1d"
+
+[tables.maintenance]
+# A snapshot is what makes a past settlement reproducible, so this is a
+# compliance decision rather than a disk-space one — which is why expiry is
+# opt-in (`meterstore maintain --expire-snapshots`) rather than automatic.
+snapshot_retention = "10y"
+
+# --- Columns beyond the core schema. ---
+#
+# `identity = true` puts the column in the merge key, so two rows differing in
+# it are different readings. A tenant discriminator declared as an attribute
+# instead would let one tenant's correction supersede another's reading.
+#
+# [[tables.extra_columns]]
+# name = "tenant"
+# type = "string"
+# identity = true
+#
+# [[tables.extra_columns]]
+# name = "bilanzkreis"
+# type = "string"
+# identity = false

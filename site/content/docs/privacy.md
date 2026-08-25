@@ -1,7 +1,7 @@
 +++
 title = "Privacy and retention"
 description = "Why 15-minute consumption is personal data, why § 60 Abs. 6 MsbG is a deletion duty rather than a retention mandate, and how pseudonymisation satisfies it over an append-only lake."
-weight = 10
+weight = 11
 +++
 
 ## Is a load profile personal data?

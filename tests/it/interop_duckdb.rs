@@ -468,3 +468,50 @@ async fn duckdb_grouping_a_gas_lastgang_agrees_with_the_gastag() {
         "if the naive UTC grouping agreed, this test would prove nothing"
     );
 }
+
+#[tokio::test]
+async fn a_foreign_engine_can_read_the_audit_trail() {
+    // `provenance` is the one column whose whole purpose is to be read by a
+    // person during an investigation, and this crate tells operators to point
+    // Spark, Trino and DuckDB at these files directly.
+    //
+    // Written through `serde`, `ProvenanceEntry::occurred_at` lands as
+    // `[2026,208,6,0,0,0,0,0,0]` — `time`'s ordinal-date tuple, which is what its
+    // serde impl produces unless `serde-human-readable` is on somewhere in the
+    // graph. Unreadable, and worse, decided by feature unification rather than by
+    // this crate. It is written out explicitly instead, and this is the assertion
+    // that the result is genuinely portable: an engine that has never heard of
+    // `time` parses the timestamp as a timestamp.
+    let workload = MeteringWorkload::new(START)
+        .seed(0xA0D17)
+        .malo_ids(1)
+        .days(1);
+    let (harness, _store, _oracle) = archived(workload).await;
+    let table = table_path(&harness);
+
+    let rows = duckdb(
+        harness.warehouse(),
+        &format!(
+            "SELECT DISTINCT \
+                 json_extract_string(entry, '$.event_type') AS event_type, \
+                 CAST(json_extract_string(entry, '$.occurred_at') AS TIMESTAMPTZ) AS occurred_at \
+             FROM iceberg_scan('{table}'), \
+                  UNNEST(json_extract(provenance, '$[*]')) AS t(entry) \
+             ORDER BY 2 LIMIT 5;"
+        ),
+    )
+    .await;
+
+    // The header plus at least one entry, and the timestamp survived a cast to
+    // TIMESTAMPTZ — which the tuple form could not have.
+    assert!(rows.len() > 1, "no provenance entries came back: {rows:?}");
+    let first = &rows[1];
+    assert!(
+        first.contains("INGESTED"),
+        "the event type should be metering's own code: {first}"
+    );
+    assert!(
+        first.contains("2026-"),
+        "the timestamp should read as a date, not as an ordinal tuple: {first}"
+    );
+}

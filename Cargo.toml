@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
@@ -110,6 +110,15 @@ metering = { version = "0.19", features = ["serde"] }
 # Mixing the two would force a conversion at every row boundary. time-tz is
 # load-bearing: Europe/Berlin DST gives 92- and 100-interval days, and every
 # daily aggregate depends on getting that right.
+#
+# Deliberately **not** `serde-human-readable`. `time`'s serde impl is
+# feature-conditional — an `OffsetDateTime` goes into JSON as a nine-element
+# ordinal-date array without it and as a `time`-formatted string with it — which
+# would make the on-disk shape of this crate's `provenance` column a function of
+# what else happens to be in the binary. Enabling it here would only move that
+# decision rather than remove it, and would impose a global feature on every
+# other crate in the graph. `encode::encode_provenance` writes that column
+# explicitly instead, so the stored form depends on nothing but this crate.
 time = { version = "0.3", features = ["macros"] }
 time-tz = "2"
 # Settlement is money — never f64.
@@ -136,6 +145,14 @@ tokio = { version = "1.0", features = ["full"] }
 futures-util = "0.3"
 
 # --- Optional ---
+# The command-line front end (`cli` feature). Optional because a library
+# consumer has no use for an argument parser, and `clap`'s derive machinery is
+# not free to compile.
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"], optional = true }
+# A `tracing` subscriber, for the CLI alone. The library deliberately installs
+# none — a library that captures the global subscriber takes the decision away
+# from the application embedding it — but a binary *is* the application.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 testcontainers = { version = "0.27", optional = true }
 testcontainers-modules = { version = "0.15", features = ["postgres"], optional = true }
 tempfile = { version = "3.27", optional = true }
@@ -210,6 +227,28 @@ s3tables = ["dep:iceberg-catalog-s3tables", "object-store-s3"]
 # an external client cannot assemble for itself.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
 testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+# The `meterstore` command-line tool: create tables, archive, query, serve.
+#
+# Off by default because this crate is a library first and a binary second — a
+# service embedding it should not compile an argument parser. `cargo install
+# meterstore --features cli` is the other half of that trade.
+#
+# It pulls both serving surfaces, because `meterstore serve` is the one
+# subcommand a caller cannot assemble from the others, and a CLI whose most
+# useful verb is half missing from the obvious install line is a CLI nobody
+# finds. The two answer different questions: Flight SQL is the unified hot + cold
+# view, and the façade is what lets an external engine read the history without
+# this process in the data path at all.
+cli = ["dep:clap", "dep:tracing-subscriber", "flight", "catalog-facade"]
+
+# The command-line tool. `required-features` rather than a separate crate: it is
+# a thin front end over the same public API, and splitting it into a workspace
+# member would mean a second version number to keep in step with the library it
+# can only ever be used with.
+[[bin]]
+name = "meterstore"
+path = "src/bin/meterstore.rs"
+required-features = ["cli"]
 
 # Benchmarks run under `cargo bench`, not under `cargo test`: criterion's own
 # harness collects samples, and the default one would treat each benchmark as a

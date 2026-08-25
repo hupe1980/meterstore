@@ -31,6 +31,7 @@ pub struct PostgresHot {
     pool: PgPool,
     scan_chunk_rows: usize,
     integrity_constraints: bool,
+    ddl_lock_timeout: Duration,
 }
 
 impl PostgresHot {
@@ -45,13 +46,47 @@ impl PostgresHot {
     /// [`config::defaults`]: crate::config::defaults
     const DEFAULT_SCAN_CHUNK_ROWS: usize = crate::config::defaults::SCAN_CHUNK_ROWS;
 
+    /// How long a DDL statement waits for a lock before giving up.
+    ///
+    /// Three seconds. The statements themselves are catalogue updates that take
+    /// microseconds once they hold the lock, so this is entirely a bound on
+    /// *waiting* — and the thing being waited for is an `ACCESS EXCLUSIVE` lock
+    /// on a table that ingest is writing to continuously. Long enough that an
+    /// ordinary transaction commits and the DDL proceeds; short enough that a
+    /// forgotten `BEGIN` does not take the write path down with it.
+    const DEFAULT_DDL_LOCK_TIMEOUT: Duration = Duration::seconds(3);
+
     /// Wrap an existing connection pool.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             scan_chunk_rows: Self::DEFAULT_SCAN_CHUNK_ROWS,
             integrity_constraints: true,
+            ddl_lock_timeout: Self::DEFAULT_DDL_LOCK_TIMEOUT,
         }
+    }
+
+    /// How long a DDL statement waits for a lock before giving up. Three seconds.
+    ///
+    /// PostgreSQL grants locks **in arrival order**, so a statement waiting for
+    /// `ACCESS EXCLUSIVE` blocks every reader and writer behind it — and archival
+    /// takes that lock on its own schedule. Timed out, the statement gives up
+    /// having changed nothing: the cycle reports
+    /// [`deferred`](field@crate::ArchivalOutcome::deferred) and a write gets a
+    /// retryable [`LockTimeout`](crate::Error::LockTimeout). Untimed, the same
+    /// condition is an ingest outage.
+    ///
+    /// Raise it where the hot table carries long transactions by design; every
+    /// second added is a second the whole table can stall for. Below a second,
+    /// a detach loses to any transaction in flight and archival stops
+    /// progressing. `0` restores PostgreSQL's own queue-behind-me behaviour.
+    ///
+    /// The full argument is under [Operations][ops].
+    ///
+    /// [ops]: https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up
+    pub fn ddl_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.ddl_lock_timeout = timeout.max(Duration::ZERO);
+        self
     }
 
     /// Whether each partition refuses writes that would silently corrupt a sum.
@@ -372,6 +407,7 @@ async fn add_integrity_constraints(
     conn: &mut sqlx::PgConnection,
     table: &str,
     partition: &str,
+    lock_timeout: Duration,
 ) -> Result<()> {
     // Ships in contrib; supplies the GiST equality operators for text and
     // numeric, without which the constraint cannot combine `=` with `&&`.
@@ -412,7 +448,10 @@ async fn add_integrity_constraints(
                    EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
             equality.join(", "),
         );
-        sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+        sqlx::query(&ddl)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| pg_ddl(partition, "add overlap exclusion", lock_timeout, e))?;
     }
 
     // One network operator per reading.
@@ -445,7 +484,10 @@ async fn add_integrity_constraints(
                EXCLUDE USING gist ({}, split_part(version_scope, ':', 1) WITH <>)"#,
         merge_key.join(", "),
     );
-    sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+    sqlx::query(&ddl)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| pg_ddl(partition, "add operator exclusion", lock_timeout, e))?;
 
     Ok(())
 }
@@ -957,9 +999,16 @@ impl PostgresHot {
             // consistent view of a concurrent writer's.
             let (restated, relocated) = query.fetch_one(&mut *conn).await.map_err(pg)?;
 
+            // `IntegrityViolation`, not `InvariantViolated`: both of these are a
+            // *delivery* the store refused, exactly like the CHECK and exclusion
+            // constraints the database itself enforces. `InvariantViolated` means
+            // the tiers no longer partition the data and query results may be
+            // wrong — it is the one condition on the alerting list, and a
+            // malformed delivery must not raise it.
             if restated > 0 {
-                return Err(Error::InvariantViolated {
+                return Err(Error::IntegrityViolation {
                     table: table.to_string(),
+                    constraint: Some("version_identifies_one_assertion".to_string()),
                     detail: format!(
                         "{restated} row(s) restate a different value under an existing \
                          version — a version identifies one assertion, so a corrected \
@@ -968,8 +1017,9 @@ impl PostgresHot {
                 });
             }
             if relocated > 0 {
-                return Err(Error::InvariantViolated {
+                return Err(Error::IntegrityViolation {
                     table: table.to_string(),
+                    constraint: Some("melo_identifies_the_reading".to_string()),
                     detail: format!(
                         "{relocated} row(s) name a different Messlokation than the row \
                          already stored for the same reading. A Marktlokation may be \
@@ -1123,25 +1173,29 @@ impl PostgresHot {
 
     /// Create one partition if it is missing, returning whether it was created.
     ///
+    /// Built standalone and **attached**, never `CREATE TABLE … PARTITION OF`:
+    /// that takes `ACCESS EXCLUSIVE` on the parent, and this runs on the write
+    /// path, so it would let ordinary ingest stall ordinary ingest. `ATTACH`
+    /// takes `SHARE UPDATE EXCLUSIVE`, which conflicts with no read and no
+    /// write. The bound `CHECK` is what lets it skip the validation scan, and is
+    /// dropped once attached so no row is checked against it twice. Integrity
+    /// constraints go on before the attach, while the relation is still invisible
+    /// to every other session.
+    ///
     /// # Why this is serialised
     ///
-    /// Every writer ensures the partitions for the range it is about to write,
-    /// so the **first batch of a new day has every ingest worker creating the
-    /// same partition at the same moment** — and that is the ordinary topology
-    /// (§5.2), not an unusual one. Check-then-create loses that race outright:
-    /// `CREATE TABLE IF NOT EXISTS … PARTITION OF` does not suppress the
-    /// collision, so the losers get `relation "readings_2026_08_20_0000" already
-    /// exists` and the batch fails. Even where it did suppress it, the losers
-    /// would go on to `ADD CONSTRAINT` a constraint that now exists.
+    /// Every writer ensures the partitions for the range it is about to write, so
+    /// the **first batch of a new day has every ingest worker creating the same
+    /// partition at the same moment** — the ordinary topology (§5.2), not an
+    /// unusual one. Check-then-create loses that race: the losers get `relation
+    /// "readings_2026_08_20_0000" already exists`, and even suppressed they would
+    /// go on to `ADD CONSTRAINT` a constraint that now exists.
     ///
-    /// A transaction-scoped advisory lock keyed to the partition makes the
-    /// creation atomic against other processes, and the **re-check inside it** is
-    /// what makes the loser a no-op rather than a duplicate. Transaction-scoped
-    /// rather than session-scoped so a creator that dies cannot wedge the write
-    /// frontier for everyone else.
-    ///
-    /// The fast path is unchanged: an existing partition costs one catalogue
-    /// lookup and never reaches the lock, which is every call after the first.
+    /// A transaction-scoped advisory lock keyed to the partition makes creation
+    /// atomic against other processes, and the **re-check inside it** makes the
+    /// loser a no-op rather than a duplicate. Transaction-scoped, so a creator
+    /// that dies cannot wedge the write frontier for everyone else. An existing
+    /// partition costs one catalogue lookup and never reaches the lock.
     async fn create_partition(
         &self,
         table: &str,
@@ -1153,7 +1207,7 @@ impl PostgresHot {
             return Ok(false);
         }
 
-        let mut tx = self.pool.begin().await.map_err(pg)?;
+        let mut tx = self.begin_ddl().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key("partition", &name))
             .execute(&mut *tx)
@@ -1167,23 +1221,89 @@ impl PostgresHot {
         }
 
         let end = id.start() + step;
-        let ddl = format!(
-            r#"CREATE TABLE "{name}" PARTITION OF "{table}"
-               FOR VALUES FROM ('{}') TO ('{}')"#,
-            pg_timestamp(id.start())?,
-            pg_timestamp(end)?,
-        );
-        sqlx::query(&ddl).execute(&mut *tx).await.map_err(pg)?;
+        let (lower, upper) = (pg_timestamp(id.start())?, pg_timestamp(end)?);
+        let timeout = self.ddl_lock_timeout;
+        let ddl = |op: &'static str, sql: String| (op, sql);
+
+        // `INCLUDING CONSTRAINTS`, so the child carries the parent's `CHECK`
+        // constraints already and the attach merges them instead of adding and
+        // validating them. Deliberately **not** `INCLUDING INDEXES`: the parent's
+        // primary key and its `(malo_id, from)` index are partitioned indexes,
+        // and the attach creates the child's half of each — a copy made here
+        // would be a second, unattached index doing the same work.
+        for (operation, sql) in [
+            ddl(
+                "create partition",
+                format!(
+                    r#"CREATE TABLE "{name}" (
+                           LIKE "{table}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS
+                                          INCLUDING STORAGE INCLUDING COMMENTS
+                       )"#
+                ),
+            ),
+            ddl(
+                "constrain partition",
+                format!(
+                    r#"ALTER TABLE "{name}" ADD CONSTRAINT "{name}_bound"
+                           CHECK ("from" >= '{lower}' AND "from" < '{upper}')"#
+                ),
+            ),
+        ] {
+            sqlx::query(&sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| pg_ddl(&name, operation, timeout, e))?;
+        }
 
         if self.integrity_constraints {
-            // In the same transaction, or the constraint would be added to a
-            // partition another process cannot see yet.
-            add_integrity_constraints(&mut tx, table, &name).await?;
+            // Before the attach, while the relation is still invisible to every
+            // other session — and in the same transaction either way, or the
+            // constraint would be added to a partition nobody else can see.
+            add_integrity_constraints(&mut tx, table, &name, timeout).await?;
         }
+
+        sqlx::query(&format!(
+            r#"ALTER TABLE "{table}" ATTACH PARTITION "{name}"
+                   FOR VALUES FROM ('{lower}') TO ('{upper}')"#
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_ddl(table, "attach partition", timeout, e))?;
+
+        // Now redundant with the partition constraint the attach installed, and
+        // no longer free: left in place it is a second predicate evaluated on
+        // every one of the ~9.6 M rows a day at metering volume puts here.
+        sqlx::query(&format!(
+            r#"ALTER TABLE "{name}" DROP CONSTRAINT "{name}_bound""#
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_ddl(&name, "drop bound constraint", timeout, e))?;
+
         tx.commit().await.map_err(pg)?;
 
         debug!(table, partition = %name, "created hot partition");
         Ok(true)
+    }
+
+    /// Begin a transaction with this store's `lock_timeout` applied.
+    ///
+    /// `SET LOCAL`, so the setting dies with the transaction. A bare `SET` would
+    /// ride the pooled connection into whatever borrows it next, and a query
+    /// path silently inheriting a three-second lock timeout is a different bug
+    /// from the one this fixes.
+    async fn begin_ddl(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self.pool.begin().await.map_err(pg)?;
+        if self.ddl_lock_timeout > Duration::ZERO {
+            // Interpolated rather than bound: `SET` takes no parameters, and the
+            // value is an integer this crate computed from its own configuration.
+            let ms = self.ddl_lock_timeout.whole_milliseconds().max(1);
+            sqlx::query(&format!("SET LOCAL lock_timeout = {ms}"))
+                .execute(&mut *tx)
+                .await
+                .map_err(pg)?;
+        }
+        Ok(tx)
     }
 
     /// Whether a relation exists.
@@ -1665,7 +1785,44 @@ impl<'a> RowView<'a> {
 
 /// Map a `sqlx` failure into our error type.
 fn pg(e: sqlx::Error) -> Error {
-    Error::Storage(e.to_string())
+    let Some(db) = e.as_database_error() else {
+        return Error::Storage(e.to_string());
+    };
+    match db.code().as_deref() {
+        // Class 23 — integrity constraint violation. Every one of these is a
+        // delivery the store refused on purpose, and none of them succeeds on a
+        // retry, so they must not read as a transient storage failure.
+        Some(code) if code.starts_with("23") => Error::IntegrityViolation {
+            table: db.table().unwrap_or("<unknown>").to_string(),
+            constraint: db.constraint().map(str::to_string),
+            detail: db.message().to_string(),
+        },
+        _ => Error::Storage(e.to_string()),
+    }
+}
+
+/// PostgreSQL's `lock_not_available`, raised when `lock_timeout` expires.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// [`pg`], for a statement running under a `lock_timeout`.
+///
+/// The timeout is the whole point of the DDL path (see [`Error::LockTimeout`]),
+/// so the one error it exists to produce is named rather than flattened into a
+/// storage failure whose message a caller would have to grep.
+fn pg_ddl(relation: &str, operation: &str, timeout: Duration, e: sqlx::Error) -> Error {
+    let timed_out = e
+        .as_database_error()
+        .and_then(|db| db.code().map(|c| c == LOCK_NOT_AVAILABLE))
+        .unwrap_or(false);
+
+    match timed_out {
+        true => Error::LockTimeout {
+            relation: relation.to_string(),
+            operation: operation.to_string(),
+            waited_ms: timeout.whole_milliseconds().max(0) as u64,
+        },
+        false => pg(e),
+    }
 }
 
 /// Which partitions a catalog lookup should return.
@@ -1847,13 +2004,30 @@ impl HotStore for PostgresHot {
         self.relation_exists(&partition.relation_name()?).await
     }
 
+    /// Detach a partition, under the DDL lock timeout.
+    ///
+    /// This is the one statement in the crate that genuinely needs
+    /// `ACCESS EXCLUSIVE` on the parent — a partition cannot be removed from a
+    /// table's inheritance while anything might be reading through it — and it
+    /// is issued by a *background* loop against a table under continuous write.
+    /// Queued rather than timed out, its lock request would block every insert
+    /// and every query that arrived after it, for as long as whatever it is
+    /// waiting on runs.
+    ///
+    /// So it gives up instead. The archival cycle reports the run as
+    /// [`deferred`](field@crate::ArchivalOutcome::deferred) and retries on the next
+    /// one, with nothing changed in between.
     async fn detach_partition(&self, partition: &PartitionId) -> Result<()> {
         let name = partition.relation_name()?;
-        let sql = format!(
-            r#"ALTER TABLE "{}" DETACH PARTITION "{name}""#,
-            partition.table()
-        );
-        sqlx::query(&sql).execute(&self.pool).await.map_err(pg)?;
+        let table = partition.table();
+        let mut tx = self.begin_ddl().await?;
+        sqlx::query(&format!(
+            r#"ALTER TABLE "{table}" DETACH PARTITION "{name}""#
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_ddl(table, "detach partition", self.ddl_lock_timeout, e))?;
+        tx.commit().await.map_err(pg)?;
         debug!(partition = %name, "detached");
         Ok(())
     }
@@ -1969,12 +2143,25 @@ impl HotStore for PostgresHot {
         Ok(Some(count.max(0) as u64))
     }
 
+    /// Drop a detached partition, under the DDL lock timeout.
+    ///
+    /// The relation is already out of the parent's inheritance by the time this
+    /// runs, so the `ACCESS EXCLUSIVE` lock is on the partition alone and the
+    /// only thing that can hold a conflicting one is a query still reading it —
+    /// [`scan_range`](HotStore::scan_range) reads detached partitions on purpose,
+    /// so that is an ordinary occurrence rather than a fault.
+    ///
+    /// Timing out here costs nothing: the rows are already durable in the cold
+    /// tier, so the partition is exactly the orphan an interrupted run leaves,
+    /// and the next cycle reclaims it.
     async fn drop_partition(&self, partition: &PartitionId) -> Result<()> {
         let name = partition.relation_name()?;
+        let mut tx = self.begin_ddl().await?;
         sqlx::query(&format!(r#"DROP TABLE IF EXISTS "{name}""#))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(pg)?;
+            .map_err(|e| pg_ddl(&name, "drop partition", self.ddl_lock_timeout, e))?;
+        tx.commit().await.map_err(pg)?;
         debug!(partition = %name, "dropped");
         Ok(())
     }

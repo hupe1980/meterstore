@@ -110,18 +110,20 @@ impl Settings {
     /// has its own use for it — the subject registry takes one, and so does
     /// whatever else the service keeps in the same database.
     ///
-    /// # It does not build the store
+    /// # It stops at the tiers
     ///
     /// A [`MeterStore`](crate::MeterStore) needs a cold *table provider*, which
-    /// needs the table to exist; and a deployment with several tables wants a
-    /// [`MeterCatalog`](crate::MeterCatalog) rather than N stores. Both are two
-    /// lines from here and neither is a configuration file's decision.
+    /// needs the cold table to exist — and whether a deployment wants one store
+    /// or a [`MeterCatalog`](crate::MeterCatalog) over all its tables is not
+    /// something a configuration file decides. [`Deployment::store`] and
+    /// [`Deployment::catalog`] are those two answers; this is what they are both
+    /// built from, and what a deployment assembling its own takes instead.
     pub async fn connect(&self) -> Result<Deployment> {
         let tables = self.validate_all()?;
         let pool = self.hot.connect().await?;
         let cold = self.cold.build().await?;
         Ok(Deployment {
-            hot: std::sync::Arc::new(crate::hot::PostgresHot::new(pool.clone())),
+            hot: std::sync::Arc::new(self.hot.hot(pool.clone())),
             pool,
             cold,
             tables,
@@ -162,6 +164,19 @@ pub struct HotSettings {
     /// Pool size.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// How long a DDL statement waits for a lock before giving up.
+    ///
+    /// Defaults to `3s`. See
+    /// [`PostgresHot::ddl_lock_timeout`](crate::PostgresHot::ddl_lock_timeout)
+    /// for why there is one at all: PostgreSQL grants locks in arrival order, so
+    /// a statement that waits for an `ACCESS EXCLUSIVE` lock blocks every reader
+    /// and writer behind it, and both of the paths that take one here run on a
+    /// schedule nobody chose.
+    ///
+    /// `0s` disables it, which is PostgreSQL's own default and this crate's
+    /// advice against.
+    #[serde(default = "default_ddl_lock_timeout")]
+    pub ddl_lock_timeout: HumanDuration,
 }
 
 impl HotSettings {
@@ -186,6 +201,15 @@ impl HotSettings {
         Ok(())
     }
 
+    /// Build the hot tier this section describes, over an existing pool.
+    ///
+    /// Separate from [`connect`](Self::connect) because a deployment almost
+    /// always brings its own pool — MeterStore never owns a connection — and
+    /// this is what carries the file's settings onto it.
+    pub fn hot(&self, pool: sqlx::PgPool) -> crate::hot::PostgresHot {
+        crate::hot::PostgresHot::new(pool).ddl_lock_timeout(self.ddl_lock_timeout.0)
+    }
+
     /// Open the pool this section describes.
     pub async fn connect(&self) -> Result<sqlx::PgPool> {
         self.validate()?;
@@ -207,6 +231,7 @@ impl Default for HotSettings {
         Self {
             url: String::new(),
             max_connections: default_max_connections(),
+            ddl_lock_timeout: default_ddl_lock_timeout(),
         }
     }
 }
@@ -216,8 +241,14 @@ impl std::fmt::Debug for HotSettings {
         f.debug_struct("HotSettings")
             .field("url", &crate::error::redacted(&self.url))
             .field("max_connections", &self.max_connections)
+            .field("ddl_lock_timeout", &self.ddl_lock_timeout)
             .finish()
     }
+}
+
+/// Matches `PostgresHot`'s own default, which is where the reasoning is.
+fn default_ddl_lock_timeout() -> HumanDuration {
+    HumanDuration(Duration::seconds(3))
 }
 
 const fn default_max_connections() -> u32 {
@@ -416,6 +447,93 @@ pub struct Deployment {
     pub cold: crate::cold::ColdTier,
     /// Every table the file declares, validated, in declaration order.
     pub tables: Vec<crate::config::ValidatedTableConfig>,
+}
+
+impl Deployment {
+    /// A builder for one declared table, with both tiers already wired.
+    ///
+    /// The cold table is created first, because a
+    /// [`TableProvider`](datafusion::catalog::TableProvider) cannot be opened
+    /// over a table the catalogue does not hold yet — which is the one step that
+    /// makes this more than field access, and the reason
+    /// [`connect`](Settings::connect) stops short of it.
+    ///
+    /// Returned as a builder rather than a store so a caller can still add what
+    /// a file cannot name: a [`SubjectRegistry`](crate::SubjectRegistry), a
+    /// [`ReadMode`](crate::ReadMode), a session it already owns.
+    pub async fn table(
+        &self,
+        config: crate::config::ValidatedTableConfig,
+    ) -> Result<crate::MeterStoreBuilder> {
+        use crate::tiering::ColdStore as _;
+
+        let cold = self.cold.cold();
+        // **With the declared columns, never bare.** The bare constructor would
+        // create the table with the core schema and the default partition spec,
+        // and a deployment declaring identity columns would then find its own
+        // `create_tables` refusing the table this call had just made for it: the
+        // identity columns are the *leading partition fields*, so getting them
+        // wrong is not a difference a later call can reconcile.
+        cold.create_tables(
+            config.name(),
+            &config.identity_column_names(),
+            &config.extra_columns(),
+        )
+        .await?;
+        let provider = cold.table_provider(config.name()).await?;
+        Ok(crate::MeterStore::builder()
+            .hot(self.hot.clone() as std::sync::Arc<dyn crate::HotStore>)
+            .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider)
+            .table(config))
+    }
+
+    /// Build a store over the **one** table the file declares.
+    ///
+    /// Errors when it declares several, rather than silently picking one — use
+    /// [`catalog`](Self::catalog) for those, which is what makes a statement able
+    /// to mention both.
+    ///
+    /// Creates the hot and cold tables as a side effect, exactly as
+    /// [`MeterStore::create_tables`](crate::MeterStore::create_tables) does, so
+    /// a fresh deployment is one call from usable.
+    pub async fn store(&self) -> Result<crate::MeterStore> {
+        let config = match self.tables.as_slice() {
+            [one] => one.clone(),
+            [] => return Err(Error::config("no [[tables]] declared")),
+            many => {
+                return Err(Error::config(format!(
+                    "{} tables are declared ({}), so there is no single store to build. \
+                     Use Deployment::catalog, which puts them in one session and lets a \
+                     statement mention more than one",
+                    many.len(),
+                    many.iter()
+                        .map(crate::config::ValidatedTableConfig::name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
+        };
+        let store = self.table(config).await?.build().await?;
+        store.create_tables().await?;
+        Ok(store)
+    }
+
+    /// Build a catalog over **every** table the file declares.
+    ///
+    /// One DataFusion session across all of them, so a statement can join two
+    /// streams — and one maintenance schedule, while each table keeps its own
+    /// watermark, archiver and lease.
+    ///
+    /// Creates every table's hot and cold relations as a side effect.
+    pub async fn catalog(&self) -> Result<crate::MeterCatalog> {
+        let mut builder = crate::MeterCatalog::builder();
+        for config in &self.tables {
+            builder = builder.table(self.table(config.clone()).await?);
+        }
+        let catalog = builder.build().await?;
+        catalog.create_tables().await?;
+        Ok(catalog)
+    }
 }
 
 impl std::fmt::Debug for Deployment {
@@ -758,7 +876,26 @@ impl<'de> Deserialize<'de> for HumanDuration {
     }
 }
 
-/// Parse `30s`, `15m`, `6h`, `1d`, `2w`, `10y`.
+/// Parse a duration the way a configuration file spells it.
+///
+/// The file format's own parser, exposed because the CLI takes durations on the
+/// command line and `--interval 15m` had better mean what `interval = "15m"`
+/// means. Two spellings of one unit is exactly the drift a single parser exists
+/// to prevent.
+pub fn parse_human_duration(text: &str) -> Result<Duration> {
+    parse_duration(text).map_err(Error::config)
+}
+
+/// Render a duration the way a configuration file spells it.
+///
+/// The inverse of [`parse_human_duration`], and what the CLI prints so a value
+/// it reports can be pasted straight back into the file.
+#[must_use]
+pub fn format_human_duration(d: Duration) -> String {
+    format_duration(d)
+}
+
+/// Parse `250ms`, `30s`, `15m`, `6h`, `1d`, `2w`, `10y`.
 ///
 /// A year is 365 days and a week is 7. Neither is a calendar unit here — these
 /// configure retention and headroom, not interval arithmetic, and the calendar
@@ -775,6 +912,13 @@ fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
         .parse()
         .map_err(|_| format!("{value:?} is not a whole number"))?;
 
+    // Milliseconds are their own arm rather than a fraction of a second: every
+    // other unit here is a retention or a headroom, and the one setting written
+    // below a second — a DDL lock timeout — is a wait, not a span.
+    if unit.trim() == "ms" {
+        return Ok(Duration::milliseconds(value));
+    }
+
     let seconds = match unit.trim() {
         "s" => 1,
         "m" => 60,
@@ -783,7 +927,9 @@ fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
         "w" => 604_800,
         "y" => 31_536_000,
         other => {
-            return Err(format!("unknown unit {other:?}; use s, m, h, d, w or y"));
+            return Err(format!(
+                "unknown unit {other:?}; use ms, s, m, h, d, w or y"
+            ));
         }
     };
 
@@ -794,7 +940,16 @@ fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
 }
 
 /// The inverse of [`parse_duration`], choosing the largest exact unit.
+///
+/// Sub-second first, and it is not cosmetic: without it a `750ms` timeout
+/// renders as `0s`, which is the spelling that *disables* the timeout. A
+/// round-tripped file would then silently turn the setting off.
 fn format_duration(d: Duration) -> String {
+    let millis = d.whole_milliseconds();
+    if millis % 1_000 != 0 {
+        return format!("{millis}ms");
+    }
+
     let s = d.whole_seconds();
     for (unit, size) in [
         ("y", 31_536_000),
@@ -817,8 +972,42 @@ fn format_duration(d: Duration) -> String {
 /// from the mistake, with a message about the wrong thing.
 fn interpolate(text: &str) -> Result<String> {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    for line in text.split_inclusive('\n') {
+        let (value, comment) = split_comment(line);
+        interpolate_into(&mut out, value)?;
+        out.push_str(comment);
+    }
+    Ok(out)
+}
 
+/// Split a line into its value part and its trailing `#` comment.
+///
+/// Comments are copied through untouched, which is not cosmetic: the file this
+/// crate ships as a starter *documents* the interpolation, and a comment
+/// explaining `${DATABASE_URL}` would otherwise be a reference to be resolved —
+/// so the template could only be read by a process that already had every
+/// variable it was describing.
+///
+/// A `#` inside a quoted string is not a comment. Tracked with a two-state scan
+/// rather than a TOML parser, which is exactly enough: the input has already
+/// been read as text and is about to be parsed properly, so this only has to
+/// avoid making things *worse* than passing the line through whole.
+fn split_comment(line: &str) -> (&str, &str) {
+    let mut quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), c) if c == open => quote = None,
+            (None, '#') => return (&line[..i], &line[i..]),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// Replace every `${VAR}` in one stretch of value text.
+fn interpolate_into(out: &mut String, text: &str) -> Result<()> {
+    let mut rest = text;
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let tail = &rest[start + 2..];
@@ -835,9 +1024,8 @@ fn interpolate(text: &str) -> Result<String> {
         out.push_str(&value);
         rest = &tail[end + 1..];
     }
-
     out.push_str(rest);
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1152,6 +1340,10 @@ settlment_lag = "7d"
 
     #[test]
     fn durations_parse_the_way_operators_write_them() {
+        assert_eq!(
+            parse_duration("250ms").unwrap(),
+            Duration::milliseconds(250)
+        );
         assert_eq!(parse_duration("30s").unwrap(), Duration::seconds(30));
         assert_eq!(parse_duration("15m").unwrap(), Duration::minutes(15));
         assert_eq!(parse_duration("6h").unwrap(), Duration::hours(6));
@@ -1169,8 +1361,43 @@ settlment_lag = "7d"
     }
 
     #[test]
+    fn the_hot_section_carries_a_ddl_lock_timeout() {
+        // A file that says nothing gets the same default `PostgresHot` has, and
+        // one that says something gets that. Both matter: this is the setting
+        // that decides whether a background archival can stall ingest.
+        let quiet: Settings = toml::from_str(
+            r#"
+            [hot]
+            url = "postgresql://localhost/meterstore"
+            [[tables]]
+            name = "readings_versions"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(quiet.hot.ddl_lock_timeout.0, Duration::seconds(3));
+
+        let stated: Settings = toml::from_str(
+            r#"
+            [hot]
+            url = "postgresql://localhost/meterstore"
+            ddl_lock_timeout = "750ms"
+            [[tables]]
+            name = "readings_versions"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(stated.hot.ddl_lock_timeout.0, Duration::milliseconds(750));
+
+        // And it survives a round trip, so normalising a hand-written file does
+        // not quietly drop it.
+        let text = stated.to_toml().unwrap();
+        let back = Settings::from_toml(&text).unwrap();
+        assert_eq!(back.hot.ddl_lock_timeout.0, Duration::milliseconds(750));
+    }
+
+    #[test]
     fn durations_round_trip_through_the_file_format() {
-        for text in ["30s", "15m", "6h", "7d", "2w", "10y"] {
+        for text in ["250ms", "30s", "15m", "6h", "7d", "2w", "10y"] {
             let parsed = parse_duration(text).unwrap();
             assert_eq!(
                 parse_duration(&format_duration(parsed)).unwrap(),
@@ -1208,6 +1435,30 @@ settlment_lag = "7d"
         )
         .unwrap();
         assert_eq!(settings.cold.warehouse, "s3://meterstore/meterstore");
+    }
+
+    #[test]
+    fn a_comment_may_document_a_placeholder_without_resolving_it() {
+        // The starter file this crate writes explains the interpolation in a
+        // comment. Interpolating comments too would make that file unreadable by
+        // any process that did not already have the variable it was describing —
+        // which is every process running `meterstore init`.
+        let settings = Settings::from_toml(
+            "# set url = \"${METERSTORE_DEFINITELY_UNSET}\" to take it from the environment\n\
+             [hot]\n\
+             url = \"postgresql://${CARGO_PKG_NAME}\"  # and here it is\n",
+        )
+        .expect("a comment is documentation, not a reference to resolve");
+        assert_eq!(settings.hot.url, "postgresql://meterstore");
+    }
+
+    #[test]
+    fn a_hash_inside_a_value_is_not_a_comment() {
+        // A password may contain one, and treating it as a comment would silently
+        // truncate the URL.
+        let settings =
+            Settings::from_toml("[hot]\nurl = \"postgresql://u:p#w@host/db\"\n").unwrap();
+        assert_eq!(settings.hot.url, "postgresql://u:p#w@host/db");
     }
 
     #[test]

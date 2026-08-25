@@ -79,6 +79,43 @@ jobs:
           echo "single-sourced dependencies OK"
 
 
+  # `--all-features` hides a broken feature combination entirely: an optional
+  # dependency reached from non-optional code compiles fine as long as
+  # *something* enables it. The failure only appears for someone who picked a
+  # narrower set — that is, only after publishing, in someone else's build.
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Every feature combination a published crate's users can select
+        run: |
+          set -uo pipefail
+          fail=0
+          for set in "--no-default-features" \
+                     "--no-default-features --features rest-catalog" \
+                     "--no-default-features --features flight" \
+                     "--no-default-features --features cli" \
+                     "--no-default-features --features catalog-facade" \
+                     "--no-default-features --features s3tables" \
+                     "--no-default-features --features testkit" \
+                     "--all-features"; do
+            printf '%-56s' "$set"
+            if cargo check --quiet --all-targets $set 2>/tmp/out; then
+              echo ok
+            else
+              echo FAILED
+              grep -E '^error' -A 6 /tmp/out | head -20
+              fail=1
+            fi
+          done
+          exit "$fail"
+
   # A declared MSRV that nothing checks is a guess. This makes it a fact.
   msrv:
     runs-on: ubuntu-latest

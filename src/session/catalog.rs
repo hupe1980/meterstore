@@ -160,6 +160,14 @@ impl MeterCatalog {
     /// any of them scanned. A single watermark would be a fiction here, because
     /// two tables genuinely have two boundaries (§15.3) and a figure spanning
     /// both was computed against both.
+    ///
+    /// # Caller-supplied SQL reaches every registered relation
+    ///
+    /// That is the point of a catalog and also the risk. Where the text comes from
+    /// outside, confine the **session**: [`isolated`](Self::isolated) gives a
+    /// session holding one table, so a statement naming another fails to plan, and
+    /// [`MeterStore::scoped`](crate::MeterStore::scoped) pins a merge-key column
+    /// below the projection. The two compose.
     pub async fn query(&self, sql: &str) -> Result<QueryResult> {
         self.query_with_params(sql, Vec::new()).await
     }
@@ -220,7 +228,7 @@ impl MeterCatalog {
             .state()
             .create_logical_plan(sql)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
         let scanned = scanned_relations(&plan);
 
         let mut watermarks = Vec::with_capacity(self.stores.len());

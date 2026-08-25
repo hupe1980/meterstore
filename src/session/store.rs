@@ -121,6 +121,16 @@ impl MeterStore {
     /// and output format works and there is no second query language to maintain.
     /// Use [`query`](Self::query) instead when the result needs its provenance.
     ///
+    /// # Caller-supplied SQL: confine the session, not the statement
+    ///
+    /// Where the text comes from outside, the confinement has to be a property of
+    /// the **session** — the statement is the thing you do not control.
+    /// [`scoped`](Self::scoped) injects a merge-key equality *below the
+    /// projection*, so no statement can omit it, alias around it or `UNION` past
+    /// it; [`MeterCatalog::isolated`](super::MeterCatalog::isolated) does the same
+    /// for relations. The two compose. Matching relation names against a
+    /// deny-list does not: that boundary holds until someone adds a table.
+    ///
     /// # Queries only
     ///
     /// Anything else is refused. DataFusion's SQL surface is wider than
@@ -142,7 +152,7 @@ impl MeterStore {
         let plan = state
             .create_logical_plan(query)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
         require_read_only(&plan)?;
         Ok(DataFrame::new(state, plan))
     }
@@ -161,6 +171,12 @@ impl MeterStore {
     ///
     /// Both facts are already available at plan time, so this costs a plan walk
     /// rather than a second query.
+    ///
+    /// Everything [`sql`](Self::sql) says about caller-supplied text applies: it
+    /// is refused unless it is a query, and a scan is confined by
+    /// [`scoped`](Self::scoped) and
+    /// [`MeterCatalog::isolated`](super::MeterCatalog::isolated) rather than by
+    /// anything in the text.
     pub async fn query(&self, sql: &str) -> Result<super::QueryResult> {
         self.query_with_params(sql, Vec::new()).await
     }
@@ -218,10 +234,7 @@ impl MeterStore {
     ) -> Result<super::QueryDescription> {
         let frame = self.sql(sql).await?;
         let schema = Arc::new(frame.schema().as_arrow().clone());
-        let plan = frame
-            .create_physical_plan()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let plan = frame.create_physical_plan().await.map_err(Error::from)?;
 
         Ok(super::QueryDescription::new(
             schema,
@@ -254,7 +267,7 @@ impl MeterStore {
 
         let batches = datafusion::physical_plan::collect(plan, self.ctx.task_ctx())
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
 
         Ok(super::QueryResult::new(
             batches, schema, watermarks, tiers, self.mode,
@@ -277,6 +290,11 @@ impl MeterStore {
     /// caller that has to put the boundary on the wire needs it before it starts
     /// writing (P1). It is the same type [`describe`](Self::describe) returns, so
     /// the two surfaces cannot disagree about what a statement produces.
+    ///
+    /// This is what Flight SQL serves, so it is the surface most likely to be
+    /// handed **caller-supplied SQL**: confine the session with
+    /// [`scoped`](Self::scoped) and
+    /// [`MeterCatalog::isolated`](super::MeterCatalog::isolated).
     ///
     /// [`QueryDescription`]: super::QueryDescription
     pub async fn stream(
@@ -333,7 +351,7 @@ impl MeterStore {
         let tiers = super::query::tiers_of(&plan);
 
         let stream = datafusion::physical_plan::execute_stream(plan, self.ctx.task_ctx())
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
 
         Ok((
             super::QueryDescription::new(schema, watermarks, tiers, self.mode),
@@ -349,14 +367,9 @@ impl MeterStore {
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let mut frame = self.sql(sql).await?;
         if !params.is_empty() {
-            frame = frame
-                .with_param_values(params)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+            frame = frame.with_param_values(params).map_err(Error::from)?;
         }
-        frame
-            .create_physical_plan()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))
+        frame.create_physical_plan().await.map_err(Error::from)
     }
 
     /// This store's validated configuration.
@@ -467,7 +480,7 @@ impl MeterStore {
             .ctx
             .table_provider(self.resolved_table().as_str())
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
 
         super::completeness::compute(
             &self.ctx.state(),
@@ -572,11 +585,50 @@ impl MeterStore {
     /// reads at the current watermark; the ceiling, not the watermark, is what
     /// makes the read historical.
     pub async fn as_known_at(&self, at: time::OffsetDateTime) -> Result<Self> {
+        self.derive(ReadMode::AsKnownAt(at)).await
+    }
+
+    /// The same store, reading a different set of tiers.
+    ///
+    /// The general form of [`as_known_at`](Self::as_known_at), and the one a
+    /// service reaches for when the *caller* chooses:
+    /// [`Historical`](ReadMode::Historical) answers a reporting query off the
+    /// lake with no load on the operational database, and
+    /// [`Operational`](ReadMode::Operational) answers a monitoring query off the
+    /// recent window without an Iceberg round trip.
+    ///
+    /// Everything else about the session carries over — the row scope, the
+    /// subject registry, both tiers — because a boundary a derived session drops
+    /// is not a boundary.
+    ///
+    /// [`AsOf`](ReadMode::AsOf) is **refused** here. It has to resolve its
+    /// snapshot and walk back the boundary that snapshot published, neither of
+    /// which a mode value carries; [`as_of`](Self::as_of) is that constructor and
+    /// it takes the arguments it needs.
+    pub async fn in_read_mode(&self, mode: ReadMode) -> Result<Self> {
+        if let ReadMode::AsOf { .. } = mode {
+            return Err(Error::config(
+                "a pinned snapshot is not just a read mode: it has to be resolved, and \
+                 the boundary it published has to be walked back from it, or a settlement \
+                 rerun reports the epoch as the boundary it ran against. Use \
+                 MeterStore::as_of, which does both",
+            ));
+        }
+        self.derive(mode).await
+    }
+
+    /// A session over the same tiers, table and confinement, in another mode.
+    ///
+    /// Written once because every derived session has to carry the *same* things
+    /// forward, and the failure of forgetting one is silent: a scoped store whose
+    /// derived session dropped the scope answers caller-supplied SQL over every
+    /// tenant.
+    async fn derive(&self, mode: ReadMode) -> Result<Self> {
         let mut builder = MeterStoreBuilder::default()
             .hot(Arc::clone(&self.hot))
             .cold(Arc::clone(&self.cold), Arc::clone(&self.cold_provider))
             .table(self.config.clone())
-            .read_mode(ReadMode::AsKnownAt(at))
+            .read_mode(mode)
             .row_scope(self.row_scope.clone());
         if let Some(registry) = self.registry.clone() {
             builder = builder.subject_registry(registry);
@@ -1995,8 +2047,11 @@ impl MeterStore {
                 if let Some(stored) = stored_melo.get(&(row.key.clone(), version))
                     && *stored != row.melo
                 {
-                    return Err(Error::InvariantViolated {
+                    // A delivery the store refused, not a state the store is in:
+                    // the cold-tier twin of the hot path's `melo_id` check.
+                    return Err(Error::IntegrityViolation {
                         table: self.config.name().to_string(),
+                        constraint: Some("melo_identifies_the_reading".to_string()),
                         detail: format!(
                             "reading {} {} at {} is already stored at version {version} for \
                              Messlokation {:?} but this delivery names {:?}. A Marktlokation \
@@ -2013,8 +2068,9 @@ impl MeterStore {
                     });
                 }
                 if held.value != row.written.value {
-                    return Err(Error::InvariantViolated {
+                    return Err(Error::IntegrityViolation {
                         table: self.config.name().to_string(),
+                        constraint: Some("version_identifies_one_assertion".to_string()),
                         detail: format!(
                             "reading {} {} at {} is already stored at version {version} with \
                              value {} but this delivery restates it as {} — a version \
@@ -3117,7 +3173,7 @@ impl MeterStoreBuilder {
         // careless `SELECT SUM(...)` hits.
         let raw = raw_name(config.name());
         ctx.register_table(&raw, Arc::clone(&tiered) as Arc<dyn TableProvider>)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
 
         let resolved = self
             .register_as
@@ -3143,7 +3199,7 @@ impl MeterStoreBuilder {
                 self.mode.recorded_at_ceiling(),
             ))
             .await
-            .map_err(|e| Error::Storage(format!("planning resolution: {e}")))?;
+            .map_err(Error::from)?;
 
         // A provider rather than a view: eliding resolution needs per-file
         // version statistics for the range being scanned, which a view cannot
@@ -3156,7 +3212,7 @@ impl MeterStoreBuilder {
                 resolution_plan,
             ));
         ctx.register_table(&resolved, Arc::clone(&resolved_provider))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
 
         // Completeness reads the *resolved* table: a corrected interval is one
         // interval, and counting both its versions would report a complete day

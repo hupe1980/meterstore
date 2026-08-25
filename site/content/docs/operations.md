@@ -26,7 +26,8 @@ flight, exactly as `shutdown()` does, so a handle that goes out of scope cannot
 leave a task archiving against a store nobody is watching.
 
 Every replica can run the same schedule. One wins the archive lease; the others
-report `lease_contended` and stop. That is not a failure.
+report `lease_contended` and stop. That is not a failure. Nor is `deferred`, the
+other benign no-op — see [locks](#locks-and-why-ddl-gives-up).
 
 **One loop, however many tables.** A [catalogue](@/docs/querying.md#several-tables-in-one-session)
 maintains all of its tables from one schedule:
@@ -60,6 +61,82 @@ when it ran. Tiering itself never reads a clock at all — it routes on `from`, 
 data value — so the only thing wall time decides is *when* a window becomes
 eligible.
 
+## Locks, and why DDL gives up {#locks-and-why-ddl-gives-up}
+
+PostgreSQL grants locks **in arrival order**. A statement waiting for an
+`ACCESS EXCLUSIVE` lock therefore blocks every reader and writer that arrives
+behind it, whether or not those would have conflicted with each other. One
+long-running query on the hot table, or one session left idle in a transaction,
+turns a background job into a total ingest outage that lasts as long as the query
+does.
+
+MeterStore's hot tier issues DDL on two schedules an operator does not choose:
+partition creation on the **write path**, and partition detach and drop in the
+**archival loop**. So both are made unable to do that, in two different ways.
+
+### Creation avoids the lock
+
+`CREATE TABLE … PARTITION OF` takes `ACCESS EXCLUSIVE` on the parent. MeterStore
+does not use it. It builds the relation standalone, adds the bound `CHECK` that
+lets the attach prove the partition constraint from the catalogue instead of
+scanning, attaches it — `SHARE UPDATE EXCLUSIVE` on the parent from PostgreSQL 12,
+which conflicts with no read and no write — and drops the now-redundant `CHECK`
+again so no row is ever checked against it twice.
+
+The integrity constraints go on **before** the attach, while the relation is still
+invisible to every other session. A `GiST` index built on a table nobody can see
+cannot contend with anything.
+
+### Detach cannot, so it declines to wait
+
+Removing a partition from a table's inheritance genuinely needs the strong lock.
+Every DDL statement therefore runs under a `lock_timeout`:
+
+```toml
+[hot]
+ddl_lock_timeout = "3s"    # 0s disables it — PostgreSQL's default, and the advice against
+```
+
+A detach that cannot get its lock promptly gives up **having changed nothing**.
+The cycle reports `deferred` and the next one tries again. Raise the timeout on a
+deployment that reports out of the same tables it writes; every second added is a
+second the whole table can stall for.
+
+The drop *after* the cold commit is the one case where a timeout changes state,
+and it is a state the design already has a name for: the window is durable in
+Iceberg, so what is left behind is exactly the orphan an interrupted run leaves,
+and orphan reclamation takes it on the next cycle. Failing the run instead would
+re-archive a window that is already committed.
+
+**Alert on watermark lag, not on deferral** (`outcome.tables[..].deferred()`). A
+cycle deferring once means a long query was in flight, which is ordinary. A table
+deferring every cycle for an hour means something holds a conflicting lock
+permanently — look for it in `pg_stat_activity`, usually a session idle in a
+transaction.
+
+## Errors, and which to retry
+
+`Error::is_retryable()` is the split: a lost connection and an unavailable lock
+are worth retrying; a refused delivery, an invalid configuration and a statement
+that will not plan are not, and retrying them loops on a message that will never
+change.
+
+| Error | Retryable | What it means |
+|---|---|---|
+| `LockTimeout` | yes | Nothing was changed. Something else holds a conflicting lock |
+| `Storage` | yes | The backend failed — a connection, a timeout, a full disk |
+| `DataFusion` | *depends* | Both the planner and the object-store reader: a statement that will not plan is not retried, a warehouse that could not be reached is |
+| `IntegrityViolation` | no | The store refused a delivery. The delivery has to change |
+| `InvariantViolated` | no | The store's own state is wrong. **An operator has to look** |
+| `Quarantined` | no | An incompatible schema change. An operator has to resolve it |
+
+The last two are the pair worth keeping straight, and the difference is who is at
+fault. `IntegrityViolation` means the store **stopped** something from becoming
+true — an overlapping delivery, two network operators for one reading, a value
+restated under an existing version. `InvariantViolated` means something already is
+true that should not be. Whoever is paged for the second must not be woken by a
+producer sending a bad row.
+
 ## System tables
 
 ```sql
@@ -80,6 +157,13 @@ FROM system.tables;
   `settlement_lag + headroom`: that figure is a constant, so it reports the runway
   a healthy deployment *would* have and cannot warn you about the one that
   stopped.
+
+  A table with **no partitions at all** is exempt, because "not started" and
+  "exhausted" show the same two numbers and mean opposite things. A table created
+  a moment ago has no frontier to run out of, and reporting it degraded made the
+  first status of every new deployment an alarm — which is how an alert stops
+  being read. A store that cannot enumerate its partitions reports `-1` and is
+  *not* called healthy: "cannot say" must not read as "fine".
 
 Three more relations answer questions that otherwise need Iceberg metadata by
 hand:
@@ -130,10 +214,11 @@ Every instrument carries a `table` attribute; scan metrics add `tier`.
 | `meterstore.tiering.watermark_lag` | Archival falling behind. Trends toward failure before causing one. |
 | `meterstore.tiering.hot_partitions_ahead` | Reaching 0 stops writes outright. |
 | `meterstore.archival.rows` / `.duration` / `.failures` | Throughput, and whether a window still fits its schedule. |
+| `meterstore.archival.deferred` | Cycles that stopped because a lock was not available. **Not a failure** — nothing was changed and the next cycle retries. Alert on watermark lag; read this to explain it. |
 | `meterstore.partitions.dropped` / `.orphans_reclaimed` | Purge keeping up; non-zero orphans mean runs are being interrupted. |
 | `meterstore.write.rows` / `.rows_deduplicated` / `.late_corrections` | Ingest volume, the redelivery rate (expected to be non-zero), and corrections arriving after their interval was archived. |
 | `meterstore.query.plan_duration` / `.scan_duration` | **Two instruments, not one.** A single `query.duration` recorded at plan time measured only the time to build a plan — making a slow catalogue look like a slow query and hiding a slow scan behind fast planning. |
-| `meterstore.query.merge_elided` / `.merge_elision_decisions` | The elided ratio — how often a historical scan skipped version resolution. It falls as corrections accumulate in the ranges being queried, which is the data changing rather than the layout degrading; see [maintenance](#maintenance-that-is-not-implemented). |
+| `meterstore.query.merge_elided` / `.merge_elision_decisions` | The elided ratio — how often a historical scan skipped version resolution. It falls as corrections accumulate in the ranges being queried, which is the data changing rather than the layout degrading; see [compaction](#compaction). |
 
 ## Schema evolution
 
@@ -182,6 +267,7 @@ compaction with Spark, or a second deployment on an older configuration.
 | Postgres unavailable | Archival retries; cold queries unaffected | Automatic |
 | Iceberg commit conflict | Retried against the refreshed base, summary re-derived | Automatic |
 | Second archiver on the same table | Lease refused; the run is a reported no-op | Automatic; alert on lag, not on contention |
+| A DDL lock held by a long query | Statement gives up; the run is a reported no-op (`deferred`) | Automatic; alert on lag, not on deferral |
 | Incompatible schema change | Table quarantined; rows stay correctable in PostgreSQL | Operator resolves |
 | As-of read against an expired snapshot | Fails naming the snapshot | Pick another from `system.snapshots` |
 | Clock skew | No impact — tiering is on `from`, a data value | — |
@@ -190,90 +276,57 @@ compaction with Spark, or a second deployment on an older configuration.
 **Degrade, don't lie** is the rule behind that table. When Iceberg is unreachable,
 cold queries fail loudly rather than silently returning only the hot window.
 
-## Maintenance that is not implemented
+## Compaction and orphan files {#compaction}
 
-Two jobs are blocked upstream rather than deferred:
+Both run **out of band**, with Spark or PyIceberg against the same standard
+table — `iceberg-rust` can neither commit a snapshot that removes files (no
+rewrite action, and `TableCommit`'s builder is crate-private) nor list a
+warehouse to find files the manifests do not reference. The
+[interop suite](@/docs/interop.md) checks that a foreign engine reads the schema,
+the partition spec, the format version and the tiering watermark out of these
+tables.
 
-- **Compaction.** `iceberg-rust` has no public way to land a snapshot that
-  *removes* files: there is no rewrite action, and both `TransactionAction` and
-  `TableCommit`'s builder are crate-private. Every byte of a compacted snapshot
-  can be produced and not committed.
-- **General orphan-file cleanup.** Blocked one step earlier, on the read path:
-  finding files nobody knows about means listing the warehouse and subtracting
-  what the manifests reference, and `FileIO` exposes no listing operation at all.
+Neither costs correctness, and **compaction does not recover version elision**,
+which is worth saying because it reads as if it should: a corrected reading has
+two versions stored and appears twice however the bytes are arranged. Coarser
+files in fact push elision the wrong way, since a scan reads whole files. The case
+for compaction is the ordinary one — less manifest to plan against.
 
-Neither costs correctness. **Compaction does not recover version elision**, which
-is worth stating because it reads as if it should: elision is a property of the
-data, so a corrected reading has two versions stored and appears twice however the
-bytes are arranged. What the layout affects is collateral loss — a scan reads
-whole files, so a **coarser** file forces more uncorrected keys through resolution
-alongside a corrected one — and compaction moves that the wrong way. The case for
-it is the ordinary one: fewer, larger files mean less manifest to plan against.
+The one orphan source that is closed needs no listing: a commit that wrote its
+data files and failed to land still holds every path, so it deletes them before
+returning the error. It re-reads the table first, because a commit can fail
+*after* landing.
 
-An operator who needs either can run it out of band with
-Spark or PyIceberg against the same standard table. The
-[interop suite](@/docs/interop.md) checks that this works: PyIceberg reads the
-schema, the partition spec, the format version and the tiering watermark out of
-these tables.
+## Snapshot expiry
 
-### The one orphan source that *is* closed
+Ten years by default, and opt-in: a snapshot is what makes a past settlement
+reproducible, so retention is a compliance decision rather than a disk-space one.
 
-Nothing here removes a committed file, so a warehouse gains orphans from one
-event only: a commit that wrote its data files and failed to land. Those need no
-listing — the writer holds every path — so it deletes them before returning the
-error.
+It reclaims **metadata, not readings**. The table is append-only, so every data
+file an old snapshot referenced is still referenced by the current one; what
+expiry bounds is the metadata JSON, whose snapshot array grows with every commit
+and is parsed on **every** table load. Unreferenced manifest lists and old
+metadata files stay on object storage — removing those needs the listing operation
+above.
 
-It re-reads the table first, because a commit can fail *after* landing: a timeout
-says nothing about whether the catalog applied the update, and deleting on that
-reading would take files out from under a live snapshot. Anything the current
-snapshot references is left alone, and so is everything if the reload fails.
+### Do not expire snapshots from a foreign tool
 
-### What snapshot expiry reclaims
+A foreign commit carries no watermark, so the boundary lookup walks back the
+parent chain to find one — and removing **any** ancestor on that walk strands it.
+Not just the snapshot carrying the boundary: an intermediate one leaves a hole,
+the walk stops at a parent id that no longer resolves, and every query fails at
+once on a table that is otherwise healthy.
 
-**Metadata.** The unreferenced manifest lists, manifests and old metadata files
-stay on object storage — upstream's action rewrites metadata only, and removing
-them needs the listing operation above.
-
-No bytes of readings, and there are none to reclaim: the table is append-only, so
-every data file an old snapshot referenced is still referenced by the current one.
-What expiry bounds is the metadata JSON, whose snapshot array grows with every
-commit and is parsed on **every** table load. That is the growth that compounds.
-
-### The one rule an out-of-band tool must not break
-
-A foreign commit is a perfectly valid Iceberg snapshot that says nothing about
-tiering — so it carries no watermark, and the boundary lookup walks back the
-parent chain to find one.
-
-That works, and it makes snapshot expiry dangerous in a way that is not obvious:
-removing **any** ancestor on that walk is enough to strand the boundary. Not just
-the snapshot carrying it — an intermediate one leaves the chain with a hole, the
-walk stops at a parent id that no longer resolves, and no boundary is found. Every
-query then fails at once, on a table that is otherwise perfectly healthy. A
-maintenance job following the advice above would have done that.
-
-Two things prevent it:
-
-- **`expire_snapshots` re-stamps the boundary first**, onto the current snapshot,
-  so the walk is one snapshot long and there is no chain to punch a hole in. It
-  then protects that path anyway, for a history it did not create.
-- **`store.reassert_watermark()`** is the same operation on its own. Run it after
-  any out-of-band maintenance if you are not also running expiry. It republishes
-  what the history already says — it cannot move the boundary — and is a no-op
-  when the current snapshot already carries one.
+`expire_snapshots` re-stamps the boundary onto the current snapshot first, so
+there is no chain to punch a hole in. `store.reassert_watermark()` is that step on
+its own — run it after any out-of-band maintenance if you are not also running
+expiry. It republishes what the history already says, cannot move the boundary,
+and is a no-op when the current snapshot carries one:
 
 ```rust
 // After compacting with Spark or PyIceberg:
 store.reassert_watermark().await?;
 ```
-
-**Do not expire snapshots from the foreign tool.** Retention is a compliance
-decision and MeterStore owns it; an external expiry knows nothing about the
-boundary it might be removing.
-
-Snapshot expiry **is** implemented. It defaults to ten years, because a snapshot
-is what makes a past settlement reproducible: that is a compliance decision rather
-than a disk-space one, which is also why it is opt-in.
 
 ## Removing data
 

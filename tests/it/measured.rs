@@ -180,15 +180,28 @@ async fn archival_throughput_does_not_collapse() {
         elapsed
     );
 
-    // Far below the target, and expected to be: each window here is ~5 700 rows,
-    // so the fixed per-window cost — catalog compare-and-swap, file creation,
-    // footer — dominates entirely. A real 9.6 M-row window amortises all of it.
-    // What this catches is a per-row round trip creeping back into the scan,
-    // which would cost two more orders of magnitude.
+    // Far below the §18 target, and expected to be: each window here is ~5 700
+    // rows, so the fixed per-window cost — catalog compare-and-swap, file
+    // creation, footer — dominates entirely. A real 9.6 M-row window amortises
+    // all of it. The number above is the useful output; what follows is only a
+    // floor against pathology.
+    //
+    // **The scan's round-trip shape is not guarded here.** A wall clock cannot
+    // distinguish a per-row round trip from a loaded machine: on this workload
+    // the two differ by a factor of a few, and an assertion tight enough to
+    // catch the first fires constantly on the second. That property is exact and
+    // belongs in an exact test — `a_range_scan_streams_in_bounded_chunks` pins
+    // the round-trip *count* against the chunk size, where 25 rows in chunks of
+    // ten is three statements and nothing else passes.
+    //
+    // So this floor sits where only something catastrophic reaches it: ~2 600
+    // rows/s unloaded on a developer machine, ~650 with three suites competing
+    // for the same cores and Docker daemon. A hundred means archival took three
+    // minutes to move seventeen thousand rows.
     assert!(
-        per_second > 1_000.0,
-        "archival managed only {per_second:.0} rows/s; that is slow enough to \
-         suggest a per-row round trip rather than a batched scan"
+        per_second > 100.0,
+        "archival managed only {per_second:.0} rows/s over {rows} rows — that is \
+         not slow, it is broken"
     );
 }
 

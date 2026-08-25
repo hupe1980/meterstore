@@ -307,14 +307,21 @@ mod tests {
 
     #[test]
     fn the_pinned_image_meets_the_documented_minimum() {
-        // §3.1 requires PostgreSQL ≥ 14. The container library's default is
-        // 11-alpine, so this has to be set rather than inherited.
+        // The documented floor is **12**, where `ATTACH PARTITION` stopped taking
+        // `ACCESS EXCLUSIVE` on the parent — which is what keeps partition
+        // creation off the ingest path's critical lock. The container library's
+        // own default is 11-alpine, below that, so the tag has to be set rather
+        // than inherited.
+        //
+        // The suite pins a much newer one on purpose: the floor is what the
+        // design *needs*, and what the tests run against should be what a
+        // deployment plausibly runs.
         let major: u32 = TestHarness::POSTGRES_IMAGE_TAG
             .split('-')
             .next()
             .and_then(|m| m.parse().ok())
             .expect("the tag must start with a major version");
-        assert!(major >= 14, "§3.1 requires PostgreSQL 14 or newer");
+        assert!(major >= 12, "the documented floor is PostgreSQL 12");
     }
 
     #[test]

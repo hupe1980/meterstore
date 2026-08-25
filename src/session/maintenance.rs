@@ -72,6 +72,18 @@ impl TableMaintenance {
         self.archival.iter().any(|o| o.lease_contended)
     }
 
+    /// Whether a run stopped because a lock was not available.
+    ///
+    /// Not a failure and not counted as one: the statement declined to queue for
+    /// a lock rather than blocking every reader and writer behind it, and nothing
+    /// was changed. It is worth surfacing because a table that defers *every*
+    /// cycle is a table whose watermark is not moving, and the fix is on the
+    /// database — a long-running query, or a session idle in a transaction —
+    /// rather than here.
+    pub fn deferred(&self) -> bool {
+        self.archival.iter().any(|o| o.deferred)
+    }
+
     /// Whether this table's cycle completed and its tiers still partition its
     /// data as they should.
     pub fn healthy(&self) -> bool {
@@ -125,6 +137,11 @@ impl MaintenanceOutcome {
     /// Whether another process was doing the work for any table.
     pub fn lease_contended(&self) -> bool {
         self.tables.iter().any(TableMaintenance::lease_contended)
+    }
+
+    /// Whether any table's run stopped because a lock was not available.
+    pub fn deferred(&self) -> bool {
+        self.tables.iter().any(TableMaintenance::deferred)
     }
 
     /// Whether every table's tiers still partition their data as they should.
@@ -411,6 +428,7 @@ mod tests {
             orphans_reclaimed: 0,
             partitions_created: 0,
             lease_contended: false,
+            deferred: false,
         }
     }
 
@@ -422,6 +440,7 @@ mod tests {
             orphans_reclaimed: 0,
             partitions_created: 3,
             lease_contended: false,
+            deferred: false,
         }
     }
 

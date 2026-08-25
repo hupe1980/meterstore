@@ -32,6 +32,12 @@
 //! and serialising them entirely would add about a minute to every run for a
 //! safety margin that [`MAX_CONCURRENT`] already provides.
 
+// Only the foreign-engine suites use this, and those are `testkit`-gated. Without
+// the gate a narrow feature build compiles the module into a binary where nothing
+// calls it, and CI — which builds every feature combination with `-D warnings` —
+// fails on dead code in a helper rather than on anything a user could hit.
+#![cfg(feature = "testkit")]
+
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};

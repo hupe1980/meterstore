@@ -1,7 +1,7 @@
 +++
 title = "External engines"
 description = "Reading the history from Spark, Trino, DuckDB or PyIceberg with MeterStore out of the data path — and the version-resolution trap that silently double-counts if you skip one step."
-weight = 9
+weight = 10
 +++
 
 **The default answer for external engines is the Iceberg catalogue, not a
@@ -138,6 +138,10 @@ select a metadata document that was never committed. DuckDB requires
 let router = cold_tier.catalog_facade().router();   // feature = "catalog-facade"
 ```
 
+```bash
+meterstore serve --catalog-addr 127.0.0.1:8181     # the same thing, bound
+```
+
 A read-only Iceberg REST Catalog endpoint implementing the spec's config,
 namespace and table-metadata routes. Every Iceberg engine speaks this; nothing
 MeterStore-specific is needed client-side.
@@ -155,7 +159,9 @@ Three decisions it makes explicit:
   keeps the endpoint out of the data path — and means compromising it does not
   hand over the warehouse.
 - **It returns a `Router`, not a bound port**, so you wrap it in your own
-  authentication, TLS and tracing.
+  authentication, TLS and tracing. [The CLI](@/docs/cli.md#serving) binds it bare
+  for a deployment that puts its own proxy in front, alongside Flight SQL and
+  under one shutdown.
 
 ## Flight SQL, and when *not* to use it
 

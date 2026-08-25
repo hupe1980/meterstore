@@ -66,23 +66,10 @@ async fn a_configuration_file_builds_a_working_store() {
     assert_eq!(config.name(), TestHarness::TABLE);
     assert_eq!(config.settlement_lag(), Duration::DAY);
 
-    // The tiers the file described, assembled into a store exactly as a
-    // hand-wired deployment would.
-    let cold = deployment.cold.cold();
-    cold.create_table(config.name()).await.expect("cold table");
-
-    let store = meterstore::MeterStore::builder()
-        .hot(deployment.hot.clone() as std::sync::Arc<dyn meterstore::HotStore>)
-        .cold(
-            cold.clone() as std::sync::Arc<dyn meterstore::ColdStore>,
-            cold.table_provider(config.name()).await.expect("provider"),
-        )
-        .table(config.clone())
-        .build()
-        .await
-        .expect("store");
-
-    store.create_tables().await.expect("create tables");
+    // The tiers the file described, assembled into a store — including the one
+    // step that is not field access: the cold table has to exist before a table
+    // provider can be opened over it.
+    let store = deployment.store().await.expect("store");
 
     // And it works: a reading in, the same reading out.
     let intervals = vec![MeterInterval {
@@ -151,4 +138,112 @@ async fn a_file_naming_an_unopenable_warehouse_fails_at_validation() {
     // The table half is still fine, so a deployment wiring its own tiers is
     // unaffected — which is why the two checks are separate.
     settings.validate().expect("the tables are complete");
+}
+
+#[tokio::test]
+async fn a_multi_table_file_builds_a_catalog_and_refuses_a_single_store() {
+    // A file declaring two streams has no single store to build, and picking
+    // one silently is the failure mode: a billing query would read whichever
+    // table happened to win, and an ESA Typ-2 stream must never reach one.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+
+    let text = format!(
+        "{}\n[[tables]]\nname = \"esa_typ2_versions\"\n\n[tables.archival]\nsettlement_lag = \"1d\"\narchival_step = \"1d\"\n",
+        file(&url, warehouse.path()),
+    );
+    let deployment = Settings::from_toml(&text)
+        .expect("parse")
+        .connect()
+        .await
+        .expect("connect");
+
+    let err = deployment
+        .store()
+        .await
+        .expect_err("two tables, so there is no single store")
+        .to_string();
+    assert!(err.contains("readings_versions"), "{err}");
+    assert!(err.contains("esa_typ2_versions"), "{err}");
+    assert!(err.contains("catalog"), "{err}");
+
+    // The catalog builds both, and a statement can name either.
+    let catalog = deployment.catalog().await.expect("catalog");
+    let mut names: Vec<&str> = catalog.tables().map(|t| t.table()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["esa_typ2_versions", "readings_versions"]);
+
+    catalog
+        .query("SELECT count(*) FROM readings")
+        .await
+        .expect("the resolved relation is registered");
+}
+
+#[tokio::test]
+async fn a_declared_identity_column_reaches_both_tiers() {
+    // The trap this closes: the cold table has to exist before a table provider
+    // can be opened over it, so building a store from a file creates it — and an
+    // identity column is a *leading partition field*, not just a column. Created
+    // bare, the table would carry the default spec, and the deployment's own
+    // `create_tables` would then refuse the table that was just made for it.
+    //
+    // There is no reconciling that afterwards: a partition spec is fixed at
+    // creation.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+
+    let text = format!(
+        r#"
+[hot]
+url = "{url}"
+max_connections = 4
+
+[cold]
+catalog = "sql"
+uri = "{url}"
+warehouse = "file://{}"
+namespace = "metering"
+file_target_bytes = 8388608
+metadata_pool_max_connections = 2
+
+[[tables]]
+name = "readings_versions"
+extra_columns = [
+  {{ name = "tenant", identity = true }},
+  {{ name = "bilanzkreis" }},
+]
+
+[tables.archival]
+settlement_lag = "1d"
+archival_step = "1d"
+"#,
+        warehouse.path().display(),
+    );
+
+    let deployment = Settings::from_toml(&text)
+        .expect("parse")
+        .connect()
+        .await
+        .expect("connect");
+
+    let store = deployment
+        .store()
+        .await
+        .expect("the cold table must be created with the declared identity columns");
+
+    // The identity column is in the merge key, which is what makes two tenants'
+    // readings two readings rather than one superseding the other.
+    assert!(
+        store.config().merge_key().iter().any(|c| c == "tenant"),
+        "{:?}",
+        store.config().merge_key()
+    );
+
+    // And it survives a second build over the same warehouse, which is the call
+    // that would have failed on a bare creation.
+    deployment.store().await.expect("idempotent");
 }

@@ -148,12 +148,7 @@ impl<'a> SystemTables<'a> {
             hot_partitions,
             partitions_ahead,
             invariant_violations: violations,
-            // Healthy is the absence of violations **and** a write frontier that
-            // still exists. A store whose partitions have run out is not
-            // returning wrong answers, but the next insert fails — and an
-            // operator reading one health column should not have to know that
-            // is tracked somewhere else.
-            healthy: violations == 0 && partitions_ahead != 0,
+            healthy: is_healthy(violations, hot_partitions, partitions_ahead),
         })
     }
 
@@ -304,7 +299,7 @@ pub async fn register_all(
             let created: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
             catalog
                 .register_schema(SCHEMA, Arc::clone(&created))
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(Error::from)?;
             created
         }
     };
@@ -348,7 +343,7 @@ pub async fn register_all(
                 name.to_string(),
                 Arc::new(MemTable::try_new(schema_ref, vec![batches])?),
             )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(Error::from)?;
         Ok::<(), Error>(())
     };
 
@@ -468,6 +463,36 @@ pub fn status_batch(rows: &[TableStatus]) -> Result<RecordBatch> {
     )?)
 }
 
+/// The two ways a table stops working, as one column.
+///
+/// **Wrong answers now** — rows below the watermark still in PostgreSQL — and
+/// **no answers shortly** — no partition left that can hold a row written from
+/// here on, which makes the next insert fail outright. An operator reading one
+/// health column should not have to know the second is tracked elsewhere.
+///
+/// # A table with no partitions is *not started*, not *exhausted*
+///
+/// The two look identical in `partitions_ahead` and are opposites. A table
+/// created a moment ago has no partitions and no frontier to run out of, and
+/// reporting it degraded made the very first status of every new deployment an
+/// alarm — which is how an alert stops being read. The condition becomes real
+/// the moment the table holds a partition at all.
+///
+/// # A store that cannot count is not asserted healthy
+///
+/// [`HotStore::partition_starts`](crate::tiering::store::HotStore::partition_starts)
+/// may answer `None`, which reports as `-1`. That is neither zero partitions nor
+/// a runway, so it fails the check rather than passing it on a number that was
+/// never obtained: "cannot say" must not read as "fine".
+const fn is_healthy(violations: i64, hot_partitions: i64, partitions_ahead: i64) -> bool {
+    violations == 0
+        && match hot_partitions {
+            0 => true,
+            n if n < 0 => false,
+            _ => partitions_ahead > 0,
+        }
+}
+
 /// Encode configuration entries as a batch.
 pub fn config_batch(rows: &[ConfigEntry]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(
@@ -516,8 +541,23 @@ mod tests {
         // Wrong answers now, and no answers shortly: a table with no partition
         // ahead of the frontier rejects the next insert, and an operator reading
         // one health column should not have to know that lives elsewhere.
-        assert!(status(0).healthy);
-        assert!(!status(1).healthy);
+        assert!(is_healthy(0, 21, 14), "the ordinary steady state");
+        assert!(!is_healthy(1, 21, 14), "wrong answers now");
+        assert!(!is_healthy(0, 21, 0), "no answers shortly");
+    }
+
+    #[test]
+    fn a_table_that_has_not_started_is_not_reported_degraded() {
+        // Zero partitions and zero ahead are the same two numbers whether a
+        // table was created a second ago or has run its runway out, and they
+        // mean opposite things. Reporting the first as degraded made the very
+        // first `status` of every new deployment an alarm.
+        assert!(is_healthy(0, 0, 0), "created, never written to");
+        assert!(!is_healthy(0, 1, 0), "one partition, none ahead: exhausted");
+
+        // And a store that cannot enumerate its partitions reports -1, which is
+        // not a runway. "Cannot say" must not read as "fine".
+        assert!(!is_healthy(0, -1, -1));
     }
 
     #[test]

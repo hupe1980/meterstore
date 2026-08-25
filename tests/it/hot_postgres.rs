@@ -408,6 +408,185 @@ async fn detached_partition_survives_as_an_orphan() {
     assert_eq!(orphans[0].start(), D20);
 }
 
+/// A session holding `ACCESS SHARE` on the parent, as an ordinary query does.
+///
+/// Opened in its own transaction on its own connection and left open, so the
+/// lock is still held while the test runs DDL from another connection. That is
+/// exactly the shape of an analytical query running against the hot table while
+/// the archival loop comes round.
+struct HoldingAccessShare {
+    _pool: PgPool,
+    tx: Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+}
+
+impl HoldingAccessShare {
+    async fn on(url: &str, table: &str) -> Self {
+        let pool = PgPool::connect(url).await.expect("connect");
+        // Leaked so the transaction can outlive this call; released on `drop`.
+        let leaked: &'static PgPool = Box::leak(Box::new(pool.clone()));
+        let mut tx = leaked.begin().await.expect("begin");
+        sqlx::query(&format!(r#"SELECT count(*) FROM "{table}""#))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read the parent, taking ACCESS SHARE");
+        Self {
+            _pool: pool,
+            tx: Some(tx),
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(tx) = self.tx.take() {
+            tx.rollback().await.expect("rollback");
+        }
+    }
+}
+
+#[tokio::test]
+async fn creating_a_partition_does_not_block_on_a_reader() {
+    // `CREATE TABLE … PARTITION OF` takes ACCESS EXCLUSIVE on the parent, which
+    // conflicts with the ACCESS SHARE every `SELECT` holds — so with that
+    // spelling this test would sit out the DDL lock timeout and fail.
+    //
+    // Partition creation runs on the **write path**: an append reaching past the
+    // pre-created frontier makes what it needs. Building the relation standalone
+    // and attaching it takes only SHARE UPDATE EXCLUSIVE, which conflicts with
+    // no read and no write at all, so ingest cannot be stalled by a query.
+    let h = Harness::start().await;
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let pool = PgPool::connect(&url).await.expect("connect");
+    let hot = PostgresHot::new(pool).ddl_lock_timeout(Duration::seconds(2));
+    hot.create_table(TABLE).await.expect("create table");
+
+    let reader = HoldingAccessShare::on(&url, TABLE).await;
+
+    let started = std::time::Instant::now();
+    let made = hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .expect("a reader must not be able to block partition creation");
+    let elapsed = started.elapsed();
+
+    assert_eq!(made.len(), 1);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "creation waited {elapsed:?}, so it queued for a lock it should not need"
+    );
+
+    reader.release().await;
+    drop(h);
+}
+
+#[tokio::test]
+async fn a_detach_that_cannot_get_its_lock_reports_a_lock_timeout() {
+    // Detaching genuinely needs ACCESS EXCLUSIVE on the parent, and PostgreSQL
+    // grants locks in arrival order — so a detach that *waits* also blocks every
+    // reader and writer that arrives behind it. It gives up instead, and the
+    // failure is typed so the archival loop can report the cycle as deferred
+    // rather than failed.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let pool = PgPool::connect(&url).await.expect("connect");
+    let hot = PostgresHot::new(pool).ddl_lock_timeout(Duration::milliseconds(250));
+    hot.create_table(TABLE).await.expect("create table");
+    hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    let reader = HoldingAccessShare::on(&url, TABLE).await;
+
+    let err = hot
+        .detach_partition(&PartitionId::new(TABLE, D20))
+        .await
+        .expect_err("a reader holds ACCESS SHARE, so the detach cannot proceed");
+
+    assert!(
+        matches!(err, meterstore::Error::LockTimeout { .. }),
+        "expected a typed lock timeout, got {err:?}"
+    );
+    assert!(err.is_retryable());
+
+    // And once the reader is gone the very same call succeeds — nothing was
+    // left half-done.
+    reader.release().await;
+    hot.detach_partition(&PartitionId::new(TABLE, D20))
+        .await
+        .expect("the lock is free now");
+}
+
+#[tokio::test]
+async fn a_created_partition_carries_its_bounds_and_no_redundant_check() {
+    // The bound `CHECK` exists only so `ATTACH` can prove the partition
+    // constraint from the catalogue and skip its validation scan. Left in place
+    // it would be a second predicate evaluated on every inserted row, so it is
+    // dropped again — and the partition constraint the attach installed is what
+    // remains.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    let name = PartitionId::new(TABLE, D20).relation_name().unwrap();
+
+    let bound: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_expr(c.relpartbound, c.oid)
+           FROM pg_class c WHERE c.relname = $1",
+    )
+    .bind(&name)
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
+    let bound = bound.expect("the relation is attached as a partition");
+    assert!(bound.contains("2026-07-20"), "{bound}");
+    assert!(bound.contains("2026-07-21"), "{bound}");
+
+    let checks: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint
+          WHERE conrelid = $1::regclass AND contype = 'c'",
+    )
+    .bind(&name)
+    .fetch_all(h.pool())
+    .await
+    .unwrap();
+    assert!(
+        !checks.iter().any(|c| c.ends_with("_bound")),
+        "the redundant bound check must be dropped after the attach: {checks:?}"
+    );
+
+    // The parent's own CHECK constraints are still enforced on the partition, and
+    // **exactly once**. `LIKE … INCLUDING CONSTRAINTS` puts a local copy on the
+    // relation and the attach merges it with the inherited one; a copy the merge
+    // failed to match would land beside it as `sparte_known1`, and every inserted
+    // row would then be checked twice against the same predicate for ever.
+    let parent_checks: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint
+          WHERE conrelid = $1::regclass AND contype = 'c'
+          ORDER BY conname",
+    )
+    .bind(TABLE)
+    .fetch_all(h.pool())
+    .await
+    .unwrap();
+
+    let mut inherited: Vec<&String> = checks
+        .iter()
+        .filter(|c| !c.starts_with(&name))
+        .collect::<Vec<_>>();
+    inherited.sort();
+    assert_eq!(
+        inherited,
+        parent_checks.iter().collect::<Vec<_>>(),
+        "the partition must carry the parent's checks once each, no more and no fewer"
+    );
+    assert!(
+        parent_checks.iter().any(|c| c == "sparte_known"),
+        "the parent's own vocabulary checks should be among them: {parent_checks:?}"
+    );
+}
+
 #[tokio::test]
 async fn attached_partitions_are_not_reported_as_orphans() {
     let h = Harness::start().await;
@@ -714,19 +893,26 @@ async fn the_same_version_may_not_carry_a_different_value() {
         .await
         .unwrap();
 
-    let diverged = h
+    let err = h
         .hot
         .append(
             TABLE,
             &default_key(),
             &[batch(D20, 2, 99, 20_260_720_000_001)],
         )
-        .await;
+        .await
+        .expect_err("a differing value under the same version must be rejected, not ignored");
 
+    // And typed as a refused *delivery*, not as a broken invariant: nothing
+    // about the store is wrong, the producer sent a row that contradicts one it
+    // already sent. Retrying it never succeeds, and it must not page whoever is
+    // alerted on the tiering invariant.
     assert!(
-        diverged.is_err(),
-        "a differing value under the same version must be rejected, not ignored"
+        matches!(&err, meterstore::Error::IntegrityViolation { constraint, .. }
+                 if constraint.as_deref() == Some("version_identifies_one_assertion")),
+        "expected a typed integrity violation, got {err:?}"
     );
+    assert!(!err.is_retryable());
 }
 
 #[tokio::test]
@@ -767,9 +953,14 @@ async fn a_range_scan_streams_in_bounded_chunks() {
     }
 
     assert_eq!(rows, 25, "every row is still delivered");
-    assert!(
-        batches >= 3,
-        "25 rows in chunks of 10 needs several round trips"
+    // **Exactly** the round trips the chunk size implies, not merely "several".
+    // The two failure modes sit on either side of this number and a `>=` would
+    // catch only one: a scan that materialised the range first yields 1 batch,
+    // and a scan that made a round trip per row yields 25 — which passes both
+    // `>= 3` and the per-batch size bound, silently.
+    assert_eq!(
+        batches, 3,
+        "25 rows in chunks of 10 is three round trips: 10, 10, 5"
     );
 }
 
@@ -1042,9 +1233,13 @@ async fn overlapping_intervals_in_one_version_are_refused() {
         20_260_720_000_001,
     )
     .await;
+    let err = clash.expect_err("an overlapping range at the same version must be refused");
+    let constraint = err
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::constraint);
     assert!(
-        clash.is_err(),
-        "an overlapping range at the same version must be refused, not summed twice"
+        constraint.is_some_and(|c| c.ends_with("_no_overlap")),
+        "the exclusion constraint should be the one that refused it, got {constraint:?}"
     );
 
     // A correction covering the same span is a *higher* version and is exactly

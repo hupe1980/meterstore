@@ -24,7 +24,7 @@ mapping needs no lookup table.
 | `resolution` | `Utf8`, nullable | `string` | ISO 8601, e.g. `PT15M` |
 | `source_kind` | `Utf8` | `string` | Filterable discriminant — the payload's own tag (`MSCONS`, …) |
 | `source_detail` | `Utf8`, nullable | `string` | JSON variant payload |
-| `provenance` | `Utf8`, nullable | `string` | JSON audit trail |
+| `provenance` | `Utf8`, nullable | `string` | JSON audit trail, RFC 3339 timestamps — [not `serde`'s](#json-columns) |
 | `version` | `Decimal128(20,0)` | `decimal(20,0)` | MSCONS correction version |
 | `version_scope` | `Utf8` | `string` | `<operator>:<YYYY-MM>` — the **Bilanzierungsmonat**, cut at 06:00 for gas |
 | `recorded_at` | `Timestamp(µs, UTC)` | `timestamptz` | Transaction time |
@@ -73,6 +73,40 @@ would find the two columns disagreeing.
 
 Taking the tag from the serialised form means a variant renamed upstream moves
 both columns together, and a variant added upstream needs no edit here.
+
+### Two JSON columns, and the one that is *not* `serde`'s {#json-columns}
+
+`source_detail` and `provenance` are the only columns holding serialised structure
+rather than a scalar.
+
+**`source_detail` is `serde`'s**, for the reason above: `MeasurementSource` is a
+seven-variant enum with per-variant payloads, and hand-writing it would be a
+second copy of a vocabulary `metering` owns. It carries a **nested** vocabulary
+though — `VirtualMeter` holds a `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is an
+upstream tag inside an upstream payload. Retagged, `source_kind` still reads
+`VIRTUAL_METER` and still agrees with the payload's outer key, so the
+discriminant check passes and only the payload stops decoding.
+
+**`provenance` is written out explicitly**, because of one field.
+`ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose `serde` impl is
+*feature-conditional* — a nine-element ordinal-date array
+(`[2026,208,6,0,0,0,0,0,0]`) without `serde-human-readable`, a `time`-formatted
+string with it. So the on-disk shape of an audit trail under a decades-long
+retention would be chosen by Cargo feature unification rather than by this crate,
+and `time` takes the tuple path on read when the feature is off. Enabling it here
+would move that decision, not remove it, and impose a global feature on the whole
+graph. Encoded like every other column instead — `metering`'s stable event code,
+RFC 3339 for the instant — which is also what lets DuckDB cast it:
+
+```json
+[{"actor":"MSCONS","event_type":"INGESTED","note":null,"occurred_at":"2026-03-01T00:00:00Z"}]
+```
+
+> Anything persisted through `serde` has its stored shape decided by a
+> *dependency*, and a change there is a **stored-data** break, not a wire-format
+> one: rows already written stop deserialising. Both columns are asserted byte for
+> byte in the test suite, so it fails here rather than at whoever reads the
+> warehouse next.
 
 ### Codes are stored canonically, and only canonically
 

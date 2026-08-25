@@ -38,17 +38,26 @@ pub enum Error {
         reason: String,
     },
 
-    /// The tiering invariant does not hold.
+    /// An invariant the store's answers rest on does not hold.
     ///
-    /// The invariant is that a row's interval start alone decides its tier:
-    /// PostgreSQL holds exactly `from >= watermark`, Iceberg exactly
-    /// `from < watermark`.
+    /// Chiefly the **tiering** invariant: a row's interval start alone decides
+    /// its tier, so PostgreSQL holds exactly `from >= watermark` and Iceberg
+    /// exactly `from < watermark`. Also the smaller ones that make a *resolved*
+    /// reading well defined — one version scope per reading, above all, since two
+    /// incomparable scopes leave two winners and double every sum over them.
     ///
-    /// Query results may be wrong while this is true. Surfaced as the
-    /// `meterstore.tiering.invariant_violations` gauge and as the
-    /// `invariant_violations` column of `system.tables` — **the one thing on
-    /// either list to alert on.** Everything else is degradation.
-    #[error("tiering invariant violated for table {table}: {detail}")]
+    /// **Query results may be wrong while this is true**, and no retry changes
+    /// that: it describes the state of the store, not the request that found it.
+    ///
+    /// It is deliberately **not** what a refused *delivery* raises — that is
+    /// [`IntegrityViolation`](Self::IntegrityViolation), which means the store
+    /// stopped something from becoming true. A caller that pages on this one
+    /// should not be woken by a producer sending a bad row.
+    ///
+    /// **Alert on the gauge, not on this.** `meterstore.tiering.invariant_violations`
+    /// and the `invariant_violations` column of `system.tables` are counted from
+    /// the data, so they report the condition whether or not anything raised it.
+    #[error("invariant violated for table {table}: {detail}")]
     InvariantViolated {
         /// Table the violation was detected on.
         table: String,
@@ -87,15 +96,65 @@ pub enum Error {
         right: String,
     },
 
-    /// A storage backend failed.
+    /// A statement gave up waiting for a lock rather than joining the queue
+    /// behind it.
+    ///
+    /// **Nothing was changed**, so it is safe to retry: the archival loop reports
+    /// it as [`deferred`](field@crate::ArchivalOutcome::deferred) rather than as a
+    /// failure. It means something else held a conflicting lock for longer than
+    /// [`ddl_lock_timeout`](crate::PostgresHot::ddl_lock_timeout) — usually a long
+    /// analytical query or a session idle in a transaction.
+    #[error(
+        "{operation} on {relation} gave up after {waited_ms} ms waiting for a lock; \
+         nothing was changed. Look for a long-running query or a session idle in a \
+         transaction in pg_stat_activity"
+    )]
+    LockTimeout {
+        /// The relation the statement was waiting on.
+        relation: String,
+        /// What was being attempted, for the log line.
+        operation: String,
+        /// How long it waited before giving up.
+        waited_ms: u64,
+    },
+
+    /// A write was refused by a rule that exists to stop a wrong number:
+    /// overlapping spans within one version, two network operators for one
+    /// reading, a non-canonical OBIS code, a value restated under an existing
+    /// version.
+    ///
+    /// Separate from [`Storage`](Self::Storage) because the two want opposite
+    /// responses — a storage failure is retried, and this never succeeds on a
+    /// retry, since the delivery itself has to change.
+    /// [`constraint`](Self::IntegrityViolation::constraint) names the rule where
+    /// one is reported, so a caller can branch without parsing the message.
+    #[error("{table} refused a write: {detail}")]
+    IntegrityViolation {
+        /// The table the write was aimed at.
+        table: String,
+        /// The constraint's name, where the backend reported one.
+        constraint: Option<String>,
+        /// The backend's own description.
+        detail: String,
+    },
+
+    /// A storage backend failed: a connection that dropped, a disk that filled, a
+    /// catalogue that timed out. Retrying is the right default for all of it.
     ///
     /// Wraps the backend's own message rather than its error type, so adding a
     /// backend does not widen this enum or leak a driver type into the public
-    /// API.
+    /// API. The two conditions a caller reliably wants to tell apart are their own
+    /// variants above.
     #[error("storage error: {0}")]
     Storage(String),
 
-    /// A DataFusion-level failure, most often a scalar/array conversion.
+    /// A DataFusion-level failure.
+    ///
+    /// Kept as DataFusion's own error rather than flattened into a string, because
+    /// it is the one variant that arrives from **caller-supplied SQL**: a service
+    /// answers a statement that will not plan with a 400 and a warehouse it cannot
+    /// reach with a 503, and cannot tell them apart from a message.
+    /// [`is_retryable`](Self::is_retryable) splits it the same way.
     #[error("datafusion error: {0}")]
     DataFusion(#[from] datafusion::common::DataFusionError),
 
@@ -129,6 +188,32 @@ impl Error {
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
     }
+
+    /// Whether retrying the same operation could succeed.
+    ///
+    /// True for the transient conditions — a lost connection, a lock the statement
+    /// declined to queue for. False for everything describing the *input*, where a
+    /// retry loops forever on a message that will never change, and for
+    /// [`InvariantViolated`](Self::InvariantViolated) and
+    /// [`Quarantined`](Self::Quarantined), where retrying past them is how a wrong
+    /// answer gets served for a week.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::LockTimeout { .. } | Self::Storage(_) => true,
+            // DataFusion is both the query *planner* and the thing that reads
+            // the object store, so its errors fall on both sides. A statement
+            // that will not plan never plans on a retry; a scan that could not
+            // reach the warehouse might.
+            Self::DataFusion(e) => matches!(
+                e,
+                datafusion::common::DataFusionError::ObjectStore(_)
+                    | datafusion::common::DataFusionError::IoError(_)
+                    | datafusion::common::DataFusionError::ResourcesExhausted(_)
+                    | datafusion::common::DataFusionError::External(_)
+            ),
+            _ => false,
+        }
+    }
 }
 
 /// Hide everything but the shape of a connection URL or a secret.
@@ -150,5 +235,82 @@ pub(crate) fn redacted(value: &str) -> String {
     match value.split_once("://") {
         Some((scheme, _)) => format!("{scheme}://<redacted>"),
         None => "<redacted>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_splits_the_transient_from_the_wrong() {
+        // A supervisor loops on the first kind and gives up on the second, and
+        // getting it backwards is either a hot loop on a message that will never
+        // change or a delivery dropped on a blip.
+        assert!(Error::Storage("connection reset".into()).is_retryable());
+        assert!(
+            Error::LockTimeout {
+                relation: "readings_versions".into(),
+                operation: "detach partition".into(),
+                waited_ms: 3_000,
+            }
+            .is_retryable()
+        );
+
+        assert!(!Error::config("archival_step must equal partition_step").is_retryable());
+        assert!(!Error::encode("version", "too many digits").is_retryable());
+        assert!(
+            !Error::IntegrityViolation {
+                table: "readings_versions".into(),
+                constraint: Some("version_identifies_one_assertion".into()),
+                detail: "restated".into(),
+            }
+            .is_retryable()
+        );
+
+        // Neither of the two an operator has to look at. Retrying past them is
+        // how a wrong answer gets served for a week.
+        assert!(
+            !Error::InvariantViolated {
+                table: "readings_versions".into(),
+                detail: "rows below the watermark".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !Error::Quarantined {
+                table: "readings_versions".into(),
+                detail: "a required column was dropped".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn a_statement_that_will_not_plan_is_not_retried() {
+        // DataFusion is both the planner and the thing that reads the object
+        // store, so its errors fall on both sides — and the planning half is the
+        // one that arrives from caller-supplied SQL.
+        use datafusion::common::DataFusionError;
+
+        let unplannable = Error::DataFusion(DataFusionError::Plan("no such table".into()));
+        assert!(!unplannable.is_retryable());
+
+        let unreachable = Error::DataFusion(DataFusionError::ResourcesExhausted(
+            "the warehouse is not answering".into(),
+        ));
+        assert!(unreachable.is_retryable());
+    }
+
+    #[test]
+    fn a_connection_url_keeps_its_scheme_and_loses_its_secret() {
+        // The useful half of a redacted value: which store failed to connect,
+        // without the password reaching a log aggregator.
+        assert_eq!(
+            redacted("postgresql://u:p@host/db"),
+            "postgresql://<redacted>"
+        );
+        assert_eq!(redacted("AKIAsecret"), "<redacted>");
+        assert_eq!(redacted(""), "");
     }
 }

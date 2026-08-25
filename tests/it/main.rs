@@ -17,6 +17,7 @@
 mod archival_end_to_end;
 mod calendar_delegation;
 mod catalog_facade;
+mod cli;
 mod cold_partitioning;
 mod commodities;
 mod containers;

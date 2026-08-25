@@ -18,8 +18,6 @@ let df = store.sql(r#"
 
 `sql` returns DataFusion's own `DataFrame`, so every expression, window function
 and output format works, and there is no second query language to maintain.
-`.analytics()` gives the same thing bound to the unified view for callers who
-prefer the builder.
 
 Caller-supplied values are bound as parameters, never concatenated into the SQL
 text, so a `malo_id` can come straight off a market message:
@@ -30,6 +28,12 @@ let result = store.query_with_params(
     vec![ScalarValue::Utf8(Some(malo.into()))],
 ).await?;
 ```
+
+> **If the statement itself comes from outside** — an ad-hoc endpoint, a Flight
+> SQL client, a report a user wrote — the confinement has to be a property of the
+> *session*, because the statement is the thing you do not control. That is
+> [Confining a session](#confining-a-session), and it is the section to read
+> before exposing any of these three.
 
 ## Results carry their provenance
 
@@ -209,6 +213,8 @@ is not.
 | `.collect()` | `Option<MeasurementSeries>` |
 | `.collect_with_sparte()` | …plus the commodity |
 | `.collect_resolved()` | …plus the declared attribute/identity columns |
+| `.collect_by_channel()` | `BTreeMap<ObisCode, ResolvedSeries>` — **every** channel, one scan |
+| `.channels()` | The channels this range holds, without decoding an interval |
 | `.latest()` | The newest interval, via `ORDER BY … DESC LIMIT 1` — not a full scan |
 | `.intervals()` | Just the intervals, empty when the range holds none |
 | `.collect_with_provenance()` | The series and the `QueryResult` |
@@ -248,6 +254,36 @@ A column that is *not* in the merge key never splits a series: a Bilanzkreis
 reassigned between two deliveries is one series with a changed attribute, and
 refusing that would make an ordinary correction unreadable.
 
+### …but a measuring point is a set of them
+
+Naming one channel is right when the caller means one. Plenty of questions mean
+the **whole point**: a billing period projecting the canonical Bezug across HT, NT
+and total, a Mehr-/Mindermengensaldo, an audit of what a delivery contained.
+
+```rust
+let point = store.series(malo)?.range(from, to).collect_by_channel().await?;
+for (channel, resolved) in &point {
+    println!("{channel}: {} intervals", resolved.series.intervals.len());
+}
+```
+
+**One scan, not one per channel.** It runs the same single query `collect` does
+and splits the decoded rows, so every channel in the map was resolved against
+**one** boundary — `collect_by_channel_with_provenance` returns it. `SELECT
+DISTINCT obis_code` plus a read each is `1 + N` round trips against N boundaries
+observed at N different moments, with resolution and the tier split outside the
+store.
+
+**It still refuses to fold two readings.** A reading is `(channel, merge-key
+discriminators)`, not a channel alone — so two tenants reporting `1-0:1.8.0` are
+two readings, and splitting by channel alone would fold exactly what the refusal
+prevents. Narrow with `.column_eq(..)` and the map is one entry per channel again.
+
+`.channels()` answers the list on its own, as a `SELECT DISTINCT` rather than a
+fold, and takes `&self` so the builder survives. Both are narrowed by everything
+the builder was, including `.column_eq(..)`: an unscoped list would name channels
+belonging to a tenant the read cannot see.
+
 ### Reading registers
 
 ```rust
@@ -273,6 +309,17 @@ table § 146 Abs. 4 AO forbids discarding.
 
 `.deliveries()` returns the unfolded shape: one `StoredReadings` per meter, per
 channel and per delivery, which is what an audit trail wants.
+
+And a meter is a set of registers, so the point-table counterparts are there too:
+
+```rust
+let registers = store.readings(malo)?.melo(melo)?.channels().await?;
+let all       = store.readings(malo)?.melo(melo)?.collect_by_channel().await?;
+```
+
+One scan, split by register, with the same refusal kept: two *meters* carrying
+`1-0:1.8.0` under one Marktlokation are two readings, and `.melo(..)` is what
+makes them one.
 
 ## Calendar functions
 

@@ -65,12 +65,36 @@ pub struct ArchivalOutcome {
     /// archival failures should ignore it, and an alert on watermark lag will
     /// still fire if *nobody* is winning.
     pub lease_contended: bool,
+
+    /// Whether the run stopped because a statement declined to wait for a lock.
+    ///
+    /// Also not a failure, and for a related reason: detaching a partition needs
+    /// an `ACCESS EXCLUSIVE` lock on a table that ingest is writing to, and
+    /// PostgreSQL grants locks in arrival order — so a request that *waits*
+    /// blocks every reader and writer behind it. The statement gives up instead
+    /// ([`PostgresHot::ddl_lock_timeout`]), and this says so.
+    ///
+    /// **Nothing was changed.** The next cycle retries. Alert on watermark lag,
+    /// which is what a *persistently* deferred table looks like — a run deferring
+    /// once means a long query was in flight, which is ordinary.
+    ///
+    /// [`PostgresHot::ddl_lock_timeout`]: crate::PostgresHot::ddl_lock_timeout
+    pub deferred: bool,
 }
 
 impl ArchivalOutcome {
     /// Whether this run moved any data.
     pub fn archived_anything(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Whether this run did nothing for a reason that is not a fault.
+    ///
+    /// Another archiver held the lease, or a lock was not available. Both are
+    /// states a healthy deployment passes through, and neither is worth an alert
+    /// on its own — [`watermark`](Self::watermark) falling behind is.
+    pub const fn is_benign_noop(&self) -> bool {
+        self.lease_contended || self.deferred
     }
 
     /// A run that did nothing because another archiver holds the lease.
@@ -82,6 +106,20 @@ impl ArchivalOutcome {
             orphans_reclaimed: 0,
             partitions_created: 0,
             lease_contended: true,
+            deferred: false,
+        }
+    }
+
+    /// A run that stopped because a statement declined to wait for a lock.
+    fn deferred(watermark: TieringWatermark) -> Self {
+        Self {
+            window: None,
+            rows: 0,
+            watermark,
+            orphans_reclaimed: 0,
+            partitions_created: 0,
+            lease_contended: false,
+            deferred: true,
         }
     }
 }
@@ -129,7 +167,26 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             return Ok(ArchivalOutcome::contended(watermark));
         };
 
-        let outcome = self.run_once_inner(now).await;
+        // A statement that declined to wait for a lock changed nothing, so the
+        // cycle is a no-op rather than a failure — the same shape as losing the
+        // lease. Reported as such so an alert on `archival.failures` does not
+        // fire every time a long analytical query happens to overlap a detach.
+        let outcome = match self.run_once_inner(now).await {
+            Err(Error::LockTimeout {
+                relation,
+                operation,
+                waited_ms,
+            }) => {
+                warn!(
+                    table = self.config.name(),
+                    relation, operation, waited_ms, "archival deferred: lock not available"
+                );
+                metrics.archival_deferred.add(1, &attrs);
+                let watermark = self.cold.watermark(self.config.name()).await?;
+                Ok(ArchivalOutcome::deferred(watermark))
+            }
+            other => other,
+        };
 
         // Released whether or not the run succeeded. A failed run must not keep
         // the table locked against the next attempt.
@@ -223,6 +280,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                 orphans_reclaimed,
                 partitions_created,
                 lease_contended: false,
+                deferred: false,
             });
         };
 
@@ -250,6 +308,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             orphans_reclaimed,
             partitions_created,
             lease_contended: false,
+            deferred: false,
         })
     }
 
@@ -401,7 +460,24 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         }
 
         // Only now is it safe to reclaim the space.
-        self.hot.drop_partition(&partition).await?;
+        //
+        // A lock timeout here is **not** a failed archival: the rows are already
+        // durable in Iceberg and the watermark is about to advance over them.
+        // What is left behind is precisely the orphan an interrupted run leaves,
+        // and `reclaim_orphans` drops it on the next cycle. Failing the run
+        // instead would re-archive a window that is already committed.
+        if let Err(e) = self.hot.drop_partition(&partition).await {
+            match e {
+                Error::LockTimeout { .. } => warn!(
+                    table,
+                    partition = %partition.relation_name()?,
+                    error = %e,
+                    "window is committed but its partition could not be dropped; \
+                     it is now an orphan and the next cycle reclaims it"
+                ),
+                other => return Err(other),
+            }
+        }
 
         Ok(rows)
     }
@@ -519,6 +595,28 @@ mod tests {
         AfterColdCommit,
     }
 
+    /// Where a DDL statement declines to wait for a lock.
+    ///
+    /// The two places matter for different reasons: a detach that times out has
+    /// changed nothing and the cycle defers, while a drop that times out happens
+    /// **after** the cold commit, so the window is archived and what is left is an
+    /// orphan.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum LockAt {
+        #[default]
+        Never,
+        Detach,
+        Drop,
+    }
+
+    fn lock_timeout(relation: &str, operation: &str) -> Error {
+        Error::LockTimeout {
+            relation: relation.to_string(),
+            operation: operation.to_string(),
+            waited_ms: 3_000,
+        }
+    }
+
     #[derive(Default)]
     struct FakeHotInner {
         /// start -> row count, for live partitions
@@ -535,6 +633,8 @@ mod tests {
         lease_held_elsewhere: bool,
         /// Whether this store can answer `partition_starts`.
         enumerates_partitions: bool,
+        /// Where a lock is refused, standing in for `lock_timeout` firing.
+        lock_at: LockAt,
     }
 
     impl FakeHot {
@@ -548,7 +648,13 @@ mod tests {
                 fail_at: FailAt::Never,
                 lease_held_elsewhere: false,
                 enumerates_partitions: true,
+                lock_at: LockAt::Never,
             }
+        }
+
+        fn locked_at(mut self, at: LockAt) -> Self {
+            self.lock_at = at;
+            self
         }
 
         fn failing(mut self, at: FailAt) -> Self {
@@ -693,6 +799,9 @@ mod tests {
         }
 
         async fn detach_partition(&self, partition: &PartitionId) -> Result<()> {
+            if self.lock_at == LockAt::Detach {
+                return Err(lock_timeout(partition.table(), "detach partition"));
+            }
             let mut inner = self.inner.lock().unwrap();
             let rows = inner.live.remove(&partition.start()).unwrap_or(0);
             inner.detached.insert(partition.start(), rows);
@@ -720,6 +829,9 @@ mod tests {
         }
 
         async fn drop_partition(&self, partition: &PartitionId) -> Result<()> {
+            if self.lock_at == LockAt::Drop {
+                return Err(lock_timeout(&partition.relation_name()?, "drop partition"));
+            }
             let mut inner = self.inner.lock().unwrap();
             inner.detached.remove(&partition.start());
             inner.dropped.push(partition.start());
@@ -980,6 +1092,7 @@ mod tests {
             fail_at: FailAt::Never,
             lease_held_elsewhere: false,
             enumerates_partitions: true,
+            lock_at: LockAt::Never,
         };
         let cold = FakeCold {
             watermark: Mutex::new(*archiver.cold.watermark.lock().unwrap()),
@@ -1012,6 +1125,7 @@ mod tests {
             fail_at: FailAt::Never,
             lease_held_elsewhere: false,
             enumerates_partitions: true,
+            lock_at: LockAt::Never,
         };
         let archiver = Archiver::new(hot, FakeCold::new(D20), config());
 
@@ -1205,6 +1319,70 @@ mod tests {
         assert!(archiver.hot.detached_starts().is_empty());
         assert!(archiver.hot.dropped().is_empty());
         assert!(archiver.cold.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_detach_that_cannot_get_its_lock_defers_the_cycle() {
+        // PostgreSQL grants locks in arrival order, so a detach that *waits* for
+        // its ACCESS EXCLUSIVE lock blocks every reader and writer behind it.
+        // The statement gives up instead — and giving up is not a failure: it
+        // changed nothing, so the run is a reported no-op and the next cycle
+        // tries again.
+        let hot = FakeHot::with_rows(&[(D20, 96)]).locked_at(LockAt::Detach);
+        let cold = FakeCold::new(D20);
+        let archiver = Archiver::new(hot, cold, config());
+
+        let out = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .expect("a deferred run is not a failure");
+
+        assert!(out.deferred);
+        assert!(out.is_benign_noop());
+        assert!(!out.archived_anything());
+        assert_eq!(out.watermark.get(), D20, "the boundary must not move");
+        assert!(archiver.cold.commits().is_empty(), "nothing was committed");
+    }
+
+    #[tokio::test]
+    async fn a_drop_that_cannot_get_its_lock_leaves_an_orphan_rather_than_failing() {
+        // The drop runs *after* the cold commit, so by then the window is
+        // durable and the watermark is about to advance over it. Failing the run
+        // would re-archive a window that is already committed; what actually
+        // happens is the state an interrupted run leaves — an orphaned detached
+        // partition — which the next cycle reclaims.
+        let hot = FakeHot::with_rows(&[(D20, 96)]).locked_at(LockAt::Drop);
+        let cold = FakeCold::new(D20);
+        let archiver = Archiver::new(hot, cold, config());
+
+        let out = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .expect("the window is committed, so the run succeeded");
+
+        assert!(!out.deferred, "the archival itself completed");
+        assert!(out.archived_anything());
+        assert_eq!(out.rows, 96);
+        assert_eq!(archiver.cold.commits().len(), 1);
+        assert_eq!(
+            archiver.hot.detached_starts(),
+            vec![D20],
+            "left detached, which is exactly the orphan shape"
+        );
+
+        // And the next cycle reclaims it, now that the lock is free.
+        let hot = FakeHot::with_rows(&[]);
+        {
+            let mut inner = hot.inner.lock().unwrap();
+            inner.detached.insert(D20, 96);
+        }
+        let archiver = Archiver::new(hot, FakeCold::new(D21), config());
+        let out = archiver
+            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .await
+            .unwrap();
+        assert_eq!(out.orphans_reclaimed, 1);
+        assert!(archiver.hot.detached_starts().is_empty());
     }
 
     #[tokio::test]

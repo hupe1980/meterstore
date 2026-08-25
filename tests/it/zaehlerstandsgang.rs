@@ -129,6 +129,18 @@ fn zsg_at(
     start_value: i64,
     step: i64,
 ) -> StoredReadings {
+    zsg_register(melo, "1-0:1.8.0", first, count, start_value, step)
+}
+
+/// [`zsg_at`] on a named register — a meter has several.
+fn zsg_register(
+    melo: &str,
+    obis: &str,
+    first: OffsetDateTime,
+    count: i64,
+    start_value: i64,
+    step: i64,
+) -> StoredReadings {
     let readings: Vec<MeterReading> = (0..count)
         .map(|i| MeterReading {
             at: first + Duration::minutes(15 * i),
@@ -140,8 +152,8 @@ fn zsg_at(
 
     StoredReadings::new(
         MALO.parse().expect("a valid MaLo-ID"),
-        // The Zählerstand register, not the Lastgang.
-        "1-0:1.8.0".parse().expect("obis"),
+        // A Zählerstand register, not the Lastgang.
+        obis.parse().expect("obis"),
         Sparte::Strom,
         readings,
         MeasurementSource::Mscons {
@@ -821,5 +833,109 @@ async fn a_register_read_resolves_corrections_and_spans_the_boundary() {
         measured.len(),
         191,
         "the corrected reading carries a different flag"
+    );
+}
+
+#[tokio::test]
+async fn a_meter_reads_back_register_by_register() {
+    // A meter *is* a set of registers — a total beside its HT and NT halves —
+    // and `collect` cannot describe them together: `StoredReadings` holds one
+    // register, and folding two interleaves two cumulative sequences so that
+    // differencing the result gives advances belonging to neither.
+    //
+    // Asking for all of them used to mean a hand-written `SELECT DISTINCT
+    // obis_code` and one typed read per register. This is that question, in one
+    // scan, with resolution and the tier split still inside the store.
+    let (store, _warehouse) = point_store().await;
+    for obis in ["1-0:1.8.0", "1-0:1.8.1", "1-0:1.8.2"] {
+        store
+            .append_readings(&[zsg_register(MELO, obis, START, 4, 1_000, 5)])
+            .await
+            .expect("append");
+    }
+
+    let query = || store.readings(MALO).unwrap().melo(MELO).unwrap();
+
+    let registers = query().channels().await.expect("channels");
+    assert_eq!(
+        registers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["1-0:1.8.0", "1-0:1.8.1", "1-0:1.8.2"],
+    );
+
+    let by_register = query()
+        .collect_by_channel()
+        .await
+        .expect("collect_by_channel");
+    assert_eq!(by_register.len(), 3);
+    for (register, folded) in &by_register {
+        assert_eq!(&folded.obis_code, register);
+        assert_eq!(folded.readings.len(), 4);
+        // Each register's own sequence, unmixed: 1000, 1005, 1010, 1015 — which
+        // is what makes differencing it mean something.
+        assert_eq!(folded.readings[0].value, Decimal::new(1_000, 0));
+        assert_eq!(folded.readings[3].value, Decimal::new(1_015, 0));
+    }
+
+    // The single-register read still refuses, so nothing was loosened.
+    let err = query()
+        .collect()
+        .await
+        .expect_err("three registers cannot be one Zählerstandsgang");
+    assert!(err.to_string().contains("registers"), "{err}");
+}
+
+#[tokio::test]
+async fn a_per_register_read_keeps_two_meters_apart() {
+    // The refusal `collect_by_channel` keeps. A point table identifies a reading
+    // by its Messlokation, so two meters carrying `1-0:1.8.0` under one
+    // Marktlokation are two readings — splitting by register alone would fold
+    // them, and the interleaved sequence differences into nonsense.
+    let (store, _warehouse) = point_store().await;
+    store
+        .append_readings(&[
+            zsg_at(MELO, START, 4, 1_000, 5),
+            zsg_at(MELO_2, START, 4, 7_000, 9),
+        ])
+        .await
+        .expect("append");
+
+    let err = store
+        .readings(MALO)
+        .unwrap()
+        .collect_by_channel()
+        .await
+        .expect_err("two meters on one register are two readings");
+    let msg = err.to_string();
+    assert!(msg.contains("two meters"), "{msg}");
+    assert!(msg.contains(".melo(..)"), "the fix has to be named: {msg}");
+
+    // Naming the meter makes it one reading again, and the map holds it.
+    let mine = store
+        .readings(MALO)
+        .unwrap()
+        .melo(MELO_2)
+        .unwrap()
+        .collect_by_channel()
+        .await
+        .expect("one meter");
+    assert_eq!(mine.len(), 1);
+    let register: metering::obis::ObisCode = "1-0:1.8.0".parse().unwrap();
+    assert_eq!(mine[&register].readings[0].value, Decimal::new(7_000, 0));
+
+    // And the register list spans both meters unless narrowed, which is a fact
+    // about the list rather than a bug: it is a set of registers, not readings.
+    assert_eq!(
+        store
+            .readings(MALO)
+            .unwrap()
+            .channels()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "one register, reported by two meters"
     );
 }

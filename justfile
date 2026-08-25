@@ -128,6 +128,7 @@ features:
     check "no features"    --no-default-features
     check "rest-catalog"   --no-default-features --features rest-catalog
     check "flight"         --no-default-features --features flight
+    check "cli"            --no-default-features --features cli
     check "catalog-facade" --no-default-features --features catalog-facade
     check "s3tables"       --no-default-features --features s3tables
     check "testkit"        --no-default-features --features testkit
@@ -178,6 +179,12 @@ site:
 # Build it, failing on a dangling internal link.
 site-build:
     cd site && zola check && zola build
+
+# --- cli --------------------------------------------------------------------
+
+# Build the `meterstore` binary and print its help.
+cli *ARGS:
+    cargo run --features cli --bin meterstore -- {{ARGS}}
 
 # --- examples ---------------------------------------------------------------
 

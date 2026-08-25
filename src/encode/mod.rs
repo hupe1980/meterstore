@@ -442,6 +442,83 @@ fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
     Ok((kind, serde_json::to_string(&payload)?))
 }
 
+/// Encode a series' audit trail for the `provenance` column.
+///
+/// **Written out rather than `serde_json::to_string`, and the reason is one
+/// field.** `ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose
+/// serde impl is *feature-conditional* — a nine-element ordinal-date array
+/// (`[2026,208,6,0,0,0,0,0,0]`) without `serde-human-readable`, a `time`-formatted
+/// string with it. So the on-disk shape of an audit trail under a decades-long
+/// retention would be decided by Cargo feature unification, and `time` takes the
+/// tuple path on read when the feature is off. Enabling it here would move that
+/// decision rather than remove it, at the cost of a global feature.
+///
+/// Encoded like every other column instead: `metering`'s own stable code for the
+/// event type, RFC 3339 for the instant, and the field names serde produced.
+fn encode_provenance(trail: &[ProvenanceEntry]) -> Result<String> {
+    let rows: Vec<serde_json::Value> = trail
+        .iter()
+        .map(|entry| {
+            Ok(serde_json::json!({
+                "occurred_at": entry
+                    .occurred_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|e| Error::encode(col::PROVENANCE, e.to_string()))?,
+                "event_type": entry.event_type.as_str(),
+                "actor": entry.actor,
+                "note": entry.note,
+            }))
+        })
+        .collect::<Result<_>>()?;
+    Ok(serde_json::to_string(&rows)?)
+}
+
+/// The inverse of [`encode_provenance`].
+///
+/// Fallible where the encoder is total, for the reason every decoder here is:
+/// the input is a string read back out of storage, which a file this crate did
+/// not write may set to anything at all.
+fn decode_provenance(raw: &str) -> Result<Vec<ProvenanceEntry>> {
+    let malformed = |detail: String| Error::decode(col::PROVENANCE, detail);
+
+    let serde_json::Value::Array(rows) = serde_json::from_str::<serde_json::Value>(raw)? else {
+        return Err(malformed(format!("{raw:?} is not a JSON array")));
+    };
+
+    rows.into_iter()
+        .map(|row| {
+            let field = |name: &str| -> Result<&serde_json::Value> {
+                row.get(name)
+                    .ok_or_else(|| malformed(format!("entry is missing {name:?}: {row}")))
+            };
+            let text = |name: &str| -> Result<String> {
+                field(name)?
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| malformed(format!("{name:?} is not a string: {row}")))
+            };
+
+            Ok(ProvenanceEntry {
+                occurred_at: time::OffsetDateTime::parse(
+                    &text("occurred_at")?,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map_err(|e| malformed(format!("occurred_at: {e}")))?,
+                // `decode_code`, so a spelling that merely parses is refused the
+                // same way every other coded column's is.
+                event_type: decode_code(col::PROVENANCE, &text("event_type")?)?,
+                actor: text("actor")?,
+                note: match field("note")? {
+                    serde_json::Value::Null => None,
+                    other => Some(other.as_str().map(str::to_string).ok_or_else(|| {
+                        malformed(format!("note is neither a string nor null: {row}"))
+                    })?),
+                },
+            })
+        })
+        .collect()
+}
+
 /// Decode a source from its discriminant and payload.
 ///
 /// The discriminant is authoritative for filtering; the payload is authoritative
@@ -745,7 +822,7 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
             resolution: s.series.resolution.map(|r| r.to_iso8601()),
             source_kind: kind,
             source_detail: detail,
-            provenance: serde_json::to_string(&s.series.provenance)?,
+            provenance: encode_provenance(&s.series.provenance)?,
             version: s.version.version().to_i128(),
             version_scope: s.version.scope().as_str().to_string(),
             recorded_at: schema::micros(s.recorded_at),
@@ -827,7 +904,7 @@ pub fn readings_to_record_batch_with(
             resolution: s.cadence.map(|r| r.to_iso8601()),
             source_kind: kind,
             source_detail: detail,
-            provenance: serde_json::to_string(&s.provenance)?,
+            provenance: encode_provenance(&s.provenance)?,
             version: s.version.version().to_i128(),
             version_scope: s.version.scope().as_str().to_string(),
             recorded_at: schema::micros(s.recorded_at),
@@ -928,7 +1005,7 @@ pub fn distinct_malo_ids(batches: &[RecordBatch]) -> u64 {
 }
 
 /// Downcast a column, producing a decode error rather than panicking.
-fn column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
+pub(crate) fn column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
     batch
         .column_by_name(name)
         .ok_or_else(|| Error::decode(name, "column missing"))?
@@ -1045,7 +1122,7 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
             let prov: Vec<ProvenanceEntry> = if provenance.is_null(i) {
                 Vec::new()
             } else {
-                serde_json::from_str(provenance.value(i))?
+                decode_provenance(provenance.value(i))?
             };
 
             let mut extra = BTreeMap::new();
@@ -1205,7 +1282,7 @@ pub fn readings_from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredReadi
             };
             let prov: Vec<ProvenanceEntry> = match provenance.is_null(i) {
                 true => Vec::new(),
-                false => serde_json::from_str(provenance.value(i))?,
+                false => decode_provenance(provenance.value(i))?,
             };
             let mut extra = BTreeMap::new();
             for name in &extra_names {
@@ -1841,6 +1918,121 @@ mod tests {
             vec![&kind],
             "the discriminant column must be the payload's own key"
         );
+    }
+
+    #[test]
+    fn the_stored_json_representation_is_pinned() {
+        // `source_detail` and `provenance` are **stored** JSON — in the hot
+        // table's TEXT columns and in the cold tier's Parquet, which external
+        // engines are meant to read directly. So their shape is not a wire
+        // format that can be renegotiated between two versions of this crate: it
+        // is on disk, under a retention measured in decades, and a change to it
+        // is a change to data already written.
+        //
+        // Nothing else here would catch that. Every other test round-trips
+        // through the *current* serde impl, so an upstream retag, a renamed
+        // variant, or a `time` feature flipped on by some unrelated crate in the
+        // graph would pass all of them and break every stored row. This is the
+        // one that fails instead, here, with the reason attached.
+        let (kind, detail) = encode_source(&source()).unwrap();
+        assert_eq!(kind, "MSCONS");
+        assert_eq!(
+            detail,
+            r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000001"}}"#,
+            "the stored shape of MeasurementSource changed. Rows already in \
+             source_detail are in the old shape and will not decode — this is a \
+             stored-data break, not a serialisation detail"
+        );
+
+        // The variant that embeds a *second* upstream vocabulary, which is the
+        // one this test exists for. `MeasurementSource::VirtualMeter` carries a
+        // `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is a `metering` tag stored
+        // inside a `metering` payload inside this column — and if it is ever
+        // retagged, `source_kind` stays `VIRTUAL_METER` and agrees with itself
+        // while the payload silently stops decoding. The discriminant check in
+        // `decode_source` cannot see that; only this can.
+        let (kind, detail) = encode_source(&MeasurementSource::VirtualMeter {
+            rule: metering::aggregation_rule::VirtualMeterKind::PvSelfConsumption,
+            source_ids: vec!["12345678905".to_string()],
+        })
+        .unwrap();
+        assert_eq!(kind, "VIRTUAL_METER");
+        assert_eq!(
+            detail,
+            r#"{"VIRTUAL_METER":{"rule":"PV_SELF_CONSUMPTION","source_ids":["12345678905"]}}"#,
+            "a nested vocabulary in source_detail changed. Rows written for \
+             virtual-meter series are in the old shape and no longer decode — and \
+             source_kind still reads VIRTUAL_METER, so nothing else reports it"
+        );
+
+        // The audit trail, and its timestamp above all. `serde` would have written
+        // `occurred_at` as `[2026,60,0,0,0,0,0,0,0]` — the shape `time` uses when
+        // `serde-human-readable` is off, which is a decision made by whatever else
+        // is in the binary rather than by this crate. It is written out instead.
+        let entry = ProvenanceEntry {
+            occurred_at: datetime!(2026-03-01 00:00 UTC),
+            event_type: metering::measurement_series::ProvenanceEventType::Ingested,
+            actor: "MSCONS".to_string(),
+            note: None,
+        };
+        assert_eq!(
+            encode_provenance(std::slice::from_ref(&entry)).unwrap(),
+            r#"[{"actor":"MSCONS","event_type":"INGESTED","note":null,"occurred_at":"2026-03-01T00:00:00Z"}]"#,
+            "the stored shape of a provenance entry changed. Rows already in the \
+             provenance column are in the old shape — this is a stored-data \
+             break, and an audit trail is the one column that must stay readable"
+        );
+
+        // And it decodes back, which is the half that matters on the read path.
+        assert_eq!(
+            decode_provenance(&encode_provenance(std::slice::from_ref(&entry)).unwrap()).unwrap(),
+            vec![entry],
+        );
+    }
+
+    #[test]
+    fn a_provenance_trail_survives_every_event_type_and_a_note() {
+        // Derived from `metering`'s own list, so an event type added upstream is
+        // covered without an edit here — the same rule the source tags follow.
+        use metering::measurement_series::ProvenanceEventType;
+
+        let trail: Vec<ProvenanceEntry> = ProvenanceEventType::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, event_type)| ProvenanceEntry {
+                occurred_at: datetime!(2026-03-01 00:00 UTC) + time::Duration::seconds(i as i64),
+                event_type: *event_type,
+                actor: format!("actor-{i}"),
+                note: (i % 2 == 0).then(|| format!("note {i}")),
+            })
+            .collect();
+
+        assert_eq!(
+            decode_provenance(&encode_provenance(&trail).unwrap()).unwrap(),
+            trail,
+        );
+        assert_eq!(encode_provenance(&[]).unwrap(), "[]");
+        assert_eq!(decode_provenance("[]").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_malformed_provenance_column_fails_rather_than_decoding_to_nothing() {
+        // The input is a string read back out of storage, which a file this crate
+        // did not write may set to anything. Each is a decode error naming the
+        // column and what is wrong with it, not a serde error naming a Rust type.
+        for bad in [
+            r#"{"occurred_at":"2026-03-01T00:00:00Z"}"#,
+            r#"[{"event_type":"INGESTED","actor":"a","note":null}]"#,
+            r#"[{"occurred_at":"the first of March","event_type":"INGESTED","actor":"a","note":null}]"#,
+            r#"[{"occurred_at":"2026-03-01T00:00:00Z","event_type":"ingested","actor":"a","note":null}]"#,
+            r#"[{"occurred_at":"2026-03-01T00:00:00Z","event_type":"INGESTED","actor":7,"note":null}]"#,
+        ] {
+            let err = decode_provenance(bad).expect_err("{bad}");
+            assert!(
+                err.to_string().contains(col::PROVENANCE) || err.to_string().contains("json"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

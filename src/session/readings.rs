@@ -26,9 +26,12 @@
 use metering::QualityFlag;
 use metering::ids::{MaloId, MeloId};
 use metering::measurement_series::{MeasurementSource, ProvenanceEntry};
+use metering::obis::ObisCode;
 use metering::reading::MeterReading;
 use metering::resolution::IntervalResolution;
 use time::OffsetDateTime;
+
+use std::collections::BTreeMap;
 
 use datafusion::common::ScalarValue;
 
@@ -183,6 +186,13 @@ impl<'a> ReadingsQuery<'a> {
     /// with [`obis`](Self::obis) or [`melo`](Self::melo) — the order is completed
     /// by the rest of the merge key so the choice among them is deterministic,
     /// but it is still a choice, and narrowing is how to make it deliberately.
+    ///
+    /// For the current value of **every** register — which is what a meter
+    /// reading actually is — ask [`channels`](Self::channels) and then `latest`
+    /// per register. Deliberately not one call: each `latest` is an
+    /// `ORDER BY … DESC LIMIT 1` the index answers, so a meter's four registers
+    /// cost four point lookups rather than the history scan a single windowed
+    /// query would need on the one table § 146 Abs. 4 AO forbids discarding.
     pub async fn latest(mut self) -> Result<Option<MeterReading>> {
         self.latest_only = true;
         Ok(self
@@ -212,6 +222,92 @@ impl<'a> ReadingsQuery<'a> {
         Ok(self.scan().await?.0)
     }
 
+    /// The registers this range holds, in OBIS order.
+    ///
+    /// A meter **is** a set of registers — `1-0:1.8.0` beside its HT and NT
+    /// counterparts, a feed-in register beside a consumption one — and a range
+    /// carries whichever of them were actually delivered. This is that question,
+    /// as a `SELECT DISTINCT` rather than a fold, so it costs one aggregate
+    /// instead of decoding a decade of readings.
+    ///
+    /// Narrowed by everything this builder was narrowed by, including
+    /// [`melo`](Self::melo). That matters here more than on a Lastgang: a point
+    /// table identifies a reading by its Messlokation, so an unnarrowed list over
+    /// a Marktlokation with two meters names the union of both meters' registers.
+    ///
+    /// It is a set of **registers**, not of readings: two meters carrying the same
+    /// register both appear once.
+    /// [`collect_by_channel`](Self::collect_by_channel) is what refuses to fold
+    /// those together.
+    pub async fn channels(&self) -> Result<Vec<ObisCode>> {
+        let (conditions, params) = self.predicate();
+        let sql = format!(
+            r#"SELECT DISTINCT "{obis}" FROM "{table}" WHERE {conditions} ORDER BY 1"#,
+            obis = col::OBIS_CODE,
+            table = self.store.resolved_table(),
+            conditions = conditions.join(" AND "),
+        );
+
+        let result = self.store.query_with_params(&sql, params).await?;
+        let mut out = Vec::new();
+        for batch in result.batches() {
+            let codes =
+                crate::encode::column::<crate::arrow::array::StringArray>(batch, col::OBIS_CODE)?;
+            for i in 0..batch.num_rows() {
+                out.push(codes.value(i).parse().map_err(|e| {
+                    Error::decode(
+                        col::OBIS_CODE,
+                        format!("{:?} is not an OBIS code: {e}", codes.value(i)),
+                    )
+                })?);
+            }
+        }
+        // Sorted **in Rust**, not left to the `ORDER BY`. The column is text, and
+        // OBIS codes do not sort as text the way they sort as codes: `1-0:10.8.0`
+        // precedes `1-0:2.8.0` alphabetically and follows it numerically. The
+        // `ORDER BY` is kept so the batches themselves are deterministic; this is
+        // what decides the answer.
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Every register in this range, each resolved on its own.
+    ///
+    /// What a meter reads, where [`collect`](Self::collect) describes one register
+    /// of it — and `collect` must refuse the rest, since [`StoredReadings`] *is*
+    /// one register's history and folding two gives advances that alternate
+    /// between them.
+    ///
+    /// **One scan**, split in Rust, so every register is resolved against one tier
+    /// boundary rather than N read at N different moments.
+    ///
+    /// **It still refuses to fold two readings.** A reading is `(register,
+    /// merge-key discriminators)`, and a point table keys on the Messlokation by
+    /// default — so two meters carrying `1-0:1.8.0` are refused exactly as
+    /// `collect` refuses them. Narrow with [`melo`](Self::melo) and the map is one
+    /// entry per register again.
+    ///
+    /// Empty when the range holds nothing, which is the statement `collect`'s
+    /// `None` makes.
+    pub async fn collect_by_channel(self) -> Result<BTreeMap<ObisCode, StoredReadings>> {
+        Ok(self.collect_by_channel_with_provenance().await?.0)
+    }
+
+    /// As [`collect_by_channel`](Self::collect_by_channel), but keeping the
+    /// query's provenance.
+    ///
+    /// One [`QueryResult`](super::QueryResult) for the whole map, because it was
+    /// one scan.
+    pub async fn collect_by_channel_with_provenance(
+        self,
+    ) -> Result<(BTreeMap<ObisCode, StoredReadings>, super::QueryResult)> {
+        let malo_id = self.malo_id;
+        let discriminators = self.store.config().discriminator_columns();
+        let (stored, result) = self.scan().await?;
+        Ok((split_by_register(malo_id, &discriminators, stored)?, result))
+    }
+
     /// The shared read: run the range query, then fold.
     async fn resolve(self) -> Result<(Option<StoredReadings>, super::QueryResult)> {
         let malo_id = self.malo_id;
@@ -224,8 +320,17 @@ impl<'a> ReadingsQuery<'a> {
         ))
     }
 
-    /// Run the range query and decode it, without folding.
-    async fn scan(self) -> Result<(Vec<StoredReadings>, super::QueryResult)> {
+    /// The `WHERE` clause this read narrows to, and the values it binds.
+    ///
+    /// Extracted because three reads share it — the fold, the per-register split
+    /// and the register list — and a second copy would be a second place for a
+    /// filter to be forgotten. On a point table that is the Messlokation, which
+    /// is the one narrowing a Marktlokation with two meters cannot do without.
+    ///
+    /// **Every value is bound**; only column *names* reach the SQL text, and each
+    /// is either a core column or one [`column_eq`](Self::column_eq) checked
+    /// against the store's declared set.
+    fn predicate(&self) -> (Vec<String>, Vec<ScalarValue>) {
         let mut conditions = vec![format!(r#""{}" = $1"#, col::MALO_ID)];
         let mut params: Vec<ScalarValue> = vec![ScalarValue::Utf8(Some(self.malo_id.to_string()))];
 
@@ -278,6 +383,12 @@ impl<'a> ReadingsQuery<'a> {
             }
         }
 
+        (conditions, params)
+    }
+
+    /// Run the range query and decode it, without folding.
+    async fn scan(&self) -> Result<(Vec<StoredReadings>, super::QueryResult)> {
+        let (conditions, params) = self.predicate();
         let merge_key = self.store.config().merge_key();
         // Ordered by the **whole** merge key so decoding sees contiguous runs of
         // one delivery. A point table identifies a reading by its Messlokation, so
@@ -330,6 +441,45 @@ fn filterable_columns(store: &crate::session::MeterStore) -> Vec<String> {
 /// thing for a sharper reason: two meters' registers folded together produce
 /// advances that alternate between them, so differencing the result is not a
 /// wrong number but a meaningless one.
+/// Group decoded deliveries by register and fold each group on its own.
+///
+/// The split half of [`ReadingsQuery::collect_by_channel`], separated so the
+/// property that matters can be checked without a database: two registers split,
+/// and two *readings* within one register still refuse.
+///
+/// Grouped rather than run-detected, for the reason the series path gives: the
+/// scan's order already makes each register contiguous, and relying on that would
+/// make the split silently wrong the day the order changes.
+fn split_by_register(
+    malo_id: MaloId,
+    discriminators: &[String],
+    stored: Vec<StoredReadings>,
+) -> Result<BTreeMap<ObisCode, StoredReadings>> {
+    let mut grouped: BTreeMap<ObisCode, Vec<StoredReadings>> = BTreeMap::new();
+    for delivery in stored {
+        grouped
+            .entry(delivery.obis_code)
+            .or_default()
+            .push(delivery);
+    }
+
+    let mut out = BTreeMap::new();
+    for (register, deliveries) in grouped {
+        // `merge` runs the same refusal `collect` does. Within one register it can
+        // only fire on differing discriminators — a second Messlokation, a tenant
+        // — which is the half that still means two readings.
+        if let Some(folded) = merge(
+            malo_id,
+            Some(&register.to_string()),
+            discriminators,
+            deliveries,
+        )? {
+            out.insert(register, folded);
+        }
+    }
+    Ok(out)
+}
+
 fn merge(
     malo_id: MaloId,
     obis_code: Option<&str>,
@@ -353,7 +503,7 @@ fn merge(
     let mut sparte = None;
     let mut unit = None;
     let mut version = None;
-    let mut extra = std::collections::BTreeMap::new();
+    let mut extra = BTreeMap::new();
     let mut obis = None;
 
     for delivery in stored {
@@ -455,5 +605,101 @@ fn render(values: &[(String, String)]) -> String {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(", "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::version::{ScopedVersion, Version, VersionScope};
+    use metering::interval::Sparte;
+    use metering::reading::MeterReading;
+    use rust_decimal::Decimal;
+    use time::macros::datetime;
+
+    fn malo() -> MaloId {
+        "12345678905".parse().expect("a valid MaLo-ID")
+    }
+
+    fn source() -> MeasurementSource {
+        MeasurementSource::Mscons {
+            pid: 13_005,
+            message_ref: None,
+            sender_mp_id: "99".to_string(),
+        }
+    }
+
+    /// One register reading of the given register, at a fixed instant.
+    ///
+    /// The instant is shared on purpose: two cumulative values at one timestamp
+    /// is exactly what makes a fold meaningless — differencing the result gives
+    /// advances that alternate between two registers.
+    fn one_reading(obis: &str) -> StoredReadings {
+        let at = datetime!(2026-07-20 00:00 UTC);
+        let code = obis.parse().expect("a valid OBIS code");
+        StoredReadings::new(
+            malo(),
+            code,
+            Sparte::Strom,
+            vec![MeterReading {
+                at,
+                value: Decimal::new(1_234, 0),
+                quality: metering::QualityFlag::Measured,
+                obis_code: Some(code),
+            }],
+            source(),
+            ScopedVersion::new(
+                VersionScope::for_interval("99", at, Sparte::Strom).unwrap(),
+                Version::new(20_260_720_000_001).unwrap(),
+            ),
+            at,
+        )
+    }
+
+    #[test]
+    fn a_per_register_read_splits_what_the_fold_refuses() {
+        // A meter *is* a set of registers, and "what does this meter read" is a
+        // question about all of them. `collect` cannot answer it — StoredReadings
+        // holds one register — so this is the shape that can.
+        let split = split_by_register(
+            malo(),
+            &[],
+            vec![one_reading("1-0:1.8.1"), one_reading("1-0:1.8.2")],
+        )
+        .expect("two registers are two histories, not an error");
+
+        assert_eq!(split.len(), 2);
+        for code in ["1-0:1.8.1", "1-0:1.8.2"] {
+            let register: ObisCode = code.parse().unwrap();
+            assert_eq!(split[&register].obis_code, register);
+            assert_eq!(split[&register].readings.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_per_register_read_still_refuses_two_meters_on_one_register() {
+        // A point table identifies a reading by its Messlokation by default, so
+        // two meters under one Marktlokation carrying `1-0:1.8.0` are two
+        // readings. Splitting by register alone would fold them, and differencing
+        // the fold produces advances that alternate between meters.
+        let a = one_reading("1-0:1.8.0")
+            .with_melo_id("DE0001112223334445556667778889990".parse().unwrap());
+        let b = one_reading("1-0:1.8.0")
+            .with_melo_id("DE0009998887776665554443332221110".parse().unwrap());
+
+        let err = split_by_register(malo(), &[col::MELO_ID.to_string()], vec![a, b])
+            .expect_err("two meters on one register are two readings");
+        let msg = err.to_string();
+        assert!(msg.contains("two meters"), "{msg}");
+        assert!(msg.contains(".melo(..)"), "the fix has to be named: {msg}");
+    }
+
+    #[test]
+    fn a_per_register_read_of_nothing_is_an_empty_map() {
+        assert!(
+            split_by_register(malo(), &[], Vec::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 }

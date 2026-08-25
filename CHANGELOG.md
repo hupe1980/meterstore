@@ -7,6 +7,163 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.6.0] — 2026-08-25
+
+A lock audit, the front end the crate did not have, and consumer feedback from an
+MSB integrating against it.
+
+### The typed API could not describe a measuring point
+
+`collect` refuses a range spanning two channels, and the refusal is right — a
+`MeasurementSeries` holds one `obis_code`, so folding import and export puts two
+values at every instant and `aggregate` returns twice the truth. But a measuring
+point **is** a set of registers, and the questions that are about all of them — a
+billing period projecting the canonical Bezug across HT, NT and total, a
+Mehr-/Mindermengensaldo, an audit of what a delivery contained — had no typed
+answer at all.
+
+What a consumer had to write instead was a hand-rolled `SELECT DISTINCT
+obis_code` followed by one typed read per channel: SQL in front of the one API
+whose whole point is that callers do not write SQL, `1 + N` round trips, and
+version resolution and the tier split held outside the store by convention.
+
+### A stored audit trail nobody could read
+
+`provenance` was written with `serde_json::to_string`, and
+`ProvenanceEntry::occurred_at` is a `time::OffsetDateTime` — whose `serde`
+implementation is *feature-conditional*. With `serde-human-readable` off, as it
+was, the column held `[2026,208,6,0,0,0,0,0,0]`.
+
+Two things wrong with that, and the second is the sharper one. It is unreadable,
+in files this crate tells operators to point Spark and Trino at — a timestamp
+that reads as `208` is an audit trail nobody can audit. And the choice between
+that shape and a string was being made by Cargo **feature unification**: the
+on-disk representation of data under a decades-long retention depended on what
+else happened to be in the binary that wrote it, and `time`'s deserialiser takes
+the tuple path when the feature is off, so rows written while some other crate
+had turned it on would silently stop decoding.
+
+### The lock audit
+
+### The lock audit
+
+PostgreSQL grants locks **in arrival order**, so a statement waiting for an
+`ACCESS EXCLUSIVE` lock blocks every reader and writer that arrives behind it —
+whether or not those would have conflicted with each other. This crate issued DDL
+on two schedules nobody chooses the timing of, and neither of them knew that.
+
+`CREATE TABLE … PARTITION OF` takes exactly that lock on the parent, and
+partition creation runs on the **write path**: an append reaching past the
+pre-created frontier makes what it needs. One long analytical query on the hot
+table could therefore stall every subsequent insert for as long as it ran, and
+the failure would read as "the database is slow" rather than as a lock queue.
+Partitions are now built standalone and *attached*, which takes only
+`SHARE UPDATE EXCLUSIVE` — a lock that conflicts with no read and no write at all.
+The bound `CHECK` that lets the attach skip its validation scan is added and then
+dropped again, so no row is ever checked against a redundant predicate.
+
+The detach genuinely needs the strong lock, so it declines to *wait* for it
+instead: every DDL statement now runs under a `lock_timeout`, and one that cannot
+get its lock gives up having changed nothing. Both properties are asserted against
+a real server holding a real conflicting lock rather than argued.
+
+### The errors that came out of it
+
+`pg` flattened every backend failure into `Error::Storage(String)`, in a crate
+whose error type is documented as "callers match on variants and never parse
+strings". A caller could not tell an unavailable lock from a lost connection, nor
+either from an overlapping delivery the store refused on purpose.
+
+That, followed outwards, found a worse conflation: a **refused delivery** raised
+`InvariantViolated` — the variant documented as *the* thing to alert on, meaning
+query results may be wrong — so a producer sending a bad row paged whoever was
+watching the tiering invariant.
+
+### Added
+
+- **`SeriesQuery::collect_by_channel`** and **`ReadingsQuery::collect_by_channel`**
+  — every channel (or register) in a range, each resolved on its own, from **one
+  scan**. They keep the refusal that matters: a reading is `(channel, merge-key
+  discriminators)`, so two tenants on one OBIS code, or two meters on one
+  register, are still refused rather than folded. `…_with_provenance` returns the
+  single boundary the whole map was computed against, which is exactly what the
+  `1 + N` spelling cannot state.
+- **`SeriesQuery::channels`** and **`ReadingsQuery::channels`** — the list on its
+  own, as a `SELECT DISTINCT` rather than a fold, for an audit that wants to know
+  what arrived without decoding a year of intervals. Both take `&self`, so the
+  builder survives, and both are narrowed by everything the builder was narrowed
+  by — an unscoped list would name channels belonging to a tenant the read cannot
+  see.
+- **`meterstore`, a command-line tool** (`cli` feature): `init`, `check`,
+  `create`, `status`, `archive`, `maintain`, `query`, `explain`, `snapshots`,
+  `serve` and `purge` — with `serve` binding both surfaces, Flight SQL and the
+  read-only Iceberg REST façade, under one shutdown. A thin front end over the
+  same public API — every result
+  carries the tier boundary it was computed against, `--format json` renders it
+  for a pipe, and `status` exits non-zero when a table is unhealthy so it works as
+  a monitoring check. Deliberately no `append`: mapping an MSCONS message or an
+  SMGW push to a `MeasurementSeries` is an application's job, not a flag's.
+- `PostgresHot::ddl_lock_timeout`, and `ddl_lock_timeout` in `[hot]`. Three
+  seconds by default; `0s` restores PostgreSQL's own behaviour, which is the
+  queue-behind-me one.
+- `Error::LockTimeout` and `Error::IntegrityViolation`, and `Error::is_retryable`
+  to split the transient from the wrong.
+- `ArchivalOutcome::deferred` and `TableMaintenance::deferred()` — a cycle that
+  stopped because a lock was not available, reported like lease contention rather
+  than as a failure. `ArchivalOutcome::is_benign_noop` covers both.
+- `Deployment::store()`, `Deployment::catalog()` and `Deployment::table()`. A
+  configuration file reached the tiers and stopped, leaving every deployment to
+  repeat twenty lines of wiring — including the one step that is not field access,
+  creating the cold table before a provider can be opened over it.
+- `MeterStore::in_read_mode`, the general form of `as_known_at`. There was no way
+  to derive a `Historical` or `Operational` session from an existing store.
+- `settings::parse_human_duration` / `format_human_duration`, and an `ms` unit, so
+  `--interval 15m` on the command line means what `interval = "15m"` means in the
+  file.
+
+### Changed
+
+- **`provenance` is written explicitly, not through `serde`.** Timestamps are
+  RFC 3339 and the event type is `metering`'s own stable code, so the column is
+  encoded like every other column in the schema and its shape depends on nothing
+  but this crate. **This is a stored-data change**: rows written by an earlier
+  build hold the old array form and no longer decode. Recreate the table — the
+  crate is unpublished and this is a hard cut.
+  `source_detail` stays `serde`'s, deliberately: `MeasurementSource` is a
+  seven-variant enum whose variants carry no timestamp, and hand-writing it would
+  be a second copy of `metering`'s vocabulary.
+- `the_stored_json_representation_is_pinned` asserts both JSON columns byte for
+  byte, including the **nested** vocabulary: `MeasurementSource::VirtualMeter`
+  holds a `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is an upstream tag stored
+  inside an upstream payload inside `source_detail`. Retagged, `source_kind`
+  would still read `VIRTUAL_METER` and still agree with the payload's outer key —
+  the existing discriminant check passes and the payload just stops decoding.
+  Everything else round-trips through the *current* `serde` impl, so such a
+  change would have passed every test and broken every stored row. **Anything
+  persisted through `serde` has its stored shape decided by a dependency**, and a
+  change there is a stored-data break rather than a wire one.
+- **Partition creation no longer takes `ACCESS EXCLUSIVE` on the parent.** This
+  raises the effective PostgreSQL floor to **12**, where `ATTACH PARTITION`
+  acquired the weaker lock. The documentation previously claimed 14 for a reason
+  that was true of 10.
+- A refused delivery raises `IntegrityViolation`, not `InvariantViolated` — in
+  both tiers, and for both the restated-value and the wrong-Messlokation cases.
+  `InvariantViolated` now means only that the store's own state is wrong.
+- DataFusion failures keep their type instead of being stringified into
+  `Storage`, so a statement that will not plan is distinguishable from a warehouse
+  that cannot be reached — and is not retried.
+- `system.tables.healthy` no longer reports a table with **no partitions** as
+  degraded. "Not started" and "exhausted" show the same two numbers and mean
+  opposite things, and calling the first degraded made the very first status of
+  every new deployment an alarm.
+- `MeterStore::sql`, `query`, `stream` and `MeterCatalog::query` now point at
+  `scoped` and `isolated` from their own documentation. A reader who arrives at
+  those looking for a way to confine a scan is exactly the reader who needs them,
+  and they met the refusal list first.
+- Environment interpolation skips comments, so a configuration file can document
+  its own placeholders — which the one `meterstore init` writes does. A `#` inside
+  a quoted value is no longer read as a comment either.
+
 ## [0.5.0] — 2026-08-25
 
 Three audits, the `metering` 0.19 upgrade, and consumer feedback from an MSB

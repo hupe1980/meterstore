@@ -48,10 +48,12 @@ use crate::error::{Error, Result};
 /// The PostgreSQL image every suite runs against.
 ///
 /// **Pinned, and not at the library default.** `testcontainers-modules` defaults
-/// to `11-alpine`, four majors below the ≥ 14 this design requires (§3.1) — so
+/// to `11-alpine`, one major below the floor this design requires (§3.1) — so
 /// every suite would have been proving the store works on a version it does not
-/// claim to support, and would have missed anything needing a newer one. 16
-/// matches the §18 reference deployment.
+/// claim to support, and `ATTACH PARTITION` would still have taken
+/// `ACCESS EXCLUSIVE` on the parent there, so the lock properties the tests
+/// assert would have been asserted against the one server where they do not
+/// hold. 16 matches the §18 reference deployment.
 pub const IMAGE_TAG: &str = "16-alpine";
 
 /// A running PostgreSQL, kept for the life of the process.

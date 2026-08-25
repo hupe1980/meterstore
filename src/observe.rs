@@ -39,6 +39,15 @@ pub struct Metrics {
     pub archival_duration: Histogram<f64>,
     /// Archival runs that failed.
     pub archival_failures: Counter<u64>,
+    /// Archival cycles that stopped because a lock was not available.
+    ///
+    /// **Not a failure**, and separate from one for that reason: nothing was
+    /// changed and the next cycle retries. It is worth counting because a table
+    /// that defers *every* cycle is a table whose watermark is not moving, and
+    /// the cause is on the database — a long query, or a session idle in a
+    /// transaction — rather than here. Alert on
+    /// [`watermark_lag`](Self::watermark_lag); read this to explain it.
+    pub archival_deferred: Counter<u64>,
     /// Partitions dropped after a successful commit.
     pub partitions_dropped: Counter<u64>,
     /// Partitions reclaimed from an interrupted run.
@@ -95,6 +104,13 @@ impl Metrics {
             archival_failures: meter
                 .u64_counter("meterstore.archival.failures")
                 .with_description("Archival runs that did not complete")
+                .build(),
+            archival_deferred: meter
+                .u64_counter("meterstore.archival.deferred")
+                .with_description(
+                    "Archival runs that stopped because a lock was not available. \
+                     Not a failure: nothing was changed and the next cycle retries",
+                )
                 .build(),
             partitions_dropped: meter
                 .u64_counter("meterstore.partitions.dropped")

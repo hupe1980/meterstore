@@ -232,6 +232,14 @@ impl<'a> SeriesQuery<'a> {
     /// does a table keyed by Messlokation or extended with a tenant. The rest of
     /// the merge key completes the order so the choice among them is
     /// deterministic, but it is still a choice.
+    ///
+    /// For the newest value of **each** channel, ask
+    /// [`channels`](Self::channels) and then `latest` per channel. That is
+    /// deliberately not one call: each `latest` is an `ORDER BY … DESC LIMIT 1`
+    /// the index answers, so the cost is a handful of point lookups rather than
+    /// the whole-history scan a single windowed query would need — which is the
+    /// opposite trade from [`collect_by_channel`](Self::collect_by_channel),
+    /// where reading each channel in turn means scanning the range N times.
     pub async fn latest(self) -> Result<Option<metering::interval::MeterInterval>> {
         Ok(self
             .latest_resolved()
@@ -271,10 +279,118 @@ impl<'a> SeriesQuery<'a> {
         Ok((resolved.map(|r| r.series), result))
     }
 
-    /// The shared read: run the range query and fold the rows into one series,
-    /// keeping the commodity, the declared attribute columns, and the tier-boundary
-    /// provenance the public collectors each project a subset of.
-    async fn resolve(self) -> Result<(Option<ResolvedSeries>, super::QueryResult)> {
+    /// The channels this range holds, in OBIS order.
+    ///
+    /// A measuring point **is** a set of registers — a Bezug channel beside HT and
+    /// NT, import beside export — and there is no way to know which of them a
+    /// range actually carries without asking. This is that question, and it is a
+    /// `SELECT DISTINCT` rather than a fold, so it costs one aggregate instead of
+    /// decoding every interval.
+    ///
+    /// Narrowed by everything this builder was narrowed by: the range, the quality
+    /// filter and any [`column_eq`](Self::column_eq). That matters most for the
+    /// last — on a shared store, an unscoped list would name channels belonging to
+    /// a tenant the caller may not be reading.
+    ///
+    /// It is a set of **channels**, not of readings: where two tenants report the
+    /// same OBIS code, it appears once. [`collect_by_channel`](Self::collect_by_channel)
+    /// is what refuses to fold those together.
+    ///
+    /// Takes `&self`, so the builder survives to be collected afterwards.
+    pub async fn channels(&self) -> Result<Vec<ObisCode>> {
+        let (conditions, params) = self.predicate();
+        let sql = format!(
+            r#"SELECT DISTINCT "{obis}" FROM "{table}" WHERE {conditions} ORDER BY 1"#,
+            obis = col::OBIS_CODE,
+            table = self.store.resolved_table(),
+            conditions = conditions.join(" AND "),
+        );
+
+        let result = self.store.query_with_params(&sql, params).await?;
+        let mut out = Vec::new();
+        for batch in result.batches() {
+            let codes =
+                crate::encode::column::<crate::arrow::array::StringArray>(batch, col::OBIS_CODE)?;
+            for i in 0..batch.num_rows() {
+                out.push(codes.value(i).parse::<ObisCode>().map_err(|e| {
+                    Error::decode(
+                        col::OBIS_CODE,
+                        format!("{:?} is not an OBIS code: {e}", codes.value(i)),
+                    )
+                })?);
+            }
+        }
+        // Sorted **in Rust**, not left to the `ORDER BY`. The column is text, and
+        // OBIS codes do not sort as text the way they sort as codes: `1-0:10.8.0`
+        // precedes `1-0:2.8.0` alphabetically and follows it numerically. The
+        // `ORDER BY` is kept so the batches themselves are deterministic; this is
+        // what decides the answer.
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Every channel in this range, each resolved as its own series.
+    ///
+    /// The whole measuring point, where [`collect`](Self::collect) describes one
+    /// channel of it — a billing period projecting Bezug across HT, NT and total,
+    /// a Mehr-/Mindermengensaldo, an audit of what a delivery contained.
+    ///
+    /// **One scan**, split in Rust: the same single query `collect` runs, so every
+    /// channel is resolved against one tier boundary rather than N boundaries read
+    /// at N different moments. `SELECT DISTINCT` plus a read per channel is
+    /// `1 + N` round trips and holds resolution and the tier split outside the
+    /// store by convention.
+    ///
+    /// **It still refuses to fold two readings.** A reading is `(channel,
+    /// merge-key discriminators)`, so two tenants — or two meters — on one OBIS
+    /// code are refused exactly as `collect` refuses them. Narrow with
+    /// [`column_eq`](Self::column_eq) and the map is one entry per channel again.
+    ///
+    /// Empty when the range holds nothing, which is the statement `collect`'s
+    /// `None` makes.
+    ///
+    /// ```no_run
+    /// # async fn f(store: &meterstore::MeterStore, malo: &str,
+    /// #            from: time::OffsetDateTime, to: time::OffsetDateTime)
+    /// #     -> meterstore::Result<()> {
+    /// let point = store.series(malo)?.range(from, to).collect_by_channel().await?;
+    /// for (channel, resolved) in &point {
+    ///     println!("{channel}: {} intervals", resolved.series.intervals.len());
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn collect_by_channel(self) -> Result<BTreeMap<ObisCode, ResolvedSeries>> {
+        Ok(self.collect_by_channel_with_provenance().await?.0)
+    }
+
+    /// As [`collect_by_channel`](Self::collect_by_channel), but keeping the
+    /// query's provenance.
+    ///
+    /// One [`QueryResult`](super::QueryResult) for the whole map, because it was
+    /// one scan: every channel here was computed against the same tier boundary,
+    /// which is precisely what the `1 + N` spelling cannot say.
+    pub async fn collect_by_channel_with_provenance(
+        self,
+    ) -> Result<(BTreeMap<ObisCode, ResolvedSeries>, super::QueryResult)> {
+        let malo_id = self.malo_id;
+        let discriminators = self.store.config().discriminator_columns();
+        let (stored, result) = self.scan().await?;
+        Ok((split_by_channel(malo_id, &discriminators, stored)?, result))
+    }
+
+    /// The `WHERE` clause this read narrows to, and the values it binds.
+    ///
+    /// Extracted because three reads share it — the fold, the per-channel split
+    /// and the channel list — and a second copy would be a second place for a
+    /// filter to be forgotten. That failure is silent in the worst direction:
+    /// [`channels`](Self::channels) listing a tenant's channels unscoped, or a
+    /// quality filter applying to the fold and not to the list.
+    ///
+    /// **Every value is bound.** Only column *names* reach the SQL text, and
+    /// every one of them is either a core column or one
+    /// [`column_eq`](Self::column_eq) checked against the store's declared set.
+    fn predicate(&self) -> (Vec<String>, Vec<ScalarValue>) {
         let mut conditions = vec![format!(r#""{}" = $1"#, col::MALO_ID)];
         let mut params: Vec<ScalarValue> = vec![ScalarValue::Utf8(Some(self.malo_id.to_string()))];
 
@@ -309,6 +425,13 @@ impl<'a> SeriesQuery<'a> {
                 params.push(ScalarValue::Utf8(Some(q.as_str().to_owned())));
             }
         }
+
+        (conditions, params)
+    }
+
+    /// Run the read and decode it, without folding.
+    async fn scan(&self) -> Result<(Vec<crate::encode::StoredSeries>, super::QueryResult)> {
+        let (conditions, params) = self.predicate();
 
         // Ordered by the **whole** merge key so decoding sees contiguous runs of
         // one series, which is what `from_record_batch` groups on. Not by
@@ -355,14 +478,21 @@ impl<'a> SeriesQuery<'a> {
         for batch in result.batches() {
             stored.extend(crate::encode::from_record_batch(batch)?);
         }
+        Ok((stored, result))
+    }
 
+    /// The shared single-series read: scan, then fold the rows into one series.
+    ///
+    /// Every collector that returns *one* [`ResolvedSeries`] goes through here,
+    /// and each projects a subset of what it returns — the commodity, the declared
+    /// attribute columns, or the tier-boundary provenance.
+    async fn resolve(self) -> Result<(Option<ResolvedSeries>, super::QueryResult)> {
+        let malo_id = self.malo_id;
+        let obis_code = self.obis_code.clone();
+        let discriminators = self.store.config().discriminator_columns();
+        let (stored, result) = self.scan().await?;
         Ok((
-            merge(
-                self.malo_id,
-                self.obis_code.as_deref(),
-                &self.store.config().discriminator_columns(),
-                stored,
-            )?,
+            merge(malo_id, obis_code.as_deref(), &discriminators, stored)?,
             result,
         ))
     }
@@ -549,6 +679,52 @@ fn refuse_mixed_readings(
     Ok(())
 }
 
+/// Group decoded rows by channel and fold each group on its own.
+///
+/// The split half of [`SeriesQuery::collect_by_channel`], separated so the
+/// property that matters can be checked without a database: two channels split,
+/// and two *readings* within one channel still refuse.
+///
+/// Grouped rather than run-detected. The scan orders by the whole merge key, so
+/// one channel's rows are already contiguous — but relying on that would make the
+/// split silently wrong if the order ever changed, and the failure would be a
+/// channel returned twice with half its intervals each.
+fn split_by_channel(
+    malo_id: MaloId,
+    discriminators: &[String],
+    stored: Vec<crate::encode::StoredSeries>,
+) -> Result<BTreeMap<ObisCode, ResolvedSeries>> {
+    let mut grouped: BTreeMap<ObisCode, Vec<crate::encode::StoredSeries>> = BTreeMap::new();
+    for series in stored {
+        // Always `Some` off the decode path: `obis_code` is non-nullable in
+        // storage and `from_record_batch` refuses a code that does not parse.
+        // Reported rather than assumed, because the alternative to a channel is a
+        // silently dropped series.
+        let channel = series.series.obis_code.ok_or_else(|| {
+            Error::decode(
+                col::OBIS_CODE,
+                format!(
+                    "a decoded series for {malo_id} carries no channel, so it cannot be placed \
+                     in a per-channel read"
+                ),
+            )
+        })?;
+        grouped.entry(channel).or_default().push(series);
+    }
+
+    let mut out = BTreeMap::new();
+    for (channel, series) in grouped {
+        // `merge` runs the same refusal `collect` does. Within one channel it can
+        // only fire on differing discriminators, which is the half that still
+        // means two readings.
+        if let Some(resolved) = merge(malo_id, Some(&channel.to_string()), discriminators, series)?
+        {
+            out.insert(channel, resolved);
+        }
+    }
+    Ok(out)
+}
+
 /// Render a merge-key discriminator tuple for an error message.
 fn render(values: &[(String, String)]) -> String {
     match values.is_empty() {
@@ -669,6 +845,104 @@ mod tests {
         // Never empty: `malo_id` is in every merge key.
         assert!(
             !key_order_without_start(&[col::MALO_ID.to_string(), col::FROM.to_string(),])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_per_channel_read_splits_what_the_fold_refuses() {
+        // The whole point of `collect_by_channel`: a measuring point *is* a set
+        // of registers, and asking for all of them must not require the caller to
+        // discover the list with hand-written SQL and then read each one.
+        let split = split_by_channel(
+            malo(),
+            &[],
+            vec![one_interval("1-0:1.8.0"), one_interval("1-0:2.8.0")],
+        )
+        .expect("two channels are two series, not an error");
+
+        assert_eq!(split.len(), 2);
+        let import: ObisCode = "1-0:1.8.0".parse().unwrap();
+        let export: ObisCode = "1-0:2.8.0".parse().unwrap();
+        assert_eq!(split[&import].series.obis_code, Some(import));
+        assert_eq!(split[&export].series.obis_code, Some(export));
+
+        // One interval each, at the same instant — which is exactly the shape a
+        // fold would have doubled.
+        assert_eq!(split[&import].series.intervals.len(), 1);
+        assert_eq!(split[&export].series.intervals.len(), 1);
+        assert_eq!(
+            split[&import].series.intervals[0].from,
+            split[&export].series.intervals[0].from
+        );
+    }
+
+    #[test]
+    fn a_per_channel_read_still_refuses_two_readings_on_one_channel() {
+        // A reading is `(channel, discriminators)`, not a channel alone. Splitting
+        // by channel and stopping there would fold two tenants — or the two meters
+        // of a Mehrfamilienhaus — into one series on the same OBIS code, which is
+        // the exact double-count `collect`'s second refusal exists to prevent.
+        let mut a = one_interval("1-0:1.8.0");
+        let mut b = one_interval("1-0:1.8.0");
+        a.extra.insert(
+            "tenant".to_string(),
+            ScalarValue::Utf8(Some("alpha".to_string())),
+        );
+        b.extra.insert(
+            "tenant".to_string(),
+            ScalarValue::Utf8(Some("beta".to_string())),
+        );
+
+        let err = split_by_channel(malo(), &["tenant".to_string()], vec![a, b])
+            .expect_err("two tenants on one channel are two readings");
+        let msg = err.to_string();
+        assert!(msg.contains("two readings"), "{msg}");
+        assert!(msg.contains("tenant=alpha"), "{msg}");
+
+        // And naming the tenant is what makes it one reading again.
+        let mut scoped = one_interval("1-0:1.8.0");
+        scoped.extra.insert(
+            "tenant".to_string(),
+            ScalarValue::Utf8(Some("alpha".to_string())),
+        );
+        let split = split_by_channel(malo(), &["tenant".to_string()], vec![scoped]).unwrap();
+        assert_eq!(split.len(), 1);
+    }
+
+    #[test]
+    fn channels_come_back_in_obis_order_not_alphabetical_order() {
+        // The column is text, and OBIS codes do not sort as text the way they
+        // sort as codes: `1-0:10.8.0` precedes `1-0:2.8.0` alphabetically and
+        // follows it numerically. A list ordered by the database alone would put
+        // a two-digit value group in the wrong place, which for a report read top
+        // to bottom is the kind of wrong nobody checks.
+        let mut codes: Vec<ObisCode> = ["1-0:2.8.0", "1-0:10.8.0", "1-0:1.8.0"]
+            .iter()
+            .map(|c| c.parse().unwrap())
+            .collect();
+        codes.sort_unstable();
+
+        assert_eq!(
+            codes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["1-0:1.8.0", "1-0:2.8.0", "1-0:10.8.0"],
+        );
+        // …which is not what the database's own text order would have produced.
+        let mut text: Vec<&str> = vec!["1-0:2.8.0", "1-0:10.8.0", "1-0:1.8.0"];
+        text.sort_unstable();
+        assert_ne!(
+            text,
+            codes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "if the two agreed, sorting in Rust would prove nothing"
+        );
+    }
+
+    #[test]
+    fn a_per_channel_read_of_nothing_is_an_empty_map() {
+        // The same statement `collect`'s `None` makes, in the shape a map has.
+        assert!(
+            split_by_channel(malo(), &[], Vec::new())
+                .unwrap()
                 .is_empty()
         );
     }
