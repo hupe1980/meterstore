@@ -235,21 +235,20 @@ impl PartitionId {
     }
 }
 
-/// An exclusive claim on archiving one table, held for the duration of a run.
+/// An exclusive claim on one table, for one purpose, held for the duration of a
+/// run.
 ///
-/// Archival detaches a partition, and a detached-but-not-yet-dropped partition
-/// is the one state where the §6.3 invariant is relaxed. That state is only safe
-/// because exactly one process owns it. Two archivers racing would both pick the
-/// window above the same watermark, both detach it — the second finding it
-/// already gone — and one would commit a window whose rows the other had already
-/// taken.
+/// Two purposes take one: archiving ([`HotStore::try_archive_lease`]) and
+/// appending a late correction to the cold tier
+/// ([`HotStore::cold_append_lease`]). Both are states where a second writer
+/// would produce rows nothing downstream could detect.
 ///
 /// Held as a guard rather than checked as a flag, so the claim cannot outlive
 /// the run that took it. Release is explicit because `Drop` cannot await; a
 /// process that dies without releasing loses its session, and a session-scoped
 /// lock dies with it.
 #[async_trait]
-pub trait ArchiveLease: Send + Sync + std::fmt::Debug {
+pub trait TableLease: Send + Sync + std::fmt::Debug {
     /// Give the claim up.
     async fn release(self: Box<Self>) -> Result<()>;
 }
@@ -270,8 +269,28 @@ pub trait HotStore: Send + Sync {
     /// archiver. [`PostgresHot`] enforces it with a session-scoped advisory lock.
     ///
     /// [`PostgresHot`]: crate::hot::PostgresHot
-    async fn try_archive_lease(&self, _table: &str) -> Result<Option<Box<dyn ArchiveLease>>> {
+    async fn try_archive_lease(&self, _table: &str) -> Result<Option<Box<dyn TableLease>>> {
         Ok(Some(Box::new(UnenforcedLease)))
+    }
+
+    /// Claim the right to append a late correction to `table`'s **cold** tier,
+    /// waiting if another process holds it.
+    ///
+    /// The hot tier gets exclusion from its primary key. Iceberg has none, so
+    /// two processes appending the same late correction both read no existing
+    /// row, both write, and the reading is stored twice at one version —
+    /// which version resolution cannot collapse, and which a historical scan
+    /// then returns twice because the files provably hold a single version.
+    ///
+    /// **Waits**, unlike [`try_archive_lease`](Self::try_archive_lease): a
+    /// second archiver has nothing to do, but a second correction has a write to
+    /// land. The wait is bounded and late corrections are rare, so contention is
+    /// brief.
+    ///
+    /// The default grants an **unenforced** lease and says so, for the same
+    /// reason `try_archive_lease` does.
+    async fn cold_append_lease(&self, _table: &str) -> Result<Box<dyn TableLease>> {
+        Ok(Box::new(UnenforcedLease))
     }
 
     /// Ensure partitions exist from `from` through `until`.
@@ -287,11 +306,17 @@ pub trait HotStore: Send + Sync {
     ) -> Result<Vec<PartitionId>>;
 
     /// Create the table, its primary key, and any deployment columns.
+    ///
+    /// `time_model` decides two pieces of DDL and nothing else: whether `to` is
+    /// `NOT NULL` with a forward check, and whether the partition carries the
+    /// overlap exclusion. Instants cannot overlap, and a
+    /// [`Point`](crate::config::TimeModel::Point) table has no span to check.
     async fn create_tables(
         &self,
         table: &str,
         merge_key: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        time_model: crate::config::TimeModel,
     ) -> Result<()>;
 
     /// Append rows to the live table.
@@ -409,8 +434,15 @@ pub trait HotStore: Send + Sync {
     /// The data is intact and invisible; the next run reclaims it.
     async fn orphaned_partitions(&self, table: &str) -> Result<Vec<PartitionId>>;
 
-    /// Count rows at or above `watermark` that are *not* in the hot tier, and
-    /// rows below it that still are. Both must be zero.
+    /// Count rows the hot tier holds that belong to the cold one — those with
+    /// `from < watermark`. Must be zero.
+    ///
+    /// **One direction, and that is the whole of what a hot store can answer.**
+    /// The other half of the invariant — that every row at or above the watermark
+    /// is here rather than in Iceberg — is not observable from this side: a hot
+    /// store cannot see what the cold one holds. That half is established by the
+    /// archiver's commit ordering instead, which never drops a partition until
+    /// its rows are durable in the cold tier.
     async fn invariant_violations(&self, table: &str, watermark: TieringWatermark) -> Result<u64>;
 }
 
@@ -490,18 +522,24 @@ pub trait ColdStore: Send + Sync {
         Ok(None)
     }
 
-    /// Per-file `version` bounds for the data files overlapping `range`.
+    /// Per-file statistics for the data files overlapping `range`.
     ///
-    /// Feeds the decision to skip version resolution entirely. The default is
-    /// deliberately pessimistic — one file whose statistics are unknown, which
-    /// forces resolution — so a store that cannot supply statistics is slow
+    /// Feeds the decision to skip version resolution entirely, which needs two
+    /// facts per file: the versions it holds, and the span of `from` it covers —
+    /// files covering disjoint spans cannot share a merge key, so they are free
+    /// to disagree about versions. See [`planner::version::plan`].
+    ///
+    /// The default is deliberately pessimistic — one file nothing is known about,
+    /// which forces resolution — so a store that cannot supply statistics is slow
     /// rather than wrong.
+    ///
+    /// [`planner::version::plan`]: crate::planner::version::plan
     async fn version_stats(
         &self,
         _table: &str,
         _range: (OffsetDateTime, OffsetDateTime),
-    ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
-        Ok(vec![None])
+    ) -> Result<Vec<crate::planner::FileStats>> {
+        Ok(vec![crate::planner::FileStats::unknown()])
     }
 
     /// A DataFusion provider pinned to a past state of the table.
@@ -545,14 +583,14 @@ pub trait ColdStore: Send + Sync {
 
 /// The lease a store with no cross-process locking can offer.
 ///
-/// Named for what it is. A deployment running one archiver is fine with it; one
-/// running several against a store that cannot lock has a correctness problem
-/// that no lease type can fix.
+/// Named for what it is. A deployment running one writer per table is fine with
+/// it; one running several against a store that cannot lock has a correctness
+/// problem no lease type can fix.
 #[derive(Debug)]
 pub struct UnenforcedLease;
 
 #[async_trait]
-impl ArchiveLease for UnenforcedLease {
+impl TableLease for UnenforcedLease {
     async fn release(self: Box<Self>) -> Result<()> {
         Ok(())
     }
@@ -579,8 +617,12 @@ pub struct SnapshotInfo {
 /// while the application keeps writing through another handle.
 #[async_trait]
 impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
-    async fn try_archive_lease(&self, table: &str) -> Result<Option<Box<dyn ArchiveLease>>> {
+    async fn try_archive_lease(&self, table: &str) -> Result<Option<Box<dyn TableLease>>> {
         (**self).try_archive_lease(table).await
+    }
+
+    async fn cold_append_lease(&self, table: &str) -> Result<Box<dyn TableLease>> {
+        (**self).cold_append_lease(table).await
     }
 
     async fn ensure_partitions(
@@ -598,8 +640,11 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         table: &str,
         merge_key: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        time_model: crate::config::TimeModel,
     ) -> Result<()> {
-        (**self).create_tables(table, merge_key, extra).await
+        (**self)
+            .create_tables(table, merge_key, extra, time_model)
+            .await
     }
 
     async fn append(
@@ -715,7 +760,7 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         &self,
         table: &str,
         range: (OffsetDateTime, OffsetDateTime),
-    ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
+    ) -> Result<Vec<crate::planner::FileStats>> {
         (**self).version_stats(table, range).await
     }
 

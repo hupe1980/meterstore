@@ -277,11 +277,72 @@ fn gas_series(malo: &str, from: OffsetDateTime, to: OffsetDateTime, value: i64) 
         Sparte::Gas,
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", from).expect("scope"),
+            meterstore::VersionScope::for_interval("9900000000001", from, Sparte::Gas)
+                .expect("scope"),
             meterstore::Version::new(20_261_001_000_001).expect("version"),
         ),
         to,
     )
+}
+
+#[tokio::test]
+async fn a_gas_delivery_scoped_to_its_real_bilanzierungsmonat_is_accepted() {
+    // EDI@Energy Allgemeine Festlegungen v6.1c, Kap. 3.1: the gas
+    // Bilanzierungsmonat Juni 2021 covers 01.06 06:00 to 01.07 06:00 — the
+    // Gastag boundary carries all the way up, so a gas interval in the first six
+    // hours of a calendar month belongs to the *previous* month's scope.
+    //
+    // 01:00 UTC on 1 March is 02:00 local: March by the calendar, still the
+    // Gastag of February.
+    let straddling = datetime!(2026-03-01 1:00 UTC);
+    let series = gas_series(
+        "10000000009",
+        straddling,
+        straddling + Duration::hours(1),
+        7,
+    );
+
+    assert_eq!(
+        series.version.scope().period(),
+        "2026-02",
+        "the derived scope must be February's, not March's"
+    );
+
+    let harness = TestHarness::start().await.expect("harness");
+    harness
+        .ensure_partitions(
+            straddling - Duration::days(1),
+            straddling + Duration::days(1),
+        )
+        .await
+        .expect("partitions");
+    let store = harness.store().await.expect("store");
+
+    // The whole point: this is the correctly-scoped delivery, and it must land.
+    let outcome = store
+        .append(&[series])
+        .await
+        .expect("a correctly scoped gas delivery");
+    assert_eq!(outcome.total(), 4, "four quarter-hours");
+
+    // And the calendar month is refused for gas, naming the commodity.
+    let mut wrong = gas_series(
+        "10000000009",
+        straddling,
+        straddling + Duration::hours(1),
+        7,
+    );
+    wrong.version = meterstore::ScopedVersion::new(
+        meterstore::VersionScope::new("9900000000001", 2026, 3).expect("scope"),
+        meterstore::Version::new(20_261_001_000_002).expect("version"),
+    );
+    let err = store
+        .append(&[wrong])
+        .await
+        .expect_err("the calendar month is not this interval's gas Bilanzierungsmonat")
+        .to_string();
+    assert!(err.contains("Bilanzierungsmonat"), "{err}");
+    assert!(err.contains("GAS"), "{err}");
 }
 
 #[tokio::test]

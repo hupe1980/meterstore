@@ -249,15 +249,7 @@ for f in t.schema().fields:
         Some("decimal(20, 0)"),
         "an MSCONS version is 20 digits, past i64: {out:?}"
     );
-    for required in [
-        "malo_id",
-        "obis_code",
-        "from",
-        "to",
-        "value",
-        "unit",
-        "sparte",
-    ] {
+    for required in ["malo_id", "obis_code", "from", "value", "unit", "sparte"] {
         assert_eq!(
             by_name.get(required).map(|f| f[1]),
             Some("required"),
@@ -267,6 +259,31 @@ for f in t.schema().fields:
     assert!(
         by_name.contains_key("melo_id") && by_name["melo_id"][1] == "optional",
         "a nullable column must stay nullable: {out:?}"
+    );
+
+    // `to` is optional so one schema can also describe a point table, where a
+    // Zählerstand has no span end. On an *interval* table it is never null —
+    // which the schema alone cannot state, so this asserts the data.
+    assert_eq!(
+        by_name.get("to").map(|f| f[1]),
+        Some("optional"),
+        "one schema describes both time models: {out:?}"
+    );
+    let nulls = pyiceberg(
+        harness.warehouse(),
+        &open(
+            &newest_metadata(&harness),
+            r#"
+column = t.scan().to_arrow().column("to")
+print(sum(1 for chunk in column.chunks for v in chunk if v is None))
+"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        nulls.first().map(String::as_str),
+        Some("0"),
+        "an interval table's rows all carry a span end: {nulls:?}"
     );
 }
 

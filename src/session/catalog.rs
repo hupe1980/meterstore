@@ -98,6 +98,43 @@ impl MeterCatalog {
         })
     }
 
+    /// A store for one table whose session holds **only that table**.
+    ///
+    /// ```no_run
+    /// # async fn f(catalog: &meterstore::MeterCatalog, sql: &str)
+    /// #     -> meterstore::Result<()> {
+    /// let billing = catalog.isolated("readings").await?;
+    /// let rows = billing.query(sql).await?;   // cannot name any other relation
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A catalog shares one `SessionContext` across its tables — that is what
+    /// makes a cross-table join expressible — so any registered relation is
+    /// reachable by naming it in caller-supplied SQL. Where a deployment
+    /// deliberately keeps a stream *out* of a path, a deny-list of relation names
+    /// is a boundary that holds until someone adds a table.
+    ///
+    /// This makes the isolation a property of the session instead: a statement
+    /// naming another table fails to plan. Composes with
+    /// [`MeterStore::scoped`](crate::MeterStore::scoped), which confines the rows
+    /// as this confines the relations.
+    ///
+    /// The table keeps its own watermark, archiver and lease either way — this
+    /// builds a query surface, not a second store.
+    pub async fn isolated(&self, name: &str) -> Result<MeterStore> {
+        let store = self.table(name).ok_or_else(|| {
+            Error::config(format!(
+                "this catalog holds no table {name:?}: it holds [{}]",
+                self.stores
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        store.in_own_session().await
+    }
+
     /// Every table, in name order.
     pub fn tables(&self) -> impl Iterator<Item = &MeterStore> {
         self.stores.values()
@@ -139,23 +176,45 @@ impl MeterCatalog {
         sql: &str,
         params: Vec<datafusion::scalar::ScalarValue>,
     ) -> Result<QueryResult> {
+        let (first, watermarks) = self.watermarks_for(sql).await?;
+        first.run(sql, params, watermarks).await
+    }
+
+    /// The boundaries a statement's answer should be attributed to, and a store
+    /// to execute it through.
+    ///
+    /// **The tables the statement actually reads, not every table hosted.**
+    ///
+    /// Reporting all of them looks harmless and is not:
+    /// [`QueryResult::watermark`](super::QueryResult::watermark) is the
+    /// conservative boundary — the oldest of the reported ones — so a
+    /// single-table query in a twenty-table catalog would be attributed to
+    /// whichever unrelated table happens to archive least often. The figure would
+    /// be reconciled against a boundary it was never computed against, which is
+    /// precisely the confusion carrying provenance exists to prevent.
+    ///
+    /// Read off the logical plan, which is where relation names still exist: by
+    /// the time the physical plan is built they have become scan nodes. A
+    /// statement that reads no managed table — `SELECT 1`, or a query over
+    /// `system.*` — has no tier boundary, and saying so beats attaching an
+    /// arbitrary one.
+    ///
+    /// The store returned is only an executor: every table in the catalog shares
+    /// one `SessionContext`, so any of them plans and runs the same statement
+    /// identically.
+    async fn watermarks_for(
+        &self,
+        sql: &str,
+    ) -> Result<(
+        &MeterStore,
+        Vec<(String, crate::watermark::TieringWatermark)>,
+    )> {
         let first = self
             .stores
             .values()
             .next()
             .ok_or_else(|| Error::config("catalog hosts no tables"))?;
 
-        // **The tables the statement actually reads, not every table hosted.**
-        //
-        // Reporting all of them looks harmless and is not: `watermark()` is the
-        // conservative boundary — the oldest of the reported ones — so a
-        // single-table query in a twenty-table catalog would be attributed to
-        // whichever unrelated table happens to archive least often. The figure
-        // would be reconciled against a boundary it was never computed against,
-        // which is precisely the confusion carrying provenance exists to prevent.
-        //
-        // Read off the logical plan, which is where relation names still exist:
-        // by the time the physical plan is built they have become scan nodes.
         let plan = self
             .ctx
             .state()
@@ -175,10 +234,74 @@ impl MeterCatalog {
             }
         }
 
-        // A statement that reads no managed table — `SELECT 1`, or a query over
-        // `system.*` — has no tier boundary, and saying so beats attaching an
-        // arbitrary one.
-        first.run(sql, params, watermarks).await
+        Ok((first, watermarks))
+    }
+
+    /// What a statement would produce, **without running it**.
+    ///
+    /// The multi-table counterpart of
+    /// [`MeterStore::describe`](crate::MeterStore::describe), and the half a
+    /// Flight SQL client asks for before it fetches anything. The provenance is
+    /// the union across the tables the plan touched, exactly as
+    /// [`query`](Self::query)'s is.
+    pub async fn describe(&self, sql: &str) -> Result<super::QueryDescription> {
+        let (first, watermarks) = self.watermarks_for(sql).await?;
+        first.describe_with(sql, watermarks).await
+    }
+
+    /// Run SQL over every table and **stream** its rows.
+    ///
+    /// [`query`](Self::query) collects every batch before returning one, which is
+    /// right for a settlement total and wrong for the case where the rows *are*
+    /// the answer — a BI tool pulling a year of quarter-hour readings across two
+    /// streams, or an export. Peak memory is one batch either way here.
+    ///
+    /// The [`QueryDescription`](super::QueryDescription) comes back before any
+    /// row, because a caller putting the boundaries on the wire needs them before
+    /// it starts writing — and a catalog has *several*, which is precisely why
+    /// they cannot be reconstructed afterwards.
+    pub async fn stream(
+        &self,
+        sql: &str,
+    ) -> Result<(
+        super::QueryDescription,
+        datafusion::execution::SendableRecordBatchStream,
+    )> {
+        self.stream_with_params(sql, Vec::new()).await
+    }
+
+    /// [`stream`](Self::stream) with positional parameters.
+    pub async fn stream_with_params(
+        &self,
+        sql: &str,
+        params: Vec<datafusion::scalar::ScalarValue>,
+    ) -> Result<(
+        super::QueryDescription,
+        datafusion::execution::SendableRecordBatchStream,
+    )> {
+        let (first, watermarks) = self.watermarks_for(sql).await?;
+        first.stream_at(sql, params, watermarks).await
+    }
+
+    /// Upkeep for **every** table, as one scheduled loop.
+    ///
+    /// Each table keeps its own watermark, archiver and lease (§15.3) — that
+    /// cannot be otherwise and is not what this changes. What it changes is the
+    /// *scheduling*: a deployment running a timer per table pays for the same
+    /// thing this type exists to stop paying for — no single place to ask whether
+    /// upkeep is keeping up, and one cadence per table to drift.
+    ///
+    /// ```no_run
+    /// # async fn f(catalog: meterstore::MeterCatalog) {
+    /// let running = catalog.maintenance().expire_snapshots(false).spawn();
+    /// # running.shutdown().await;
+    /// # }
+    /// ```
+    ///
+    /// The outcome carries one row per table, so an alert names the table that is
+    /// unhealthy rather than reporting a number nobody can act on.
+    pub fn maintenance(&self) -> super::Maintenance {
+        super::Maintenance::over(self.stores.values().cloned().collect())
     }
 
     /// Create every table's storage, in both tiers.
@@ -263,18 +386,50 @@ impl MeterCatalog {
 fn scanned_relations(
     plan: &datafusion::logical_expr::LogicalPlan,
 ) -> std::collections::HashSet<String> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::logical_expr::LogicalPlan;
 
     let mut found = std::collections::HashSet::new();
+    // **With subqueries.** A scalar subquery's plan hangs off an *expression*,
+    // not off `inputs()`, so a plain `apply` walks past it and
+    // `SELECT (SELECT COUNT(*) FROM readings)` names no table at all — which
+    // `QueryResult::watermark` reports as the epoch, that nothing has been
+    // settled.
+    //
     // Infallible visitor, so the traversal cannot fail — the closure only reads.
-    let _ = plan.apply(|node| {
+    let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             found.insert(scan.table_name.table().to_string());
         }
         Ok(TreeNodeRecursion::Continue)
     });
     found
+}
+
+#[async_trait::async_trait]
+impl super::SqlSurface for MeterCatalog {
+    fn label(&self) -> String {
+        self.stores
+            .values()
+            .map(MeterStore::resolved_table)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    async fn describe_sql(&self, sql: &str) -> Result<super::QueryDescription> {
+        self.describe(sql).await
+    }
+
+    async fn stream_sql(
+        &self,
+        sql: &str,
+        params: Vec<datafusion::scalar::ScalarValue>,
+    ) -> Result<(
+        super::QueryDescription,
+        datafusion::execution::SendableRecordBatchStream,
+    )> {
+        self.stream_with_params(sql, params).await
+    }
 }
 
 /// Builds a [`MeterCatalog`] from per-table builders.

@@ -10,7 +10,7 @@ weight = 1
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
 | PostgreSQL | **14 or later** | Declarative range partitioning, so purging an archived window is `DETACH` + `DROP TABLE` rather than a row-wise `DELETE`. The test suite pins 16 |
-| `metering` | 0.18 or later | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | 0.19 or later | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs only `SELECT` plus ownership of its own tables. No server
@@ -28,7 +28,7 @@ Optional features, all off unless you need them:
 
 | Feature | What it adds |
 |---|---|
-| `rest-catalog` *(default)* | Iceberg REST catalog client |
+| `rest-catalog` *(default)* | `IcebergRestCatalog` — the cold tier on a REST catalogue |
 | `object-store-s3` / `-gcs` / `-azure` | Cloud object stores. `file://` and `memory://` are always available |
 | `catalog-facade` | A read-only Iceberg REST endpoint, for deployments on the SQL catalog |
 | `s3tables` | AWS S3 Tables as the cold-tier catalogue (implies `object-store-s3`) |
@@ -36,6 +36,25 @@ Optional features, all off unless you need them:
 | `testkit` | The real-infrastructure harness, workload generator and correctness oracle |
 
 ## A store over both tiers
+
+The shortest path is a [configuration file](@/docs/configuration.md), which builds
+both tiers and every validated table:
+
+```rust
+let deployment = Settings::from_path("meterstore.toml")?.connect().await?;
+let cold = deployment.cold.cold();
+let config = deployment.tables[0].clone();
+
+let store = MeterStore::builder()
+    .hot(deployment.hot.clone())
+    .cold(cold.clone(), cold.table_provider(config.name()).await?)
+    .table(config)
+    .build()
+    .await?;
+```
+
+The longer one is the same thing spelled out, and it is what an application that
+owns its own pool writes:
 
 ```rust
 use meterstore::prelude::*;
@@ -91,7 +110,7 @@ test suite against a catalogue MeterStore did not build, not merely asserted.
 | Catalogue | Status |
 |---|---|
 | **SQL** (PostgreSQL-backed) | Built for you by `IcebergSqlCatalog`. Serve the [façade](@/docs/interop.md) for external engines |
-| **REST** (Polaris, Lakekeeper, Nessie, Gravitino) | Construct with `iceberg-catalog-rest` and pass to `IcebergCold::new`. Engines point at the same endpoint |
+| **REST** (Polaris, Lakekeeper, Nessie, Gravitino) | Built for you by `IcebergRestCatalog`, behind the `rest-catalog` feature *(default)*. Engines point at the same endpoint, so no façade is needed |
 | **AWS S3 Tables** | Built for you by `S3TablesCatalog`, behind the `s3tables` feature — see below |
 | Glue, Hive, anything else | Any `Arc<dyn Catalog>` works |
 

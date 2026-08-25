@@ -11,6 +11,7 @@
 // across the binary instead of starting one per test (§17.2.0.1).
 #![cfg(feature = "testkit")]
 
+use metering::interval::Sparte;
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
@@ -87,7 +88,12 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
     let hot_dyn: Arc<dyn HotStore> = hot.clone();
     let cold_dyn: Arc<dyn ColdStore> = cold.clone();
     hot_dyn
-        .create_tables(TABLE, &config.merge_key(), &config.extra_columns())
+        .create_tables(
+            TABLE,
+            &config.merge_key(),
+            &config.extra_columns(),
+            config.time_model(),
+        )
         .await
         .expect("hot table");
     cold_dyn
@@ -139,7 +145,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D20).unwrap(),
+            VersionScope::for_interval("99", D20, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -238,11 +244,10 @@ async fn attribute_columns_round_trip_without_joining_the_identity() {
 
 #[tokio::test]
 async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
-    // The typed read path used to drop everything the `MeasurementSeries` could
-    // not carry — commodity aside — so a caller reconstructing domain rows had to
-    // hard-code the provenance back. `collect_resolved` folds the declared extra
-    // columns from the newest contributing delivery and hands them back, so the
-    // round-trip preserves them instead of guessing.
+    // A `MeasurementSeries` carries neither the commodity nor the deployment's
+    // declared columns, so a caller reconstructing domain rows would have to
+    // hard-code them back. `collect_resolved` folds them from the newest
+    // contributing delivery instead.
     let (store, _w) = store_with_tenant_identity().await;
     store
         .append(&[reading("a", 10, 20_260_720_000_001)])
@@ -253,6 +258,7 @@ async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
         .series("11111111115")
         .unwrap()
         .column_eq("tenant", ScalarValue::Utf8(Some("a".to_string())))
+        .unwrap()
         .range(D20, D21)
         .collect_resolved()
         .await
@@ -270,6 +276,129 @@ async fn collect_resolved_recovers_attribute_columns_on_the_typed_read() {
         "the identity column is recovered too"
     );
     assert_eq!(resolved.series.intervals.len(), 1);
+}
+
+#[tokio::test]
+async fn an_unscoped_typed_read_refuses_to_fold_two_tenants() {
+    // `series()` filters by measuring point, two tenants report the same one,
+    // and version resolution leaves a row per tenant per interval — so a fold
+    // would produce a `MeasurementSeries` with two intervals at every instant.
+    // `aggregate` sums them: the month doubles, with one tenant's readings
+    // inside the other's series.
+    let (store, _w) = store_with_tenant_identity().await;
+    store
+        .append(&[reading("a", 10, 20_260_720_000_001)])
+        .await
+        .unwrap();
+    store
+        .append(&[reading("b", 25, 20_260_720_000_001)])
+        .await
+        .unwrap();
+
+    let err = store
+        .series("11111111115")
+        .unwrap()
+        .range(D20, D21)
+        .collect()
+        .await
+        .expect_err("a series that spans tenants is not a series")
+        .to_string();
+    assert!(err.contains("two readings"), "{err}");
+    assert!(err.contains("tenant="), "{err}");
+
+    // Naming the tenant is the whole of the fix, and it returns that tenant's
+    // reading rather than the sum of both.
+    let scoped = store
+        .series("11111111115")
+        .unwrap()
+        .column_eq("tenant", ScalarValue::Utf8(Some("a".to_string())))
+        .unwrap()
+        .range(D20, D21)
+        .collect()
+        .await
+        .unwrap()
+        .expect("tenant a has a reading");
+    assert_eq!(scoped.intervals.len(), 1);
+    assert_eq!(scoped.intervals[0].value, rust_decimal::Decimal::new(10, 0));
+
+    // …and so is scoping the session, which is what a service exposing SQL uses.
+    let confined = store.scoped("tenant", "b").await.unwrap();
+    let only_b = confined
+        .series("11111111115")
+        .unwrap()
+        .range(D20, D21)
+        .collect()
+        .await
+        .unwrap()
+        .expect("tenant b has a reading");
+    assert_eq!(only_b.intervals[0].value, rust_decimal::Decimal::new(25, 0));
+}
+
+#[tokio::test]
+async fn caller_supplied_sql_cannot_step_outside_the_query_surface() {
+    // A row scope is enforced inside a table provider, so it can only confine
+    // statements that go *through* one. DataFusion's SQL surface is wider than
+    // `SELECT`, and three of its statements never touch a provider at all:
+    //
+    //   CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION '<warehouse>/…'
+    //
+    // reads the cold tier's own Parquet — every tenant's rows, unscoped — and
+    // `ctx.sql` *executes* DDL while planning it, so it is one round trip from
+    // any surface that runs caller-supplied SQL. `COPY … TO` is the same door in
+    // the other direction.
+    let (store, warehouse) = store_with_tenant_identity().await;
+    store
+        .append(&[reading("a", 10, 20_260_720_000_001)])
+        .await
+        .unwrap();
+
+    let scoped = store.scoped("tenant", "a").await.unwrap();
+    let escape = warehouse.path().join("escape.parquet");
+
+    for sql in [
+        format!(
+            "CREATE EXTERNAL TABLE leak STORED AS PARQUET LOCATION '{}'",
+            warehouse.path().display()
+        ),
+        format!(
+            "COPY (SELECT 1 AS a) TO '{}' STORED AS PARQUET",
+            escape.display()
+        ),
+        "CREATE TABLE leak2 AS SELECT 1 AS a".to_string(),
+        "INSERT INTO readings_versions SELECT * FROM readings_versions".to_string(),
+        "DROP TABLE readings".to_string(),
+        "SET datafusion.execution.batch_size = 1".to_string(),
+        // The wrapper that made a root-only check useless: planning a COPY is
+        // what performs it, so EXPLAIN does not make it harmless.
+        format!(
+            "EXPLAIN COPY (SELECT 1 AS a) TO '{}' STORED AS PARQUET",
+            escape.display()
+        ),
+    ] {
+        let err = scoped
+            .query(&sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was accepted"));
+        assert!(
+            err.to_string().contains("not accepted here"),
+            "{sql} failed for the wrong reason: {err}"
+        );
+    }
+
+    assert!(!escape.exists(), "no statement may write a file");
+
+    // And an ordinary query still works, scoped.
+    let rows = scoped
+        .query("SELECT COUNT(*) AS n FROM readings")
+        .await
+        .expect("a query is a query")
+        .to_json()
+        .unwrap();
+    assert_eq!(rows[0]["n"].as_i64(), Some(1));
+
+    // `EXPLAIN SELECT` is a read, and stays available.
+    assert!(scoped.query("EXPLAIN SELECT 1").await.is_ok());
 }
 
 #[tokio::test]
@@ -388,4 +517,153 @@ async fn a_coded_attribute_column_refuses_a_value_outside_its_vocabulary() {
         .append(&[reading("a", 10, 20_260_720_000_001)])
         .await
         .expect("an allowed bilanzkreis must insert");
+}
+
+// ── A session confined to one tenant ─────────────────────────────────────────
+
+#[tokio::test]
+async fn a_scoped_session_confines_caller_supplied_sql_to_one_tenant() {
+    // The point: `query` runs SQL the caller wrote, so a service exposing an
+    // ad-hoc SQL endpoint has no way to add a tenant predicate — and a
+    // deny-list of relation names is a boundary that holds until someone adds a
+    // table. The predicate is injected into the plan instead, below the
+    // projection, so no statement can omit it.
+    let (store, _w) = store_with_tenant_identity().await;
+
+    store
+        .append(&[
+            reading("a", 10, 20_260_720_000_001),
+            reading("b", 99, 20_260_720_000_001),
+        ])
+        .await
+        .expect("both tenants");
+
+    let unscoped = count(&store, "SELECT COUNT(*) FROM readings").await;
+    assert_eq!(unscoped, 2, "both tenants are there to be found");
+
+    let scoped = store.scoped("tenant", "a").await.expect("scope");
+    assert_eq!(count(&scoped, "SELECT COUNT(*) FROM readings").await, 1);
+
+    // The raw audit relation is confined too — a caller reaching past the
+    // resolved view must not step outside the scope.
+    assert_eq!(
+        count(&scoped, "SELECT COUNT(*) FROM readings_versions").await,
+        1
+    );
+
+    // And a statement that names the other tenant explicitly still cannot see
+    // it: the enforced predicate is conjoined with whatever the caller wrote.
+    assert_eq!(
+        count(&scoped, "SELECT COUNT(*) FROM readings WHERE tenant = 'b'").await,
+        0,
+        "a caller cannot select its way out of the scope"
+    );
+
+    // Nor by unioning, aliasing or sub-selecting around it.
+    assert_eq!(
+        count(
+            &scoped,
+            "SELECT COUNT(*) FROM (SELECT * FROM readings UNION ALL SELECT * FROM readings) t"
+        )
+        .await,
+        2,
+        "the scope applies to each scan, so the union is two scoped scans"
+    );
+
+    // The value the scoped session returns is the scoped tenant's.
+    let total = count(&scoped, "SELECT CAST(SUM(value) AS BIGINT) FROM readings").await;
+    assert_eq!(total, 10, "tenant b's 99 is not in this session at all");
+}
+
+#[tokio::test]
+async fn scoping_composes_and_does_not_come_off() {
+    let (store, _w) = store_with_tenant_identity().await;
+    store
+        .append(&[
+            reading("a", 10, 20_260_720_000_001),
+            reading("b", 99, 20_260_720_000_001),
+        ])
+        .await
+        .expect("both tenants");
+
+    let scoped = store.scoped("tenant", "a").await.expect("scope");
+
+    // A transaction-time read derived from a scoped store stays scoped: a
+    // boundary a derived session drops is not a boundary.
+    let then = scoped
+        .as_known_at(datetime!(2027-01-01 00:00 UTC))
+        .await
+        .expect("as_known_at");
+    assert_eq!(count(&then, "SELECT COUNT(*) FROM readings").await, 1);
+    assert_eq!(then.row_scope().len(), 1);
+
+    // A scoped handle cannot be re-pointed at another tenant. That is the
+    // escalation the scope exists to prevent: hand this store to less-trusted
+    // code and it must not be able to widen itself.
+    let err = scoped.scoped("tenant", "b").await.unwrap_err().to_string();
+    assert!(err.contains("already scoped"), "{err}");
+    assert!(err.contains("narrows"), "{err}");
+
+    // Re-scoping to the same value is idempotent rather than an error.
+    let same = scoped.scoped("tenant", "a").await.expect("idempotent");
+    assert_eq!(count(&same, "SELECT COUNT(*) FROM readings").await, 1);
+
+    // And the store it was derived from is unaffected.
+    let other = store.scoped("tenant", "b").await.expect("scope b");
+    assert_eq!(count(&other, "SELECT COUNT(*) FROM readings").await, 1);
+}
+
+#[tokio::test]
+async fn only_a_merge_key_column_can_scope_a_session() {
+    // Not taste: a merge-key column partitions *readings*, so filtering before
+    // or after version resolution gives the same winner. An attribute column
+    // would slice through one reading's version history, so a scoped read would
+    // resolve to a different value rather than returning fewer rows.
+    //
+    // The rule is stated over the merge key rather than over the word
+    // "identity", because a table that identifies a reading by its Messlokation
+    // puts a *core* column in the key and must be scopable on it too.
+    let (store, _w) = store_with_tenant_identity().await;
+
+    let err = store
+        .scoped("bilanzkreis", "BK-1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("merge key"), "{err}");
+    assert!(
+        err.contains("tenant"),
+        "the message names what is available: {err}"
+    );
+
+    assert!(store.scoped("no_such_column", "x").await.is_err());
+    assert!(store.scoped("malo_id", "41373559241").await.is_err());
+}
+
+#[tokio::test]
+async fn writes_are_unaffected_by_a_session_scope() {
+    // A scope confines reads. Writes carry their identity in the row itself and
+    // route by `from`, so there is nothing for a session scope to add — and
+    // silently rewriting a caller's row would be worse than not scoping it.
+    let (store, _w) = store_with_tenant_identity().await;
+    let scoped = store.scoped("tenant", "a").await.expect("scope");
+
+    scoped
+        .append(&[reading("b", 99, 20_260_720_000_001)])
+        .await
+        .expect("a write names its own tenant");
+
+    // Written, and invisible from the scoped session by construction.
+    assert_eq!(count(&scoped, "SELECT COUNT(*) FROM readings").await, 0);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM readings").await, 1);
+}
+
+/// A scalar `i64` from a query against `store`.
+async fn count(store: &MeterStore, sql: &str) -> i64 {
+    use meterstore::arrow::array::AsArray;
+    let result = store.query(sql).await.expect("query");
+    result.batches()[0]
+        .column(0)
+        .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
+        .value(0)
 }

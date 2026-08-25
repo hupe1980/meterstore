@@ -1,44 +1,22 @@
 //! Making Article 17 erasure possible over an append-only lake.
 //!
-//! # Why not crypto-shredding
-//!
-//! The usual answer for an immutable store is to encrypt each subject's data
-//! under its own key and destroy the key on request. Regulators accept it: the
-//! EDPB (Guidelines 5/2019), the UK ICO and the French CNIL all recognise
-//! cryptographic erasure, provided the algorithm is strong, the destruction is
-//! irreversible, and it is auditable.
-//!
-//! It does not work here, for a structural reason rather than a missing feature.
-//! Crypto-shredding requires **key granularity aligned to the erasure unit** —
-//! one key per data subject. Iceberg's envelope encryption keys data per *file*:
-//! a master key in a KMS, key-encryption keys in table metadata, and a data
-//! key per file. At metering volume a single Parquet file holds readings for
-//! thousands of measuring points, so destroying its key erases all of them.
-//! Aligning keys to subjects would mean one file per subject, which at 100k
-//! meters is not a table but a directory listing.
-//!
-//! Encrypting the value column per subject instead would preserve the file
-//! layout but destroy everything that makes the cold tier fast: delta encoding
-//! needs adjacent values to be numerically close, min/max statistics need
-//! comparable values, and bloom filters need stable equality. Ciphertext has
-//! none of those properties.
-//!
-//! # What works instead
+//! # Pseudonymisation, not crypto-shredding
 //!
 //! The personal data in a metering series is not the numbers — it is the *link*
-//! between a consumption pattern and a person. Break the link and what remains
-//! is a series of quantities attached to an opaque token, which is anonymous
-//! data and outside the Regulation's scope (Recital 26).
+//! between a consumption pattern and a person. Break the link and what remains is
+//! a series of quantities against an opaque token, which is anonymous data and
+//! outside the Regulation's scope (Recital 26).
 //!
-//! So the lake stores a **pseudonymous reference**, and the mapping from that
-//! reference to a natural identifier lives in PostgreSQL — mutable storage where
-//! a row can genuinely be deleted. Erasure deletes the mapping row. It is
-//! `O(1)`, needs no key management, rewrites nothing, and leaves every
-//! analytical property of the lake intact.
+//! So the lake stores a **pseudonymous reference**, and the mapping from it to a
+//! natural identifier lives in PostgreSQL — mutable storage where a row can
+//! genuinely be deleted. Erasure deletes that row: `O(1)`, no key management,
+//! nothing rewritten, every analytical property of the lake intact.
 //!
-//! It is also a stronger position than crypto-shredding: there is no argument to
-//! have about whether ciphertext is still personal data, because the linking
-//! data is actually gone rather than merely unreadable.
+//! Crypto-shredding is the usual answer for an immutable store and does not fit
+//! this one: it needs a key per data subject, while Iceberg's envelope encryption
+//! keys per *file*, and at metering volume one file holds thousands of measuring
+//! points. The full argument is on the
+//! [privacy page](https://hupe1980.github.io/meterstore/docs/privacy/).
 //!
 //! # What this requires of the deployment
 //!
@@ -56,6 +34,7 @@
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -113,13 +92,47 @@ pub struct ErasureRecord {
 ///
 /// Lives in PostgreSQL rather than the lake because erasure needs storage where
 /// deletion is real.
+///
+/// # One registry spans every table in a deployment
+///
+/// It is constructed per [`MeterStoreBuilder`], which reads as *per table*, and
+/// it is not: the mapping lives in one `meterstore_subject_map` keyed by natural
+/// identifier. So two tables that register the **same** natural id share one
+/// [`SubjectRef`], and a single [`erase`](Self::erase) unlinks both.
+///
+/// That is the behaviour an Article 17 request needs rather than an accident of
+/// the schema. An erasure has to reach the authoritative readings *and* the
+/// non-authoritative second stream — an ESA "Werte nach Typ 2" store is
+/// non-authoritative for **settlement**, which says nothing about whether the
+/// data is personal. A registry per table would leave one of them linked, and
+/// nothing would report it.
+///
+/// The corollary is that the **granularity of a subject is the deployment's
+/// choice, and it is global**. Keying by measuring point alone erases a previous
+/// tenant's data along with the requester's, because a Marktlokation outlives its
+/// occupants; `(tenant, MaLo)` or an occupancy period is usually what is meant.
+///
+/// [`MeterStoreBuilder`]: crate::MeterStoreBuilder
 #[derive(Clone)]
 pub struct SubjectRegistry {
     pool: PgPool,
     /// Key for the suppression list, if the deployment configured one.
     ///
-    /// Not `Debug`-printable — see the manual implementation below.
-    erasure_secret: Option<Vec<u8>>,
+    /// Two separate protections, because they answer different questions.
+    /// [`Debug`] is hand-written below, so the key cannot reach a log line;
+    /// [`Zeroizing`] wipes the allocation on drop, so it does not linger in
+    /// freed heap pages, a core dump or swap.
+    ///
+    /// The second matters here because this type is [`Clone`] and every derived
+    /// session — [`as_of`], [`as_known_at`], [`scoped`], [`in_own_session`] —
+    /// clones it. Each clone is another copy of a cryptographic key, and without
+    /// this each one would be left behind when its session was dropped.
+    ///
+    /// [`as_of`]: crate::MeterStore::as_of
+    /// [`as_known_at`]: crate::MeterStore::as_known_at
+    /// [`scoped`]: crate::MeterStore::scoped
+    /// [`in_own_session`]: crate::MeterStore::in_own_session
+    erasure_secret: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for SubjectRegistry {
@@ -159,23 +172,30 @@ impl SubjectRegistry {
     ///
     /// # Why a keyed hash rather than the identifier
     ///
-    /// Storing the identifier would defeat the erasure it documents. Storing an
-    /// *unkeyed* hash would be barely better: meter and market-location
-    /// identifiers come from small structured spaces, so anyone with the table
-    /// could enumerate candidates and invert it. The key turns the tombstone
-    /// into an oracle that answers "was this one erased?" only for someone who
-    /// already holds both the identifier and the key, which is the minimum
-    /// needed to honour the request.
+    /// Storing the identifier would defeat the erasure it documents, and an
+    /// *unkeyed* hash barely less: meter and market-location identifiers come
+    /// from small structured spaces, so anyone with the table could enumerate
+    /// candidates and invert it. The key reduces the tombstone to an oracle
+    /// answering "was this one erased?" only for someone already holding both the
+    /// identifier and the key — the minimum needed to honour a request that says
+    /// *stop processing my data*, and the recognised practice for suppression
+    /// lists.
     ///
-    /// Retaining that much is the recognised practice for suppression lists and
-    /// sits within Article 17 — you cannot honour "do not process my data again"
-    /// without some record of what not to process.
+    /// # The key
     ///
-    /// # Operational note
+    /// It must outlive every erasure and is not recoverable from the database.
+    /// Losing it exposes nothing; it silently disables suppression.
     ///
-    /// The key must outlive every erasure and is not recoverable from the
-    /// database. Losing it does not expose anything; it silently disables
-    /// suppression, since no future identifier will hash to a stored tombstone.
+    /// The copy kept here is held in a [`Zeroizing`] buffer, so it is wiped when
+    /// the registry — and every clone of it — is dropped rather than left in a
+    /// freed heap page. A derived session clones the registry, so without that a
+    /// deployment doing reproducible reads would scatter copies of a
+    /// cryptographic key across the heap.
+    ///
+    /// That is hygiene, not a claim the key exists in one place: it does not
+    /// reach `secret` itself, an environment variable the process still holds, a
+    /// `String` the config parser already copied, or the key schedule `hmac`
+    /// derives per tombstone.
     pub fn with_erasure_secret(pool: PgPool, secret: &[u8]) -> Result<Self> {
         // A short key makes the oracle brute-forceable, which is the one thing
         // the construction is supposed to prevent.
@@ -188,7 +208,7 @@ impl SubjectRegistry {
         }
         Ok(Self {
             pool,
-            erasure_secret: Some(secret.to_vec()),
+            erasure_secret: Some(Zeroizing::new(secret.to_vec())),
         })
     }
 
@@ -639,6 +659,68 @@ mod tests {
         // Two calls must differ, or the reference is a function of its input and
         // erasure could be undone by recomputing it.
         assert_ne!(new_reference(), new_reference());
+    }
+
+    /// A pool that never connects — enough to construct a registry.
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgresql://unused@localhost/unused").expect("a well-formed URL")
+    }
+
+    #[tokio::test]
+    async fn the_erasure_key_never_reaches_a_log_line() {
+        // A registry is a plausible thing to put in a `tracing` field or an error
+        // context, and this one holds a cryptographic key.
+        let registry = SubjectRegistry::with_erasure_secret(lazy_pool(), &[0xAB; 32]).unwrap();
+        let shown = format!("{registry:?}");
+
+        assert!(!shown.contains("171"), "{shown}");
+        assert!(!shown.contains("ab"), "{shown}");
+        assert!(shown.contains("suppression: true"), "{shown}");
+        assert!(format!("{:?}", SubjectRegistry::new(lazy_pool())).contains("suppression: false"));
+    }
+
+    #[tokio::test]
+    async fn a_cloned_registry_keeps_a_key_of_its_own() {
+        // The key is wiped when a registry drops, and every derived session —
+        // `as_of`, `scoped`, `in_own_session` — clones one. A clone sharing the
+        // original's allocation would be wiped along with it, and suppression
+        // would silently stop working on the session that outlived the other.
+        let original = SubjectRegistry::with_erasure_secret(lazy_pool(), &[7; 32]).unwrap();
+        let derived = original.clone();
+        let expected = original
+            .tombstone("41373559241")
+            .expect("a key is configured");
+
+        drop(original);
+
+        assert_eq!(derived.tombstone("41373559241"), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_is_keyed_rather_than_a_bare_hash() {
+        // Meter and market-location identifiers come from small structured
+        // spaces, so an unkeyed hash of one is invertible by anyone holding the
+        // table. Two keys over one identifier must therefore differ.
+        let a = SubjectRegistry::with_erasure_secret(lazy_pool(), &[1; 32]).unwrap();
+        let b = SubjectRegistry::with_erasure_secret(lazy_pool(), &[2; 32]).unwrap();
+
+        assert_ne!(a.tombstone("41373559241"), b.tombstone("41373559241"));
+        assert_eq!(a.tombstone("41373559241"), a.tombstone("41373559241"));
+        // And without a key there is no tombstone at all, rather than an unkeyed
+        // one that would look like suppression and not be.
+        assert!(
+            SubjectRegistry::new(lazy_pool())
+                .tombstone("41373559241")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_erasure_key_is_refused() {
+        // Short enough to brute-force is short enough to leak the identifiers the
+        // suppression list exists to forget.
+        assert!(SubjectRegistry::with_erasure_secret(lazy_pool(), &[0; 31]).is_err());
+        assert!(SubjectRegistry::with_erasure_secret(lazy_pool(), &[0; 32]).is_ok());
     }
 
     #[test]

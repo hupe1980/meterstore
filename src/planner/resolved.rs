@@ -7,11 +7,11 @@
 //!
 //! # Why a provider rather than a view
 //!
-//! Resolution used to be a SQL view, which is simpler and always correct — and
-//! always paid for. The interesting property of metering data is that
-//! corrections are **rare and recent**: a settlement query over last winter
-//! reads partitions where every key has exactly one version, and ranking rows
-//! against nothing is pure overhead.
+//! A SQL view would be simpler and always correct — and always paid for. The
+//! interesting property of metering data is that corrections are **rare and
+//! recent**: a settlement query over last winter reads partitions where every
+//! key has exactly one version, and ranking rows against nothing is pure
+//! overhead.
 //!
 //! Proving that requires per-file `min`/`max` statistics for `version`, which
 //! only the storage layer has and a view cannot see. A provider is asked to
@@ -21,7 +21,13 @@
 //! # When resolution is skipped
 //!
 //! Only when the scan is **historical** — entirely below the tiering watermark —
-//! and every cold file in range provably holds one version.
+//! and no merge key can appear twice among the cold files in range. Each file
+//! must provably hold one version, and two files may only disagree about which
+//! version when their `from` bounds do not overlap: `from` is in the merge key,
+//! so files covering different days cannot hold the same key however their
+//! versions differ. Consecutive archival windows are exactly that, which is what
+//! makes the optimisation fire on a year-long scan rather than only on a
+//! single-day one. See [`super::version::plan`].
 //!
 //! Two separate things are going on there, and it is worth not conflating them.
 //!

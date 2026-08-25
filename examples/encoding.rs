@@ -6,6 +6,7 @@
 //! correction versioning, and the tiering boundary. The hot and cold stores are
 //! not wired up yet, so nothing here touches a database.
 
+use metering::interval::Sparte;
 use meterstore::encode::{StoredSeries, from_record_batch, to_record_batch};
 use meterstore::watermark::{Tier, next_window};
 use meterstore::{TieringWatermark, Version, VersionScope};
@@ -53,7 +54,7 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
         series,
         meterstore::ScopedVersion::new(
             // Derived from the interval, never from the delivery month.
-            VersionScope::for_interval("9900000000001", start).unwrap(),
+            VersionScope::for_interval("9900000000001", start, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),

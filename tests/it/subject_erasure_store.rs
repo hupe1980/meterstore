@@ -10,6 +10,7 @@
 // across the binary instead of starting one per test (§17.2.0.1).
 #![cfg(feature = "testkit")]
 
+use metering::interval::Sparte;
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
@@ -80,7 +81,12 @@ async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
     let cold_dyn: Arc<dyn ColdStore> = cold.clone();
     // The provider is resolved at build time, so both tiers must exist first.
     hot_dyn
-        .create_tables(TABLE, &config.merge_key(), &config.extra_columns())
+        .create_tables(
+            TABLE,
+            &config.merge_key(),
+            &config.extra_columns(),
+            config.time_model(),
+        )
         .await
         .expect("hot table");
     cold_dyn
@@ -149,7 +155,7 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
         ScopedVersion::new(
             // Derived from the interval, not from a fixture constant: a scope
             // that does not cover its intervals is refused at encode time.
-            VersionScope::for_interval("99", from).unwrap(),
+            VersionScope::for_interval("99", from, Sparte::Strom).unwrap(),
             Version::new(1).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),

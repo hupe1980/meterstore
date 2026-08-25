@@ -37,12 +37,9 @@ pub struct TableStatus {
     pub watermark_lag_seconds: i64,
     /// Hot partitions that exist, attached or detached.
     ///
-    /// Was `hot_rows`, which was **always `-1`** — counting the hot tier means
-    /// scanning it, so the column was declared, documented and never computed. A
-    /// diagnostic that reports a sentinel is worse than one that is absent,
-    /// because an operator reads it as a number. Partitions answer the questions
-    /// row counts were wanted for — is archival keeping up, is anything left
-    /// behind — and are a catalog lookup rather than a scan.
+    /// Partitions rather than rows: counting rows means scanning the hot tier,
+    /// and these answer the same questions — is archival keeping up, is anything
+    /// left behind — from a catalog lookup.
     pub hot_partitions: i64,
     /// Partitions that can still hold a row written now or later.
     ///
@@ -191,8 +188,13 @@ impl<'a> SystemTables<'a> {
                 "expected_hot_partitions",
                 c.expected_hot_partitions().to_string(),
             ),
-            entry("target_file_size", c.target_file_size().to_string()),
             entry("scan_chunk_rows", c.scan_chunk_rows().to_string()),
+            // What `to` and `value` mean on this table, which an external engine
+            // cannot infer from a single row: `to IS NULL` is the signal, and a
+            // table whose window happens to hold no readings shows nothing.
+            // Summing a Zählerstandsgang produces a number with no meaning that
+            // looks exactly like a consumption total.
+            entry("time_model", c.time_model().as_str().to_string()),
             entry(
                 "identity_columns",
                 c.identity_columns()
@@ -333,7 +335,14 @@ pub async fn register_all(
         )?);
     }
 
+    // **Deregistered first**, because these are snapshots and this is a *refresh*:
+    // `MemorySchemaProvider::register_table` refuses a name it already holds, so
+    // every call after the first would fail.
+    //
+    // A missing table is the ordinary case on the first pass, so a failure to
+    // deregister is not one: only the registration that follows has to succeed.
     let register = |name: &str, schema_ref: SchemaRef, batches: Vec<RecordBatch>| {
+        let _ = schema.deregister_table(name);
         schema
             .register_table(
                 name.to_string(),
@@ -380,7 +389,7 @@ pub fn snapshot_batch(
     table: &str,
     rows: &[crate::tiering::store::SnapshotInfo],
 ) -> Result<RecordBatch> {
-    let micros = |t: OffsetDateTime| (t.unix_timestamp_nanos() / 1_000) as i64;
+    let micros = crate::encode::schema::micros;
     Ok(RecordBatch::try_new(
         snapshot_schema(),
         vec![
@@ -423,7 +432,7 @@ pub fn snapshot_batch(
 
 /// Encode statuses as a batch.
 pub fn status_batch(rows: &[TableStatus]) -> Result<RecordBatch> {
-    let micros = |t: OffsetDateTime| (t.unix_timestamp_nanos() / 1_000) as i64;
+    let micros = crate::encode::schema::micros;
     Ok(RecordBatch::try_new(
         status_schema(),
         vec![
@@ -529,7 +538,7 @@ mod tests {
             2
         );
         // Past the last one: the very next insert has nowhere to go. This is the
-        // value the old configuration-derived gauge could never produce.
+        // value a configuration-derived gauge could never produce.
         assert_eq!(
             partitions_ahead(&starts, datetime!(2026-07-22 00:00 UTC), Duration::DAY),
             0
@@ -607,7 +616,13 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(&self, _: &str, _: &[String], _: &[Field]) -> Result<()> {
+        async fn create_tables(
+            &self,
+            _: &str,
+            _: &[String],
+            _: &[Field],
+            _: crate::config::TimeModel,
+        ) -> Result<()> {
             unreachable!()
         }
         async fn append(&self, _: &str, _: &[String], _: &[RecordBatch]) -> Result<u64> {

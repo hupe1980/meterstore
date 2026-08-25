@@ -34,10 +34,16 @@ pub struct PostgresHot {
 }
 
 impl PostgresHot {
-    /// Rows fetched per round trip when streaming a range.
+    /// Rows fetched per round trip when streaming a range, when a `ScanSpec`
+    /// does not say.
     ///
-    /// Bounds the memory a scan holds regardless of how much the range covers.
-    const DEFAULT_SCAN_CHUNK_ROWS: usize = 50_000;
+    /// Taken from [`config::defaults`] rather than written again here: two
+    /// literals are two things to change, and the pair disagreeing would make the
+    /// archival path and the query path hold different amounts of memory for one
+    /// configured table.
+    ///
+    /// [`config::defaults`]: crate::config::defaults
+    const DEFAULT_SCAN_CHUNK_ROWS: usize = crate::config::defaults::SCAN_CHUNK_ROWS;
 
     /// Wrap an existing connection pool.
     pub fn new(pool: PgPool) -> Self {
@@ -56,10 +62,10 @@ impl PostgresHot {
     /// 1. **Overlapping intervals within one version.** The primary key is the
     ///    merge key plus `version`, so two rows for one channel at one version
     ///    must differ in `from` — and two ranges that differ in `from` can still
-    ///    overlap. An hourly delivery followed by a quarter-hourly one leaves
-    ///    both stored and every aggregate over them inflated. Scoped to a single
-    ///    version, so a correction — a higher version covering the same span —
-    ///    stays legal.
+    ///    overlap. A delivery carrying one hour *and* the quarter-hours inside it
+    ///    leaves five rows where four belong, and every aggregate over them is
+    ///    inflated. Scoped to a single version, because a correction *is* a
+    ///    higher version covering the same span and has to stay legal.
     ///
     /// 2. **A second network operator for one interval.** A version is
     ///    comparable only within its `(operator, month)` scope (§4.2). The month
@@ -73,21 +79,18 @@ impl PostgresHot {
     ///
     /// # When the second one is not what you want
     ///
-    /// A store that deliberately keeps **two parties' assertions about the same
-    /// reading** — reconciling what a grid operator and a supplier each reported,
-    /// say — is a legitimate shape, and constraint 2 refuses it. The right answer
-    /// is usually to say so in the schema: give the reporting party an
-    /// `identity_column`, and the two assertions become two readings that no
-    /// aggregate can conflate. That is what identity columns are for (§7.3), and
-    /// it makes the intent explicit rather than resting on a constraint being off.
-    ///
-    /// Disabling is the escape hatch when that is genuinely not the model.
+    /// A store deliberately keeping **two parties' assertions about one reading**
+    /// — reconciling what a grid operator and a supplier each reported — is a
+    /// legitimate shape that constraint 2 refuses. Say so in the schema instead:
+    /// an `identity_column` for the reporting party makes them two readings no
+    /// aggregate can conflate (§7.3), which states the intent rather than resting
+    /// on a constraint being off.
     ///
     /// Turning this off trades both guarantees for insert throughput — two GiST
-    /// indexes per partition on the busiest table in the schema — and should be
-    /// done with a measurement in hand rather than on principle. Completeness
-    /// (§9.6) then reports an overlap as `surplus` after the fact; a duplicated
-    /// scope has no after-the-fact detection at all.
+    /// indexes per partition on the busiest table in the schema — and wants a
+    /// measurement in hand. Completeness (§9.6) then reports an overlap as
+    /// `surplus` after the fact; a duplicated scope has no after-the-fact
+    /// detection at all.
     ///
     /// Requires `btree_gist` (PostgreSQL contrib), created on demand.
     pub fn integrity_constraints(mut self, enabled: bool) -> Self {
@@ -120,6 +123,7 @@ impl PostgresHot {
                 .map(|s| (*s).to_string())
                 .collect::<Vec<_>>(),
             &[],
+            crate::config::TimeModel::Interval,
         )
         .await
     }
@@ -135,6 +139,7 @@ impl PostgresHot {
         table: &str,
         merge_key: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        time_model: crate::config::TimeModel,
     ) -> Result<()> {
         let mut extra_ddl = String::new();
         for f in extra {
@@ -164,11 +169,31 @@ impl PostgresHot {
             ));
         }
 
+        // A table that identifies a reading by its Messlokation puts `melo_id` in
+        // the primary key, and a primary-key column cannot be null — nor should
+        // it be: a null does not compare equal to itself, so two such rows would
+        // never resolve against each other. Everywhere else the column stays
+        // optional, because a Lastgang is a Marktlokation's channel and the
+        // meter behind it need not be named.
+        let melo_ddl = match merge_key.iter().any(|c| c == col::MELO_ID) {
+            true => " NOT NULL",
+            false => "",
+        };
+
+        // An interval table keeps `NOT NULL` and the forward check; a point table
+        // has neither, because an instant has no end to check.
+        let to_ddl = match time_model.has_interval_end() {
+            true => {
+                "      NOT NULL\n                    CONSTRAINT interval_forward CHECK (\"to\" > \"from\")"
+            }
+            false => "",
+        };
+
         let ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS "{table}" (
                 malo_id       TEXT             NOT NULL,
-                melo_id       TEXT,
+                melo_id       TEXT{melo_ddl},
                 -- Canonical OBIS only. This column is part of the merge key,
                 -- so two spellings of one channel would let a correction fail
                 -- to supersede the value it corrects. The canonical form omits
@@ -186,8 +211,12 @@ impl PostgresHot {
                 sparte        TEXT             NOT NULL
                     CONSTRAINT sparte_known CHECK (sparte IN ({sparte_codes})),
                 "from"        TIMESTAMPTZ      NOT NULL,
-                "to"          TIMESTAMPTZ      NOT NULL
-                    CONSTRAINT interval_forward CHECK ("to" > "from"),
+                -- On an interval table: the span's exclusive end, present and
+                -- after the start. On a point table there is no end — a
+                -- Zählerstand is a register value at an instant — so the column
+                -- is null and `to IS NULL` is what tells a reader that `value`
+                -- is a cumulative reading rather than energy over a span.
+                "to"          TIMESTAMPTZ{to_ddl},
                 value         NUMERIC({VALUE_PRECISION},{VALUE_SCALE}) NOT NULL,
                 -- Water is m³ and gas may be either side of the Brennwert
                 -- conversion, so the number's dimension is stored, never implied
@@ -240,6 +269,13 @@ impl PostgresHot {
         );
         sqlx::query(&ddl).execute(&self.pool).await.map_err(pg)?;
 
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, which is
+        // what makes `create_tables` safe to call on every start — and what
+        // makes a *changed* declaration silent. Both of the things this DDL
+        // encodes are therefore read back and compared.
+        self.verify_declaration(table, merge_key, time_model)
+            .await?;
+
         // The dominant read is one meter over a time range.
         let idx = format!(
             r#"CREATE INDEX IF NOT EXISTS "{table}_malo_from_idx" ON "{table}" (malo_id, "from")"#
@@ -247,6 +283,67 @@ impl PostgresHot {
         sqlx::query(&idx).execute(&self.pool).await.map_err(pg)?;
 
         info!(table, "hot table ready");
+        Ok(())
+    }
+
+    /// Refuse a configuration the existing table cannot be reconciled with.
+    ///
+    /// Two declarations are baked into the DDL and cannot be altered by
+    /// re-running it, and changing either in configuration fails quietly:
+    ///
+    /// * **The primary key**, which *is* the merge key. Resolution would
+    ///   partition by the new one while the table enforced the old, so the
+    ///   second reading a wider key exists to admit conflicts on the narrower
+    ///   primary key and is skipped — invisible to the divergence check too,
+    ///   which joins on the new key.
+    /// * **Whether `to` carries a span end.** `value` is interval energy on one
+    ///   model and a cumulative register reading on the other, and one table
+    ///   holding both carries a column no aggregate can interpret.
+    ///
+    /// The cold tier gets the equivalent from `evolution::compare`. This is the
+    /// hot half of the same rule, and it fires at `create_tables` — on start,
+    /// before a row is written.
+    async fn verify_declaration(
+        &self,
+        table: &str,
+        merge_key: &[String],
+        time_model: crate::config::TimeModel,
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await.map_err(pg)?;
+
+        let expected: Vec<String> = merge_key
+            .iter()
+            .cloned()
+            .chain(std::iter::once(col::VERSION.to_string()))
+            .collect();
+        let stored = primary_key_columns(&mut conn, table).await?;
+        if stored != expected {
+            return Err(Error::config(format!(
+                "{table} already exists with the primary key ({}), but this configuration \
+                 declares the merge key ({}). The primary key is the merge key, and \
+                 `CREATE TABLE IF NOT EXISTS` cannot change it — so resolution would \
+                 partition by one key while the table enforced the other, and a reading \
+                 the wider key exists to keep apart would be dropped with nothing \
+                 reporting it. Restore the declaration, or create a new table",
+                stored.join(", "),
+                expected.join(", "),
+            )));
+        }
+
+        let stored_model = has_interval_end(&mut conn, table).await?;
+        if stored_model != time_model.has_interval_end() {
+            return Err(Error::config(format!(
+                "{table} already exists as a {} table, but this configuration declares {}. \
+                 `value` is interval energy on one and a cumulative register reading on the \
+                 other, so one table cannot hold both. Declare a second table",
+                match stored_model {
+                    true => crate::config::TimeModel::Interval,
+                    false => crate::config::TimeModel::Point,
+                },
+                time_model,
+            )));
+        }
+
         Ok(())
     }
 }
@@ -305,12 +402,18 @@ async fn add_integrity_constraints(
         )));
     }
 
-    let ddl = format!(
-        r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_no_overlap"
-               EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
-        equality.join(", "),
-    );
-    sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+    // Only an interval table has spans to overlap. A point table's rows are
+    // instants: `tstzrange` needs an end, and two instants cannot overlap at
+    // all — the primary key already refuses two rows at one `(merge key,
+    // version)`, which is the whole of what uniqueness means there.
+    if has_interval_end(&mut *conn, table).await? {
+        let ddl = format!(
+            r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_no_overlap"
+                   EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
+            equality.join(", "),
+        );
+        sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
+    }
 
     // One network operator per reading.
     //
@@ -345,6 +448,36 @@ async fn add_integrity_constraints(
     sqlx::query(&ddl).execute(&mut *conn).await.map_err(pg)?;
 
     Ok(())
+}
+
+/// Whether the parent table's rows carry a span end.
+///
+/// Read from the table rather than passed in, and that is the point: the table
+/// **is** the record of its own time model, so `ensure_partitions` — called on
+/// every write path — does not have to carry a second copy of a fact that could
+/// then disagree with the DDL it is about to extend.
+///
+/// `to NOT NULL` is exactly the declaration
+/// [`TimeModel::has_interval_end`](crate::config::TimeModel::has_interval_end)
+/// produces, so the round trip is closed.
+async fn has_interval_end(conn: &mut sqlx::PgConnection, table: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"SELECT a.attnotnull
+               FROM   pg_attribute a
+               WHERE  a.attrelid = $1::regclass
+                AND   a.attname = 'to'
+                AND   NOT a.attisdropped"#,
+    )
+    .bind(format!("\"{table}\""))
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(pg)?
+    .ok_or_else(|| {
+        Error::config(format!(
+            "{table} has no {:?} column, so its time model cannot be read",
+            col::TO
+        ))
+    })
 }
 
 /// The parent table's primary key columns, in key order.
@@ -433,7 +566,7 @@ impl PostgresHot {
             let r = RowView::new(batch, row)?;
             let mut ident = Vec::with_capacity(identity.len());
             for name in &identity {
-                ident.push((name.clone(), text_column(batch, name, row)?.to_string()));
+                ident.push((name.clone(), key_column(batch, name, row)?.to_string()));
             }
             rows.push((
                 (r.malo.to_string(), r.obis.to_string(), r.from, ident),
@@ -622,7 +755,7 @@ impl PostgresHot {
         let mut obis = Vec::with_capacity(n);
         let mut sparte = Vec::with_capacity(n);
         let mut from = Vec::with_capacity(n);
-        let mut to = Vec::with_capacity(n);
+        let mut to: Vec<Option<OffsetDateTime>> = Vec::with_capacity(n);
         let mut value = Vec::with_capacity(n);
         let mut unit = Vec::with_capacity(n);
         let mut quality = Vec::with_capacity(n);
@@ -734,9 +867,17 @@ impl PostgresHot {
             // deployment declaring `identity_column("tenant")` otherwise turns
             // every redelivery into a SQL error about a column that does not
             // exist.
+            // `melo_id` is excluded even where it *is* part of the merge key:
+            // the query below already carries it as its own `incoming` column,
+            // and naming it twice in one alias list makes the join's reference
+            // to it ambiguous. The join itself is built from the whole merge
+            // key, so it still compares on it.
             let identity: Vec<&String> = merge_key
                 .iter()
-                .filter(|c| !crate::encode::schema::MERGE_KEY.contains(&c.as_str()))
+                .filter(|c| {
+                    !crate::encode::schema::MERGE_KEY.contains(&c.as_str())
+                        && c.as_str() != col::MELO_ID
+                })
                 .collect();
 
             let join = merge_key
@@ -749,27 +890,47 @@ impl PostgresHot {
                 .join(" AND ");
 
             let identity_params = (0..identity.len())
-                .map(|i| format!(", ${}::text[]", 6 + i))
+                .map(|i| format!(", ${}::text[]", 7 + i))
                 .collect::<String>();
             let identity_cols = identity
                 .iter()
                 .map(|c| format!(", {c:?}"))
                 .collect::<String>();
 
+            // Two questions of the same join, because a skipped row has exactly
+            // two innocent-looking causes and one of them is silent.
+            //
+            // `value` is the one a producer error reaches: a version identifies
+            // one assertion, so a different number under an existing version has
+            // to fail rather than be taken for a replay.
+            //
+            // `melo_id` is the one a *model* error reaches, and it is why this
+            // query asks about a column the join may not contain. A
+            // Marktlokation may be measured by several Messlokationen, so on a
+            // table not keyed by them two meters' registers share a merge key —
+            // and where the two readings agree on the number, which two freshly
+            // installed meters do, `ON CONFLICT DO NOTHING` drops one with
+            // nothing to notice. Naming the cause is the difference between a
+            // configuration fix and a hunt.
             let sql = format!(
-                r#"SELECT count(*) FROM unnest(
+                r#"SELECT
+                       count(*) FILTER (
+                           WHERE stored.value IS DISTINCT FROM incoming.value) AS restated,
+                       count(*) FILTER (
+                           WHERE stored.melo_id IS DISTINCT FROM incoming.melo_id) AS relocated
+                   FROM unnest(
                        $1::text[], $2::text[], $3::timestamptz[],
-                       $4::numeric[], $5::numeric[]{identity_params}
-                   ) AS incoming(malo_id, obis_code, "from", version, value{identity_cols})
-                   JOIN "{table}" stored ON {join}
-                   WHERE stored.value IS DISTINCT FROM incoming.value"#
+                       $4::numeric[], $5::numeric[], $6::text[]{identity_params}
+                   ) AS incoming(malo_id, obis_code, "from", version, value, melo_id{identity_cols})
+                   JOIN "{table}" stored ON {join}"#
             );
-            let mut query = sqlx::query_scalar::<_, i64>(&sql)
+            let mut query = sqlx::query_as::<_, (i64, i64)>(&sql)
                 .bind(&malo)
                 .bind(&obis)
                 .bind(&from)
                 .bind(&version)
-                .bind(&value);
+                .bind(&value)
+                .bind(&melo);
 
             for name in &identity {
                 let index = extra
@@ -794,15 +955,29 @@ impl PostgresHot {
             // see the same snapshot as the insert it is checking, and a separate
             // connection sees neither the transaction's own rows nor a
             // consistent view of a concurrent writer's.
-            let diverged = query.fetch_one(&mut *conn).await.map_err(pg)?;
+            let (restated, relocated) = query.fetch_one(&mut *conn).await.map_err(pg)?;
 
-            if diverged > 0 {
+            if restated > 0 {
                 return Err(Error::InvariantViolated {
                     table: table.to_string(),
                     detail: format!(
-                        "{diverged} row(s) restate a different value under an existing \
+                        "{restated} row(s) restate a different value under an existing \
                          version — a version identifies one assertion, so a corrected \
                          value needs a higher version"
+                    ),
+                });
+            }
+            if relocated > 0 {
+                return Err(Error::InvariantViolated {
+                    table: table.to_string(),
+                    detail: format!(
+                        "{relocated} row(s) name a different Messlokation than the row \
+                         already stored for the same reading. A Marktlokation may be \
+                         measured by several Messlokationen — a Mehrfamilienhaus, a house \
+                         with an Einliegerwohnung — and this table does not identify a \
+                         reading by its, so two meters' registers share a merge key and \
+                         one of them is dropped. Declare \
+                         TableConfig::identify_by_melo(true)"
                     ),
                 });
             }
@@ -825,6 +1000,27 @@ impl PostgresHot {
     /// than* the last row of a chunk, so a non-unique cursor drops every
     /// remaining row that ties with it — silently, and only once a table is
     /// large enough for a chunk boundary to land inside a tie.
+    ///
+    /// # What paging costs, and where it does not
+    ///
+    /// Each chunk is its own statement on its own connection, so a scan of the
+    /// hot window is **not a single snapshot**: a row inserted while it runs is
+    /// returned if it sorts after the cursor and missed if it sorts before.
+    ///
+    /// That is the deliberate trade against a held cursor, and it is bounded by
+    /// what the hot tier is for. Writes are appends at the *frontier* — the
+    /// current interval, sorting last — while the reads that must reconcile are
+    /// over closed periods, where nothing is arriving. The rows that can move
+    /// under a scan are the ones a settlement is not summing.
+    ///
+    /// Where a scan must see one instant, the answer is not a longer
+    /// transaction: it is [`ReadMode::AsKnownAt`], which pins `recorded_at` on
+    /// every row in both tiers, or a pinned snapshot for the cold half. Those
+    /// reproduce; a repeatable-read transaction over PostgreSQL would only make
+    /// the hot half self-consistent for the length of one query, at the cost of
+    /// minutes of blocked vacuum on the busiest table in the schema.
+    ///
+    /// [`ReadMode::AsKnownAt`]: crate::planner::ReadMode::AsKnownAt
     fn chunked_scan(&self, relation: &str, range: TimeRange, spec: &ScanSpec) -> BatchStream {
         let pool = self.pool.clone();
         let relation = relation.to_string();
@@ -1005,6 +1201,12 @@ impl PostgresHot {
     }
 }
 
+/// How long a late correction waits for another one to finish.
+///
+/// Doubling from 25 ms, so ~1.6 s in total. A cold append is a read and one
+/// Iceberg commit; anything longer than that means the holder is stuck.
+const COLD_APPEND_LEASE_ATTEMPTS: u32 = 6;
+
 /// An advisory-lock key in MeterStore's own namespace.
 ///
 /// PostgreSQL advisory locks are keyed by a 64-bit integer in a namespace shared
@@ -1054,30 +1256,33 @@ async fn relation_exists_in(conn: &mut sqlx::PgConnection, name: &str) -> Result
 /// *session*-scoped: taken on a pooled connection and then returned to the pool,
 /// it would be released the moment another caller checked the connection out, or
 /// held indefinitely by whoever got it next.
-struct PgArchiveLease {
+struct PgTableLease {
     connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
     key: i64,
     table: String,
+    /// Which claim this is — `archive` or `cold-append`. Only for the log line;
+    /// the key already separates them.
+    purpose: &'static str,
 }
 
-impl std::fmt::Debug for PgArchiveLease {
+impl std::fmt::Debug for PgTableLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgArchiveLease")
+        f.debug_struct("PgTableLease")
             .field("table", &self.table)
-            .field("key", &self.key)
-            .finish()
+            .field("purpose", &self.purpose)
+            .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl crate::tiering::store::ArchiveLease for PgArchiveLease {
+impl crate::tiering::store::TableLease for PgTableLease {
     async fn release(mut self: Box<Self>) -> Result<()> {
         sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
             .execute(&mut *self.connection)
             .await
             .map_err(pg)?;
-        debug!(table = %self.table, "archive lease released");
+        debug!(table = %self.table, purpose = self.purpose, "lease released");
         Ok(())
     }
 }
@@ -1096,13 +1301,25 @@ fn decimal_to_version(value: Decimal) -> Result<crate::version::Version> {
     )
 }
 
-/// One text cell of a batch, by column name.
-fn text_column<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a str> {
-    Ok(batch
+/// One text cell of a merge-key column, refusing a null.
+///
+/// `StringArray::value` returns an empty slice for a null rather than failing,
+/// so a merge-key column read without this check would silently name every row
+/// with no value the *same* reading. That matters for `melo_id`, the one
+/// nullable column a table may put in its key.
+fn key_column<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a str> {
+    let column = batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| Error::encode(name, "expected a string column"))?
-        .value(row))
+        .ok_or_else(|| Error::encode(name, "expected a string column"))?;
+    if column.is_null(row) {
+        return Err(Error::encode(
+            name,
+            "is part of this table's merge key and must not be null: a null cannot \
+             identify a reading, and in SQL it does not compare equal to itself",
+        ));
+    }
+    Ok(column.value(row))
 }
 
 /// Render a domain code list as a SQL `IN` list.
@@ -1163,9 +1380,9 @@ impl CursorValue {
     /// (§7.3).
     ///
     /// The type is taken from the storage schema rather than from a literal
-    /// position. Hardcoded indices here were silently wrong the moment a column
-    /// was inserted ahead of `from`, and the symptom was a decode error deep in
-    /// `sqlx` naming a column number rather than a column.
+    /// position: a hardcoded index goes silently wrong the moment a column is
+    /// inserted ahead of `from`, and surfaces as a `sqlx` decode error naming a
+    /// column number rather than a column.
     fn read(row: &sqlx::postgres::PgRow, index: usize) -> Result<Self> {
         use crate::arrow::datatypes::DataType;
 
@@ -1200,10 +1417,10 @@ fn projection_index(column: &str, extra: &[String]) -> Result<usize> {
 
 /// Core columns in the storage schema, and therefore in every projection.
 ///
-/// Derived rather than written down. As a literal it was a second copy of the
-/// schema's length, and adding a core column left it silently one short — which
-/// surfaces as a `sqlx` decode error naming a column *number*, several layers
-/// from the edit that caused it.
+/// Derived rather than written down: as a literal it is a second copy of the
+/// schema's length, and adding a core column leaves it silently one short —
+/// which surfaces as a `sqlx` decode error naming a column *number*, several
+/// layers from the edit that caused it.
 fn core_column_count() -> usize {
     schema::storage_schema(&[]).fields().len()
 }
@@ -1237,7 +1454,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
     let mut obis = Vec::with_capacity(n);
     let mut sparte = Vec::with_capacity(n);
     let mut from = Vec::with_capacity(n);
-    let mut to = Vec::with_capacity(n);
+    let mut to: Vec<Option<i64>> = Vec::with_capacity(n);
     let mut value = Vec::with_capacity(n);
     let mut unit = Vec::with_capacity(n);
     let mut quality = Vec::with_capacity(n);
@@ -1255,8 +1472,14 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
         melo.push(row.try_get::<Option<String>, _>(1).map_err(pg)?);
         obis.push(row.try_get::<String, _>(2).map_err(pg)?);
         sparte.push(row.try_get::<String, _>(3).map_err(pg)?);
-        from.push(micros(row.try_get::<OffsetDateTime, _>(4).map_err(pg)?)?);
-        to.push(micros(row.try_get::<OffsetDateTime, _>(5).map_err(pg)?)?);
+        from.push(schema::micros(
+            row.try_get::<OffsetDateTime, _>(4).map_err(pg)?,
+        ));
+        to.push(
+            row.try_get::<Option<OffsetDateTime>, _>(5)
+                .map_err(pg)?
+                .map(schema::micros),
+        );
         value.push(decimal_to_i128(
             row.try_get::<Decimal, _>(6).map_err(pg)?,
             VALUE_SCALE,
@@ -1274,8 +1497,10 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
             col::VERSION,
         )?);
         version_scope.push(row.try_get::<String, _>(14).map_err(pg)?);
-        recorded_at.push(micros(row.try_get::<OffsetDateTime, _>(15).map_err(pg)?)?);
-        balancing_day.push(days_since_epoch(
+        recorded_at.push(schema::micros(
+            row.try_get::<OffsetDateTime, _>(15).map_err(pg)?,
+        ));
+        balancing_day.push(schema::date32(
             row.try_get::<time::Date, _>(16).map_err(pg)?,
         ));
     }
@@ -1335,7 +1560,8 @@ struct RowView<'a> {
     obis: &'a str,
     sparte: &'a str,
     from: OffsetDateTime,
-    to: OffsetDateTime,
+    /// `None` on a point table: a register reading is an instant, not a span.
+    to: Option<OffsetDateTime>,
     value: Decimal,
     unit: &'a str,
     quality: &'a str,
@@ -1368,6 +1594,19 @@ impl<'a> RowView<'a> {
                 .filter(|a| !a.is_null(row))
                 .map(|a| a.value(row))
         }
+        /// A timestamp that may be absent — `to` on a point table.
+        fn ts_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<OffsetDateTime>> {
+            let column = batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .ok_or_else(|| Error::encode(name, "expected a timestamp column"))?;
+            if column.is_null(row) {
+                return Ok(None);
+            }
+            OffsetDateTime::from_unix_timestamp_nanos(i128::from(column.value(row)) * 1_000)
+                .map(Some)
+                .map_err(|e| Error::encode(name, e.to_string()))
+        }
         fn ts(batch: &RecordBatch, name: &str, row: usize) -> Result<OffsetDateTime> {
             let micros = batch
                 .column_by_name(name)
@@ -1386,9 +1625,7 @@ impl<'a> RowView<'a> {
                 })
                 .ok_or_else(|| Error::encode(name, "expected a date column"))?
                 .value(row);
-            epoch_date()
-                .checked_add(Duration::days(i64::from(days)))
-                .ok_or_else(|| Error::encode(name, format!("{days} is out of Date range")))
+            schema::date_of(days)
         }
         fn dec(batch: &RecordBatch, name: &str, row: usize, scale: i8) -> Result<Decimal> {
             let raw = batch
@@ -1410,7 +1647,7 @@ impl<'a> RowView<'a> {
             obis: text(batch, col::OBIS_CODE, row)?,
             sparte: text(batch, col::SPARTE, row)?,
             from: ts(batch, col::FROM, row)?,
-            to: ts(batch, col::TO, row)?,
+            to: ts_opt(batch, col::TO, row)?,
             value: dec(batch, col::VALUE, row, VALUE_SCALE)?,
             unit: text(batch, col::UNIT, row)?,
             quality: text(batch, col::QUALITY, row)?,
@@ -1491,7 +1728,7 @@ impl HotStore for PostgresHot {
     async fn try_archive_lease(
         &self,
         table: &str,
-    ) -> Result<Option<Box<dyn crate::tiering::store::ArchiveLease>>> {
+    ) -> Result<Option<Box<dyn crate::tiering::store::TableLease>>> {
         let key = lock_key("archive", table);
         let mut connection = self.pool.acquire().await.map_err(pg)?;
 
@@ -1510,11 +1747,47 @@ impl HotStore for PostgresHot {
         }
 
         debug!(table, "archive lease acquired");
-        Ok(Some(Box::new(PgArchiveLease {
+        Ok(Some(Box::new(PgTableLease {
             connection,
             key,
             table: table.to_string(),
+            purpose: "archive",
         })))
+    }
+
+    async fn cold_append_lease(
+        &self,
+        table: &str,
+    ) -> Result<Box<dyn crate::tiering::store::TableLease>> {
+        let key = lock_key("cold-append", table);
+        let mut connection = self.pool.acquire().await.map_err(pg)?;
+
+        // Spun rather than taken with the blocking `pg_advisory_lock`, so a
+        // caller waits for a bounded time and gets an error naming the contention
+        // instead of hanging on a connection that may never be released. Late
+        // corrections are rare, so a holder is on its way out.
+        for attempt in 0..COLD_APPEND_LEASE_ATTEMPTS {
+            let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(pg)?;
+            if acquired {
+                return Ok(Box::new(PgTableLease {
+                    connection,
+                    key,
+                    table: table.to_string(),
+                    purpose: "cold-append",
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25 << attempt.min(5))).await;
+        }
+
+        Err(Error::Storage(format!(
+            "{table}: another process has held the cold-append claim for the whole of \
+             {COLD_APPEND_LEASE_ATTEMPTS} attempts. A late correction is rare, so this \
+             means a writer is stuck rather than busy"
+        )))
     }
 
     async fn ensure_partitions(
@@ -1590,8 +1863,10 @@ impl HotStore for PostgresHot {
         table: &str,
         merge_key: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        time_model: crate::config::TimeModel,
     ) -> Result<()> {
-        self.create_table_with_key(table, merge_key, extra).await
+        self.create_table_with_key(table, merge_key, extra, time_model)
+            .await
     }
 
     async fn append_reporting(
@@ -1633,7 +1908,43 @@ impl HotStore for PostgresHot {
         if range.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
         }
-        Ok(self.chunked_scan(table, range, spec))
+
+        // The parent, **plus whatever is currently detached from it**.
+        //
+        // Archival detaches a partition before it reads it and drops it only
+        // after the cold commit lands (§8.2). Between those two moments the
+        // rows are in neither relation a query would look at: the parent no
+        // longer inherits them, Iceberg has not been told about them yet, and
+        // the watermark — which is published *by* that commit — still says the
+        // hot tier owns the range. A scan of the parent alone therefore returns
+        // a whole window short for as long as writing it takes, which for a day
+        // at metering volume is not an instant, and reports nothing.
+        //
+        // Including the detached relations closes that window, and cannot
+        // double-count. A detached partition is in exactly one of two states:
+        //
+        // * **Mid-archival** — not yet in Iceberg, and the watermark has not
+        //   passed it, so this scan's range (which starts at the watermark)
+        //   covers it and it is read from here. Correct, and read once.
+        // * **Orphaned** — the commit landed, so the watermark is past it and
+        //   the range starts above it. The `from` predicate excludes every row.
+        //   It also covers the third state, an orphan whose commit *failed*:
+        //   those rows are below no watermark, so they are read here and stay
+        //   visible while an operator repairs the run.
+        //
+        // The cost is one `pg_class` lookup per scan, which is a fraction of
+        // what the tiered provider already pays to read the watermark.
+        let mut streams: Vec<BatchStream> = vec![self.chunked_scan(table, range, spec)];
+        for partition in partitions_of(&self.pool, table, Attachment::Detached).await? {
+            let name = partition.relation_name()?;
+            debug!(table, partition = %name, "including a detached partition in the scan");
+            streams.push(self.chunked_scan(&name, range, spec));
+        }
+
+        match streams.len() {
+            1 => Ok(streams.pop().expect("length checked")),
+            _ => Ok(Box::pin(futures::stream::select_all(streams))),
+        }
     }
 
     async fn scan_detached(&self, partition: &PartitionId, spec: &ScanSpec) -> Result<BatchStream> {
@@ -1694,21 +2005,6 @@ impl HotStore for PostgresHot {
 }
 
 /// The Unix epoch as a date, the origin `Date32` counts from.
-fn epoch_date() -> time::Date {
-    time::Date::from_ordinal_date(1970, 1).expect("epoch is a valid date")
-}
-
-/// Days between the Unix epoch and a date, the `Date32` encoding.
-fn days_since_epoch(date: time::Date) -> i32 {
-    (date - epoch_date()).whole_days() as i32
-}
-
-/// Microseconds since the Unix epoch.
-fn micros(ts: OffsetDateTime) -> Result<i64> {
-    i64::try_from(ts.unix_timestamp_nanos() / 1_000)
-        .map_err(|_| Error::decode("timestamp", format!("{ts} out of microsecond range")))
-}
-
 /// Render a timestamp for inclusion in DDL.
 ///
 /// Partition bounds cannot be parameterised, so this is the one place a value

@@ -16,12 +16,9 @@
 //! deployment-declared extras: a number whose dimension is configuration is a
 //! number no query can safely sum.
 //!
-//! This was a deliberate *deviation* from `metering` until 0.17, which renamed
-//! [`MeterInterval::value`] for the same reason. The names agree again, which is
-//! §4.1.1's rule working in the direction it is supposed to: the argument was
-//! made here, reported upstream, and settled there.
+//! [`metering`] names the field the same way, so the mapping stays a rename-free
+//! one (§4.1.1).
 //!
-//! [`MeterInterval::value`]: metering::interval::MeterInterval::value
 //! [`Sparte::billing_unit`]: metering::Sparte::billing_unit
 //!
 //! # Why `balancing_day` is stored, when derived values are not
@@ -60,6 +57,7 @@
 use std::sync::Arc;
 
 use crate::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use crate::error::{Error, Result};
 
 /// Decimal precision for `value`.
 ///
@@ -99,6 +97,11 @@ pub mod col {
     /// Interval start, UTC, inclusive.
     pub const FROM: &str = "from";
     /// Interval end, UTC, exclusive. Stored, never derived.
+    ///
+    /// **Null on a point table.** An instant has no end, and `to IS NULL` is
+    /// what tells a reader — including one holding only the Parquet — that
+    /// [`VALUE`] is a cumulative register reading rather than energy over a
+    /// span. See [`TimeModel`](crate::config::TimeModel).
     pub const TO: &str = "to";
     /// The measured quantity, in [`UNIT`].
     ///
@@ -142,6 +145,70 @@ pub fn timestamp_type() -> DataType {
     DataType::Timestamp(TS_UNIT, Some("UTC".into()))
 }
 
+/// An instant in the unit the storage schema uses.
+///
+/// The single conversion into the storage encoding. Every layer that puts a
+/// timestamp into a row, a bind parameter or a predicate goes through this, so
+/// none of them can round or wrap differently from the others.
+///
+/// # Infallible, and what makes it so
+///
+/// `time` without the `large-dates` feature bounds `OffsetDateTime` at ±9999
+/// years — ±3.2 × 10^17 microseconds, comfortably inside `i64` — so every value
+/// that can be constructed converts, and a `Result` here would be an error arm no
+/// caller could produce and every caller would have to handle.
+///
+/// That is an assumption about a *dependency's* feature set, and feature
+/// unification means something else in the graph could enable `large-dates`
+/// without a line changing here. It is therefore asserted rather than assumed:
+/// `the_storage_encoding_holds_every_representable_instant` fails at this crate's
+/// boundary rather than as a wrapped timestamp inside a committed Parquet file.
+#[must_use]
+pub fn micros(instant: time::OffsetDateTime) -> i64 {
+    // The saturating fallback is unreachable while the test below passes; it is
+    // here so that a graph which does enable `large-dates` clamps to a wrong-but-
+    // bounded instant instead of wrapping to a plausible one in the far past.
+    i64::try_from(instant.unix_timestamp_nanos() / 1_000).unwrap_or(i64::MAX)
+}
+
+/// The inverse of [`micros`].
+///
+/// Fallible where [`micros`] is not, and the asymmetry is the point: the input
+/// here is a number read back out of storage, which a file this crate did not
+/// write may set to anything at all. Failing beats panicking, and beats an
+/// instant in the year 300 000.
+pub fn instant(micros: i64) -> Result<time::OffsetDateTime> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000)
+        .map_err(|e| Error::decode("timestamp", format!("{micros}: {e}")))
+}
+
+/// A local date in the `Date32` encoding — days since the Unix epoch.
+#[must_use]
+pub fn date32(date: time::Date) -> i32 {
+    (date - EPOCH).whole_days() as i32
+}
+
+/// The inverse of [`date32`], failing rather than panicking on a value out of
+/// range — for the reason [`instant`] gives.
+pub fn date_of(days: i32) -> Result<time::Date> {
+    EPOCH
+        .checked_add(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| Error::decode(col::BALANCING_DAY, format!("{days} is out of range")))
+}
+
+/// A timestamp literal in the exact type the storage schema declares.
+///
+/// Both halves matter: the *unit*, so the engine compares like for like rather
+/// than coercing, and the `"UTC"` zone spelling, which has to be the schema's own
+/// or a comparison against the column carries a cast.
+#[must_use]
+pub fn timestamp_scalar(instant: time::OffsetDateTime) -> datafusion::common::ScalarValue {
+    datafusion::common::ScalarValue::TimestampMicrosecond(Some(micros(instant)), Some("UTC".into()))
+}
+
+/// The Unix epoch as a date — the origin `Date32` counts from.
+const EPOCH: time::Date = time::macros::date!(1970 - 01 - 01);
+
 /// Build the storage schema.
 ///
 /// `extra` carries per-deployment attributes (Bilanzkreis, grid area, …) declared
@@ -154,7 +221,12 @@ pub fn storage_schema(extra: &[Field]) -> SchemaRef {
         Field::new(col::OBIS_CODE, DataType::Utf8, false),
         Field::new(col::SPARTE, DataType::Utf8, false),
         Field::new(col::FROM, timestamp_type(), false),
-        Field::new(col::TO, timestamp_type(), false),
+        // Nullable, because a point table has no span end. An interval table
+        // still refuses a null with a `NOT NULL` in its own DDL and with the
+        // encoder's own check, so nothing loosens for a Lastgang — what changes
+        // is that one schema can describe both, which is what lets a
+        // Zählerstandsgang reuse every part of the tiering machinery.
+        Field::new(col::TO, timestamp_type(), true),
         Field::new(
             col::VALUE,
             DataType::Decimal128(VALUE_PRECISION, VALUE_SCALE),
@@ -215,6 +287,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_storage_encoding_holds_every_representable_instant() {
+        // What makes `micros` infallible. `time` without `large-dates` bounds
+        // `OffsetDateTime` at ±9999 years, which fits `i64` microseconds with
+        // three orders of magnitude to spare — so there is no error arm a caller
+        // could ever produce.
+        //
+        // That is an assumption about a *dependency's feature set*, and feature
+        // unification means something else in the graph can enable `large-dates`
+        // without a line changing here. This is where that stops being silent:
+        // the alternative is a timestamp saturating or wrapping inside a
+        // committed Parquet file, discovered by whoever reconciles it.
+        use time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
+
+        for date in [Date::MIN, Date::MAX] {
+            for at in [Time::MIDNIGHT, Time::MAX] {
+                let instant = PrimitiveDateTime::new(date, at).assume_utc();
+                let nanos = instant.unix_timestamp_nanos() / 1_000;
+                assert!(
+                    i64::try_from(nanos).is_ok(),
+                    "{instant} does not fit the storage encoding — has `large-dates` \
+                     been enabled somewhere in the graph?"
+                );
+                assert_eq!(micros(instant), nanos as i64);
+            }
+        }
+
+        // And the inverse round-trips over the range the store actually holds.
+        let mut at = time::macros::datetime!(1970-01-01 00:00 UTC);
+        while at < time::macros::datetime!(2100-01-01 00:00 UTC) {
+            assert_eq!(instant(micros(at)).unwrap(), at);
+            at += time::Duration::days(97);
+        }
+        assert_eq!(
+            instant(micros(OffsetDateTime::UNIX_EPOCH)).unwrap(),
+            OffsetDateTime::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn a_date_round_trips_through_the_date32_encoding() {
+        use time::macros::date;
+
+        for d in [
+            date!(1970 - 01 - 01),
+            date!(2026 - 03 - 29),
+            date!(2026 - 10 - 25),
+            date!(2100 - 12 - 31),
+        ] {
+            assert_eq!(date_of(date32(d)).unwrap(), d);
+        }
+        assert_eq!(date32(date!(1970 - 01 - 01)), 0);
+        // Read back from storage, so a value a file this crate did not write may
+        // set to anything must fail rather than panic.
+        assert!(date_of(i32::MAX).is_err());
+        assert!(date_of(i32::MIN).is_err());
+        assert!(instant(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_timestamp_literal_carries_the_columns_exact_type() {
+        // Both halves were got wrong independently before this was one function:
+        // the unit, so the engine compares like for like, and the zone spelling,
+        // which has to be the schema's own or the comparison carries a cast.
+        let scalar = timestamp_scalar(time::macros::datetime!(2026-07-20 00:00 UTC));
+        assert_eq!(
+            scalar.data_type(),
+            *storage_schema(&[])
+                .field_with_name(col::FROM)
+                .unwrap()
+                .data_type()
+        );
+    }
+
+    #[test]
     fn schema_has_expected_core_columns() {
         let s = storage_schema(&[]);
         assert_eq!(s.fields().len(), 17);
@@ -265,13 +411,20 @@ mod tests {
     }
 
     #[test]
-    fn interval_bounds_are_both_present_and_non_nullable() {
-        // `to` is stored, never derived. A nullable `to` would
-        // invite recomputation as `from + resolution`, which is wrong across DST.
+    fn the_interval_end_is_stored_and_never_derived() {
+        // `to` is stored rather than computed as `from + resolution`, which is
+        // wrong across a DST transition. It is *nullable* only so one schema can
+        // also describe a point table, where an instant has no end — an interval
+        // table's own DDL keeps `NOT NULL`, and the encoder refuses a null there
+        // before it reaches the database.
         let s = storage_schema(&[]);
         let to = s.field_with_name(col::TO).unwrap();
-        assert!(!to.is_nullable());
         assert_eq!(to.data_type(), &timestamp_type());
+        assert!(to.is_nullable(), "a point row has no end");
+
+        // `from` is not: every row is somewhere on the timeline, and it is what
+        // decides the tier.
+        assert!(!s.field_with_name(col::FROM).unwrap().is_nullable());
     }
 
     #[test]

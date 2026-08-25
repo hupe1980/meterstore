@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use metering::interval::Sparte;
 use meterstore::cold::IcebergCold;
 use meterstore::config::TableConfig;
 use meterstore::hot::PostgresHot;
@@ -140,7 +141,7 @@ impl Harness {
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
-                   VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'mscons',
+                   VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'MSCONS',
                            $6,'[]',$7,'99:2026-07',$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
@@ -421,6 +422,46 @@ async fn a_reproducible_read_never_touches_the_mutable_tier() {
 }
 
 #[tokio::test]
+async fn a_pinned_session_refuses_to_be_written_through() {
+    // A pinned store is a *reading* posture. Writing through one would land the
+    // rows in the real table while every check the write path makes — is this a
+    // replay, does this reading already carry another network operator, what did
+    // it displace — was answered from the pinned view. The rows would be right
+    // and the reasoning about them wrong, which is the shape of failure this
+    // crate refuses everywhere else.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert("11111111115", D18, 96, 10, V1).await;
+    h.archive_through(D21).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let snapshot = store.snapshots().await.unwrap()[0].snapshot_id;
+    let pinned = store
+        .as_of(SnapshotSelector::Id(snapshot), None)
+        .await
+        .unwrap();
+
+    let err = pinned
+        .append(&[corrected_series()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("append is not available"), "{err}");
+    assert!(
+        err.contains("derived from"),
+        "the message must name the way out: {err}"
+    );
+
+    assert!(pinned.hot_writer().await.is_err());
+
+    // The store it was derived from is unaffected.
+    store.append(&[corrected_series()]).await.expect("writable");
+}
+
+#[tokio::test]
 async fn an_unknown_snapshot_is_refused_rather_than_silently_current() {
     // A reproducible read that quietly returns current data is worse than one
     // that does not run: the number looks like a settlement rerun and is not.
@@ -647,12 +688,10 @@ async fn a_typed_read_of_a_meter_with_no_data_is_absence_not_zero() {
 
 #[tokio::test]
 async fn a_malo_id_from_a_message_never_reaches_the_sql_text() {
-    // §19.7: user values are bound, never concatenated. Since 0.4 the
-    // identifier is also *parsed* before it is bound, so an injection attempt is
-    // refused one layer earlier than it used to be — it is not a MaLo-ID, so
-    // there is no query to run. Both layers are asserted here: the parse
-    // rejects the quote, and a well-formed identifier that happens not to exist
-    // still produces no rows rather than a syntax error.
+    // §19.7: user values are bound, never concatenated — and the identifier is
+    // *parsed* before it is bound, so an injection attempt is refused a layer
+    // earlier: it is not a MaLo-ID, so there is no query to run. Both layers are
+    // asserted here.
     let h = Harness::start().await;
     h.hot
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
@@ -1057,7 +1096,7 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
     let stored = StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D18).unwrap(),
+            VersionScope::for_interval("99", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),
@@ -1227,7 +1266,7 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D18).unwrap(),
+            VersionScope::for_interval("99", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),

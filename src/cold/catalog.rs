@@ -9,9 +9,9 @@
 //! credentials into the catalog properties, and bound the catalog's metadata pool.
 //!
 //! That wiring lives here rather than in each application, because it is
-//! infrastructure this crate already owns the dependencies for. An application
-//! that used to reach for `iceberg-catalog-sql` and `iceberg-storage-opendal`
-//! directly needs neither once it calls [`IcebergSqlCatalog::build`].
+//! infrastructure this crate already owns the dependencies for: a caller of
+//! [`IcebergSqlCatalog::build`] depends on neither `iceberg-catalog-sql` nor
+//! `iceberg-storage-opendal`.
 //!
 //! [`S3TablesCatalog`] does the same for AWS S3 Tables, behind the `s3tables`
 //! feature. It is a second constructor rather than a variant of the first because
@@ -50,7 +50,18 @@ use super::IcebergCold;
 /// instance role (MinIO, Ceph, R2, LocalStack). GCS and Azure authenticate purely
 /// through their platform chains (ADC / managed identity), so they take no fields
 /// here.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is hand-written: [`secret_access_key`](Self::secret_access_key) is a
+/// credential, and a warehouse configuration is what a service dumps into a
+/// startup log or attaches to a connection error.
+///
+/// It is redacted but **not zeroized**, unlike the erasure key in
+/// [`SubjectRegistry`](crate::erasure::SubjectRegistry). An explicit key is
+/// forwarded into the object store's own client configuration, which holds it for
+/// the life of the process — so wiping this struct's copy would suggest a
+/// protection that does not hold. The credential chain is the answer that
+/// actually keeps a key out of the process: environment, instance role, IRSA.
+#[derive(Clone, Default)]
 pub struct WarehouseAuth {
     /// S3 region, or `client.region`.
     pub region: Option<String>,
@@ -60,6 +71,19 @@ pub struct WarehouseAuth {
     pub access_key_id: Option<String>,
     /// S3 secret access key (omit to use the credential chain).
     pub secret_access_key: Option<String>,
+}
+
+impl std::fmt::Debug for WarehouseAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarehouseAuth")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            // Present-or-not rather than the value. The access key id is not a
+            // secret on its own, but a pair of them in one log line is.
+            .field("access_key_id", &self.access_key_id.is_some())
+            .field("secret_access_key", &self.secret_access_key.is_some())
+            .finish()
+    }
 }
 
 /// The `://` scheme of a warehouse URI (`file` when there is none).
@@ -79,7 +103,9 @@ fn is_s3_scheme(scheme: &str) -> bool {
 /// A scheme whose backend feature was not compiled in is an error rather than a
 /// silent fallback to the local filesystem, which would write a "cloud" warehouse
 /// to disk and fail only later, obscurely.
-fn warehouse_factory(warehouse_uri: &str) -> Result<Arc<dyn iceberg::io::StorageFactory>> {
+pub(crate) fn warehouse_factory(
+    warehouse_uri: &str,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>> {
     use iceberg_storage_opendal::OpenDalStorageFactory;
     let scheme = warehouse_scheme(warehouse_uri);
     Ok(match scheme {
@@ -162,7 +188,12 @@ fn apply_warehouse_auth(
 /// The catalog's metadata lives in `database_url` (normally the same PostgreSQL as
 /// the hot tier), and the table files in `warehouse_uri`'s object store. Pass it to
 /// [`build`](Self::build).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written for the same reason [`WarehouseAuth`]'s is:
+/// `database_url` is a PostgreSQL connection URL and therefore carries a
+/// password — usually the *same* password as the hot tier's, since the
+/// recommended deployment puts the catalogue on the same database.
+#[derive(Clone)]
 pub struct IcebergSqlCatalog<'a> {
     /// PostgreSQL URL for the catalog's own metadata (create/load table).
     pub database_url: &'a str,
@@ -183,6 +214,26 @@ pub struct IcebergSqlCatalog<'a> {
     pub metadata_pool_max_connections: u32,
     /// Object-store credentials (consulted for S3-family schemes only).
     pub auth: &'a WarehouseAuth,
+}
+
+impl std::fmt::Debug for IcebergSqlCatalog<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergSqlCatalog")
+            .field("database_url", &crate::error::redacted(self.database_url))
+            // The warehouse URI names a bucket rather than carrying a
+            // credential, so it stays legible — it is the field an operator
+            // reads this for.
+            .field("warehouse_uri", &self.warehouse_uri)
+            .field("catalog_name", &self.catalog_name)
+            .field("namespace", &self.namespace)
+            .field("file_target_bytes", &self.file_target_bytes)
+            .field(
+                "metadata_pool_max_connections",
+                &self.metadata_pool_max_connections,
+            )
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 impl IcebergSqlCatalog<'_> {
@@ -221,6 +272,107 @@ impl IcebergSqlCatalog<'_> {
                 .await
                 .map_err(storage)?,
         );
+        let cold = Arc::new(IcebergCold::new(
+            Arc::clone(&catalog),
+            NamespaceIdent::new(self.namespace.to_string()),
+            self.file_target_bytes,
+        ));
+        Ok(ColdTier { cold, catalog })
+    }
+}
+
+/// The cold tier on an **Iceberg REST catalog** — Polaris, Lakekeeper, Nessie,
+/// Gravitino, or any other implementation of the spec.
+///
+/// Built here for the reason the SQL catalogue is: the wiring is infrastructure
+/// this crate already owns the dependencies for, and every application repeating
+/// it is a place for it to drift. It applies with more force here, because a REST
+/// catalogue is the **default** shape —
+/// [`CatalogKind::Rest`](crate::settings::CatalogKind::Rest) is what a
+/// configuration file that says nothing selects.
+///
+/// # Credentials are the deployment's
+///
+/// The REST spec's own authentication — a bearer token, an OAuth2 client — goes
+/// through `props` rather than fields here, for the same reason [`WarehouseAuth`]
+/// has no place for a secret it does not need: a token in a configuration file is
+/// a token in a log, and every server worth pointing at takes one from the
+/// environment.
+///
+/// Object-store credentials stay the *engine's* either way: the catalogue hands
+/// out locations, not keys.
+///
+/// ```no_run
+/// # use meterstore::cold::IcebergRestCatalog;
+/// # async fn example() -> meterstore::Result<()> {
+/// let cold = IcebergRestCatalog {
+///     uri: "https://catalog.internal",
+///     warehouse_uri: "s3://edm/meterstore",
+///     namespace: "metering",
+///     file_target_bytes: 512 * 1024 * 1024,
+///     props: Default::default(),
+/// }
+/// .build()
+/// .await?;
+/// # let _ = cold;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "rest-catalog")]
+#[derive(Debug, Clone, Default)]
+pub struct IcebergRestCatalog<'a> {
+    /// The catalogue endpoint.
+    pub uri: &'a str,
+    /// Warehouse root; its scheme selects the object-store backend.
+    ///
+    /// A REST catalogue usually knows its own warehouse, in which case this
+    /// names *which* one to a server hosting several. It still selects this
+    /// process's object-store backend, so its scheme has to be one the build
+    /// compiled in.
+    pub warehouse_uri: &'a str,
+    /// Iceberg namespace the tables live in.
+    pub namespace: &'a str,
+    /// Target Parquet file size in the cold tier, in bytes.
+    pub file_target_bytes: usize,
+    /// Extra catalogue properties, passed through verbatim.
+    pub props: HashMap<String, String>,
+}
+
+#[cfg(feature = "rest-catalog")]
+impl IcebergRestCatalog<'_> {
+    /// Build the cold tier over a REST catalogue.
+    pub async fn build(&self) -> Result<ColdTier> {
+        use iceberg_catalog_rest::{
+            REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+        };
+
+        if self.uri.trim().is_empty() {
+            return Err(Error::config(
+                "a REST catalog needs a uri: the endpoint is the whole of how the \
+                 catalogue is reached",
+            ));
+        }
+
+        let mut props = self.props.clone();
+        props.insert(REST_CATALOG_PROP_URI.to_string(), self.uri.to_string());
+        if !self.warehouse_uri.is_empty() {
+            props.insert(
+                REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                self.warehouse_uri.to_string(),
+            );
+        }
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            RestCatalogBuilder::default()
+                // Chosen from the warehouse scheme exactly as for the SQL
+                // catalogue: a scheme whose feature was not compiled in is an
+                // error here rather than a "cloud" warehouse on local disk.
+                .with_storage_factory(warehouse_factory(self.warehouse_uri)?)
+                .load("meterstore", props)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        );
+
         let cold = Arc::new(IcebergCold::new(
             Arc::clone(&catalog),
             NamespaceIdent::new(self.namespace.to_string()),
@@ -388,6 +540,93 @@ impl ColdTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neither_the_password_nor_the_secret_key_reaches_a_log_line() {
+        // Configuration is exactly what a service dumps at startup and exactly
+        // what an error context carries. The hot tier's connection URL and the
+        // subject registry's erasure key were both hand-written for that reason;
+        // these two derived `Debug` and were the third and fourth places a
+        // credential could reach a log — the *primary* constructor a deployment
+        // writes, holding the same PostgreSQL password as the hot tier.
+        let auth = WarehouseAuth {
+            region: Some("eu-central-1".into()),
+            endpoint: Some("https://minio.internal".into()),
+            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".into()),
+            secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+        };
+        let catalog = IcebergSqlCatalog {
+            database_url: "postgresql://edm:hunter2@db.internal/prod",
+            warehouse_uri: "s3://edm/meterstore",
+            catalog_name: "meterstore",
+            namespace: "metering",
+            file_target_bytes: 1,
+            metadata_pool_max_connections: 4,
+            auth: &auth,
+        };
+
+        let shown = format!("{catalog:?}");
+        for secret in [
+            "hunter2",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+
+        // The shape survives, because that is the half an operator needs.
+        assert!(shown.contains("postgresql://<redacted>"), "{shown}");
+        assert!(shown.contains("s3://edm/meterstore"), "{shown}");
+        assert!(shown.contains("eu-central-1"), "{shown}");
+        assert!(shown.contains("secret_access_key: true"), "{shown}");
+
+        // And an absent credential says so rather than showing an empty string.
+        let empty = format!("{:?}", WarehouseAuth::default());
+        assert!(empty.contains("secret_access_key: false"), "{empty}");
+    }
+
+    #[cfg(feature = "rest-catalog")]
+    #[tokio::test]
+    async fn a_rest_catalog_without_an_endpoint_says_which_setting_is_missing() {
+        // The client's own refusal is "Catalog uri is required", which names
+        // neither the section nor the fact that a REST catalogue *is* its
+        // endpoint. This is the default catalogue kind, so it is the one a
+        // half-filled configuration file reaches first.
+        let err = IcebergRestCatalog {
+            uri: "   ",
+            warehouse_uri: "s3://edm/meterstore",
+            namespace: "metering",
+            file_target_bytes: 1,
+            props: Default::default(),
+        }
+        .build()
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("uri"), "{err}");
+        assert!(err.contains("endpoint"), "{err}");
+    }
+
+    #[cfg(feature = "rest-catalog")]
+    #[tokio::test]
+    async fn a_rest_catalog_still_refuses_a_warehouse_it_cannot_open() {
+        // The scheme selects *this process's* object-store backend whichever
+        // catalogue hands out the locations, so a backend the build did not
+        // compile in is an error here rather than a "cloud" warehouse silently
+        // written to local disk.
+        let err = IcebergRestCatalog {
+            uri: "https://catalog.internal",
+            warehouse_uri: "ftp://host/warehouse",
+            namespace: "metering",
+            file_target_bytes: 1,
+            props: Default::default(),
+        }
+        .build()
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ftp"), "{err}");
+    }
 
     #[test]
     fn scheme_defaults_to_file_when_absent() {

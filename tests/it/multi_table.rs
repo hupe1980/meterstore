@@ -164,6 +164,64 @@ async fn one_statement_can_mention_both_tables() {
 }
 
 #[tokio::test]
+async fn an_isolated_session_cannot_name_the_other_table() {
+    // Sharing one `SessionContext` is what makes the join above expressible, and
+    // it means any registered relation is reachable by naming it in
+    // caller-supplied SQL. Where a deployment keeps a stream out of a path — ESA
+    // "Werte nach Typ 2" must never reach a billing query — a deny-list of
+    // relation names holds until someone adds a table.
+    let (_h, catalog) = two_tables().await;
+
+    // In the shared session both are reachable.
+    assert!(catalog.query("SELECT COUNT(*) FROM esa_typ2").await.is_ok());
+
+    let billing = catalog.isolated("readings").await.expect("isolated");
+
+    // Its own relations still work, under both names.
+    assert!(billing.query("SELECT COUNT(*) FROM readings").await.is_ok());
+    assert!(
+        billing
+            .query("SELECT COUNT(*) FROM readings_versions")
+            .await
+            .is_ok()
+    );
+
+    // The other table is not in this session at all, so the statement fails to
+    // *plan* rather than being caught by the caller's vigilance.
+    for sql in [
+        "SELECT COUNT(*) FROM esa_typ2",
+        "SELECT COUNT(*) FROM esa_typ2_versions",
+        "SELECT COUNT(*) FROM readings UNION ALL SELECT COUNT(*) FROM esa_typ2",
+        "SELECT (SELECT COUNT(*) FROM esa_typ2)",
+    ] {
+        assert!(
+            billing.query(sql).await.is_err(),
+            "an isolated session must not reach the other table: {sql}"
+        );
+    }
+
+    // And the catalog itself is unaffected — isolation builds a query surface,
+    // not a second store.
+    assert!(catalog.query("SELECT COUNT(*) FROM esa_typ2").await.is_ok());
+    assert_eq!(catalog.len(), 2);
+}
+
+#[tokio::test]
+async fn isolating_an_unknown_table_names_what_is_there() {
+    let (_h, catalog) = two_tables().await;
+    let err = catalog
+        .isolated("no_such_table")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no_such_table"), "{err}");
+    assert!(
+        err.contains("readings"),
+        "the message lists what is held: {err}"
+    );
+}
+
+#[tokio::test]
 async fn a_result_carries_every_table_boundary_not_one() {
     // P1 across tables. Two tables genuinely have two watermarks (§15.3), so a
     // result that reported one number would be attributing a figure spanning
@@ -254,6 +312,33 @@ async fn a_result_is_attributed_only_to_the_tables_it_read() {
     // inventing one would be worse than reporting none.
     let none = catalog.query("SELECT 1").await.expect("query");
     assert!(none.watermarks().is_empty(), "{:?}", none.watermarks());
+
+    // **A table named only inside a subquery is still a table the statement
+    // read.** Attribution walks the logical plan, and a scalar subquery's plan
+    // hangs off an *expression* rather than off `inputs()` — a statement
+    // attributed to no table reports the epoch, that nothing has been settled.
+    let nested = catalog
+        .query(
+            "SELECT (SELECT COUNT(*) FROM readings) AS billing, \
+                    (SELECT COUNT(*) FROM esa_typ2) AS second",
+        )
+        .await
+        .expect("query");
+    let named: Vec<&str> = nested
+        .watermarks()
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect();
+    assert_eq!(named.len(), 2, "both subqueries name a table: {named:?}");
+    assert!(nested.watermark() > meterstore::TieringWatermark::empty());
+
+    // And a table reached through a CTE, which is the other shape a plain plan
+    // walk sees differently from the SQL an operator wrote.
+    let cte = catalog
+        .query("WITH r AS (SELECT * FROM readings) SELECT COUNT(*) FROM r")
+        .await
+        .expect("query");
+    assert_eq!(cte.watermarks().len(), 1, "{:?}", cte.watermarks());
 }
 
 #[tokio::test]
@@ -584,4 +669,41 @@ async fn a_flight_client_over_a_catalog_store_sees_every_table() {
     }
 
     drop(shutdown);
+}
+
+#[tokio::test]
+async fn one_maintenance_loop_covers_every_table_and_names_them_apart() {
+    // The operational half of what a catalogue is for. Each table keeps its own
+    // watermark, archiver and lease (§15.3); only the scheduling is shared, which
+    // is what gives a deployment one place to ask whether upkeep is keeping up.
+    let (_h, catalog) = two_tables().await;
+
+    let maintenance = catalog.maintenance();
+    let mut covered = maintenance.tables();
+    covered.sort_unstable();
+    assert_eq!(covered, vec![SECOND, TestHarness::TABLE]);
+
+    // One cycle, both tables archived, each reported by name.
+    let outcome = maintenance
+        .run_once(START + Duration::days(2))
+        .await
+        .expect("cycle");
+
+    assert_eq!(outcome.tables.len(), 2);
+    let mut named: Vec<&str> = outcome.tables.iter().map(|t| t.table.as_str()).collect();
+    named.sort_unstable();
+    assert_eq!(named, vec![SECOND, TestHarness::TABLE]);
+
+    assert!(outcome.rows_archived() > 0, "a window must have moved");
+    assert!(outcome.healthy(), "{:?}", outcome.tables);
+    assert_eq!(outcome.unhealthy().count(), 0);
+
+    // And both tables really did advance, rather than one being visited twice.
+    for store in catalog.tables() {
+        assert!(
+            store.watermark().await.expect("watermark").get() > START,
+            "{} did not advance",
+            store.config().name()
+        );
+    }
 }

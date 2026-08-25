@@ -88,6 +88,46 @@ impl Settings {
         self.tables.iter().map(TableSettings::validate).collect()
     }
 
+    /// Validate the tables **and** the `[hot]` and `[cold]` sections.
+    ///
+    /// [`validate`](Self::validate) checks only the tables, which is what a
+    /// caller wiring the tiers by hand needs; this is what
+    /// [`connect`](Self::connect) needs, and runs first.
+    ///
+    /// Separate rather than folded in, because a deployment may legitimately
+    /// bring its own catalogue (`IcebergCold` takes any `Arc<dyn Catalog>`) and
+    /// leave `[cold]` empty. Insisting on it in `validate` would refuse a file
+    /// that is complete for the way it is used.
+    pub fn validate_all(&self) -> Result<Vec<crate::config::ValidatedTableConfig>> {
+        self.hot.validate()?;
+        self.cold.validate()?;
+        self.validate()
+    }
+
+    /// Build both tiers and every table from the file.
+    ///
+    /// Returns the connection pool as well, because an application almost always
+    /// has its own use for it — the subject registry takes one, and so does
+    /// whatever else the service keeps in the same database.
+    ///
+    /// # It does not build the store
+    ///
+    /// A [`MeterStore`](crate::MeterStore) needs a cold *table provider*, which
+    /// needs the table to exist; and a deployment with several tables wants a
+    /// [`MeterCatalog`](crate::MeterCatalog) rather than N stores. Both are two
+    /// lines from here and neither is a configuration file's decision.
+    pub async fn connect(&self) -> Result<Deployment> {
+        let tables = self.validate_all()?;
+        let pool = self.hot.connect().await?;
+        let cold = self.cold.build().await?;
+        Ok(Deployment {
+            hot: std::sync::Arc::new(crate::hot::PostgresHot::new(pool.clone())),
+            pool,
+            cold,
+            tables,
+        })
+    }
+
     /// The single table's validated configuration.
     ///
     /// Convenience for the common deployment, which manages one table. Errors
@@ -124,6 +164,44 @@ pub struct HotSettings {
     pub max_connections: u32,
 }
 
+impl HotSettings {
+    /// Refuse a section that names no database.
+    ///
+    /// So that a missing `url` is a configuration error naming the setting,
+    /// rather than sqlx's opinion of a relative URL at the first connection.
+    pub fn validate(&self) -> Result<()> {
+        if self.url.trim().is_empty() {
+            return Err(Error::config(
+                "[hot] url is empty: the hot tier is PostgreSQL and there is nothing to \
+                 connect to. Set it, or use ${DATABASE_URL} to take it from the \
+                 environment",
+            ));
+        }
+        if self.max_connections == 0 {
+            return Err(Error::config(
+                "[hot] max_connections is 0: a pool that can hand out no connection \
+                 blocks the first query for ever rather than failing",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open the pool this section describes.
+    pub async fn connect(&self) -> Result<sqlx::PgPool> {
+        self.validate()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(self.max_connections)
+            .connect(&self.url)
+            .await
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "connecting to {}: {e}",
+                    crate::error::redacted(&self.url)
+                ))
+            })
+    }
+}
+
 impl Default for HotSettings {
     fn default() -> Self {
         Self {
@@ -136,7 +214,7 @@ impl Default for HotSettings {
 impl std::fmt::Debug for HotSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HotSettings")
-            .field("url", &redact(&self.url))
+            .field("url", &crate::error::redacted(&self.url))
             .field("max_connections", &self.max_connections)
             .finish()
     }
@@ -147,13 +225,21 @@ const fn default_max_connections() -> u32 {
 }
 
 /// Which Iceberg catalog, and where the warehouse lives.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written for the same reason [`HotSettings`]'s is: a SQL
+/// catalogue's [`uri`](Self::uri) is a PostgreSQL connection URL and therefore
+/// carries a password — usually the hot tier's own, since the recommended
+/// deployment puts the catalogue on the same database.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColdSettings {
     /// `rest` or `sql`.
     #[serde(default)]
     pub catalog: CatalogKind,
     /// Catalog endpoint (REST) or connection URL (SQL).
+    ///
+    /// Never logged in full: the `Debug` impl redacts it, because the SQL form
+    /// is a connection URL and carries a password.
     #[serde(default)]
     pub uri: String,
     /// Warehouse root — `s3://…`, `gs://…`, or a local path.
@@ -162,10 +248,189 @@ pub struct ColdSettings {
     /// Namespace the tables live in.
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    /// Target Parquet data-file size, in bytes.
+    ///
+    /// A cold-tier setting rather than a table one: it belongs to the object the
+    /// Parquet writer lives in.
+    #[serde(default = "default_file_target_bytes")]
+    pub file_target_bytes: usize,
+    /// Upper bound on the SQL catalogue's own metadata connection pool.
+    ///
+    /// Ignored by a REST catalogue, which opens no database of its own.
+    #[serde(default = "default_metadata_pool")]
+    pub metadata_pool_max_connections: u32,
+    /// Object-store region, for an S3-family warehouse.
+    ///
+    /// Only the **non-secret** half of [`WarehouseAuth`] is expressible here.
+    /// Keys are deliberately absent: the platform credential chain — environment,
+    /// instance role, IRSA — is the recommended path, and a secret in a
+    /// configuration file is a secret in a log. A deployment that genuinely needs
+    /// explicit keys builds the tier from [`IcebergSqlCatalog`] directly.
+    ///
+    /// [`WarehouseAuth`]: crate::cold::WarehouseAuth
+    /// [`IcebergSqlCatalog`]: crate::cold::IcebergSqlCatalog
+    #[serde(default)]
+    pub region: Option<String>,
+    /// S3-compatible endpoint override — MinIO, Ceph, R2, LocalStack.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for ColdSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColdSettings")
+            .field("catalog", &self.catalog)
+            .field("uri", &crate::error::redacted(&self.uri))
+            // The warehouse names a bucket rather than carrying a credential, so
+            // it stays legible — it is the field an operator reads this for.
+            .field("warehouse", &self.warehouse)
+            .field("namespace", &self.namespace)
+            .field("file_target_bytes", &self.file_target_bytes)
+            .field(
+                "metadata_pool_max_connections",
+                &self.metadata_pool_max_connections,
+            )
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+const fn default_file_target_bytes() -> usize {
+    crate::config::defaults::TARGET_FILE_SIZE
+}
+
+const fn default_metadata_pool() -> u32 {
+    4
 }
 
 fn default_namespace() -> String {
     "metering".to_string()
+}
+
+impl ColdSettings {
+    /// Refuse a section that cannot build a catalogue.
+    ///
+    /// Each refusal names the setting, so a `[cold]` naming no warehouse — or a
+    /// scheme this build did not compile in — fails here rather than as an
+    /// obscure failure at the first commit.
+    pub fn validate(&self) -> Result<()> {
+        if self.uri.trim().is_empty() {
+            return Err(Error::config(match self.catalog {
+                CatalogKind::Rest => {
+                    "[cold] uri is empty: a REST catalog is reached by its \
+                     endpoint and there is nothing to reach"
+                }
+                CatalogKind::Sql => {
+                    "[cold] uri is empty: a SQL catalog keeps its metadata in \
+                     PostgreSQL and there is no database named. It is normally the same URL \
+                     as [hot] url"
+                }
+            }));
+        }
+        if self.warehouse.trim().is_empty() {
+            return Err(Error::config(
+                "[cold] warehouse is empty: the catalog holds metadata, and the data files \
+                 need somewhere to live — file://, memory://, s3://, gs:// or abfss://",
+            ));
+        }
+        if self.namespace.trim().is_empty() {
+            return Err(Error::config("[cold] namespace must not be empty"));
+        }
+        if self.file_target_bytes == 0 {
+            return Err(Error::config(
+                "[cold] file_target_bytes is 0: the writer would roll a file per row",
+            ));
+        }
+        if self.metadata_pool_max_connections == 0 && self.catalog == CatalogKind::Sql {
+            return Err(Error::config(
+                "[cold] metadata_pool_max_connections is 0: the SQL catalog could open no \
+                 connection and every table load would block",
+            ));
+        }
+        // The scheme decides the object-store backend, and a backend whose
+        // feature was not compiled in is a configuration error rather than a
+        // silent fallback to local disk. Asked here so it fails at validation
+        // rather than at the first commit.
+        crate::cold::catalog::warehouse_factory(&self.warehouse)?;
+        Ok(())
+    }
+
+    /// Build the cold tier this section describes.
+    pub async fn build(&self) -> Result<crate::cold::ColdTier> {
+        self.validate()?;
+        match self.catalog {
+            CatalogKind::Sql => {
+                crate::cold::IcebergSqlCatalog {
+                    database_url: &self.uri,
+                    warehouse_uri: &self.warehouse,
+                    catalog_name: "meterstore",
+                    namespace: &self.namespace,
+                    file_target_bytes: self.file_target_bytes,
+                    metadata_pool_max_connections: self.metadata_pool_max_connections,
+                    auth: &crate::cold::WarehouseAuth {
+                        region: self.region.clone(),
+                        endpoint: self.endpoint.clone(),
+                        // Deliberately never from a file — see `region`.
+                        access_key_id: None,
+                        secret_access_key: None,
+                    },
+                }
+                .build()
+                .await
+            }
+            #[cfg(feature = "rest-catalog")]
+            CatalogKind::Rest => {
+                crate::cold::IcebergRestCatalog {
+                    uri: &self.uri,
+                    warehouse_uri: &self.warehouse,
+                    namespace: &self.namespace,
+                    file_target_bytes: self.file_target_bytes,
+                    props: std::collections::HashMap::new(),
+                }
+                .build()
+                .await
+            }
+            #[cfg(not(feature = "rest-catalog"))]
+            CatalogKind::Rest => Err(Error::config(
+                "[cold] catalog = \"rest\" needs the meterstore `rest-catalog` feature, \
+                 which was not compiled in",
+            )),
+        }
+    }
+}
+
+/// Both tiers and every table, built from one configuration file.
+///
+/// What [`Settings::connect`] returns. Deliberately not a
+/// [`MeterStore`](crate::MeterStore): that needs a cold table provider, which
+/// needs the table to exist, and a deployment with several tables wants a
+/// [`MeterCatalog`](crate::MeterCatalog) rather than N stores.
+pub struct Deployment {
+    /// The hot tier, ready for `MeterStoreBuilder::hot`.
+    pub hot: std::sync::Arc<crate::hot::PostgresHot>,
+    /// The pool behind it, for the subject registry and the application's own
+    /// tables — both of which belong in the same database.
+    pub pool: sqlx::PgPool,
+    /// The cold tier, and the catalogue façade over it.
+    pub cold: crate::cold::ColdTier,
+    /// Every table the file declares, validated, in declaration order.
+    pub tables: Vec<crate::config::ValidatedTableConfig>,
+}
+
+impl std::fmt::Debug for Deployment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deployment")
+            .field(
+                "tables",
+                &self
+                    .tables
+                    .iter()
+                    .map(crate::config::ValidatedTableConfig::name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// The catalog implementations this crate can drive.
@@ -187,6 +452,24 @@ pub enum CatalogKind {
 pub struct TableSettings {
     /// Physical table name.
     pub name: String,
+    /// What a row's timestamps mean: `"interval"` (a Lastgang) or `"point"` (a
+    /// Zählerstandsgang).
+    ///
+    /// Defaults to `"interval"`. The two are never one table: `value` is energy
+    /// over a span on one and a cumulative register reading on the other, so
+    /// summing them together produces a number with no meaning that looks
+    /// exactly like a consumption total.
+    #[serde(default)]
+    pub time_model: crate::config::TimeModel,
+    /// Whether the Messlokation is part of what identifies a reading.
+    ///
+    /// Omitted, it follows `time_model`: on for `"point"`, off for
+    /// `"interval"`. A register belongs to a meter and a load profile belongs to
+    /// a market location, and a Marktlokation may be measured by several
+    /// Messlokationen — so setting this wrongly on a Zählerstandsgang means two
+    /// meters' registers share a merge key.
+    #[serde(default)]
+    pub identify_by_melo: Option<bool>,
     /// Hot-tier layout.
     #[serde(default)]
     pub hot: TableHotSettings,
@@ -213,6 +496,7 @@ impl TableSettings {
     /// Build and validate the table configuration.
     pub fn validate(&self) -> Result<crate::config::ValidatedTableConfig> {
         let mut config = TableConfig::new(&self.name)
+            .time_model(self.time_model)
             .partition_step(self.hot.partition_step.0)
             .partition_headroom(self.hot.partition_headroom.0)
             .archival_step(self.archival.archival_step.0)
@@ -220,6 +504,10 @@ impl TableSettings {
             .scan_chunk_rows(self.archival.scan_chunk_rows)
             .snapshot_retention(self.maintenance.snapshot_retention.0)
             .min_snapshots_to_keep(self.maintenance.min_snapshots_to_keep);
+
+        if let Some(yes) = self.identify_by_melo {
+            config = config.identify_by_melo(yes);
+        }
 
         let mut seen = BTreeMap::new();
         for column in &self.extra_columns {
@@ -233,22 +521,24 @@ impl TableSettings {
         }
 
         if let Some(subject) = &self.subject_column {
-            // Declaring it twice would be a duplicate-column error from
-            // validation, with a message that does not explain the real mistake.
-            match seen.get(subject) {
-                Some(true) => {
-                    return Err(Error::config(format!(
-                        "subject_column {subject:?} is also declared as an identity column: a \
-                         pseudonymous reference must never join the merge key, or a correction \
-                         derived from a re-registered reference silently fails to supersede the \
-                         value it corrects (§19.4)"
-                    )));
-                }
-                // Already registered as an attribute, which is what
-                // `subject_column` would have done anyway.
-                Some(false) => {}
-                None => config = config.subject_column(subject),
+            // Named here whether or not `extra_columns` also spells it out:
+            // `TableConfig::subject_column` adopts an already-declared attribute
+            // column rather than declaring a second one, so what this adds in
+            // that case is the marker — and without the marker the write-path
+            // check against the registry never runs.
+            //
+            // The identity case is caught here rather than by `build`, whose
+            // message would be about a column declared twice rather than about
+            // the merge key.
+            if seen.get(subject) == Some(&true) {
+                return Err(Error::config(format!(
+                    "subject_column {subject:?} is also declared as an identity column: a \
+                     pseudonymous reference must never join the merge key, or a correction \
+                     derived from a re-registered reference silently fails to supersede the \
+                     value it corrects (§19.4)"
+                )));
             }
+            config = config.subject_column(subject);
         }
 
         config.build()
@@ -380,8 +670,7 @@ pub struct ExtraColumn {
     ///
     /// Present because §14's whole claim for this file is that it is a front end
     /// over the *same* validated types, with no setting reachable from one and
-    /// not the other. Coded columns arrived on the builder and briefly made that
-    /// false.
+    /// not the other.
     #[serde(default)]
     pub values: Option<Vec<String>>,
 }
@@ -551,21 +840,14 @@ fn interpolate(text: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Hide everything but the shape of a connection URL.
-fn redact(url: &str) -> String {
-    if url.is_empty() {
-        return String::new();
-    }
-    match url.split_once("://") {
-        Some((scheme, _)) => format!("{scheme}://<redacted>"),
-        None => "<redacted>".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The configuration page's own example, key for key.
+    ///
+    /// Kept in step deliberately: a documented key this never parses is a key a
+    /// reader copies and a `deny_unknown_fields` rejects.
     const EXAMPLE: &str = r#"
 [hot]
 url = "postgresql://edm@db.internal/prod"
@@ -576,13 +858,19 @@ catalog = "rest"
 uri = "https://catalog.internal"
 warehouse = "s3://edm/meterstore"
 namespace = "metering"
+file_target_bytes = 536870912
+metadata_pool_max_connections = 4
+region = "eu-central-1"
+endpoint = "https://minio.internal"
 
 [[tables]]
 name = "readings"
+time_model = "interval"
 subject_column = "subject_ref"
 extra_columns = [
-  { name = "tenant", identity = true },
+  { name = "tenant",        identity = true },
   { name = "bilanzkreis" },
+  { name = "ingest_source", values = ["MSCONS", "SMGW"] },
 ]
 
 [tables.hot]
@@ -624,12 +912,174 @@ min_snapshots_to_keep = 20
     }
 
     #[test]
+    fn a_point_table_is_reachable_from_the_configuration_file() {
+        // TOML is a front end over the same validated types, so a setting
+        // reachable from the builder and not from a file is a broken promise —
+        // and this one is a whole record type: a deployment configured from a
+        // file could not declare a Zählerstandsgang at all.
+        let s: Settings = toml::from_str(
+            r#"
+[hot]
+url = "postgresql://edm@db/prod"
+
+[cold]
+catalog = "sql"
+uri = "postgresql://edm@db/prod"
+warehouse = "file:///tmp/wh"
+namespace = "metering"
+
+[[tables]]
+name = "meter_reads_versions"
+time_model = "point"
+"#,
+        )
+        .expect("parse");
+
+        let table = s.single_table().expect("validate");
+        assert_eq!(table.time_model(), crate::config::TimeModel::Point);
+        // And the key follows the shape without being spelled out.
+        assert!(table.melo_in_merge_key());
+    }
+
+    #[test]
+    fn the_messlokation_key_can_be_pinned_from_the_configuration_file() {
+        let s: Settings = toml::from_str(
+            r#"
+[hot]
+url = "postgresql://edm@db/prod"
+
+[cold]
+catalog = "sql"
+uri = "postgresql://edm@db/prod"
+warehouse = "file:///tmp/wh"
+namespace = "metering"
+
+[[tables]]
+name = "meter_reads_versions"
+time_model = "point"
+identify_by_melo = false
+"#,
+        )
+        .expect("parse");
+
+        assert!(!s.single_table().expect("validate").melo_in_merge_key());
+    }
+
+    #[test]
+    fn a_table_defaults_to_the_interval_shape() {
+        let s: Settings = toml::from_str(EXAMPLE).expect("parse");
+        let table = s.single_table().expect("validate");
+        assert_eq!(table.time_model(), crate::config::TimeModel::Interval);
+        assert!(!table.melo_in_merge_key());
+    }
+
+    #[test]
     fn the_subject_column_is_registered_as_an_attribute() {
         let table = Settings::from_toml(EXAMPLE)
             .unwrap()
             .single_table()
             .unwrap();
         assert_eq!(table.subject_column(), Some("subject_ref"));
+        assert!(!table.merge_key().contains(&"subject_ref".to_string()));
+    }
+
+    #[test]
+    fn the_infrastructure_sections_are_validated_too() {
+        // They were parsed, exposed and consumed by nothing, so nothing checked
+        // them: an empty `url`, an empty `warehouse`, a scheme this build cannot
+        // open — all passed `validate` and surfaced, if at all, as an obscure
+        // failure much later.
+        let example: Settings = Settings::from_toml(EXAMPLE).unwrap();
+        example
+            .validate_all()
+            .expect("the documented example is complete");
+
+        for (mutate, expected) in [
+            (
+                Box::new(|s: &mut Settings| s.hot.url.clear()) as Box<dyn Fn(&mut Settings)>,
+                "[hot] url",
+            ),
+            (
+                Box::new(|s: &mut Settings| s.hot.max_connections = 0),
+                "max_connections",
+            ),
+            (
+                Box::new(|s: &mut Settings| s.cold.uri.clear()),
+                "[cold] uri",
+            ),
+            (
+                Box::new(|s: &mut Settings| s.cold.warehouse.clear()),
+                "[cold] warehouse",
+            ),
+            (
+                Box::new(|s: &mut Settings| s.cold.file_target_bytes = 0),
+                "file_target_bytes",
+            ),
+            (
+                Box::new(|s: &mut Settings| "ftp://host/wh".clone_into(&mut s.cold.warehouse)),
+                "ftp",
+            ),
+        ] {
+            let mut broken = example.clone();
+            mutate(&mut broken);
+            let err = broken
+                .validate_all()
+                .expect_err("a section that cannot build a tier must not validate")
+                .to_string();
+            assert!(err.contains(expected), "expected {expected:?} in {err}");
+
+            // And the *table* validation is unchanged: a file complete for a
+            // deployment wiring its own tiers still passes.
+            broken
+                .validate()
+                .expect("validate checks the tables, which are still fine");
+        }
+    }
+
+    #[test]
+    fn the_cold_section_never_prints_its_password() {
+        // The SQL form of `uri` is a PostgreSQL connection URL — usually the hot
+        // tier's own — and configuration is what a service dumps at startup.
+        let mut settings = Settings::from_toml(EXAMPLE).unwrap();
+        settings.cold.catalog = CatalogKind::Sql;
+        "postgresql://edm:hunter2@db.internal/prod".clone_into(&mut settings.cold.uri);
+
+        let shown = format!("{:?}", settings.cold);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("postgresql://<redacted>"), "{shown}");
+        assert!(shown.contains("s3://edm/meterstore"), "{shown}");
+    }
+
+    #[test]
+    fn a_subject_column_also_listed_in_extra_columns_is_still_the_subject_column() {
+        // Naming the column in both places is one statement, not two — and the
+        // marker is the half that matters: without it `subject_column()` is
+        // `None`, the write-path check against the registry never runs, and the
+        // builder's "subject column without a registry" refusal never fires.
+        let toml = r#"
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+extra_columns = [{ name = "subject_ref", values = ["A", "B"] }]
+"#;
+        let table = Settings::from_toml(toml).unwrap().single_table().unwrap();
+
+        assert_eq!(table.subject_column(), Some("subject_ref"));
+        // Declared once, not twice — and the declaration that survives is the
+        // deployment's own, vocabulary and all.
+        let declared: Vec<_> = table
+            .attribute_columns()
+            .iter()
+            .filter(|f| f.name() == "subject_ref")
+            .collect();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(
+            declared[0]
+                .metadata()
+                .get(crate::config::CHECK_VALUES_KEY)
+                .map(String::as_str),
+            Some("A,B"),
+        );
         assert!(!table.merge_key().contains(&"subject_ref".to_string()));
     }
 
@@ -788,7 +1238,7 @@ settlment_lag = "7d"
     fn a_coded_column_is_declarable_from_a_file() {
         // §14's claim for this file is that it is a front end over the *same*
         // validated types, with no setting reachable from one and not the other.
-        // Coded columns arrived on the builder and briefly made that false.
+        // §14: no setting is reachable from the builder and not from here.
         let toml = r#"
 [[tables]]
 name = "readings"

@@ -78,17 +78,34 @@ impl CatalogFacade {
     /// explicit that this needs authentication before it leaves a trusted
     /// network, and a router is the shape that lets a caller add it.
     pub fn router(self) -> Router {
+        // Every read route carries the same method fallback, so a mutating verb
+        // against a path this façade *does* serve is refused with the reason
+        // rather than with axum's bare `405` and an empty body. That is not
+        // cosmetic: an Iceberg client parses the spec's error envelope, so a
+        // bodiless refusal reads to it as a broken endpoint rather than as a
+        // read-only one — which is precisely the confusion `ApiError` exists to
+        // prevent, and `createTable` and `dropNamespace` are the two calls most
+        // likely to arrive.
+        //
+        // `get` also answers HEAD, so `namespaceExists` and `tableExists` keep
+        // working: they are reads.
         Router::new()
-            .route("/v1/config", get(config))
-            .route("/v1/namespaces", get(list_namespaces))
-            .route("/v1/namespaces/{namespace}", get(load_namespace))
-            .route("/v1/namespaces/{namespace}/tables", get(list_tables))
+            .route("/v1/config", get(config).fallback(read_only))
+            .route("/v1/namespaces", get(list_namespaces).fallback(read_only))
+            .route(
+                "/v1/namespaces/{namespace}",
+                get(load_namespace).fallback(read_only),
+            )
+            .route(
+                "/v1/namespaces/{namespace}/tables",
+                get(list_tables).fallback(read_only),
+            )
             .route(
                 "/v1/namespaces/{namespace}/tables/{table}",
-                get(load_table).fallback(any(read_only)),
+                get(load_table).fallback(read_only),
             )
-            // Anything else that mutates, including routes a future spec version
-            // adds: refused by shape rather than by enumeration.
+            // A path this façade does not serve at all, including routes a future
+            // spec version adds: refused by shape rather than by enumeration.
             .fallback(any(not_found))
             .with_state(self)
     }

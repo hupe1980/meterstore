@@ -15,10 +15,13 @@
 //! - **Will something be wrong soon?** `watermark_lag` and
 //!   `hot_partitions_ahead` both trend toward failure before they cause one —
 //!   running out of partitions stops writes outright.
-//! - **Is the cold tier earning its layout?** `merge_elided` over
-//!   `merge_elision_decisions` says how often version resolution is skipped. It
-//!   falls as corrections accumulate and would recover with compaction, so it is
-//!   the number that shows the cost of not having it.
+//! - **How much of the history is settled?** `merge_elided` over
+//!   `merge_elision_decisions` says how often a historical scan skipped version
+//!   resolution. It falls as corrections accumulate in the ranges being queried
+//!   — which is the *data* changing, not the layout degrading. Compaction would
+//!   not recover it and would cost some of it: a corrected reading has two
+//!   versions stored however the bytes are arranged, and a coarser file makes
+//!   more uncorrected keys share one with it.
 
 use std::sync::OnceLock;
 
@@ -63,9 +66,9 @@ pub struct Metrics {
     pub merge_elision_decisions: Counter<u64>,
     /// Scans that skipped version resolution.
     ///
-    /// Divided by `merge_elision_decisions` this is the elided ratio — the
-    /// signal that says whether the cold tier's layout is still earning its
-    /// keep, and the number that would justify compaction.
+    /// Divided by `merge_elision_decisions` this is the elided ratio: how much
+    /// of the queried history is settled enough to read without ranking. See the
+    /// module documentation for why compaction is not the lever it looks like.
     pub merge_elided: Counter<u64>,
 
     /// Seconds between the watermark and wall clock.

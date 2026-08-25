@@ -48,7 +48,8 @@ fn reading(kwh: i64, version: u128, quality: QualityFlag) -> meterstore::encode:
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", START).unwrap(),
+            meterstore::VersionScope::for_interval("99", START, metering::interval::Sparte::Strom)
+                .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-26 06:00 UTC),
@@ -86,7 +87,7 @@ async fn a_first_value_reports_an_insert_and_supersedes_nothing() {
     assert_eq!(d.from, START);
     assert_eq!(
         d.to,
-        START + Duration::minutes(15),
+        Some(START + Duration::minutes(15)),
         "the displacement carries the interval end, not a collapse to its start"
     );
 }
@@ -254,4 +255,144 @@ async fn the_report_matches_what_a_query_returns() {
         outcome.displacements[0].current().value,
         "the reported current value must be the one a query returns"
     );
+}
+
+// ── Values the operator authors ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn an_authored_value_takes_effect_over_a_higher_stated_version() {
+    // A § 60 Abs. 2 MsbG Ersatzwert replaces a FAULTY interval that arrived
+    // under a real MSCONS version, so the version the operator can put on its
+    // own value is *lower* than the one it has to beat. Through `append` the row
+    // is stored and silently shadowed — audited, confirmed, never current.
+    let (_h, store) = store().await;
+
+    // A faulty reading arrives from the network operator at a high version.
+    store
+        .append(&[reading(10, 20_260_726_000_500, QualityFlag::Faulty)])
+        .await
+        .expect("the delivery");
+
+    // The operator authors a substitute. Its own version is far lower.
+    let authored = reading(42, 1_787_637_600_123, QualityFlag::Substituted);
+
+    // Through `append` it is stored and silently outranked.
+    let shadowed = store
+        .append(std::slice::from_ref(&authored))
+        .await
+        .expect("append");
+    assert_eq!(shadowed.displacements[0].effect, Effect::Shadowed);
+    assert_eq!(
+        current_value(&store).await,
+        "10",
+        "the plain append leaves the faulty value in force"
+    );
+
+    // Through `append_authoritative` it takes effect.
+    let outcome = store
+        .append_authoritative(&[authored])
+        .await
+        .expect("authoritative append");
+
+    assert_eq!(outcome.displacements.len(), 1);
+    let d = &outcome.displacements[0];
+    assert!(
+        d.effect.changed_current_value(),
+        "an authored value must take effect, got {:?}",
+        d.effect
+    );
+    assert_eq!(
+        d.written.version.version().get(),
+        20_260_726_000_501,
+        "one above the version that held it, in that version's own scope"
+    );
+    assert_eq!(
+        d.written.version.scope(),
+        d.superseded.as_ref().unwrap().version.scope(),
+        "the stored scope is continued, never re-derived"
+    );
+    assert_eq!(current_value(&store).await, "42");
+}
+
+#[tokio::test]
+async fn re_asserting_the_value_already_in_force_writes_nothing() {
+    // Idempotence. Authoring a value that already holds is a no-op, not a
+    // version bump — otherwise a retried confirmation would walk the version
+    // number upwards forever.
+    let (_h, store) = store().await;
+
+    let authored = reading(42, 20_260_726_000_100, QualityFlag::Substituted);
+    let first = store
+        .append_authoritative(std::slice::from_ref(&authored))
+        .await
+        .expect("first");
+    assert_eq!(first.displacements[0].effect, Effect::Inserted);
+    let landed = first.displacements[0].written.version.version().get();
+
+    let again = store
+        .append_authoritative(&[authored])
+        .await
+        .expect("second");
+    assert_eq!(again.total(), 0, "nothing was written");
+    assert_eq!(again.displacements[0].effect, Effect::Duplicate);
+    assert_eq!(
+        again.displacements[0].written.version.version().get(),
+        landed,
+        "the version must not creep on a replay"
+    );
+    assert_eq!(current_value(&store).await, "42");
+}
+
+#[tokio::test]
+async fn an_authored_value_beats_a_chain_of_higher_versions() {
+    // More than one round: each retry re-authors above whatever now holds.
+    let (_h, store) = store().await;
+
+    for (kwh, version) in [(10i64, 20_260_726_000_500u128), (11, 20_260_726_000_900)] {
+        store
+            .append(&[reading(kwh, version, QualityFlag::Measured)])
+            .await
+            .expect("delivery");
+    }
+
+    let outcome = store
+        .append_authoritative(&[reading(42, 1, QualityFlag::Corrected)])
+        .await
+        .expect("authoritative");
+
+    assert!(outcome.displacements[0].effect.changed_current_value());
+    assert_eq!(
+        outcome.displacements[0].written.version.version().get(),
+        20_260_726_000_901
+    );
+    assert_eq!(current_value(&store).await, "42");
+}
+
+#[tokio::test]
+async fn a_pinned_session_cannot_author_a_value() {
+    // The same posture `append` takes: every check the write path makes is a
+    // query against this session, so through a pinned handle each would be
+    // answered from a state that is deliberately not current.
+    let (_h, store) = store().await;
+    let known_at = store
+        .as_known_at(datetime!(2026-07-26 06:00 UTC))
+        .await
+        .expect("session");
+    let err = known_at
+        .append_authoritative(&[reading(42, 1, QualityFlag::Corrected)])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("append_authoritative"), "{err}");
+}
+
+/// The value a query currently returns for the single seeded interval.
+async fn current_value(store: &meterstore::MeterStore) -> String {
+    let rows = store
+        .query(r#"SELECT CAST(value AS BIGINT) AS v FROM readings"#)
+        .await
+        .expect("query")
+        .to_json()
+        .expect("json");
+    rows[0]["v"].to_string()
 }

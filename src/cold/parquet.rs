@@ -32,8 +32,8 @@ const BLOOM_FPP: f64 = 0.01;
 /// OBIS codes come from a standardised code list, and a deployment reads a
 /// handful of channels per measuring point — import, export, reactive, a few
 /// tariff registers. 256 is generous for that and costs about 300 bytes per
-/// file; the measuring-point count, which this column was previously sized with,
-/// costs ~120 KiB for the same information.
+/// file; sizing it by the measuring-point count instead costs ~120 KiB for the
+/// same information.
 const OBIS_CODE_NDV: u64 = 256;
 
 /// Rows per data page.
@@ -120,11 +120,16 @@ pub fn writer_properties(expected_malo_ids: u64) -> WriterProperties {
     }
 
     // Declare the sort order in the footer, so a reader can exploit it rather
-    // than rediscovering it. The archival scan orders by a cursor whose *prefix*
-    // is exactly these columns (`ScanSpec::cursor_columns`), which is why that
-    // cursor appends the remaining key columns after `(malo_id, from)` instead
-    // of interleaving them: a footer that declared an order the rows are not in
-    // would be worse than no declaration at all.
+    // than rediscovering it. A footer declaring an order the rows are not in is
+    // worse than no declaration — what it produces is a silently skipped row
+    // group, not a slow scan — so both cold writers satisfy it, differently:
+    //
+    // * **Archival** gets it for free. The hot scan pages by a keyset cursor
+    //   whose *prefix* is exactly these columns (`ScanSpec::cursor_columns`),
+    //   which is why that cursor appends the remaining key columns after
+    //   `(malo_id, from)` instead of interleaving them.
+    // * **A late correction** is written straight from the delivery, so it is
+    //   sorted first (`encode::sorted_for_storage`).
     builder = builder.set_sorting_columns(Some(sorting_columns()));
 
     builder.build()
@@ -213,9 +218,8 @@ mod tests {
     #[test]
     fn the_channel_filter_is_sized_for_channels_not_for_meters() {
         // A bloom filter costs ~9.6 bits per declared distinct value at 1 % fpp,
-        // so sizing `obis_code` with the measuring-point count builds a ~120 KiB
-        // filter for a column holding a few dozen codes. Both columns were
-        // previously given the same number.
+        // so sizing `obis_code` with the measuring-point count would build a
+        // ~120 KiB filter for a column holding a few dozen codes.
         let props = writer_properties(1_000_000);
         let obis = props
             .bloom_filter_properties(&ColumnPath::from(col::OBIS_CODE))

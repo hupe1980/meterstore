@@ -13,7 +13,7 @@ mapping needs no lookup table.
 | Column | Arrow | Iceberg | Source |
 |---|---|---|---|
 | `malo_id` | `Utf8` | `string` | 11-digit Marktlokation, check digit verified |
-| `melo_id` | `Utf8`, nullable | `string` | 33-char Messlokation |
+| `melo_id` | `Utf8`, nullable | `string` | 33-char Messlokation — **`NOT NULL` and part of the key** where the table [identifies a reading by it](#the-messlokation-may-be-part-of-the-identity) |
 | `obis_code` | `Utf8` | `string` | Canonical form only |
 | `sparte` | `Utf8` | `string` | `STROM`, `GAS`, `WAERME`, `WASSER` |
 | `from` | `Timestamp(µs, UTC)` | `timestamptz` | Interval start, inclusive |
@@ -22,16 +22,22 @@ mapping needs no lookup table.
 | `unit` | `Utf8` | `string` | `KWH` or `M3` |
 | `quality` | `Utf8` | `string` | `MEASURED`, `SUBSTITUTED`, … |
 | `resolution` | `Utf8`, nullable | `string` | ISO 8601, e.g. `PT15M` |
-| `source_kind` | `Utf8` | `string` | Filterable discriminant |
+| `source_kind` | `Utf8` | `string` | Filterable discriminant — the payload's own tag (`MSCONS`, …) |
 | `source_detail` | `Utf8`, nullable | `string` | JSON variant payload |
 | `provenance` | `Utf8`, nullable | `string` | JSON audit trail |
 | `version` | `Decimal128(20,0)` | `decimal(20,0)` | MSCONS correction version |
-| `version_scope` | `Utf8` | `string` | `<operator>:<YYYY-MM>` |
+| `version_scope` | `Utf8` | `string` | `<operator>:<YYYY-MM>` — the **Bilanzierungsmonat**, cut at 06:00 for gas |
 | `recorded_at` | `Timestamp(µs, UTC)` | `timestamptz` | Transaction time |
 | `balancing_day` | `Date32` | `date` | The local day this reading is booked on |
 
-**Merge key:** `(malo_id, obis_code, from)` · **winner:** `max(version)` within
-the same `version_scope`.
+`to` is the one column whose meaning depends on the table's **time model**: the
+span's end on an interval table, null on a point one.
+
+
+**Merge key:** `(malo_id, obis_code, from)` — plus `melo_id` on a table that
+[identifies a reading by its Messlokation](#the-messlokation-may-be-part-of-the-identity),
+plus any [identity columns](#identity-versus-attribute-columns) · **winner:**
+`max(version)` within the same `version_scope`.
 
 ### `balancing_day` is derived, and stored anyway
 
@@ -52,6 +58,48 @@ over every commodity across a DST weekend. A day's rows share one value, so it
 dictionary-encodes to nearly nothing. The column is `NOT NULL` with no default,
 so a hand-written `INSERT` that omits it fails at the write rather than storing a
 wrong day.
+
+### `source_kind` is the payload's own tag
+
+`MeasurementSource` is a data-carrying enum, so it needs two columns: a
+discriminant that dictionary-encodes and filters cheaply, and a JSON payload that
+round-trips the variant's fields exactly.
+
+The discriminant is **read off the payload**, not written out beside it. A
+hand-written list would be a second spelling of a vocabulary `metering` already
+owns — and the payload in the very next column is renamed
+`SCREAMING_SNAKE_CASE`, so an external engine filtering `source_kind = 'MSCONS'`
+would find the two columns disagreeing.
+
+Taking the tag from the serialised form means a variant renamed upstream moves
+both columns together, and a variant added upstream needs no edit here.
+
+### Codes are stored canonically, and only canonically
+
+`sparte`, `unit`, `quality` and `resolution` hold exactly the string the domain
+writes. `metering`'s `FromStr` is deliberately lenient — it trims, ignores case,
+and accepts input aliases such as `WÄRME` for `WAERME`. That is right at an
+ingest boundary and wrong for storage, because these columns are `GROUP BY` keys:
+completeness groups by three of them, and two spellings of one commodity are two
+rows in a report an operator is meant to be able to trust.
+
+The hot tier refuses them already — its `CHECK … IN (…)` is rendered from `CODES`,
+which is uppercase-canonical and excludes aliases. **Iceberg has no constraints**,
+so decoding carries the same rule: a non-canonical spelling is a decode error
+naming the canonical one, never a silently normalised value. `PT900S` and `PT15M`
+are the same grid, and only `PT15M` is stored.
+
+### `to` is null on a point table
+
+One schema describes both time models, and `to` is what separates them: an
+interval row carries the span's exclusive end, a **point** row — a Zählerstand —
+carries null, because an instant has no end. `value` means the register's
+cumulative reading there rather than energy over a span, which is why the two are
+never the same table. See
+[Zählerstandsgänge](@/docs/writing.md).
+
+An interval table keeps `NOT NULL` in its own PostgreSQL DDL and the encoder
+refuses a null before the write, so nothing loosens for a Lastgang.
 
 ### `to` is stored, not computed
 
@@ -133,8 +181,30 @@ That last point is load-bearing. A scope keyed to the **delivery** month would
 give a July reading corrected in August two different scopes, so neither could
 supersede the other, both rows would survive resolution, and every sum over them
 would be inflated — with no error anywhere. `VersionScope::for_interval` derives
-it from the interval's *local* month, and encoding rejects a scope that does not
-cover its intervals.
+it from the interval, and encoding rejects a scope that does not cover its
+intervals.
+
+### The month is the Bilanzierungsmonat, and gas cuts it at 06:00
+
+It is a *local* month, because German market processes are defined in local time:
+an interval starting `2026-07-31T23:00Z` is already August in Berlin.
+
+For gas it is not the calendar month at all. EDI@Energy *Allgemeine Festlegungen*
+v6.1c, Kap. 3.1 spells out the Bilanzierungsmonat Juni 2021 as 01.06 00:00 to
+01.07 00:00 for Strom and 01.06 **06:00** to 01.07 **06:00** for Gas — the Gastag
+boundary carries all the way up, so a gas month is a whole number of Gastage
+rather than a calendar month shifted. An interval at 02:00 local on 1 March
+belongs to *February's* gas scope.
+
+So every `VersionScope` constructor takes a `Sparte`:
+
+```rust
+let scope = VersionScope::for_interval(operator, interval.from, Sparte::Gas)?;
+```
+
+It is not decoration: a producer deriving the correct gas Bilanzierungsmonat and
+one deriving the calendar month disagree by six hours at every month boundary,
+and `covers` refuses whichever the store was not told to expect.
 
 ## Identity versus attribute columns
 
@@ -169,6 +239,14 @@ Extra columns are `Utf8` only, and a declared name must be a plain identifier:
 names are written into DDL and SQL as identifiers, which cannot be parameterised,
 so the alphabet is restricted once rather than quoted carefully in five places.
 
+The **table** name is held to the same rule, and to a length: at most 34
+characters. PostgreSQL truncates an identifier at 63 bytes without saying so, and
+every name derived from the table's is longer — a partition adds
+`_YYYY_MM_DD_HHMM`, and its integrity constraints add `_one_operator` on top of
+that. Past 34 the two constraint names on one partition truncate to the same
+string and the second `ADD CONSTRAINT` fails, on the first write of a new day
+rather than at declaration. So it is refused at `build()`.
+
 ### Coded columns
 
 An extra column whose values are a fixed vocabulary — an ingestion source, a
@@ -187,6 +265,43 @@ That renders a `CHECK … IN (…)` on the hot table, exactly like the built-in
 rather than being read back later as an unknown code. MeterStore stays
 domain-agnostic: it enforces whatever set you supply, carried in the field's
 Arrow metadata so it disturbs neither the type nor schema evolution.
+
+## The Messlokation may be part of the identity
+
+A **Marktlokation** may be measured by more than one **Messlokation**, and that is
+ordinary: a Mehrfamilienhaus split into sub-measurements, a house whose
+Einliegerwohnung has its own meter. The network operator assigns them, many-to-one.
+
+| | Lastgang (`TimeModel::Interval`) | Zählerstandsgang (`TimeModel::Point`) |
+|---|---|---|
+| What a row is | the market location's load in a span | **a meter's** register reading at an instant |
+| `melo_id` | labels the row | *names* it |
+| In the merge key | no, by default | **yes**, by default |
+
+A load profile belongs to the market location, one channel however many meters
+produce it — keying on the Messlokation there is the mistake the
+[subject column](@/docs/privacy.md) avoids, where a correction against a
+re-registered Messlokation gets a different key and fails to supersede.
+
+A register belongs to the *meter*, so both meters under one market location carry
+`1-0:1.8.0` at the same instants. Keyed on the market location they collide: a
+differing pair is refused as a value restated under an existing version — loud,
+about the wrong thing — and an agreeing pair, which two freshly installed meters
+are at zero, has one of them dropped by `ON CONFLICT DO NOTHING`.
+
+```rust
+TableConfig::new("meter_reads_versions").time_model(TimeModel::Point)
+TableConfig::new("readings_versions").identify_by_melo(true)   // or pin it either way
+```
+
+A portfolio with one Messlokation per Marktlokation has nothing to gain from the
+wider key; a sub-metering deployment may want it on a Lastgang.
+
+In the key, `melo_id` is `NOT NULL`, a delivery naming none is refused, and a
+session can be [scoped](@/docs/querying.md#confining-a-session) to one
+Messlokation. Out of it, both tiers still **compare** the column on a redelivery
+and refuse a second Messlokation under an existing reading, naming
+`identify_by_melo`.
 
 ## A tenant is not a market participant
 
@@ -211,17 +326,24 @@ different readings.
 
 The merge key plus `version` is a primary key, and it is not the whole guard: two
 rows for one channel at one version must differ in `from`, and two ranges that
-differ in `from` can still *overlap*. An hourly delivery followed by a
-quarter-hourly one leaves both stored, and every aggregate over them
-double-counts.
+differ in `from` can still *overlap*. A delivery carrying one hour as
+`00:00–01:00` **and** the quarter-hours inside it leaves five rows standing where
+four belong, and every aggregate over them double-counts.
 
 Each hot partition therefore carries two `EXCLUDE USING gist` constraints:
 
-1. **No overlapping intervals within one version.** Scoped to a version, so a
-   correction — a higher version covering the same span — stays legal. The
-   equality columns are read from the parent's actual primary key, so a
-   tenant-extended key produces a tenant-*scoped* exclusion rather than one that
-   rejects another tenant's reading.
+1. **No overlapping intervals within one version.** Scoped to a version, because a
+   correction *is* a higher version covering the same span: comparing across
+   versions would refuse the one write the model is built around. The equality
+   columns are read from the parent's actual primary key, so a tenant-extended key
+   produces a tenant-*scoped* exclusion rather than one that rejects another
+   tenant's reading.
+
+   So two rows at *different* versions may overlap, and usually should. Resolution
+   collapses the ordinary case — a re-grid restating every interval start
+   supersedes each one on its merge key — but a **partial** re-grid leaves two
+   winners covering the same span. Nothing at the write can see that; it surfaces
+   as `surplus` in [completeness](@/docs/completeness.md).
 2. **One network operator per reading.** Two operators for one reading give two
    incomparable scopes, resolution picks a winner in each, and **both** survive
    into the resolved view. The realistic cause is not a grid-operator change —

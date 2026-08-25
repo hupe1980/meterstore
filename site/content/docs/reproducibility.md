@@ -105,6 +105,21 @@ Three details the implementation forced:
 | "What is true now, over settled history only, with no load on the database?" | `ReadMode::Historical` |
 | "What is in the recent window?" | `ReadMode::Operational` |
 
+## A pinned session is read-only
+
+`append` and `hot_writer` are refused on any session that is not reading current
+best knowledge — `as_of`, `as_known_at`, `Historical` and `Operational` alike.
+
+The rows would land in the real table; it is the *reasoning* about them that would
+be wrong. Every check the write path makes is a query against the session that is
+writing — is this a replay, does this reading already carry another network
+operator, what did the write displace — so through a pinned handle each of those
+is answered from a state that is deliberately not current. A replayed correction
+invisible in the pinned snapshot would be stored twice.
+
+The store the pinned one was derived from is unaffected, so the fix is always to
+keep hold of it rather than reaching back through the derived handle.
+
 ## What is not guaranteed
 
 **Cross-table consistency.** Each table archives independently, so a query joining

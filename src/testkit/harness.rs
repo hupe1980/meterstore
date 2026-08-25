@@ -1,10 +1,9 @@
 //! A real PostgreSQL and a real Iceberg warehouse, in one call.
 //!
-//! Every integration suite in this repository used to open with the same eighty
-//! lines: start a container, connect a pool, build a temporary warehouse, load a
-//! SQL catalog, create both tiers, assemble a store. That is not incidental
-//! duplication — it is the setup a *deployment* has to get right too, and eighty
-//! lines copied six times is six places for it to drift.
+//! Starting a container, connecting a pool, building a temporary warehouse,
+//! loading a SQL catalog, creating both tiers and assembling a store is eighty
+//! lines every suite would otherwise repeat — and it is the setup a *deployment*
+//! has to get right too, so a copy per suite is a copy per suite to drift.
 //!
 //! # Why the fixtures are real
 //!
@@ -123,6 +122,7 @@ impl TestHarness {
                 harness.config.name(),
                 &harness.config.merge_key(),
                 &harness.config.extra_columns(),
+                harness.config.time_model(),
             )
             .await?;
         harness
@@ -278,6 +278,24 @@ impl TestHarness {
     ) -> Result<()> {
         for delivery in series {
             store.append(std::slice::from_ref(delivery)).await?;
+        }
+        Ok(())
+    }
+
+    /// [`ingest`](Self::ingest) for a **Zählerstandsgang** workload.
+    ///
+    /// Through [`MeterStore::append_readings`], for the same reason: the routing
+    /// rule and the reconciliation a late correction goes through are the things
+    /// under test, and raw SQL would step past both.
+    pub async fn ingest_readings(
+        &self,
+        store: &MeterStore,
+        deliveries: &[crate::encode::StoredReadings],
+    ) -> Result<()> {
+        for delivery in deliveries {
+            store
+                .append_readings(std::slice::from_ref(delivery))
+                .await?;
         }
         Ok(())
     }

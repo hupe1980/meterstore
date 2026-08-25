@@ -67,11 +67,14 @@ pub fn recorded_at_ceiling(at: OffsetDateTime) -> Expr {
 }
 
 /// A timestamp literal in the unit and zone the storage schema uses.
+///
+/// The encoding is [`schema::timestamp_scalar`]'s, so a bound this module builds
+/// and a value the encoder wrote are the same shape by construction rather than
+/// by two functions agreeing.
+///
+/// [`schema::timestamp_scalar`]: crate::encode::schema::timestamp_scalar
 fn timestamp_lit(t: OffsetDateTime) -> Expr {
-    datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(
-        Some((t.unix_timestamp_nanos() / 1_000) as i64),
-        Some("UTC".into()),
-    ))
+    datafusion::logical_expr::lit(crate::encode::schema::timestamp_scalar(t))
 }
 
 /// The range a single expression constrains `from` to.
@@ -197,10 +200,24 @@ fn is_lossless_target(ty: &crate::arrow::datatypes::DataType) -> bool {
 }
 
 /// Read a literal timestamp, whatever unit it was written in.
+///
+/// A cast **around the literal** is seen through only when it cannot move the
+/// value, by the same rule [`is_from_column`] applies to the column side. The
+/// asymmetry is tempting — the column's cast truncates rows, the literal's only
+/// truncates one number — and it is not real: `from >= CAST(<nanos> AS
+/// Timestamp(Second))` bounds `from` at the *truncated* second, which is below
+/// the literal, so reading the literal instead narrows the range and drops the
+/// rows in between. §17.1 permits error in the widening direction only, so an
+/// unrecognised cast leaves the range unbounded and costs a scan.
 fn as_timestamp(expr: &Expr) -> Option<OffsetDateTime> {
     let scalar = match expr {
         Expr::Literal(v, _) => v,
-        Expr::Cast(cast) => return as_timestamp(&cast.expr),
+        Expr::Cast(cast) if is_lossless_target(&cast.data_type) => {
+            return as_timestamp(&cast.expr);
+        }
+        Expr::TryCast(cast) if is_lossless_target(&cast.data_type) => {
+            return as_timestamp(&cast.expr);
+        }
         _ => return None,
     };
 
@@ -241,10 +258,7 @@ mod tests {
 
     /// A timestamp literal in the unit storage uses.
     fn ts(t: OffsetDateTime) -> Expr {
-        lit(ScalarValue::TimestampMicrosecond(
-            Some((t.unix_timestamp_nanos() / 1_000) as i64),
-            Some("UTC".into()),
-        ))
+        lit(crate::encode::schema::timestamp_scalar(t))
     }
 
     fn from() -> Expr {
@@ -451,6 +465,50 @@ mod tests {
     }
 
     #[test]
+    fn a_truncating_cast_around_the_literal_yields_no_bound_either() {
+        use crate::arrow::datatypes::{DataType, TimeUnit};
+
+        // The mirror of `a_truncating_cast_is_not_mistaken_for_a_bound_on_the
+        // _column`, and the direction that is easy to wave through: casting the
+        // *literal* down to seconds truncates it, so `from >= CAST(t AS
+        // TIMESTAMP(0))` admits rows from the start of that second onwards —
+        // below the literal. Reading the literal instead narrows the range and
+        // drops them. §17.1 permits widening only.
+        let inner = ts(T10 + time::Duration::microseconds(500_000));
+        for ty in [
+            timestamp(TimeUnit::Second),
+            timestamp(TimeUnit::Millisecond),
+            DataType::Date32,
+        ] {
+            let literal = Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(inner.clone()),
+                ty.clone(),
+            ));
+            assert_eq!(
+                time_range(&[from().gt_eq(literal)]),
+                TimeRange::unbounded(),
+                "{ty:?} truncates the literal, so it cannot bound `from`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_widening_cast_around_the_literal_is_still_seen_through() {
+        use crate::arrow::datatypes::TimeUnit;
+
+        // DataFusion unifies the two sides on the finer unit, so this is the
+        // shape an ordinary query produces. It moves no value and must not cost
+        // the bound.
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let literal = Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(ts(T10)),
+                timestamp(unit),
+            ));
+            assert_eq!(time_range(&[from().gt_eq(literal)]).start(), Some(T10));
+        }
+    }
+
+    #[test]
     fn a_null_timestamp_yields_no_bound() {
         let null = lit(ScalarValue::TimestampMicrosecond(None, None));
         assert_eq!(time_range(&[from().gt_eq(null)]), TimeRange::unbounded());
@@ -464,10 +522,9 @@ mod tests {
 
     #[test]
     fn every_recognised_shape_still_narrows_the_range() {
-        // The shapes that used to be reported `Exact`. Pushdown is now always
-        // `Inexact` — correctness must not rest on a dependency's silent
-        // conversion — but the *narrowing* is what skips files, and that is the
-        // optimisation worth having. It has to keep working.
+        // Pushdown is always `Inexact` — correctness must not rest on a
+        // dependency's silent conversion — but the *narrowing* is what skips
+        // files, and that is the optimisation worth having.
         for filter in [
             from().gt_eq(ts(T10)),
             from().lt(ts(T20)),

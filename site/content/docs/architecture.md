@@ -95,8 +95,12 @@ Every step of that ordering is load-bearing:
   by `settlement_lag` (default 7 days), which must exceed the market's normal
   correction window.
 - **Detach before scanning**, so no row can be inserted into a partition that is
-  mid-archival. A detached-but-not-dropped partition is the only state where the
-  invariant is relaxed, and exactly one process owns it.
+  mid-archival. Invisible to *writers* — never to readers: the watermark is
+  published by the cold commit, so throughout the scan the range still belongs to
+  the hot tier, and the hot scan reads the parent **and** whatever is detached
+  from it. A detached partition is either mid-archival, above the watermark and
+  asked for, or already committed, below it and outside the scan's range; never
+  both, so never read twice.
 - **Commit cold before dropping hot.** A crash between them leaves an orphaned
   detached partition — data intact, invisible, reclaimable by the next run. The
   reverse ordering loses data permanently.
@@ -168,7 +172,7 @@ fails loudly instead of silently migrating a decade of history.
 | Not this | Why |
 |---|---|
 | A database | PostgreSQL and Iceberg are. No storage engine, no MVCC, no WAL of our own. |
-| A CDC pipeline | Archival is the ingestion path. Replicating rows out of Postgres does not remove them, and the purge — not the read — is where the cost actually is. |
+| A CDC pipeline | Archival is the ingestion path, and there is no `ChangeSource` seam waiting for one. Logical decoding reads the WAL and touches no heap pages, which is a genuine advantage on a busy primary — but replicating rows out of Postgres does not *remove* them, so both designs still need the purge, and the purge is where the cost is. |
 | An ingest transport | A transport parses a wire format, authenticates a producer and decides what a valid reading is. A storage layer does none of those. |
 | A domain library | Validation, substitute values, gas conversion, aggregation and the DST calendar belong to [`metering`](https://crates.io/crates/metering). Duplicating one would create a second implementation to keep correct, and it would drift. |
 | Distributed query execution | Single-process. Ballista exists if that changes. |

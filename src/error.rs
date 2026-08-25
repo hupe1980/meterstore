@@ -130,3 +130,25 @@ impl Error {
         Self::Config(msg.into())
     }
 }
+
+/// Hide everything but the shape of a connection URL or a secret.
+///
+/// A `Debug` impl is the one thing that turns a credential into a log line, and
+/// this crate holds several: the hot tier's connection URL, the Iceberg
+/// catalogue's (usually the same database, so the same password), and an S3
+/// secret key. Configuration is what a service dumps at startup and what an error
+/// context carries, so each of those types hand-writes `Debug` and redacts
+/// through here.
+///
+/// The shape is kept because it is the useful half: `postgresql://<redacted>`
+/// tells an operator which store failed to connect without telling a log
+/// aggregator the password.
+pub(crate) fn redacted(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    match value.split_once("://") {
+        Some((scheme, _)) => format!("{scheme}://<redacted>"),
+        None => "<redacted>".to_string(),
+    }
+}

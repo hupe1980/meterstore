@@ -28,6 +28,32 @@ leave a task archiving against a store nobody is watching.
 Every replica can run the same schedule. One wins the archive lease; the others
 report `lease_contended` and stop. That is not a failure.
 
+**One loop, however many tables.** A [catalogue](@/docs/querying.md#several-tables-in-one-session)
+maintains all of its tables from one schedule:
+
+```rust
+let handle = catalog.maintenance().spawn();
+```
+
+Each table keeps its own watermark, archiver and lease; only the *scheduling* is
+shared. Tables are visited one after another, because twenty archivals at once
+turns a background job into a load spike on the database it exists to relieve.
+
+The outcome carries **one row per table**, so an alert names the table rather than
+reporting a number nobody can act on:
+
+```rust
+for table in outcome.unhealthy() {
+    tracing::error!(table = %table.table, violations = table.invariant_violations);
+}
+```
+
+**A failing table does not end the cycle.** It becomes a row with a `failure` and
+the rest are still maintained. What fails here persists until an operator acts — a
+quarantined schema, an unreachable catalogue — so stopping would let one such
+table freeze archival for every other, whose hot tier then grows without bound for
+the length of the incident. `healthy()` is false while any table failed.
+
 **The clock is a parameter, never read.** Every archival, maintenance and status
 call takes `now`, so a test drives months in milliseconds and nothing depends on
 when it ran. Tiering itself never reads a clock at all — it routes on `from`, a
@@ -107,7 +133,7 @@ Every instrument carries a `table` attribute; scan metrics add `tier`.
 | `meterstore.partitions.dropped` / `.orphans_reclaimed` | Purge keeping up; non-zero orphans mean runs are being interrupted. |
 | `meterstore.write.rows` / `.rows_deduplicated` / `.late_corrections` | Ingest volume, the redelivery rate (expected to be non-zero), and corrections arriving after their interval was archived. |
 | `meterstore.query.plan_duration` / `.scan_duration` | **Two instruments, not one.** A single `query.duration` recorded at plan time measured only the time to build a plan — making a slow catalogue look like a slow query and hiding a slow scan behind fast planning. |
-| `meterstore.query.merge_elided` / `.merge_elision_decisions` | The elided ratio — whether the cold layout is still earning its keep. |
+| `meterstore.query.merge_elided` / `.merge_elision_decisions` | The elided ratio — how often a historical scan skipped version resolution. It falls as corrections accumulate in the ranges being queried, which is the data changing rather than the layout degrading; see [maintenance](#maintenance-that-is-not-implemented). |
 
 ## Schema evolution
 
@@ -119,8 +145,8 @@ far smaller than in a general framework — but not zero.
 | Add nullable column | Iceberg add column, fresh field id | No |
 | Rename column | Field ids are stable, historical files still read | No |
 | Widen decimal precision | Type promotion | No |
-| Drop column | Marked deleted, retained for time travel | No |
-| Add **NOT NULL** column, narrow a type, change the merge key | **Quarantine** | — |
+| Drop a **nullable** column | Marked deleted, retained for time travel | No |
+| Add a **NOT NULL** column, drop one, narrow a type | **Quarantine** | — |
 
 Quarantine is the honest response to a change that cannot be applied safely. The
 table halts, its watermark freezes, an operator resolves it. Freezing is the
@@ -128,11 +154,16 @@ point rather than a side effect: the rows stay in PostgreSQL, where they can sti
 be corrected, instead of being archived into a layout nobody has agreed on.
 Silent corruption is never traded for uptime.
 
-Two details:
+Three details:
 
 - **A decimal's precision may widen; its scale may not.** Precision adds
   representable digits; changing scale reinterprets every stored integer by a
   factor of ten. In a settlement figure that is a silent order-of-magnitude error.
+- **Both directions of a merge-key change quarantine.** An identity column is
+  non-nullable, so *declaring* one arrives as a NOT NULL addition and
+  *undeclaring* one as a dropped required column. The second is the more
+  dangerous: the key narrows, two readings the wider key kept apart start
+  competing in resolution, and one supersedes the other with no error anywhere.
 - **A cold store that cannot report its schema is not treated as compatible.** The
   check simply did not run, and saying so beats implying it passed.
 
@@ -144,7 +175,7 @@ compaction with Spark, or a second deployment on an older configuration.
 
 | Failure | Behaviour | Recovery |
 |---|---|---|
-| Crash mid-archival, pre-commit | Partition detached, not archived; invisible to writers | Invariant check reports; next run re-archives |
+| Crash mid-archival, pre-commit | Partition detached, not archived; invisible to writers, still **readable** by queries | Next run refuses to drop it and names it for an operator to re-attach |
 | Crash post-commit, pre-drop | Orphaned detached partition — data intact | Next run drops it |
 | Hot partitions exhausted | **Inserts fail** | Alert on `partitions_ahead`; pre-creation is automatic but monitored |
 | Object store unavailable | Archival backpressures; cold queries fail loudly | Automatic |
@@ -167,17 +198,46 @@ Two jobs are blocked upstream rather than deferred:
   *removes* files: there is no rewrite action, and both `TransactionAction` and
   `TableCommit`'s builder are crate-private. Every byte of a compacted snapshot
   can be produced and not committed.
-- **Orphan-file cleanup.** Blocked one step earlier, on the read path: finding
-  orphans means listing the warehouse and subtracting what the manifests
-  reference, and `FileIO` exposes no listing operation at all.
+- **General orphan-file cleanup.** Blocked one step earlier, on the read path:
+  finding files nobody knows about means listing the warehouse and subtracting
+  what the manifests reference, and `FileIO` exposes no listing operation at all.
 
-Neither costs correctness. Compaction would recover version elision for the few
-partitions that lose it; orphans cost storage and arise only from commits that
-failed after writing data files, which the compare-and-swap protocol makes rare.
-An operator who needs either can run it out of band with Spark or PyIceberg
-against the same standard table. The [interop suite](@/docs/interop.md) checks
-that this works: PyIceberg reads the schema, the partition spec, the format
-version and the tiering watermark out of these tables.
+Neither costs correctness. **Compaction does not recover version elision**, which
+is worth stating because it reads as if it should: elision is a property of the
+data, so a corrected reading has two versions stored and appears twice however the
+bytes are arranged. What the layout affects is collateral loss — a scan reads
+whole files, so a **coarser** file forces more uncorrected keys through resolution
+alongside a corrected one — and compaction moves that the wrong way. The case for
+it is the ordinary one: fewer, larger files mean less manifest to plan against.
+
+An operator who needs either can run it out of band with
+Spark or PyIceberg against the same standard table. The
+[interop suite](@/docs/interop.md) checks that this works: PyIceberg reads the
+schema, the partition spec, the format version and the tiering watermark out of
+these tables.
+
+### The one orphan source that *is* closed
+
+Nothing here removes a committed file, so a warehouse gains orphans from one
+event only: a commit that wrote its data files and failed to land. Those need no
+listing — the writer holds every path — so it deletes them before returning the
+error.
+
+It re-reads the table first, because a commit can fail *after* landing: a timeout
+says nothing about whether the catalog applied the update, and deleting on that
+reading would take files out from under a live snapshot. Anything the current
+snapshot references is left alone, and so is everything if the reload fails.
+
+### What snapshot expiry reclaims
+
+**Metadata.** The unreferenced manifest lists, manifests and old metadata files
+stay on object storage — upstream's action rewrites metadata only, and removing
+them needs the listing operation above.
+
+No bytes of readings, and there are none to reclaim: the table is append-only, so
+every data file an old snapshot referenced is still referenced by the current one.
+What expiry bounds is the metadata JSON, whose snapshot array grows with every
+commit and is parsed on **every** table load. That is the growth that compounds.
 
 ### The one rule an out-of-band tool must not break
 
@@ -211,10 +271,9 @@ store.reassert_watermark().await?;
 decision and MeterStore owns it; an external expiry knows nothing about the
 boundary it might be removing.
 
-Snapshot expiry **is** implemented, and it is the growth that actually compounds.
-It defaults to ten years, because a snapshot is what makes a past settlement
-reproducible: that is a compliance decision rather than a disk-space one, which is
-also why it is opt-in.
+Snapshot expiry **is** implemented. It defaults to ten years, because a snapshot
+is what makes a past settlement reproducible: that is a compliance decision rather
+than a disk-space one, which is also why it is opt-in.
 
 ## Removing data
 

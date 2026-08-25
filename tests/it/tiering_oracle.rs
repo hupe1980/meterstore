@@ -402,3 +402,151 @@ async fn completeness_agrees_with_the_gaps_the_workload_actually_left() {
         "the workload withheld intervals, so some must be reported missing"
     );
 }
+
+/// Run a **Zählerstandsgang** workload through a point store, archiving
+/// `archive_days` of it.
+///
+/// A second setup rather than a parameter on [`run`]: a point table is declared
+/// `TimeModel::Point`, identifies a reading by its Messlokation, and is written
+/// through a different entry point. Folding the two into one function would hide
+/// exactly the differences the property is being asserted across.
+async fn run_readings(
+    workload: MeteringWorkload,
+    archive_days: i64,
+) -> (TestHarness, meterstore::MeterStore, Oracle) {
+    use meterstore::config::{TableConfig, TimeModel};
+
+    let config = TableConfig::new(TestHarness::TABLE)
+        .time_model(TimeModel::Point)
+        .settlement_lag(Duration::DAY)
+        .build()
+        .expect("point table configuration");
+
+    let harness = TestHarness::with_config(config).await.expect("harness");
+    let (from, to) = workload.range();
+
+    harness
+        .ensure_partitions(from, to + Duration::days(1))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(from).await.expect("watermark");
+
+    let store = harness.store().await.expect("store");
+    let deliveries = workload.generate_readings().expect("workload");
+
+    // Keyed on the table's real merge key, which for a point table includes
+    // `melo_id` — the reference has to mean by "the same reading" what the store
+    // means, or it accuses a store that is behaving correctly.
+    let mut oracle = Oracle::for_table(harness.config());
+    oracle.record_readings(&deliveries).expect("oracle");
+    harness
+        .ingest_readings(&store, &deliveries)
+        .await
+        .expect("ingest");
+
+    if archive_days > 0 {
+        let now = from + Duration::days(archive_days + 1);
+        store.archive(now, 64).await.expect("archive");
+        assert_eq!(
+            store.watermark().await.unwrap().get(),
+            from + Duration::days(archive_days),
+            "the boundary must land where the test expects, or it proves nothing"
+        );
+    }
+
+    (harness, store, oracle)
+}
+
+#[tokio::test]
+async fn a_zaehlerstandsgang_matches_the_reference_across_the_boundary() {
+    // §17.3's property over the *other* record type.
+    //
+    // Two Messlokationen per Marktlokation, because that is the shape a merge key
+    // without `melo_id` folds into one reading: the meters agree on the channel
+    // and on the instants, so a store keyed on the Marktlokation alone silently
+    // stores half of them.
+    let workload = MeteringWorkload::new(START)
+        .seed(0x2A17)
+        .malo_ids(4)
+        .days(4)
+        .messlokationen(2);
+    let (from, to) = workload.range();
+    let (_h, store, oracle) = run_readings(workload, 2).await;
+
+    assert_eq!(
+        scalar(&store, "SELECT COUNT(*) FROM readings").await as u64,
+        oracle.row_count(from, to),
+        "every register reading, from whichever tier holds it"
+    );
+    assert_eq!(
+        total_kwh(&store, from, to).await,
+        oracle.sum_kwh(from, to).normalize(),
+        "and the values, which for a register are cumulative rather than energy"
+    );
+}
+
+#[tokio::test]
+async fn corrected_register_readings_resolve_like_corrected_intervals() {
+    // Resolution does not know the difference between a span and an instant, so
+    // the property has to hold identically. Read from the raw table a corrected
+    // reading appears twice, and summing registers is meaningless anyway — which
+    // is why the two shapes are never one table.
+    let workload = MeteringWorkload::new(START)
+        .seed(0x2A18)
+        .malo_ids(3)
+        .days(4)
+        .messlokationen(2)
+        .with_corrections(0.15)
+        .with_gaps(0.05);
+    let (from, to) = workload.range();
+    let (_h, store, oracle) = run_readings(workload, 2).await;
+
+    assert_eq!(
+        scalar(&store, "SELECT COUNT(*) FROM readings").await as u64,
+        oracle.row_count(from, to),
+    );
+    assert_eq!(
+        total_kwh(&store, from, to).await,
+        oracle.sum_kwh(from, to).normalize(),
+    );
+
+    // The audit trail keeps both versions; the resolved view returns one.
+    let raw = scalar(&store, "SELECT COUNT(*) FROM readings_versions").await as u64;
+    assert!(
+        raw > oracle.row_count(from, to),
+        "corrections must be present in the raw table: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_zaehlerstandsgang_changes_nothing_in_either_tier() {
+    // Every transport worth using delivers at least once, and a point table's
+    // late corrections reach Iceberg — which has no constraints — through the
+    // same reconciliation an interval table's do. The reference is unchanged by
+    // a replay, so the store must be too.
+    let workload = MeteringWorkload::new(START)
+        .seed(0x2A19)
+        .malo_ids(2)
+        .days(3)
+        .messlokationen(2);
+    let (from, to) = workload.range();
+    let deliveries = workload.generate_readings().expect("workload");
+    let (harness, store, oracle) = run_readings(workload, 2).await;
+
+    // Replayed *after* archival, so half of them land in the cold tier.
+    harness
+        .ingest_readings(&store, &deliveries)
+        .await
+        .expect("replay");
+
+    assert_eq!(
+        scalar(&store, "SELECT COUNT(*) FROM readings").await as u64,
+        oracle.row_count(from, to),
+        "a redelivery must not add a reading"
+    );
+    assert_eq!(
+        total_kwh(&store, from, to).await,
+        oracle.sum_kwh(from, to).normalize(),
+        "nor change a value"
+    );
+}

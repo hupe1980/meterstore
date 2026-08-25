@@ -8,13 +8,12 @@
 //! whatever the code does. So the fixtures are real, and the cost is a
 //! PostgreSQL.
 //!
-//! What is *not* required is a PostgreSQL **per test**. That was the shape the
-//! suites grew into, and at a couple of hundred integration tests it dominated
-//! the wall clock: every one paid a container start, a health check and a
-//! connection handshake before it touched a line of this crate. It also made the
-//! suite flaky in a way that looks like a bug in the code under test — fifty
-//! containers racing for ports and memory produce connection failures at
-//! whichever test happened to be starting.
+//! What is *not* required is a PostgreSQL **per test**. At a couple of hundred
+//! integration tests that dominates the wall clock — every one paying a container
+//! start, a health check and a connection handshake before it touches a line of
+//! this crate — and it is flaky in a way that looks like a bug in the code under
+//! test, since fifty containers racing for ports and memory produce connection
+//! failures at whichever test happened to be starting.
 //!
 //! A container start is seconds; `CREATE DATABASE` is milliseconds, and gives
 //! the **same** isolation. Every test still gets a database nothing else

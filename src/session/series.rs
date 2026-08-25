@@ -78,7 +78,7 @@ impl<'a> SeriesQuery<'a> {
         }
     }
 
-    /// Restrict to rows whose identity/extra column `name` equals `value`.
+    /// Restrict to rows whose declared column `name` equals `value`.
     ///
     /// A measuring point is only unique **within** the columns that join the merge
     /// key. A deployment that declares an identity column — a tenant, a reporting
@@ -87,10 +87,41 @@ impl<'a> SeriesQuery<'a> {
     /// folds them into a single series (§4.2). Naming the identity that scopes the
     /// read keeps them apart. Repeatable: each call adds one equality predicate,
     /// and the value is bound as a parameter, never concatenated into the SQL.
-    #[must_use]
-    pub fn column_eq(mut self, name: &str, value: ScalarValue) -> Self {
+    ///
+    /// The **name** cannot be a parameter — no SQL dialect parameterises an
+    /// identifier — so it is checked against the store's declared columns rather
+    /// than interpolated on trust. An unknown name is refused here, naming what is
+    /// available, instead of reaching the engine as a fragment of SQL.
+    pub fn column_eq(mut self, name: &str, value: ScalarValue) -> Result<Self> {
+        // Declared columns, plus every merge-key column beyond the core three —
+        // which is the same list except on a table that identifies a reading by
+        // its Messlokation, where `melo_id` is a *core* column doing an identity
+        // column's job. Refusing it there would leave the one read that needs
+        // separating (two meters under one Marktlokation) unable to ask for it.
+        let mut accepted: Vec<String> = self
+            .store
+            .config()
+            .extra_columns()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        for column in self.store.config().discriminator_columns() {
+            if !accepted.contains(&column) {
+                accepted.push(column);
+            }
+        }
+
+        if !accepted.iter().any(|c| c == name) {
+            return Err(Error::config(format!(
+                "{name:?} is not a filterable column of {}: this store accepts [{}]. \
+                 Column names are written into SQL as identifiers, which cannot be \
+                 parameterised, so only declared ones are accepted",
+                self.store.table(),
+                accepted.join(", "),
+            )));
+        }
         self.filters.push((name.to_string(), value));
-        self
+        Ok(self)
     }
 
     /// Restrict to intervals whose resolved quality is one of `flags`.
@@ -193,8 +224,14 @@ impl<'a> SeriesQuery<'a> {
     /// resolves it with `ORDER BY from DESC LIMIT 1` at the storage layer rather
     /// than folding the entire series and taking the maximum in memory — an
     /// unbounded scan to return one row. With no [`range`](Self::range) it is the
-    /// newest interval ever stored; with one, the newest inside it. Spans channels
-    /// unless narrowed with [`obis`](Self::obis).
+    /// newest interval ever stored; with one, the newest inside it.
+    ///
+    /// **It spans channels, meters and identity values** unless narrowed with
+    /// [`obis`](Self::obis) or [`column_eq`](Self::column_eq) — a measuring point
+    /// reporting import and export has two rows at the newest instant, and so
+    /// does a table keyed by Messlokation or extended with a tenant. The rest of
+    /// the merge key completes the order so the choice among them is
+    /// deterministic, but it is still a choice.
     pub async fn latest(self) -> Result<Option<metering::interval::MeterInterval>> {
         Ok(self
             .latest_resolved()
@@ -247,11 +284,11 @@ impl<'a> SeriesQuery<'a> {
         }
         if let Some(from) = self.from {
             conditions.push(format!(r#""{}" >= ${}"#, col::FROM, params.len() + 1));
-            params.push(timestamp(from));
+            params.push(crate::encode::schema::timestamp_scalar(from));
         }
         if let Some(to) = self.to {
             conditions.push(format!(r#""{}" < ${}"#, col::FROM, params.len() + 1));
-            params.push(timestamp(to));
+            params.push(crate::encode::schema::timestamp_scalar(to));
         }
         // Identity/extra-column scoping (e.g. tenant), so a shared store does not
         // fold two parties' readings for one MaLo into a single series.
@@ -273,18 +310,37 @@ impl<'a> SeriesQuery<'a> {
             }
         }
 
-        // Ordered by the merge key so decoding sees contiguous runs of one
-        // series, which is what `from_record_batch` groups on. A `latest` read
-        // inverts that to newest-first and takes a single interval — the whole
-        // history need not be scanned to answer "what is the current reading".
+        // Ordered by the **whole** merge key so decoding sees contiguous runs of
+        // one series, which is what `from_record_batch` groups on. Not by
+        // `(malo_id, obis_code, from)`: a table with an identity column — or one
+        // that identifies a reading by its Messlokation — stores several rows
+        // per interval, and ordering that leaves them interleaved breaks a run
+        // at every row, so a day comes back as ninety-six one-interval groups.
+        // Correct, and useless.
+        //
+        // A `latest` read inverts to newest-first and takes a single interval,
+        // so the whole history need not be scanned to answer "what is the
+        // current reading".
         let tail = if self.latest_only {
-            format!(r#"ORDER BY "{from}" DESC LIMIT 1"#, from = col::FROM)
+            // Newest first, then the rest of the merge key — a **total** order,
+            // for the same reason the published resolution SQL breaks its ties:
+            // `"from" DESC LIMIT 1` alone leaves the winner to whichever row the
+            // plan happened to produce first whenever the newest instant carries
+            // more than one row. It does exactly that on the reads most likely to
+            // want it — a measuring point with two channels, a table keyed by
+            // Messlokation, a tenant-extended key — so "the current reading"
+            // could differ between two identical calls. Narrowing with
+            // `obis`/`column_eq` is the way to *choose* a row; the tie-break is
+            // what makes the unnarrowed answer reproducible.
+            format!(
+                r#"ORDER BY "{from}" DESC, {rest} LIMIT 1"#,
+                from = col::FROM,
+                rest = key_order_without_start(&self.store.config().merge_key()),
+            )
         } else {
             format!(
-                r#"ORDER BY "{malo}", "{obis}", "{from}""#,
-                malo = col::MALO_ID,
-                obis = col::OBIS_CODE,
-                from = col::FROM,
+                "ORDER BY {}",
+                merge_key_order(&self.store.config().merge_key()),
             )
         };
         let sql = format!(
@@ -301,18 +357,43 @@ impl<'a> SeriesQuery<'a> {
         }
 
         Ok((
-            merge(self.malo_id, self.obis_code.as_deref(), stored)?,
+            merge(
+                self.malo_id,
+                self.obis_code.as_deref(),
+                &self.store.config().discriminator_columns(),
+                stored,
+            )?,
             result,
         ))
     }
 }
 
-/// A timestamp literal in the unit and zone the storage schema uses.
-fn timestamp(t: OffsetDateTime) -> ScalarValue {
-    ScalarValue::TimestampMicrosecond(
-        Some((t.unix_timestamp_nanos() / 1_000) as i64),
-        Some("UTC".into()),
-    )
+/// An `ORDER BY` list over a merge key, ending on the interval start.
+///
+/// `from` is moved to the end wherever it sits in the key: a run is a series,
+/// and a series is contiguous in time. Everything before it is what separates
+/// one series from another.
+pub(crate) fn merge_key_order(merge_key: &[String]) -> String {
+    merge_key
+        .iter()
+        .filter(|c| c.as_str() != col::FROM)
+        .map(|c| format!("\"{c}\""))
+        .chain(std::iter::once(format!("\"{}\"", col::FROM)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The merge key with the interval start removed, as an `ORDER BY` list.
+///
+/// The tie-break for a `latest` read, which has already ordered on `from`.
+/// Never empty: `malo_id` is in every merge key and is not the start.
+pub(crate) fn key_order_without_start(merge_key: &[String]) -> String {
+    merge_key
+        .iter()
+        .filter(|c| c.as_str() != col::FROM)
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Fold decoded rows into one series.
@@ -329,11 +410,14 @@ fn timestamp(t: OffsetDateTime) -> ScalarValue {
 fn merge(
     malo_id: MaloId,
     obis_code: Option<&str>,
+    discriminators: &[String],
     mut stored: Vec<crate::encode::StoredSeries>,
 ) -> Result<Option<ResolvedSeries>> {
     if stored.is_empty() {
         return Ok(None);
     }
+
+    refuse_mixed_readings(&stored, discriminators)?;
 
     // Newest delivery last, so the fields taken below are the current ones.
     stored.sort_by_key(|s| s.recorded_at);
@@ -402,6 +486,81 @@ fn merge(
     }))
 }
 
+/// The channel and the merge-key discriminators one decoded group carries — what
+/// makes two groups two *readings* rather than two deliveries of one.
+type ReadingKey = (Option<String>, Vec<(String, String)>);
+
+/// Refuse to fold rows that are not one series.
+///
+/// Version resolution leaves one row per `(merge key, from)`, so the fold below
+/// is lossless exactly while the rows share a merge key. Where they do not there
+/// are two intervals at one instant, which `MeasurementSeries` cannot express —
+/// `metering::aggregate` sums both and the month doubles.
+///
+/// Two ordinary queries reach that: a meter reporting import *and* export, whose
+/// two OBIS codes a type holding one `obis_code` cannot describe; and two
+/// readings that are not the same reading — a tenant discriminator, a second
+/// Messlokation — where the fold puts one party's data in another's series.
+///
+/// The fix is naming which was meant, so the error names it.
+fn refuse_mixed_readings(
+    stored: &[crate::encode::StoredSeries],
+    discriminators: &[String],
+) -> Result<()> {
+    let key_of = |s: &crate::encode::StoredSeries| -> Result<ReadingKey> {
+        Ok((
+            s.series.obis_code.map(|c| c.to_string()),
+            crate::session::store::discriminator_values(
+                s.series.melo_id.as_ref(),
+                &s.extra,
+                discriminators,
+            )?,
+        ))
+    };
+
+    let first = key_of(&stored[0])?;
+    for other in &stored[1..] {
+        let key = key_of(other)?;
+        if key == first {
+            continue;
+        }
+
+        let (channel, identity) = (&first.0, &first.1);
+        // The channel first: it is the difference a caller is likelier to have
+        // meant, and `.obis(..)` is the narrower fix.
+        let differs = if channel != &key.0 {
+            format!(
+                "two channels ({} and {})",
+                channel.as_deref().unwrap_or("<none>"),
+                key.0.as_deref().unwrap_or("<none>"),
+            )
+        } else {
+            format!("two readings ({} and {})", render(identity), render(&key.1))
+        };
+
+        return Err(Error::config(format!(
+            "{malo} spans {differs} over this range, and a MeasurementSeries can only \
+             describe one — folding them puts two values at the same instant into one \
+             series, which sums to twice the truth with nothing to notice it. Narrow the \
+             read with .obis(..) or .column_eq(..), or scope the session",
+            malo = stored[0].series.malo_id,
+        )));
+    }
+    Ok(())
+}
+
+/// Render a merge-key discriminator tuple for an error message.
+fn render(values: &[(String, String)]) -> String {
+    match values.is_empty() {
+        true => "<none>".to_string(),
+        false => values
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 /// The one channel every interval shares, if they do share one.
 fn single_channel(intervals: &[metering::interval::MeterInterval]) -> Option<ObisCode> {
     let mut seen: Option<ObisCode> = None;
@@ -450,7 +609,7 @@ mod tests {
     }
 
     fn stored(intervals: Vec<MeterInterval>, recorded_at: OffsetDateTime) -> StoredSeries {
-        let scope = VersionScope::for_interval("99", intervals[0].from).unwrap();
+        let scope = VersionScope::for_interval("99", intervals[0].from, Sparte::Strom).unwrap();
         StoredSeries::new(
             MeasurementSeries::new(
                 malo(),
@@ -462,6 +621,135 @@ mod tests {
             ScopedVersion::new(scope, Version::new(20_260_701_000_001).unwrap()),
             recorded_at,
         )
+    }
+
+    /// One interval of the given channel, at a fixed instant.
+    ///
+    /// The instant is shared on purpose: two rows at one instant is exactly what
+    /// makes a fold a double-count.
+    fn one_interval(obis: &str) -> StoredSeries {
+        let from = datetime!(2026-07-20 00:00 UTC);
+        let mut s = stored(
+            vec![MeterInterval {
+                from,
+                to: from + time::Duration::minutes(15),
+                value: rust_decimal::Decimal::new(15, 1),
+                quality: metering::QualityFlag::Measured,
+                obis_code: obis.parse().ok(),
+            }],
+            from,
+        );
+        s.series.obis_code = obis.parse().ok();
+        s
+    }
+
+    #[test]
+    fn the_latest_read_orders_totally() {
+        // `"from" DESC LIMIT 1` alone is not a total order, and the reads most
+        // likely to want "the current reading" are exactly the ones where the
+        // newest instant carries more than one row: a measuring point with two
+        // channels, a table keyed by Messlokation, a tenant-extended key. Two
+        // identical calls could then return different rows. The published
+        // resolution SQL breaks its ties for the same reason.
+        let key = vec![
+            col::MALO_ID.to_string(),
+            col::MELO_ID.to_string(),
+            col::OBIS_CODE.to_string(),
+            col::FROM.to_string(),
+            "tenant".to_string(),
+        ];
+        let rest = key_order_without_start(&key);
+
+        assert_eq!(
+            rest, r#""malo_id", "melo_id", "obis_code", "tenant""#,
+            "every merge-key column but the start, in key order"
+        );
+        assert!(!rest.contains(col::FROM), "the read already ordered on it");
+
+        // Never empty: `malo_id` is in every merge key.
+        assert!(
+            !key_order_without_start(&[col::MALO_ID.to_string(), col::FROM.to_string(),])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn folding_two_channels_into_one_series_is_refused() {
+        // A meter reporting import and export carries two OBIS codes at the same
+        // instants. `MeasurementSeries` holds one `obis_code`, so a folded pair
+        // is a value the type cannot describe — and `metering::aggregate` sums
+        // both, returning import plus export under the heading of consumption.
+        let mut export = one_interval("1-0:2.8.0");
+        export.recorded_at += time::Duration::hours(1);
+
+        let err = merge(malo(), None, &[], vec![one_interval("1-0:1.8.0"), export])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("two channels"), "{err}");
+        assert!(
+            err.contains("1-0:1.8.0") && err.contains("1-0:2.8.0"),
+            "{err}"
+        );
+        assert!(err.contains(".obis("), "the message names the fix: {err}");
+    }
+
+    #[test]
+    fn folding_two_tenants_into_one_series_is_refused() {
+        // Worse than a wrong total: it is one party's readings inside another's
+        // series, from a read that named neither.
+        let of = |tenant: &str| {
+            let mut s = one_interval("1-0:1.8.0");
+            s.extra.insert(
+                "tenant".to_string(),
+                ScalarValue::Utf8(Some(tenant.to_string())),
+            );
+            s
+        };
+
+        let err = merge(
+            malo(),
+            Some("1-0:1.8.0"),
+            &["tenant".to_string()],
+            vec![of("a"), of("b")],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("two readings"), "{err}");
+        assert!(
+            err.contains("tenant=a") && err.contains("tenant=b"),
+            "{err}"
+        );
+        assert!(err.contains(".column_eq("), "{err}");
+    }
+
+    #[test]
+    fn a_column_that_is_not_in_the_merge_key_does_not_split_a_series() {
+        // The rule is the merge key, not "any column that differs". A Bilanzkreis
+        // reassigned between two deliveries is one series with a changed
+        // attribute, and refusing that would make an ordinary correction
+        // unreadable.
+        let of = |bk: &str, hours: i64| {
+            let mut s = one_interval("1-0:1.8.0");
+            s.extra.insert(
+                "bilanzkreis".to_string(),
+                ScalarValue::Utf8(Some(bk.into())),
+            );
+            s.recorded_at += time::Duration::hours(hours);
+            s
+        };
+
+        assert!(
+            merge(
+                malo(),
+                Some("1-0:1.8.0"),
+                &[],
+                vec![of("BK-1", 0), of("BK-2", 1)]
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -477,7 +765,7 @@ mod tests {
             datetime!(2026-07-22 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![b, a])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), &[], vec![b, a])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.intervals.len(), 2);
@@ -497,9 +785,10 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![later, earlier])
-            .unwrap()
-            .expect("rows were supplied");
+        let ResolvedSeries { series, .. } =
+            merge(malo(), Some("1-0:1.8.0"), &[], vec![later, earlier])
+                .unwrap()
+                .expect("rows were supplied");
         assert_eq!(series.intervals[0].from, datetime!(2026-07-20 00:00 UTC));
         assert_eq!(series.intervals[1].from, datetime!(2026-07-20 12:00 UTC));
     }
@@ -510,7 +799,7 @@ mod tests {
         // there is nobody to name, and inventing one would put a delivery in the
         // audit trail that never happened.
         assert!(
-            merge(malo(), Some("1-0:1.8.0"), Vec::new())
+            merge(malo(), Some("1-0:1.8.0"), &[], Vec::new())
                 .unwrap()
                 .is_none()
         );
@@ -531,7 +820,7 @@ mod tests {
         );
         new.series.resolution = Some(metering::IntervalResolution::QuarterHour);
 
-        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![new, old])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), &[], vec![new, old])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(
@@ -550,7 +839,7 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { series, .. } = merge(malo(), None, vec![mixed])
+        let ResolvedSeries { series, .. } = merge(malo(), None, &[], vec![mixed])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.obis_code, None);
@@ -562,7 +851,7 @@ mod tests {
             vec![interval(datetime!(2026-07-20 00:00 UTC), 1)],
             datetime!(2026-07-21 00:00 UTC),
         );
-        let ResolvedSeries { series, .. } = merge(malo(), None, vec![one])
+        let ResolvedSeries { series, .. } = merge(malo(), None, &[], vec![one])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.obis_code, Some("1-0:1.8.0".parse().unwrap()));
@@ -580,7 +869,7 @@ mod tests {
         assert!(!trail.is_empty(), "the fixture must carry a trail");
         s.series.provenance = trail.clone();
 
-        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), vec![s])
+        let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), &[], vec![s])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(series.provenance, trail);
@@ -592,7 +881,9 @@ mod tests {
         // reads has only what `merge` hands back. Losing it here would relabel
         // every gas and water series as electricity — silently, since the numbers
         // look the same.
-        let scope = VersionScope::for_interval("99", datetime!(2026-07-20 00:00 UTC)).unwrap();
+        let scope =
+            VersionScope::for_interval("99", datetime!(2026-07-20 00:00 UTC), Sparte::Strom)
+                .unwrap();
         let gas = StoredSeries::of(
             Sparte::Gas,
             MeasurementSeries::new(
@@ -606,7 +897,7 @@ mod tests {
             datetime!(2026-07-21 00:00 UTC),
         );
 
-        let ResolvedSeries { sparte, .. } = merge(malo(), None, vec![gas])
+        let ResolvedSeries { sparte, .. } = merge(malo(), None, &[], vec![gas])
             .unwrap()
             .expect("rows were supplied");
         assert_eq!(sparte, Sparte::Gas);

@@ -104,6 +104,23 @@ it would look harmless and would not be: a correction whose reference was derive
 slightly differently — a re-registration, a pipeline holding a stale mapping —
 gets a different key and silently fails to supersede the value it corrects.
 
+**One registry spans every table in a deployment.** It is passed to each store
+builder, which reads as *per table* — and it is not. The mapping lives in one
+`meterstore_subject_map` keyed by natural identifier, so two tables that register
+the same natural id share one reference and a single `erase_subject` unlinks
+both.
+
+That is what an Article 17 request needs rather than an accident of the schema.
+An erasure has to reach the authoritative readings **and** the non-authoritative
+second stream: an ESA "Werte nach Typ 2" store is non-authoritative for
+*settlement*, which says nothing about whether the data is personal. A registry
+per table would leave one of them linked with nothing to report it.
+
+The corollary is that **what a subject *is* is your choice, and it is global.**
+A Marktlokation outlives its occupants, so keying by measuring point alone erases
+a previous tenant's data along with the requester's — `(tenant, MaLo)`, or an
+occupancy period, is usually what is meant.
+
 **The store refuses references the registry does not back.** A reference that does
 not resolve means either the pipeline invented it — rows unattributable from birth
 — or it belongs to an already-erased subject, meaning a replay is rebuilding the
@@ -141,6 +158,21 @@ survives.
 
 The key must outlive every erasure and is not recoverable from the database.
 Losing it exposes nothing; it silently disables suppression.
+
+**In memory it is redacted *and* wiped.** `Debug` prints only whether a key is
+configured, so it cannot reach a log line; the buffer holding it is zeroized on
+drop, so it does not linger in a freed heap page. The second matters because a
+registry is cloned by every derived session — a reproducible read, a scoped one —
+and each clone is another copy of a cryptographic key.
+
+That is hygiene, not a claim the key exists in one place. It does not reach the
+buffer you passed in, an environment variable the process still holds, or the key
+schedule `hmac` derives per tombstone. Object-store credentials are redacted but
+**not** wiped, and the difference is deliberate: an explicit S3 key is forwarded
+into the object store's own client, which holds it for the life of the process, so
+wiping MeterStore's copy would imply a protection that does not hold. The
+credential chain — environment, instance role, IRSA — is what actually keeps a key
+out of the process.
 
 ## The duty on a clock
 
@@ -187,10 +219,11 @@ requester's.
 |---|---|
 | Credentials | Environment-variable interpolation; never logged, `Debug` redacts a connection URL to its scheme |
 | SQL injection | Whitelisted expression grammar, typed parameter binding. Caller values are never concatenated into SQL; declared column names are restricted to plain identifiers, since an identifier cannot be parameterised |
+| Caller-supplied SQL | `query`, `sql` and `stream` plan without running and refuse anything that is not a query. DataFusion's surface is wider than `SELECT`: `CREATE EXTERNAL TABLE … LOCATION` reads any path the process can, `COPY … TO` writes one, and an external table over the warehouse's Parquet walks past a scoped session because it never touches the provider that enforces the scope. See [Confining a session](@/docs/querying.md#confining-a-session) |
 | Least privilege | `SELECT` plus ownership of its own tables for `DETACH`/`DROP`. No `SUPERUSER` |
 | Transport | TLS for PostgreSQL and object storage; downgrade requires explicit opt-in |
 | At rest | Object-store SSE. Per-subject encryption is deliberately not used |
-| Serving surfaces | Read-only, and both hand back a service rather than binding a port — authentication is yours to supply |
+| Serving surfaces | Read-only — the endpoints refuse mutating calls *and* the query path refuses non-query statements — and both hand back a service rather than binding a port, so authentication is yours to supply |
 | Supply chain | `cargo-deny` in CI with a pinned lockfile. Every licence and advisory exception carries a written reason and a revisit condition, because an unexplained ignore looks like a check that passed |
 
 Nothing here is legal advice. Deployments take their own.

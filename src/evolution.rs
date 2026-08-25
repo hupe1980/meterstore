@@ -14,9 +14,15 @@
 //! - **A deployment added a column.** The Iceberg table gains it with a fresh
 //!   field id; every existing Parquet file still reads, with null for the new
 //!   column. Nothing to do but proceed.
-//! - **Something narrowed, retyped, or moved into the merge key.** Then rows
-//!   already written mean something different from rows about to be written, and
-//!   *no* amount of care downstream recovers that. The table halts.
+//! - **Something narrowed, retyped, or moved into or out of the merge key.**
+//!   Then rows already written mean something different from rows about to be
+//!   written, and *no* amount of care downstream recovers that. The table halts.
+//!
+//! Both directions of a merge-key change land here: a *new* identity column as a
+//! non-nullable [`Added`](SchemaChange::Added), an *undeclared* one as a required
+//! [`Dropped`](SchemaChange::Dropped). The second is the more dangerous — the key
+//! narrows, two readings the wider key kept apart start competing in resolution,
+//! and one supersedes the other with no error anywhere.
 //!
 //! # Why halting is the right answer
 //!
@@ -50,11 +56,26 @@ pub enum SchemaChange {
     },
     /// A column the table has and the configuration no longer declares.
     ///
-    /// Safe. Iceberg keeps it for time travel, and dropping it from the write
-    /// path does not invalidate a file that contains it.
+    /// Safe when the stored column is **nullable**: Iceberg keeps it for time
+    /// travel, historical files still carry it, and rows written from now on
+    /// simply leave it null.
+    ///
+    /// A **non-nullable** one is not, and this is the mirror of an unsafe
+    /// [`Added`](Self::Added). Every identity column is non-nullable
+    /// ([`TableConfig::identity_column`]), so undeclaring one arrives here: the
+    /// resolution view would partition by the *narrower* merge key, two tenants'
+    /// readings for one measuring point would compete, and one would supersede
+    /// the other — a cross-tenant leak with no error anywhere.
+    ///
+    /// It is not safe for Iceberg either: a required field is required, and a
+    /// data file that omits it does not conform to the schema.
+    ///
+    /// [`TableConfig::identity_column`]: crate::config::TableConfig::identity_column
     Dropped {
         /// The column's name.
         name: String,
+        /// Whether the column can be left out of future writes.
+        safe: bool,
     },
     /// A column whose type changed.
     Retyped {
@@ -84,7 +105,7 @@ impl SchemaChange {
     pub fn is_safe(&self) -> bool {
         match self {
             Self::Added { safe, .. } => *safe,
-            Self::Dropped { .. } => true,
+            Self::Dropped { safe, .. } => *safe,
             Self::Retyped { safe, .. } => *safe,
             Self::Nullability { safe, .. } => *safe,
         }
@@ -104,9 +125,16 @@ impl SchemaChange {
                  declare it nullable, or rewrite history out of band first",
                 field.name()
             ),
-            Self::Dropped { name } => {
+            Self::Dropped { name, safe: true } => {
                 format!("column {name:?} no longer declared (retained for time travel)")
             }
+            Self::Dropped { name, safe: false } => format!(
+                "column {name:?} is NOT NULL in the table and is no longer declared — a \
+                 required field cannot be left out of a write, and if it was an identity \
+                 column the merge key has just narrowed: two readings the wider key kept \
+                 apart would now compete, and one would supersede the other. Restore the \
+                 declaration, or create a new table"
+            ),
             Self::Retyped {
                 name,
                 from,
@@ -217,6 +245,11 @@ pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
         if configured.field_with_name(field.name()).is_err() {
             changes.push(SchemaChange::Dropped {
                 name: field.name().clone(),
+                // The mirror of the `Added` rule. A nullable column may simply
+                // stop being written; a required one may not — and every
+                // identity column is required, so undeclaring one arrives here
+                // and nowhere else.
+                safe: field.is_nullable(),
             });
         }
     }
@@ -310,16 +343,54 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_column_is_safe_because_iceberg_keeps_it() {
+    fn a_dropped_nullable_column_is_safe_because_iceberg_keeps_it() {
+        let stored = schema(vec![
+            Field::new("malo_id", DataType::Utf8, false),
+            Field::new("bilanzkreis", DataType::Utf8, true),
+        ]);
         let configured = schema(vec![Field::new("malo_id", DataType::Utf8, false)]);
-        let c = compare(&configured, &base());
+        let c = compare(&configured, &stored);
         assert_eq!(
             c.changes,
             vec![SchemaChange::Dropped {
-                name: "value".into()
+                name: "bilanzkreis".into(),
+                safe: true,
             }]
         );
         assert!(c.is_safe());
+    }
+
+    #[test]
+    fn dropping_a_required_column_quarantines() {
+        // The mirror of `a_non_nullable_addition_quarantines`, and the more
+        // dangerous direction. Identity columns are non-nullable by validation,
+        // so *undeclaring* one arrives here: the resolution view would partition
+        // by the narrower merge key, two tenants' readings for one measuring
+        // point would compete, and one would supersede the other with nothing
+        // downstream reporting it.
+        let stored = schema(vec![
+            Field::new("malo_id", DataType::Utf8, false),
+            Field::new("value", DataType::Decimal128(18, 6), false),
+            Field::new("tenant", DataType::Utf8, false),
+        ]);
+        let c = compare(&base(), &stored);
+        assert_eq!(
+            c.changes,
+            vec![SchemaChange::Dropped {
+                name: "tenant".into(),
+                safe: false,
+            }]
+        );
+        assert!(!c.is_safe());
+
+        let err = c.require_safe("readings").unwrap_err();
+        assert!(matches!(err, Error::Quarantined { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("tenant"), "{msg}");
+        assert!(
+            msg.contains("merge key"),
+            "the message must name the consequence, not just the column: {msg}"
+        );
     }
 
     #[test]

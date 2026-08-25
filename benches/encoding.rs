@@ -27,6 +27,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use metering::interval::Sparte;
 use metering::interval::{MeterInterval, QualityFlag};
 use metering::measurement_series::{MeasurementSeries, MeasurementSource};
 use meterstore::encode::{StoredSeries, from_record_batch, to_record_batch};
@@ -81,7 +82,7 @@ fn delivery(meter: usize) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", START).expect("scope"),
+            VersionScope::for_interval("9900000000001", START, Sparte::Strom).expect("scope"),
             Version::new(20_260_701_000_001).expect("version"),
         ),
         START,
@@ -179,14 +180,22 @@ fn bench_predicate(c: &mut Criterion) {
 /// Scales with the number of data files a range touches, so a month of history
 /// at 512 MiB per file is tens to hundreds — the sizes benchmarked here.
 fn bench_elision(c: &mut Criterion) {
-    use meterstore::planner::{VersionStats, version};
+    use meterstore::planner::{FileStats, version};
 
     let mut group = c.benchmark_group("planner/elision");
     for files in [16usize, 256, 4096] {
-        // Every file at one version: the common case, and the one that has to
-        // scan the whole list before it can prove anything.
-        let stats: Vec<Option<VersionStats>> =
-            vec![Some(VersionStats::single(20_260_701_000_001)); files];
+        // One file per archival window, each at its own version over its own day
+        // — what a decade of daily commits actually looks like, and the case that
+        // has to sort and sweep the whole list before it can prove anything.
+        let stats: Vec<FileStats> = (0..files)
+            .map(|day| {
+                let start = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(day as i64);
+                FileStats::single(
+                    20_260_701_000_001 + day as i128,
+                    (start, start + time::Duration::hours(23)),
+                )
+            })
+            .collect();
 
         group.throughput(Throughput::Elements(files as u64));
         group.bench_with_input(BenchmarkId::from_parameter(files), &stats, |b, stats| {

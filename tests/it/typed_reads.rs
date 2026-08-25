@@ -48,7 +48,8 @@ fn reading(intervals: &[(i64, QualityFlag)], version: u128) -> meterstore::encod
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", START).unwrap(),
+            meterstore::VersionScope::for_interval("99", START, metering::interval::Sparte::Strom)
+                .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-26 06:00 UTC),

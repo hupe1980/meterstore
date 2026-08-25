@@ -115,7 +115,7 @@ impl Harness {
             .bind(rust_decimal::Decimal::new(1_234_567 + i, 6))
             .bind(metering::QualityFlag::Measured.as_str())
             .bind(Some("PT15M"))
-            .bind("mscons")
+            .bind("MSCONS")
             .bind(Some(detail.as_str()))
             .bind(Some("[]"))
             .bind(rust_decimal::Decimal::new(version, 0))
@@ -189,7 +189,7 @@ async fn a_fresh_table_reaches_its_first_real_window_in_one_commit() {
     // before a single row is archived. The archiver crosses the empty stretch in
     // one commit instead, stopping exactly at the first partition that exists.
     //
-    // Every suite here used to seed the boundary by hand, which is what hid this.
+    // Driven from an unseeded boundary, which is the only way this shows up.
     let h = Harness::start().await;
     h.hot
         .ensure_partitions(TABLE, D20, D22, Duration::DAY)

@@ -35,6 +35,11 @@ struct Served {
 }
 
 async fn serve(store: meterstore::MeterStore) -> Served {
+    serve_surface(store).await
+}
+
+/// The same, over anything the server can serve — a store or a whole catalog.
+async fn serve_surface(surface: impl meterstore::SqlSurface) -> Served {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral port");
@@ -43,7 +48,7 @@ async fn serve(store: meterstore::MeterStore) -> Served {
     let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(FlightSqlServer::new(store).into_service())
+            .add_service(FlightSqlServer::new(surface).into_service())
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
                 async {
@@ -287,6 +292,62 @@ async fn a_write_is_refused_with_the_reason() {
 }
 
 #[tokio::test]
+async fn a_query_shaped_statement_cannot_reach_the_filesystem() {
+    // Refusing `execute_update` by shape is not enough on its own: DataFusion's
+    // SQL surface is wider than `SELECT`, and `CREATE EXTERNAL TABLE … LOCATION`
+    // and `COPY … TO` arrive as ordinary *statement queries* — the path
+    // `execute` takes. `ctx.sql` executes DDL while planning it, so unguarded
+    // that is one round trip from any client reaching the port: arbitrary file
+    // read on the way in, arbitrary file write on the way out, and an external
+    // table over the warehouse's own Parquet returning every row a session
+    // scope is meant to confine.
+    let (_h, store, _oracle) = split_store().await;
+    let mut served = serve(store).await;
+
+    let escape = std::env::temp_dir().join("meterstore_flight_escape.parquet");
+    let _ = std::fs::remove_file(&escape);
+
+    for sql in [
+        "CREATE EXTERNAL TABLE leak STORED AS PARQUET LOCATION '/tmp'".to_string(),
+        format!(
+            "COPY (SELECT 1 AS a) TO '{}' STORED AS PARQUET",
+            escape.display()
+        ),
+        "CREATE TABLE leak2 AS SELECT 1 AS a".to_string(),
+    ] {
+        let error = served
+            .client
+            .execute(sql.clone(), None)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was accepted over Flight SQL"));
+        let status = expect_status(error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{sql}");
+        assert!(
+            status.message().contains("not accepted here"),
+            "{sql}: {}",
+            status.message()
+        );
+    }
+
+    assert!(!escape.exists(), "no Flight statement may write a file");
+
+    // The same statements through `prepare`, which is the other door in.
+    let error = served
+        .client
+        .prepare(
+            "CREATE EXTERNAL TABLE leak STORED AS PARQUET LOCATION '/tmp'".to_string(),
+            None,
+        )
+        .await
+        .expect_err("preparing DDL must be refused too");
+    assert!(
+        expect_status(error).message().contains("not accepted here"),
+        "prepare is the same surface"
+    );
+}
+
+#[tokio::test]
 async fn a_prepared_statement_round_trips() {
     // What a JDBC driver actually does: prepare once, execute, close.
     let (_h, store, oracle) = split_store().await;
@@ -336,7 +397,7 @@ async fn a_bad_statement_fails_at_plan_time() {
 #[tokio::test]
 async fn get_flight_info_plans_without_scanning() {
     // `GetFlightInfo` must produce a schema, not rows. Answering it by *running*
-    // the query — which is what an earlier version did — makes a BI tool's
+    // the query makes a BI tool's
     // ordinary `GetFlightInfo` → `DoGet` sequence cost two full scans, on the one
     // surface built for BI tools.
     //
@@ -398,4 +459,160 @@ async fn preparing_a_statement_does_not_run_it() {
     assert!(schema.fields().iter().any(|f| f.name() == "malo_id"));
 
     prepared.close().await.expect("close");
+}
+
+/// A catalog holding a billing table and a non-authoritative second stream,
+/// both populated and both archived through the boundary.
+///
+/// The shape §15.3 calls ordinary: a statement mentioning both tables is the
+/// second thing an external client cannot assemble for itself.
+async fn two_table_catalog() -> (TestHarness, meterstore::MeterCatalog) {
+    use meterstore::config::TableConfig;
+    use meterstore::tiering::store::HotStore;
+
+    const SECOND: &str = "esa_typ2_versions";
+    let config = |name: &str| {
+        TableConfig::new(name)
+            .settlement_lag(Duration::days(1))
+            .build()
+            .expect("config")
+    };
+
+    let harness = TestHarness::start().await.expect("harness");
+    let catalog = meterstore::MeterCatalog::builder()
+        .table(
+            harness
+                .builder_for(config(TestHarness::TABLE))
+                .await
+                .expect("primary builder"),
+        )
+        .table(
+            harness
+                .builder_for(config(SECOND))
+                .await
+                .expect("secondary builder"),
+        )
+        .build()
+        .await
+        .expect("catalog");
+    catalog.create_tables().await.expect("create both tables");
+
+    for store in catalog.tables() {
+        store
+            .hot_store()
+            .ensure_partitions(
+                store.config().name(),
+                START,
+                START + Duration::days(4),
+                Duration::DAY,
+            )
+            .await
+            .expect("partitions");
+        harness
+            .seed_watermark_for(store.config().name(), START, Duration::DAY)
+            .await
+            .expect("watermark");
+    }
+
+    // Different populations, so a statement returning the wrong table's rows
+    // produces the wrong count rather than the right one by luck.
+    for (table, seed, offset, malos) in [
+        (TestHarness::TABLE, 0xB111u64, 0usize, 3usize),
+        (SECOND, 0xE5A, 500, 1),
+    ] {
+        let workload = MeteringWorkload::new(START)
+            .seed(seed)
+            .malo_offset(offset)
+            .malo_ids(malos)
+            .days(3);
+        catalog
+            .table(table)
+            .expect("table")
+            .append(&workload.generate().expect("workload"))
+            .await
+            .expect("append");
+    }
+
+    // One table archived past the boundary and the other not, so the two
+    // genuinely have different watermarks — which is the fact a single reported
+    // boundary would erase.
+    catalog
+        .table(TestHarness::TABLE)
+        .expect("primary")
+        .archive(START + Duration::days(3), 2)
+        .await
+        .expect("archive");
+
+    (harness, catalog)
+}
+
+#[tokio::test]
+async fn a_catalog_serves_a_statement_that_mentions_two_tables() {
+    // The justification for this endpoint is that the unified hot + cold view is
+    // the one thing an external client cannot assemble for itself. A statement
+    // spanning two *tables* is the second: each has its own watermark and its own
+    // hot half, so no amount of object-store access reconstructs it either.
+    let (_harness, catalog) = two_table_catalog().await;
+    let mut served = serve_surface(catalog).await;
+
+    let batches = query(
+        &mut served,
+        "SELECT (SELECT COUNT(*) FROM readings) + (SELECT COUNT(*) FROM esa_typ2) AS both",
+    )
+    .await;
+
+    let total: i64 = batches
+        .iter()
+        .map(|b| {
+            use datafusion::arrow::array::AsArray;
+            b.column(0)
+                .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                .value(0)
+        })
+        .sum();
+    assert!(total > 0, "both tables must contribute rows");
+}
+
+#[tokio::test]
+async fn a_catalog_result_carries_every_boundary_rather_than_one() {
+    // Two tables genuinely have two watermarks, and the fixture archives only
+    // one of them so they differ. Reporting a single number would tell a client
+    // a figure was settled to a point only one of its inputs had reached — the
+    // fiction carrying provenance exists to prevent.
+    let (_harness, catalog) = two_table_catalog().await;
+    let mut served = serve_surface(catalog).await;
+
+    let info = served
+        .client
+        .execute(
+            "SELECT (SELECT COUNT(*) FROM readings) + (SELECT COUNT(*) FROM esa_typ2) AS both"
+                .to_string(),
+            None,
+        )
+        .await
+        .expect("get_flight_info");
+
+    let schema = info.try_decode_schema().expect("schema on the flight info");
+    let metadata = schema.metadata();
+
+    let listed = metadata
+        .get("meterstore.watermarks")
+        .expect("a catalog reports its boundaries per table");
+    assert!(
+        listed.contains(TestHarness::TABLE) && listed.contains("esa_typ2_versions"),
+        "both tables must be named: {listed}"
+    );
+    assert!(
+        listed.split(',').count() == 2,
+        "one entry per table the statement touched: {listed}"
+    );
+
+    // The conservative minimum is still there, because that is the one number a
+    // reconciliation can use directly.
+    assert!(
+        metadata
+            .get(meterstore::watermark::WATERMARK_PROPERTY)
+            .is_some(),
+        "{metadata:?}"
+    );
 }

@@ -31,7 +31,10 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 
 | Column | Meaning |
 |---|---|
+| `malo_id`, `obis_code` | The measuring point and the channel |
+| *merge-key columns* | One column per declared identity column, and `melo_id` where the table [identifies a reading by its Messlokation](@/docs/storage-model.md#the-messlokation-may-be-part-of-the-identity) |
 | `sparte` | The commodity — and therefore **which day** the row is measured on |
+| `resolution` | The declared interval grid — and therefore **how many** values a day should hold. Grouped on, so it is this row's grid rather than one of several |
 | `expected` | What the DST-aware calendar says the range should hold |
 | `actual` | What is stored |
 | `missing` | Intervals short, **summed per balancing day** |
@@ -41,6 +44,33 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 | `not_billable` | Intervals whose quality bars them from billing |
 | `complete` | `missing == 0 && surplus == 0` |
 
+## One row per reading, not per measuring point
+
+The report groups by the **merge key**, so identity columns and a key-carrying
+`melo_id` are both grouped on and reported — `row.identity` carries them in key
+order.
+
+That matters on a shared store. Two tenants, or the two meters of a
+Mehrfamilienhaus, each deliver a full day of one channel: folded, that is 192
+intervals against an expectation of 96 and a `surplus` of 96 where nothing is
+wrong. Worse in the other direction — one of them four short nets against the
+other's full day and the channel reads as **complete**, the one answer this
+report must never give about a series with a real gap.
+
+Scoping the session narrows the report as it narrows a query.
+
+### And one row per interval grid
+
+`resolution` is grouped on for the same reason `sparte` is: both decide which
+expectation a row is measured against, and a channel can hold two of either. A
+meter converted from an hourly profile to a quarter-hourly one mid-month is the
+ordinary case, and it is the *grid* that says whether a day of 24 values is
+complete or 72 short.
+
+Folded, such a channel would report one arbitrary grid against a count drawn from
+both — arbitrary literally, since the aggregate yields groups in no defined order.
+Split, a clean conversion comes back as two complete rows, which is what it is.
+
 ## Why the expected count is not 96
 
 `Europe/Berlin` gives **92**-interval and **100**-interval days at the DST
@@ -48,9 +78,13 @@ transitions. A check that assumes 96 raises a false alarm on every meter every
 spring — and, worse, masks a genuine four-interval gap every autumn, which is the
 direction that reaches a bill.
 
-The count comes from `metering::calendar::intervals_in_day` against the series'
-own declared `resolution`. At one value a minute the autumn expectation is
-**1 500**, not 1 440.
+The count comes from `metering`'s own `DayBoundary::intervals_in_day` against the
+series' declared `resolution`. At one value a minute the autumn expectation is
+**1 500**, not 1 440. A resolution coarser than a day (`P1M`, `P1Y`) has no fixed
+count within one, so the row reports what it found and declines to call it
+complete or short — `is_measurable()` says which.
+
+A **daily** series expects one interval per day, on both boundaries alike.
 
 ## And why the day is not always the calendar day
 
@@ -58,6 +92,11 @@ Gas balances on the **Gastag** — 06:00 to 06:00 local — so a gas channel's d
 not the day electricity's is. Both the bucketing and the expected count follow
 the row's `sparte`, which is why it is a reported column rather than an implicit
 assumption.
+
+That choice is `metering`'s own `DayBoundary`. MeterStore adds one thing to it:
+the mapping from a stored row's `sparte` to the boundary that applies, written
+once in `planner::day_boundary`. Which of the two applies is a storage fact — a
+row carries its commodity — rather than a calendar one.
 
 This matters twice over at a DST transition. The clocks change at 02:00/03:00
 local, *before* the 06:00 boundary, so the long and short gas days are the ones
@@ -102,12 +141,13 @@ so a billing period starting at noon does not report the morning as missing.
 
 ## Where the work happens
 
-The heavy half — group a range by measuring point, channel, commodity and
-balancing day — is a
-single DataFusion aggregate over the resolved table, so it prunes and streams like
-any other query. The balancing day is a **stored column**, not a function call, so
-the group-by is an ordinary column reference the engine can collect statistics
-for; the calendar was consulted once, when the row was written. The roll-up to one row per channel happens in Rust, where the
-calendar lives and where billability can be *asked* of `metering` rather than
-restated as a `CASE`. § 60 Abs. 2 MsbG is a statute; a second copy of it in SQL is
-a second thing to keep in step with it.
+The heavy half — group a range by measuring point, channel, commodity, grid and
+balancing day — is a single DataFusion aggregate over the resolved table, so it
+prunes and streams like any other query. The balancing day is a **stored column**
+rather than a function call, so the group-by is an ordinary column reference the
+engine can collect statistics for.
+
+The roll-up to one row per channel happens in Rust, where the calendar lives and
+where billability can be *asked* of `metering` rather than restated as a `CASE`.
+§ 60 Abs. 2 MsbG is a statute; a second copy of it in SQL is a second thing to
+keep in step with it.

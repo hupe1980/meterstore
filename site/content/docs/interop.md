@@ -33,21 +33,35 @@ rather than assumed.
 SELECT malo_id, obis_code, "from", value, … FROM (
   SELECT *, ROW_NUMBER() OVER (
     PARTITION BY malo_id, obis_code, "from", version_scope
-    ORDER BY version DESC
+    ORDER BY version DESC, recorded_at DESC
   ) AS _meterstore_rank
   FROM readings_versions
 ) AS _meterstore_resolved WHERE _meterstore_rank = 1
 ```
 
-Two parts of that are not guessable:
+Do not retype it. `system.resolution` carries this exact text for *your* table,
+merge key and all, and `store.resolution_sql()` returns the same string — both
+from the one definition the store itself plans against, so a pasted query and the
+store cannot drift.
+
+Three parts of it are not guessable:
 
 - **`version_scope` is in the `PARTITION BY`.** MSCONS assigns versions per
   network operator per month, so versions from different scopes are not
   comparable and must not be ranked against each other.
-- **Identity columns widen the merge key.** If the deployment declares any
-  ([storage model](@/docs/storage-model.md)), add them to the `PARTITION BY` —
-  omitting one resolves *across* it, so with a `tenant` column one tenant's
-  correction supersedes another's reading.
+- **The merge key may be wider than those three.** Declared identity columns
+  join it, and so does `melo_id` on a table that
+  [identifies a reading by its Messlokation](@/docs/storage-model.md#the-messlokation-may-be-part-of-the-identity)
+  — which a Zählerstandsgang does by default. Omitting one resolves *across* it:
+  with a `tenant` column one tenant's correction supersedes another's reading,
+  and without `melo_id` on a point table one meter's register supersedes the
+  meter next door's. This is the part not to retype from memory — take it from
+  `system.resolution`, which carries your table's own key.
+- **`recorded_at DESC` breaks ties.** MeterStore's own write paths refuse to
+  store two rows at one `(merge key, version)`, so a tie should not arise — but
+  a warehouse is a shared surface, and `ROW_NUMBER` with a partial ordering
+  returns a different row on a different plan. A settlement that reproduces only
+  sometimes is not reproducible.
 
 ## Gas is not on the calendar day {#the-gas-day-trap}
 
@@ -66,6 +80,12 @@ day at all. Neither error raises anything — both produce a plausible daily cur
 The column is computed at write time because SQL dialects differ on timestamp
 arithmetic, so no single published expression is right everywhere.
 
+The same boundary carries up to the **month**: EDI@Energy *Allgemeine
+Festlegungen* v6.1c, Kap. 3.1 defines the gas Bilanzierungsmonat as 01.06 06:00
+to 01.07 06:00, so `version_scope`'s `YYYY-MM` for a gas row is cut at 06:00 too.
+A row at 02:00 local on 1 March carries February's scope. Reading it as a
+calendar month splits one operator-month in two.
+
 At a DST transition the long and short gas days are the ones named after the
 **Saturday**, because the clocks change before the 06:00 boundary:
 
@@ -77,6 +97,25 @@ At a DST transition the long and short gas days are the ones named after the
 The DuckDB suite groups a gas workload across that transition by the stored
 column, matches MeterStore's own histogram, and checks that the naive UTC
 grouping disagrees.
+
+## Decimals cross as strings
+
+`QueryResult::to_json` renders `value`, `version` and any `SUM` over them as
+`"123.456789"`, not `123.456789`. That is the one shape in which JSON carries an
+exact decimal.
+
+A JSON *number* cannot. Arrow renders the decimal exactly, and then every
+ordinary reader — `serde_json` without `arbitrary_precision`, every JavaScript
+engine, Python's `json` — parses it into an `f64`. At the full eighteen digits
+the last one is simply gone: `123456789012.345678` reads back
+`123456789012.34567`. No error, no warning, and a settlement figure that no
+longer reconciles.
+
+Enabling `arbitrary_precision` would fix `serde_json` and none of the consumers,
+who are the point of a JSON surface. Timestamps are already strings for the same
+reason. Non-decimal columns are unchanged: a count is still a number.
+
+Arrow IPC and Flight SQL are unaffected — they carry `Decimal128` as itself.
 
 ## Which catalogue you are on matters
 
@@ -134,15 +173,31 @@ would be *worse* than reading object storage directly: a proxy hop that serialis
 parallel reads through one process.
 
 ```rust
-let service = FlightSqlServer::new(store).into_service();   // feature = "flight"
+let service = FlightSqlServer::new(store).into_service();     // feature = "flight"
+let service = FlightSqlServer::new(catalog).into_service();   // …or every table
 ```
 
+- **A store or a whole catalogue.** The server takes any `SqlSurface` — the pair
+  of methods serving needs: plan a statement without running it, and run it as a
+  stream. A statement spanning two
+  [tables](@/docs/querying.md#several-tables-in-one-session) is the second thing
+  an external client cannot assemble for itself, since each has its own watermark
+  and its own hot half.
 - **Read-only.** A write here would bypass the tier routing and the subject-
   reference check, neither of which is recoverable afterwards, so every mutating
   call answers `PermissionDenied` naming both.
 - **Results carry their boundary over the wire.** The watermark, the tiers scanned
   and the read mode travel as **Arrow schema metadata** on every response, so a BI
-  tool that keeps the schema keeps the provenance.
+  tool that keeps the schema keeps the provenance. Over a catalogue,
+  `meterstore.watermarks` names *each* table the statement touched and its
+  boundary, beside the conservative minimum — two tables have two boundaries, and
+  one number would claim a figure was settled to a point only half its inputs had
+  reached.
+- **Rows are streamed, never collected.** This is the surface built for BI tools,
+  and a BI tool's query is the one whose rows genuinely are the answer. Buffering
+  the result to send it would make the server's peak memory the size of whatever
+  a client asked for, over a socket the client controls. The provenance is
+  available before the first batch, which is what lets the schema go out first.
 - **The statement handle *is* the SQL.** A server-side cache would need eviction
   and would leak on a disconnected client, and at metering result sizes it buys
   nothing — the cost is the scan, not the parse.
@@ -154,6 +209,6 @@ let service = FlightSqlServer::new(store).into_service();   // feature = "flight
 - **`into_service` returns a tonic service, not a bound port**, for the same
   reason the façade returns a router.
 
-`information_schema` is enabled on the store's session, so a BI tool can list the
+`information_schema` is enabled on the session, so a BI tool can list the
 catalogue before it queries anything — and the distinction between `readings` and
 `readings_versions` is discoverable rather than folklore.

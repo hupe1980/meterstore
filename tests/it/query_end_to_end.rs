@@ -155,7 +155,7 @@ impl Harness {
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
-                   VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH','MEASURED','PT15M','mscons',
+                   VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH','MEASURED','PT15M','MSCONS',
                            $6,'[]',$7,$9,$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
@@ -503,7 +503,8 @@ fn correction(
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", start).unwrap(),
+            meterstore::VersionScope::for_interval("99", start, metering::interval::Sparte::Strom)
+                .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-26 06:00 UTC),
@@ -590,6 +591,282 @@ async fn a_correction_spanning_the_tier_boundary_resolves_correctly() {
         )
         .await;
     assert_eq!(total, 198, "2 x 99, the corrected value only");
+}
+
+#[tokio::test]
+async fn a_replayed_late_correction_is_not_stored_twice() {
+    // The hot tier absorbs a replay with its primary key; Iceberg has no
+    // constraints. Two rows at one version are two winners, and a historical
+    // scan whose files hold a single version elides resolution entirely — so the
+    // raw rows come back and the sum doubles with nothing reporting it.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert_versioned("11111111115", D18, 2, 10, 20_260_718_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let correction = correction("11111111115", D18, 2, 99, 20_260_726_000_002);
+
+    let first = store
+        .append(std::slice::from_ref(&correction))
+        .await
+        .expect("first");
+    assert_eq!(first.cold_rows, 2, "the correction lands in the cold tier");
+
+    let replay = store.append(&[correction]).await.expect("replay");
+    assert_eq!(
+        replay.cold_rows, 0,
+        "a redelivery must write nothing to the cold tier"
+    );
+    assert!(
+        replay
+            .displacements
+            .iter()
+            .all(|d| d.effect == meterstore::session::Effect::Duplicate),
+        "every replayed interval reports as a duplicate: {:?}",
+        replay.displacements
+    );
+
+    let total = h
+        .scalar(
+            ReadMode::Unified,
+            "SELECT CAST(SUM(value) AS BIGINT) FROM readings",
+        )
+        .await;
+    assert_eq!(total, 198, "2 x 99 — the replay must not double it");
+
+    // And the audit trail holds one row per version, not three.
+    let raw = h
+        .scalar(ReadMode::Unified, "SELECT COUNT(*) FROM readings_versions")
+        .await;
+    assert_eq!(
+        raw, 4,
+        "two originals and two corrections, nothing repeated"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_delivery_cannot_slip_past_an_elided_resolution() {
+    // The sharpest form of the duplicate hazard, and the one that produces a
+    // wrong *number* rather than an extra row.
+    //
+    // A delivery replayed after its window was archived carries the version it
+    // always had. Stored twice, the cold files in range all still hold that one
+    // version — so the planner proves the range correction-free and **elides
+    // resolution**, the raw rows are returned, and the sum doubles. Resolution
+    // would have masked it; elision is exactly the case where it cannot.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert_versioned("11111111115", D18, 2, 10, 20_260_718_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let replay = store
+        .append(&[correction("11111111115", D18, 2, 10, 20_260_718_000_001)])
+        .await
+        .expect("a replay is ordinary traffic, not an error");
+    assert_eq!(replay.cold_rows, 0, "nothing new to store");
+
+    // Cold-only, so elision is on the table — and the answer has to be right
+    // either way.
+    let total = h
+        .scalar(
+            ReadMode::Historical,
+            "SELECT CAST(SUM(value) AS BIGINT) FROM readings",
+        )
+        .await;
+    assert_eq!(total, 20, "2 x 10 kWh, not 4 x 10");
+}
+
+#[tokio::test]
+async fn concurrent_late_corrections_do_not_both_write() {
+    // Reconciling reads what is stored and then writes what is left. Two
+    // processes doing that at once would both find no stored row and both
+    // append, storing the reading twice at one version — which resolution cannot
+    // collapse, and which an elided historical scan then returns twice.
+    //
+    // The hot tier gets that exclusion from its primary key. Iceberg has none,
+    // so it is a lease, and this is what proves the lease is doing the work.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_versioned("11111111115", D18, 2, 10, 20_260_718_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    // Two independent stores over one database and one warehouse — the
+    // replicated topology, not two handles that happen to share a lock.
+    let a = h.store(ReadMode::Unified).await;
+    let b = h.store(ReadMode::Unified).await;
+    let correction = correction("11111111115", D18, 2, 99, 20_260_726_000_002);
+
+    let (ra, rb) = tokio::join!(
+        a.append(std::slice::from_ref(&correction)),
+        b.append(std::slice::from_ref(&correction)),
+    );
+    let written: u64 = [ra.expect("a"), rb.expect("b")]
+        .iter()
+        .map(|o| o.cold_rows)
+        .sum();
+    assert_eq!(written, 2, "the correction lands once, not twice");
+
+    // The audit trail holds two originals and two corrections, and the resolved
+    // sum is the corrected value rather than double it.
+    assert_eq!(
+        h.scalar(ReadMode::Unified, "SELECT COUNT(*) FROM readings_versions")
+            .await,
+        4
+    );
+    assert_eq!(
+        h.scalar(
+            ReadMode::Historical,
+            "SELECT CAST(SUM(value) AS BIGINT) FROM readings",
+        )
+        .await,
+        198,
+        "2 x 99 — and this range elides resolution, so a duplicate would show"
+    );
+}
+
+#[tokio::test]
+async fn a_late_correction_reports_what_it_displaced() {
+    // The cold tier's displacement report. Documented from the start and, until
+    // now, only ever produced for the hot tier — so a caller building a
+    // correction audit trail silently got nothing for exactly the deliveries
+    // that most need one.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert_versioned("11111111115", D18, 1, 10, 20_260_718_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let outcome = store
+        .append(&[correction("11111111115", D18, 1, 99, 20_260_726_000_002)])
+        .await
+        .expect("append correction");
+
+    assert_eq!(outcome.displacements.len(), 1);
+    let d = &outcome.displacements[0];
+    assert_eq!(d.effect, meterstore::session::Effect::Superseded);
+    assert_eq!(d.from, D18);
+    assert_eq!(
+        d.to,
+        Some(D18 + Duration::minutes(15)),
+        "the interval end travels, not a collapse to its start"
+    );
+    assert_eq!(
+        d.superseded.as_ref().expect("a prior value").value,
+        rust_decimal::Decimal::new(10, 0)
+    );
+    assert_eq!(d.written.value, rust_decimal::Decimal::new(99, 0));
+    assert!(d.value_changed());
+
+    // A backfill the correction already outranks is stored and reports as such.
+    let backfill = store
+        .append(&[correction("11111111115", D18, 1, 55, 20_260_719_000_001)])
+        .await
+        .expect("append backfill");
+    assert_eq!(backfill.cold_rows, 1, "it joins the audit trail");
+    assert_eq!(
+        backfill.displacements[0].effect,
+        meterstore::session::Effect::Shadowed,
+        "an existing higher version still wins"
+    );
+}
+
+#[tokio::test]
+async fn restating_a_cold_value_under_an_existing_version_is_refused() {
+    // A version identifies one assertion. Redelivering an identical row is
+    // ordinary; restating a different value under the same version means a
+    // producer is wrong, and keeping either copy silently would bury that. The
+    // hot tier already refused this; the cold tier kept both.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert_versioned("11111111115", D18, 1, 10, 20_260_718_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    store
+        .append(&[correction("11111111115", D18, 1, 99, 20_260_726_000_002)])
+        .await
+        .expect("the correction itself is fine");
+
+    let err = store
+        .append(&[correction("11111111115", D18, 1, 42, 20_260_726_000_002)])
+        .await
+        .expect_err("a different value under the same version must be refused");
+    let message = err.to_string();
+    assert!(message.contains("higher version"), "{message}");
+}
+
+#[tokio::test]
+async fn a_streamed_query_carries_its_boundary_before_the_first_row() {
+    // The ordering is the whole point. A surface that has to put the boundary on
+    // the wire — Flight SQL writes the schema before any batch — cannot get it
+    // from a result it has not finished computing, and collecting the result to
+    // find out would make the server's peak memory whatever a client asked for.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_versioned("11111111115", D18, 96, 10, 20_260_718_000_001)
+        .await;
+    h.insert_versioned("11111111115", D20, 96, 10, 20_260_720_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let (described, stream) = store
+        .stream(r#"SELECT "from", value FROM readings ORDER BY "from""#)
+        .await
+        .expect("stream");
+
+    // Provenance is in hand before a single row has been read.
+    assert_eq!(described.watermark().get(), D20);
+    assert!(
+        described.spans_tiers(),
+        "the range covers both sides of the boundary: {:?}",
+        described.tiers_scanned()
+    );
+    assert!(described.schema().field_with_name("value").is_ok());
+
+    use futures::StreamExt;
+    let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+    let rows: usize = batches
+        .into_iter()
+        .map(|b| b.expect("batch").num_rows())
+        .sum();
+    assert_eq!(rows, 192, "the stream yields exactly what a collect would");
+
+    // And it agrees with the collecting path, so the two cannot drift.
+    assert_eq!(
+        h.scalar(ReadMode::Unified, "SELECT COUNT(*) FROM readings")
+            .await,
+        192
+    );
 }
 
 #[tokio::test]
@@ -755,6 +1032,13 @@ async fn system_config_shows_the_settings_that_interact() {
     let h = Harness::start().await;
     let store = h.store(ReadMode::Unified).await;
     store.refresh_system_tables(NOW_FOR_STATUS).await.unwrap();
+    // **Twice**, because it is a refresh: `MemorySchemaProvider::register_table`
+    // refuses a name it already holds, and the second call is the first one a
+    // maintenance loop or an operator dashboard makes.
+    store
+        .refresh_system_tables(NOW_FOR_STATUS)
+        .await
+        .expect("a refresh must be repeatable");
 
     let batches = store
         .sql(
@@ -860,6 +1144,84 @@ async fn a_corrected_history_scan_still_resolves() {
         sum_kwh(&store, sql).await,
         100,
         "4 intervals at the corrected value of 25, not 140"
+    );
+}
+
+#[tokio::test]
+async fn consecutive_archival_windows_elide_resolution_however_their_versions_differ() {
+    // The optimisation the cold layout exists for, on the shape real data has.
+    //
+    // MSCONS versions ascend per delivery and archival commits one day per
+    // window, so a year of history is one file per day at a different version
+    // each. The first rule — every file in range must hold the *same* version —
+    // is sound and was true of almost nothing: every scan wider than a single day
+    // resolved, and the provider-rather-than-a-view argument bought nothing.
+    //
+    // `from` is in the merge key, so two files covering different days cannot
+    // hold the same key however their versions differ. This asserts the
+    // consequence twice over: the plan carries no window aggregate, and the sum
+    // is the same one resolution would have produced.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    // Two days, two deliveries, two versions — as an operator would issue them.
+    h.insert_versioned("11111111115", D18, 4, 10, 20_260_718_000_001)
+        .await;
+    h.insert_versioned("11111111115", D19, 4, 20, 20_260_719_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let historical = "SELECT CAST(SUM(value) AS BIGINT) FROM readings                       WHERE \"from\" >= '2026-07-18T00:00:00Z'                         AND \"from\" < '2026-07-20T00:00:00Z'";
+
+    assert!(
+        !ranks_rows(&store, historical).await,
+        "two disjoint daily windows cannot share a merge key, so nothing needs ranking"
+    );
+    assert_eq!(
+        h.scalar(ReadMode::Unified, historical).await,
+        4 * 10 + 4 * 20,
+        "and the answer is still the resolved one"
+    );
+}
+
+#[tokio::test]
+async fn a_late_correction_overlapping_an_archived_day_still_resolves() {
+    // The other half, and the one that keeps the optimisation honest. A
+    // correction appends a second cold file covering a day already archived, at a
+    // higher version — the two overlap on `from`, so a key really does appear in
+    // both and eliding would return the superseded value alongside the current
+    // one.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_versioned("11111111115", D18, 4, 10, 20_260_718_000_001)
+        .await;
+    h.insert_versioned("11111111115", D19, 4, 20, 20_260_719_000_001)
+        .await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    store
+        .append(&[correction("11111111115", D18, 4, 99, 20_260_726_000_002)])
+        .await
+        .expect("late correction");
+
+    let historical = "SELECT CAST(SUM(value) AS BIGINT) FROM readings                       WHERE \"from\" >= '2026-07-18T00:00:00Z'                         AND \"from\" < '2026-07-20T00:00:00Z'";
+
+    assert!(
+        ranks_rows(&store, historical).await,
+        "the correction's file overlaps the original's day, so the versions must be ranked"
+    );
+    assert_eq!(
+        h.scalar(ReadMode::Unified, historical).await,
+        4 * 99 + 4 * 20,
+        "the corrected value only — eliding here would add the superseded 4 x 10"
     );
 }
 
@@ -1108,7 +1470,8 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
     let store = h.store(ReadMode::Unified).await;
     let mut other = correction("11111111115", D18, 2, 40, 20_260_718_000_002);
     other.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("88", D18).unwrap(),
+        meterstore::VersionScope::for_interval("88", D18, metering::interval::Sparte::Strom)
+            .unwrap(),
         meterstore::Version::new(20_260_718_000_002).unwrap(),
     );
     let late = store.append(&[other]).await;

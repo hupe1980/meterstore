@@ -11,7 +11,7 @@
 //! and a crash inside it either loses data or replays it. Here there is no such
 //! window: recovery just reads the watermark back off the current snapshot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use iceberg::spec::{DataFileFormat, FormatVersion};
@@ -26,7 +26,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use time::OffsetDateTime;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::arrow::array::RecordBatch;
 use crate::encode::schema;
@@ -381,9 +381,9 @@ impl IcebergCold {
         &self,
         table: &str,
         range: (OffsetDateTime, OffsetDateTime),
-    ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
+    ) -> Result<Vec<crate::planner::FileStats>> {
         use crate::encode::schema::col;
-        use crate::planner::VersionStats;
+        use crate::planner::{FileStats, VersionStats};
 
         let loaded = self.load(table).await?;
         let metadata = loaded.metadata();
@@ -398,7 +398,7 @@ impl IcebergCold {
         // file as unprovable rather than silently claiming elision.
         let (Some(version_id), Some(from_id)) = (field_id(col::VERSION), field_id(col::FROM))
         else {
-            return Ok(vec![None]);
+            return Ok(vec![FileStats::unknown()]);
         };
 
         let file_io = loaded.file_io();
@@ -419,30 +419,41 @@ impl IcebergCold {
                 }
                 let data_file = entry.data_file();
 
-                // Files provably outside the range cannot affect this scan, and
-                // including them would let one untouched historical file with a
-                // correction disable elision for every query.
-                if let (Some(lo), Some(hi)) = (
+                // The file's own `from` span, which does two jobs. Files
+                // provably outside the scan's range are dropped here — including
+                // them would let one untouched historical file with a correction
+                // disable elision for every query — and the span travels with the
+                // ones that remain, because two files that do not overlap on
+                // `from` cannot hold the same merge key and are therefore free to
+                // carry different versions.
+                let interval = match (
                     data_file.lower_bounds().get(&from_id),
                     data_file.upper_bounds().get(&from_id),
-                ) && let (Some(lo), Some(hi)) = (as_timestamp(lo), as_timestamp(hi))
+                ) {
+                    (Some(lo), Some(hi)) => match (as_timestamp(lo), as_timestamp(hi)) {
+                        (Some(lo), Some(hi)) => Some((lo, hi)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((lo, hi)) = interval
                     && (hi < range.0 || lo >= range.1)
                 {
                     continue;
                 }
 
-                stats.push(
-                    match (
-                        data_file.lower_bounds().get(&version_id),
-                        data_file.upper_bounds().get(&version_id),
-                    ) {
-                        (Some(lo), Some(hi)) => match (as_i128(lo), as_i128(hi)) {
-                            (Some(min), Some(max)) => Some(VersionStats { min, max }),
-                            _ => None,
-                        },
+                let version = match (
+                    data_file.lower_bounds().get(&version_id),
+                    data_file.upper_bounds().get(&version_id),
+                ) {
+                    (Some(lo), Some(hi)) => match (as_i128(lo), as_i128(hi)) {
+                        (Some(min), Some(max)) => Some(VersionStats { min, max }),
                         _ => None,
                     },
-                );
+                    _ => None,
+                };
+
+                stats.push(FileStats { version, interval });
             }
         }
 
@@ -775,14 +786,112 @@ impl IcebergCold {
                         .await;
                     base = self.load(table).await?;
                 }
-                Err(e) => return Err(ice(e)),
+                Err(e) => {
+                    // Not a lost race — a catalog that refused, or one that may
+                    // not have answered. Either way the files this attempt wrote
+                    // will not be committed by anyone.
+                    self.discard(table, &base, &data_files).await;
+                    return Err(ice(e));
+                }
             }
         }
 
+        self.discard(table, &base, &data_files).await;
         Err(Error::Storage(format!(
             "{table}: {COMMIT_ATTEMPTS} commit attempts all lost the compare-and-swap; \
              another writer is committing continuously"
         )))
+    }
+
+    /// Remove data files a commit wrote and never landed.
+    ///
+    /// Files are written before the commit and reused across its retries, so a
+    /// run that exhausts them leaves unreferenced Parquet — the warehouse's only
+    /// source of orphans, since nothing here removes a committed file. General
+    /// orphan cleanup stays blocked on `FileIO` having no listing operation;
+    /// this needs none, because the writer still holds every path.
+    ///
+    /// It **re-reads first**: a commit can fail *after* landing — a timeout says
+    /// nothing about whether the catalog applied the update — and deleting then
+    /// would take files out from under a live snapshot. Anything the current
+    /// snapshot references is left alone, and so is everything if the reload
+    /// fails.
+    ///
+    /// Best-effort, and silent about its own failures: the caller is already
+    /// returning the error that matters, and an orphan costs storage rather than
+    /// correctness.
+    async fn discard(&self, table: &str, base: &Table, files: &[iceberg::spec::DataFile]) {
+        if files.is_empty() {
+            return;
+        }
+
+        let referenced = match self.referenced_paths(table).await {
+            Ok(paths) => paths,
+            Err(e) => {
+                warn!(
+                    table,
+                    error = %e,
+                    files = files.len(),
+                    "could not confirm the failed commit left its data files unreferenced; \
+                     leaving them in place"
+                );
+                return;
+            }
+        };
+
+        let io = base.file_io();
+        let (mut removed, mut kept) = (0usize, 0usize);
+        for file in files {
+            if referenced.contains(file.file_path()) {
+                kept += 1;
+                continue;
+            }
+            match io.delete(file.file_path()).await {
+                Ok(()) => removed += 1,
+                Err(e) => warn!(table, path = file.file_path(), error = %e, "orphan not removed"),
+            }
+        }
+
+        if kept > 0 {
+            // The commit landed after all, and the error the caller is about to
+            // return is a lie about durability rather than about the data.
+            warn!(
+                table,
+                kept, "the failed commit had in fact landed; its data files are live and were kept"
+            );
+        }
+        if removed > 0 {
+            info!(
+                table,
+                removed, "removed data files from a commit that never landed"
+            );
+        }
+    }
+
+    /// Every data-file path the table's current snapshot references.
+    async fn referenced_paths(&self, table: &str) -> Result<HashSet<String>> {
+        let loaded = self.load(table).await?;
+        let Some(snapshot) = loaded.metadata().current_snapshot() else {
+            return Ok(HashSet::new());
+        };
+
+        let file_io = loaded.file_io();
+        let manifest_list = loaded
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ice)?;
+
+        let mut paths = HashSet::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(file_io).await.map_err(ice)?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    paths.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+        Ok(paths)
     }
 }
 
@@ -1141,7 +1250,7 @@ impl ColdStore for IcebergCold {
         &self,
         table: &str,
         range: (OffsetDateTime, OffsetDateTime),
-    ) -> Result<Vec<Option<crate::planner::VersionStats>>> {
+    ) -> Result<Vec<crate::planner::FileStats>> {
         IcebergCold::version_stats(self, table, range).await
     }
 

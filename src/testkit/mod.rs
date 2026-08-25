@@ -30,14 +30,14 @@
 
 use std::collections::BTreeMap;
 
-use metering::ids::MaloId;
+use metering::ids::{MaloId, MeloId};
 use metering::interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte};
 use metering::measurement_series::{MeasurementSeries, MeasurementSource};
 use metering::resolution::IntervalResolution;
 use rust_decimal::Decimal;
 use time::{Duration, OffsetDateTime};
 
-use crate::encode::StoredSeries;
+use crate::encode::{StoredReadings, StoredSeries};
 use crate::error::{Error, Result};
 use crate::version::{ScopedVersion, Version, VersionScope};
 
@@ -101,6 +101,7 @@ pub struct MeteringWorkload {
     malo_offset: usize,
     sparte: Sparte,
     unit: MeasurementUnit,
+    messlokationen: usize,
 }
 
 impl MeteringWorkload {
@@ -118,7 +119,28 @@ impl MeteringWorkload {
             malo_offset: 0,
             sparte: Sparte::Strom,
             unit: Sparte::Strom.billing_unit(),
+            messlokationen: 0,
         }
+    }
+
+    /// Give each Marktlokation `n` **Messlokationen**, each reporting the same
+    /// channel at the same instants.
+    ///
+    /// Zero — the default — names none, which is the shape a plain Lastgang has.
+    ///
+    /// Any other value is the shape a Mehrfamilienhaus or a house with an
+    /// Einliegerwohnung has, and the one that separates a store keyed by the
+    /// Messlokation from one that is not: the meters agree on the channel, on the
+    /// instants and — at installation — on the number, so a merge key without
+    /// `melo_id` folds them into one reading and `ON CONFLICT DO NOTHING` drops
+    /// the second with nothing to notice.
+    ///
+    /// Pair with `TableConfig::identify_by_melo(true)` (or a point table, where
+    /// it is the default), and with [`Oracle::for_table`], which then keys on the
+    /// same thing the store does.
+    pub fn messlokationen(mut self, n: usize) -> Self {
+        self.messlokationen = n;
+        self
     }
 
     /// Measure a different commodity, in that commodity's billing unit.
@@ -243,58 +265,158 @@ impl MeteringWorkload {
     pub fn generate(&self) -> Result<Vec<StoredSeries>> {
         let mut rng = Rng::new(self.seed);
         let mut out = Vec::new();
-        let mut corrections: Vec<(usize, OffsetDateTime, Decimal)> = Vec::new();
+        let mut corrections: Vec<(usize, Option<usize>, OffsetDateTime, Decimal)> = Vec::new();
 
         for day in 0..self.days {
             let day_start = self.start + Duration::days(day);
             let steps = Duration::DAY.whole_seconds() / self.resolution.whole_seconds();
 
             for malo in 0..self.malo_ids {
-                let mut intervals = Vec::new();
-                for step in 0..steps {
-                    let from = day_start + self.resolution * step as i32;
-                    if rng.chance(self.gap_rate) {
-                        continue;
+                for meter in self.meters() {
+                    let mut intervals = Vec::new();
+                    for step in 0..steps {
+                        let from = day_start + self.resolution * step as i32;
+                        if rng.chance(self.gap_rate) {
+                            continue;
+                        }
+                        let kwh = Decimal::new(rng.below(500) as i64 + 1, 2);
+                        if rng.chance(self.correction_rate) {
+                            corrections.push((malo, meter, from, kwh + Decimal::new(100, 2)));
+                        }
+                        intervals.push(self.interval(from, kwh));
                     }
-                    let kwh = Decimal::new(rng.below(500) as i64 + 1, 2);
-                    if rng.chance(self.correction_rate) {
-                        corrections.push((malo, from, kwh + Decimal::new(100, 2)));
+                    // A delivery is split per version scope, not per day. A UTC
+                    // day is not inside one local month: 2026-07-31T22:00Z is
+                    // already August in Berlin, so a day-aligned batch at a month
+                    // end spans two scopes and encoding rejects it (§4.2). Real
+                    // ingestion has the same constraint, which is the point of
+                    // generating it.
+                    for (_, group) in group_by_scope(intervals, self.sparte) {
+                        let anchor = group[0].from;
+                        out.push(self.stored(malo, meter, group, FIRST_VERSION, anchor)?);
                     }
-                    intervals.push(self.interval(from, kwh));
-                }
-                // A delivery is split per version scope, not per day. A UTC day
-                // is not inside one local month: 2026-07-31T22:00Z is already
-                // August in Berlin, so a day-aligned batch at a month end spans
-                // two scopes and encoding rejects it (§4.2). Real ingestion has
-                // the same constraint, which is the point of generating it.
-                for (_, group) in group_by_scope(intervals) {
-                    let anchor = group[0].from;
-                    out.push(self.stored(malo, group, FIRST_VERSION, anchor)?);
                 }
             }
         }
 
-        // Corrections are grouped per measuring point so each lands as one
-        // delivery, which is how a market message arrives.
-        let mut by_malo: BTreeMap<usize, Vec<MeterInterval>> = BTreeMap::new();
-        for (malo, from, kwh) in corrections {
-            by_malo
-                .entry(malo)
+        // Corrections are grouped per measuring point *and meter* so each lands
+        // as one delivery, which is how a market message arrives.
+        let mut by_meter: BTreeMap<(usize, Option<usize>), Vec<MeterInterval>> = BTreeMap::new();
+        for (malo, meter, from, kwh) in corrections {
+            by_meter
+                .entry((malo, meter))
                 .or_default()
                 .push(self.interval(from, kwh));
         }
-        for (malo, mut intervals) in by_malo {
+        for ((malo, meter), mut intervals) in by_meter {
             intervals.sort_by_key(|i| i.from);
             // A version scope covers one local month, so a correction batch
             // spanning a month boundary has to be split — encoding rejects a
             // scope that does not cover its intervals (§4.2).
-            for (_, group) in group_by_scope(intervals) {
+            for (_, group) in group_by_scope(intervals, self.sparte) {
                 let anchor = group[0].from;
-                out.push(self.stored(malo, group, CORRECTION_VERSION, anchor)?);
+                out.push(self.stored(malo, meter, group, CORRECTION_VERSION, anchor)?);
             }
         }
 
         Ok(out)
+    }
+
+    /// Generate **Zählerstandsgänge** — register readings at instants.
+    ///
+    /// The point-series counterpart of [`generate`](Self::generate).
+    ///
+    /// The values are **cumulative and monotonic**, because that is what a
+    /// register is: differencing two of them is the derived Lastgang, and a
+    /// generator emitting independent draws would produce a series no meter could
+    /// have. Corrections restate a reading *upwards* at a higher version, so the
+    /// series stays monotonic after resolution too.
+    ///
+    /// Register readings are keyed by the **Messlokation** where the table says
+    /// so, so this defaults to one meter per Marktlokation rather than none —
+    /// `identify_by_melo` is on by default for a point table, and a delivery
+    /// naming no Messlokation is refused there.
+    pub fn generate_readings(&self) -> Result<Vec<StoredReadings>> {
+        use metering::reading::MeterReading;
+
+        let mut rng = Rng::new(self.seed);
+        let mut out = Vec::new();
+        let mut corrections: Vec<(usize, usize, OffsetDateTime, Decimal)> = Vec::new();
+        // One running register per (measuring point, meter), so a reading only
+        // ever ascends — across days as well as within one.
+        let mut registers: BTreeMap<(usize, usize), Decimal> = BTreeMap::new();
+
+        for day in 0..self.days {
+            let day_start = self.start + Duration::days(day);
+            let steps = Duration::DAY.whole_seconds() / self.resolution.whole_seconds();
+
+            for malo in 0..self.malo_ids {
+                for meter in 0..self.messlokationen.max(1) {
+                    let mut readings = Vec::new();
+                    for step in 0..steps {
+                        let at = day_start + self.resolution * step as i32;
+                        let advance = Decimal::new(rng.below(500) as i64 + 1, 2);
+                        let register = registers.entry((malo, meter)).or_default();
+                        *register += advance;
+                        if rng.chance(self.gap_rate) {
+                            // The register still advanced; the *reading* is what
+                            // did not arrive. A gap that also froze the register
+                            // would make the next value understate consumption.
+                            continue;
+                        }
+                        if rng.chance(self.correction_rate) {
+                            corrections.push((malo, meter, at, *register + Decimal::new(100, 2)));
+                        }
+                        readings.push(MeterReading {
+                            at,
+                            value: *register,
+                            quality: QualityFlag::Measured,
+                            obis_code: "1-0:1.8.0".parse().ok(),
+                        });
+                    }
+                    for (_, group) in group_readings_by_scope(readings, self.sparte) {
+                        let anchor = group[0].at;
+                        out.push(self.stored_readings(
+                            malo,
+                            meter,
+                            group,
+                            FIRST_VERSION,
+                            anchor,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        let mut by_meter: BTreeMap<(usize, usize), Vec<MeterReading>> = BTreeMap::new();
+        for (malo, meter, at, value) in corrections {
+            by_meter
+                .entry((malo, meter))
+                .or_default()
+                .push(MeterReading {
+                    at,
+                    value,
+                    quality: QualityFlag::Corrected,
+                    obis_code: "1-0:1.8.0".parse().ok(),
+                });
+        }
+        for ((malo, meter), mut readings) in by_meter {
+            readings.sort_by_key(|r| r.at);
+            for (_, group) in group_readings_by_scope(readings, self.sparte) {
+                let anchor = group[0].at;
+                out.push(self.stored_readings(malo, meter, group, CORRECTION_VERSION, anchor)?);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// The meters of one Marktlokation, or a single unnamed one.
+    fn meters(&self) -> Vec<Option<usize>> {
+        match self.messlokationen {
+            0 => vec![None],
+            n => (0..n).map(Some).collect(),
+        }
     }
 
     fn interval(&self, from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
@@ -310,6 +432,7 @@ impl MeteringWorkload {
     fn stored(
         &self,
         malo: usize,
+        meter: Option<usize>,
         intervals: Vec<MeterInterval>,
         version: u128,
         scope_anchor: OffsetDateTime,
@@ -333,16 +456,56 @@ impl MeteringWorkload {
         // 15 minutes the two disagree, and completeness would then measure the
         // series against an expectation nothing in the workload produced.
         series.resolution = Some(self.declared_resolution());
+        series.melo_id = meter.map(|m| melo_id(self.malo_offset + malo, m));
 
         Ok(StoredSeries::of(
             self.sparte,
             series,
             ScopedVersion::new(
-                VersionScope::for_interval(&self.operator, scope_anchor)?,
+                VersionScope::for_interval(&self.operator, scope_anchor, self.sparte)?,
                 Version::new(version)?,
             ),
             recorded_at,
         )
+        .in_unit(self.unit))
+    }
+
+    /// One delivery of register readings.
+    fn stored_readings(
+        &self,
+        malo: usize,
+        meter: usize,
+        readings: Vec<metering::reading::MeterReading>,
+        version: u128,
+        scope_anchor: OffsetDateTime,
+    ) -> Result<StoredReadings> {
+        let malo_id = malo_id(self.malo_offset + malo);
+        let recorded_at = readings
+            .last()
+            .map(|r| r.at + self.resolution)
+            .unwrap_or(scope_anchor);
+
+        Ok(StoredReadings::new(
+            malo_id,
+            "1-0:1.8.0".parse().expect("a canonical OBIS code"),
+            self.sparte,
+            readings,
+            MeasurementSource::Mscons {
+                pid: 13_005,
+                message_ref: None,
+                sender_mp_id: self.operator.clone(),
+            },
+            ScopedVersion::new(
+                VersionScope::for_interval(&self.operator, scope_anchor, self.sparte)?,
+                Version::new(version)?,
+            ),
+            recorded_at,
+        )
+        .with_melo_id(melo_id(self.malo_offset + malo, meter))
+        // The cadence answers the same question a series' resolution does — how
+        // many values a day should there be — so completeness measures a
+        // Zählerstandsgang against the grid it was generated on.
+        .at_cadence(self.declared_resolution())
         .in_unit(self.unit))
     }
 
@@ -355,14 +518,41 @@ impl MeteringWorkload {
     }
 }
 
-/// Split intervals into runs sharing a local month.
-fn group_by_scope(intervals: Vec<MeterInterval>) -> Vec<(time::Date, Vec<MeterInterval>)> {
+/// Split intervals into runs sharing a **Bilanzierungsmonat**.
+///
+/// Not the calendar month: for gas the month is cut at 06:00 local, like the
+/// Gastag it is built from, so a run boundary at midnight would put the first six
+/// hours of a calendar month in the wrong scope — and `covers` would then refuse
+/// the delivery this generator produced. The workload must be one a real ingest
+/// could send, or the oracle is comparing against something the store is right to
+/// reject.
+fn group_by_scope(
+    intervals: Vec<MeterInterval>,
+    sparte: Sparte,
+) -> Vec<(time::Date, Vec<MeterInterval>)> {
     let mut out: Vec<(time::Date, Vec<MeterInterval>)> = Vec::new();
     for interval in intervals {
-        let month = metering::calendar::local_month(interval.from);
+        let month = crate::planner::balancing_month(interval.from, sparte);
         match out.last_mut() {
             Some((m, group)) if *m == month => group.push(interval),
             _ => out.push((month, vec![interval])),
+        }
+    }
+    out
+}
+
+/// [`group_by_scope`] over register readings, which carry an instant rather than
+/// a span.
+fn group_readings_by_scope(
+    readings: Vec<metering::reading::MeterReading>,
+    sparte: Sparte,
+) -> Vec<(time::Date, Vec<metering::reading::MeterReading>)> {
+    let mut out: Vec<(time::Date, Vec<metering::reading::MeterReading>)> = Vec::new();
+    for reading in readings {
+        let month = crate::planner::balancing_month(reading.at, sparte);
+        match out.last_mut() {
+            Some((m, group)) if *m == month => group.push(reading),
+            _ => out.push((month, vec![reading])),
         }
     }
     out
@@ -390,6 +580,18 @@ fn malo_id(n: usize) -> MaloId {
         .expect("a computed check digit is the one the parser recomputes")
 }
 
+/// A synthetic Zählpunktbezeichnung for meter `meter` of measuring point `malo`.
+///
+/// Thirty-three ASCII alphanumerics, two uppercase letters then six digits —
+/// `MeloId` enforces exactly that, so a generator emitting anything else would
+/// fail to build a single row. Derived from both indices so two meters of one
+/// Marktlokation differ, which is the whole point of generating them.
+fn melo_id(malo: usize, meter: usize) -> MeloId {
+    format!("DE{:06}{:025}", malo % 1_000_000, meter)
+        .parse()
+        .expect("the shape MeloId's parser enforces")
+}
+
 /// What identifies one reading in the reference: the core key, plus whatever the
 /// deployment declared as identity.
 type OracleKey = (String, String, OffsetDateTime, Vec<String>);
@@ -404,9 +606,9 @@ type OracleKey = (String, String, OffsetDateTime, Vec<String>);
 /// # Tell it the merge key
 ///
 /// [`Oracle::new`] keys on `(malo_id, obis_code, from)`, which is right only for
-/// a table with no identity columns. A deployment that declares one — a tenant
-/// discriminator being the obvious case — has a *wider* notion of "the same
-/// reading", and an oracle using the narrower one folds two tenants' readings
+/// a table with no identity columns and no key-carrying Messlokation. A
+/// deployment with either has a *wider* notion of "the same reading", and an
+/// oracle using the narrower one folds two tenants' — or two meters' — readings
 /// into a single key and picks a winner across them. It would then disagree with
 /// a store that is behaving correctly, which is the worst way for a reference to
 /// be wrong: it accuses the thing it exists to check.
@@ -440,38 +642,69 @@ impl Oracle {
 
     /// An empty reference over the table's **actual** merge key.
     ///
-    /// Reads the identity columns from the same validated configuration the
-    /// store was built with, so "the same reading" means one thing in both.
+    /// Reads `discriminator_columns` from the same validated configuration the
+    /// store was built with, so "the same reading" means one thing in both. That
+    /// list rather than `identity_columns`, because a table identifying a reading
+    /// by its Messlokation puts a *core* column in the key.
     pub fn for_table(config: &crate::config::ValidatedTableConfig) -> Self {
         Self {
-            identity: config
-                .identity_columns()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect(),
+            identity: config.discriminator_columns(),
             rows: BTreeMap::new(),
         }
     }
 
-    /// The identity values of a delivery, in merge-key order.
+    /// The discriminator values of a delivery, in merge-key order.
     ///
-    /// A missing identity value is an error rather than a default: identity
-    /// columns are non-nullable by validation, so a series without one could not
-    /// have been written, and silently substituting an empty string would merge
-    /// it with every other series that is also missing one.
+    /// A missing value is an error rather than a default: every column in this
+    /// list is non-nullable in the key, so a delivery without one could not have
+    /// been written, and silently substituting an empty string would merge it
+    /// with every other delivery that is also missing one.
+    ///
+    /// `melo_id` is read from the delivery rather than from `extra` because it is
+    /// a core column: it lives on the series, not among the deployment's declared
+    /// ones.
     fn identity_of(&self, stored: &StoredSeries) -> Result<Vec<String>> {
+        self.discriminators(
+            &stored.series.malo_id,
+            stored.series.melo_id.as_ref(),
+            &stored.extra,
+        )
+    }
+
+    /// [`identity_of`](Self::identity_of) for a register delivery.
+    fn identity_of_readings(&self, stored: &StoredReadings) -> Result<Vec<String>> {
+        self.discriminators(&stored.malo_id, stored.melo_id.as_ref(), &stored.extra)
+    }
+
+    fn discriminators(
+        &self,
+        malo_id: &MaloId,
+        melo_id: Option<&MeloId>,
+        extra: &std::collections::BTreeMap<String, datafusion::common::ScalarValue>,
+    ) -> Result<Vec<String>> {
         self.identity
             .iter()
-            .map(|name| match stored.extra.get(name) {
-                Some(datafusion::common::ScalarValue::Utf8(Some(value))) => Ok(value.clone()),
-                _ => Err(Error::encode(
-                    name,
-                    format!(
-                        "{} declares {name:?} as an identity column, but this series carries no \
-                         value for it — the store would have refused the write",
-                        stored.series.malo_id
-                    ),
-                )),
+            .map(|name| {
+                let value = match name.as_str() {
+                    n if n == crate::encode::schema::col::MELO_ID => {
+                        melo_id.map(std::string::ToString::to_string)
+                    }
+                    _ => match extra.get(name) {
+                        Some(datafusion::common::ScalarValue::Utf8(Some(value))) => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    },
+                };
+                value.ok_or_else(|| {
+                    Error::encode(
+                        name,
+                        format!(
+                            "{malo_id} identifies a reading by {name:?}, but this delivery \
+                             carries no value for it — the store would have refused the write"
+                        ),
+                    )
+                })
             })
             .collect()
     }
@@ -502,33 +735,73 @@ impl Oracle {
                     identity.clone(),
                 );
 
-                match self.rows.get(&key) {
-                    // Same scope: a strictly higher version supersedes. Equal is
-                    // deliberately *not* an overwrite — the store inserts with
-                    // `ON CONFLICT DO NOTHING`, so the first value at a version
-                    // is the one that stays, and a divergent restatement under an
-                    // existing version is refused rather than accepted. An oracle
-                    // that took the last would disagree with a correct store.
-                    Some((existing, seen, _)) if *existing == scope => {
-                        if version > *seen {
-                            self.rows
-                                .insert(key, (scope.clone(), version, interval.value));
-                        }
-                    }
-                    // A different scope is not comparable. The generator never
-                    // produces one for the same key, so this is a guard against
-                    // the *test* drifting rather than the store.
-                    Some((existing, _, _)) => {
-                        return Err(Error::VersionScopeMismatch {
-                            left: existing.clone(),
-                            right: scope,
-                        });
-                    }
-                    None => {
-                        self.rows
-                            .insert(key, (scope.clone(), version, interval.value));
-                    }
+                self.observe(key, scope.clone(), version, interval.value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a **Zählerstandsgang** delivery, applying latest-version-wins.
+    ///
+    /// The point-series counterpart of [`record`](Self::record), and it resolves
+    /// identically because resolution is identical: a register reading is keyed
+    /// by its instant exactly as an interval is keyed by its start, and the
+    /// version axis does not know the difference. Only where the fields are read
+    /// from differs.
+    pub fn record_readings(&mut self, deliveries: &[StoredReadings]) -> Result<()> {
+        for stored in deliveries {
+            let scope = stored.version.scope().as_str().to_string();
+            let version = stored.version.version().get();
+            let identity = self.identity_of_readings(stored)?;
+
+            for reading in &stored.readings {
+                let obis = reading.obis_code.unwrap_or(stored.obis_code).to_string();
+                let key = (
+                    stored.malo_id.to_string(),
+                    obis,
+                    reading.at,
+                    identity.clone(),
+                );
+                self.observe(key, scope.clone(), version, reading.value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold one asserted value into the reference.
+    ///
+    /// Shared by both record paths so the two cannot resolve differently — which
+    /// they must not, because the store does not either.
+    fn observe(
+        &mut self,
+        key: OracleKey,
+        scope: String,
+        version: u128,
+        value: Decimal,
+    ) -> Result<()> {
+        match self.rows.get(&key) {
+            // Same scope: a strictly higher version supersedes. Equal is
+            // deliberately *not* an overwrite — the store inserts with
+            // `ON CONFLICT DO NOTHING`, so the first value at a version is the
+            // one that stays, and a divergent restatement under an existing
+            // version is refused rather than accepted. An oracle that took the
+            // last would disagree with a correct store.
+            Some((existing, seen, _)) if *existing == scope => {
+                if version > *seen {
+                    self.rows.insert(key, (scope, version, value));
                 }
+            }
+            // A different scope is not comparable. The generator never produces
+            // one for the same key, so this is a guard against the *test*
+            // drifting rather than the store.
+            Some((existing, _, _)) => {
+                return Err(Error::VersionScopeMismatch {
+                    left: existing.clone(),
+                    right: scope,
+                });
+            }
+            None => {
+                self.rows.insert(key, (scope, version, value));
             }
         }
         Ok(())
@@ -628,6 +901,113 @@ mod tests {
             aware.len(),
             naive.len() * 2,
             "the tenant-aware reference holds both tenants' readings"
+        );
+    }
+
+    #[test]
+    fn an_oracle_over_a_melo_keyed_table_keeps_the_meters_apart() {
+        use crate::config::{TableConfig, TimeModel};
+
+        // The same argument as the tenant case, on the column that made
+        // `discriminator_columns` necessary: a Marktlokation may be measured by
+        // several Messlokationen, and a point table identifies a reading by its.
+        // `for_table` read `identity_columns`, which is that list only while
+        // `melo_id` cannot join the key — so on the one shape where it always
+        // does, the reference folded two meters into one reading and would have
+        // accused a correct store.
+        let config = TableConfig::new("meter_reads_versions")
+            .time_model(TimeModel::Point)
+            .build()
+            .expect("config");
+        assert!(config.melo_in_merge_key());
+
+        let workload = MeteringWorkload::new(START)
+            .malo_ids(1)
+            .days(1)
+            .messlokationen(2);
+        let deliveries = workload.generate_readings().expect("workload");
+
+        let mut aware = Oracle::for_table(&config);
+        aware.record_readings(&deliveries).expect("record");
+
+        let mut naive = Oracle::new();
+        naive.record_readings(&deliveries).expect("record");
+
+        assert_eq!(
+            aware.len(),
+            naive.len() * 2,
+            "two meters at one Marktlokation are two registers, not one"
+        );
+    }
+
+    #[test]
+    fn a_generated_zaehlerstandsgang_only_ever_ascends() {
+        // A register is cumulative: differencing two readings is the derived
+        // Lastgang. A generator emitting independent draws would produce a series
+        // no meter could have, and would hide any bug that depends on the values
+        // ascending — including across a day boundary and across a gap, where the
+        // register keeps advancing even though the reading did not arrive.
+        let deliveries = MeteringWorkload::new(START)
+            .malo_ids(2)
+            .days(3)
+            .messlokationen(2)
+            .with_gaps(0.1)
+            .generate_readings()
+            .expect("workload");
+
+        let mut latest: BTreeMap<(String, String), (OffsetDateTime, Decimal)> = BTreeMap::new();
+        for delivery in &deliveries {
+            // Corrections restate a value upwards at a higher version, so they
+            // are not part of the monotonic first-delivery sequence.
+            if delivery.version.version().get() != FIRST_VERSION {
+                continue;
+            }
+            let melo = delivery
+                .melo_id
+                .as_ref()
+                .expect("a named meter")
+                .to_string();
+            for reading in &delivery.readings {
+                let key = (delivery.malo_id.to_string(), melo.clone());
+                if let Some((previous_at, previous)) = latest.get(&key) {
+                    assert!(reading.at > *previous_at, "{key:?} went back in time");
+                    assert!(
+                        reading.value > *previous,
+                        "{key:?}: {} is not above {previous}",
+                        reading.value
+                    );
+                }
+                latest.insert(key, (reading.at, reading.value));
+            }
+        }
+        assert!(!latest.is_empty(), "the workload produced no registers");
+    }
+
+    #[test]
+    fn readings_and_intervals_resolve_the_same_way() {
+        // Resolution does not know the difference between a span and an instant,
+        // so the two record paths must fold identically — a correction at a
+        // higher version wins, and a replay at an existing one does not.
+        let workload = MeteringWorkload::new(START)
+            .malo_ids(1)
+            .days(1)
+            .messlokationen(1)
+            .with_corrections(0.2);
+
+        let deliveries = workload.generate_readings().expect("workload");
+        let mut once = Oracle::new();
+        once.record_readings(&deliveries).expect("record");
+
+        let mut twice = Oracle::new();
+        twice.record_readings(&deliveries).expect("first");
+        twice.record_readings(&deliveries).expect("replay");
+
+        assert_eq!(once.len(), twice.len(), "a replay adds no readings");
+        let (from, to) = workload.range();
+        assert_eq!(
+            once.sum_kwh(from, to),
+            twice.sum_kwh(from, to),
+            "a replay changes no value"
         );
     }
 
@@ -858,21 +1238,65 @@ mod tests {
 
     #[test]
     fn a_workload_spanning_a_month_boundary_splits_its_correction_scopes() {
-        // A scope covers one local month, and encoding rejects a scope that does
-        // not cover its intervals. A correction batch spanning the boundary has
-        // to become two deliveries.
-        let series = MeteringWorkload::new(datetime!(2026-07-30 00:00 UTC))
+        // A scope covers one Bilanzierungsmonat, and encoding rejects a scope
+        // that does not cover its intervals. A correction batch spanning the
+        // boundary has to become two deliveries.
+        //
+        // Driven for **gas** as well as electricity, because the gas month is cut
+        // at 06:00 local: splitting the runs at midnight put the first six hours
+        // of a calendar month in the previous month's scope, and the generator
+        // would then produce a workload the store is right to refuse.
+        for sparte in [Sparte::Strom, Sparte::Gas, Sparte::Waerme, Sparte::Wasser] {
+            let series = MeteringWorkload::new(datetime!(2026-07-30 00:00 UTC))
+                .sparte(sparte)
+                .malo_ids(1)
+                .days(4)
+                .seed(11)
+                .with_corrections(0.5)
+                .generate()
+                .unwrap();
+
+            assert!(!series.is_empty(), "{sparte}");
+            for stored in &series {
+                for interval in &stored.series.intervals {
+                    assert!(
+                        stored.version.scope().covers(interval.from, stored.sparte),
+                        "scope {} does not cover {} ({sparte})",
+                        stored.version.scope(),
+                        interval.from
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_gas_workload_straddling_a_month_start_lands_in_two_scopes() {
+        // The case the midnight split got wrong. A gas workload beginning before
+        // 06:00 local on the first of a month has its opening intervals in the
+        // *previous* Bilanzierungsmonat, so the generator must emit two
+        // deliveries rather than one mislabelled batch.
+        let series = MeteringWorkload::new(datetime!(2026-02-28 23:00 UTC))
+            .sparte(Sparte::Gas)
             .malo_ids(1)
-            .days(4)
-            .seed(11)
-            .with_corrections(0.5)
+            .days(2)
+            .seed(7)
             .generate()
             .unwrap();
+
+        let scopes: std::collections::BTreeSet<_> = series
+            .iter()
+            .map(|s| s.version.scope().period().to_string())
+            .collect();
+        assert!(
+            scopes.contains("2026-02") && scopes.contains("2026-03"),
+            "a gas workload across 1 March must split at 06:00 local, got {scopes:?}"
+        );
 
         for stored in &series {
             for interval in &stored.series.intervals {
                 assert!(
-                    stored.version.scope().covers(interval.from),
+                    stored.version.scope().covers(interval.from, stored.sparte),
                     "scope {} does not cover {}",
                     stored.version.scope(),
                     interval.from

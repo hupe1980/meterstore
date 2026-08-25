@@ -6,6 +6,13 @@
 //! 1. **Detach, then scan.** Detaching first makes the partition invisible to
 //!    writers while the archiver still reads it, so no row can be inserted into
 //!    a partition that is mid-archival.
+//!
+//!    Invisible to *writers* — not to readers. The watermark is published by the
+//!    cold commit at step 2, so for the whole of the scan the range still
+//!    belongs to the hot tier and a query asks PostgreSQL for it.
+//!    [`HotStore::scan_range`] therefore reads the parent **and** whatever is
+//!    detached from it, or a settlement running during archival would come back
+//!    a window short with nothing reporting it.
 //! 2. **Commit cold, then drop hot.** A crash between them leaves an orphaned
 //!    detached partition — data intact, invisible, reclaimable. The reverse
 //!    order loses data permanently.
@@ -257,9 +264,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
     /// row: some twenty thousand commits, capped at a few dozen per maintenance
     /// cycle, and twenty thousand snapshots retained for the ten years §10.5
     /// keeps them. The store is unusable for days and its metadata never
-    /// recovers. Every integration suite used to hide this by seeding the
-    /// boundary by hand, which is the tell that it was a production gap rather
-    /// than a test convenience.
+    /// recovers.
     ///
     /// The same shape recurs whenever a table is idle for a stretch — a
     /// deployment that stops receiving one commodity, a backfill that starts in
@@ -596,7 +601,7 @@ mod tests {
         async fn try_archive_lease(
             &self,
             _table: &str,
-        ) -> Result<Option<Box<dyn crate::tiering::store::ArchiveLease>>> {
+        ) -> Result<Option<Box<dyn crate::tiering::store::TableLease>>> {
             Ok(if self.lease_held_elsewhere {
                 None
             } else {
@@ -609,6 +614,7 @@ mod tests {
             _table: &str,
             _key: &[String],
             _extra: &[crate::arrow::datatypes::Field],
+            _model: crate::config::TimeModel,
         ) -> Result<()> {
             Ok(())
         }

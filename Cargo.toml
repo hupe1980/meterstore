@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
@@ -78,9 +78,13 @@ iceberg-catalog-sql = "0.10"
 # file-only deployment does not compile the AWS/GCS/Azure SDKs — see the
 # `object-store-*` features below.
 iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs", "opendal-memory"] }
-# REST catalog client, and the basis for the read-only catalog facade that lets
-# Spark/Trino/DuckDB/PyIceberg read the history directly from object storage,
-# without MeterStore in the data path.
+# The REST catalogue client behind `IcebergRestCatalog`, which is the cold tier on
+# Polaris, Lakekeeper, Nessie or Gravitino. On by default because a REST catalogue
+# is the shape a deployment picks when it has not picked one: it is what every
+# engine already speaks, so such a deployment needs no facade at all.
+#
+# It has nothing to do with `catalog-facade`, which serves the REST *protocol*
+# over whatever catalogue is in use and is built on axum.
 iceberg-catalog-rest = { version = "0.10", optional = true }
 # AWS S3 Tables. Not the Iceberg REST endpoint — that one authenticates with
 # SigV4, which `iceberg-catalog-rest` cannot sign — but the **native** S3 Tables
@@ -96,7 +100,11 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # MeasurementUnit, IntervalResolution, DST-aware billing aggregation, gas
 # conversion, Ersatzwertbildung. MeterStore persists and queries those types —
 # it does not redefine them. Part of the mako platform (hupe1980/mako).
-metering = { version = "0.18", features = ["serde"] }
+#
+# 0.19 is a floor rather than a preference: `calendar::DayBoundary` is what makes
+# the gas Bilanzierungsmonat expressible, and a version scope derived without it
+# is wrong for a whole commodity.
+metering = { version = "0.19", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is
@@ -117,6 +125,11 @@ getrandom = "0.4"
 # without the audit trail retaining the identifier it just erased.
 hmac = "0.12"
 sha2 = "0.10"
+# The erasure key is the one secret this crate copies and holds for the life of
+# the process, and `SubjectRegistry` is `Clone` — so every derived session would
+# otherwise leave another copy of it on the heap at drop. Already in the graph
+# through `rustls`; declared so the key can be wiped rather than merely redacted.
+zeroize = "1.9"
 
 # --- Runtime ---
 tokio = { version = "1.0", features = ["full"] }
@@ -162,16 +175,26 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 # Turns a bound `TcpListener` into the connection stream tonic serves, so the
 # Flight tests can take an ephemeral port instead of racing on a fixed one.
 tokio-stream = { version = "0.1", features = ["net"] }
+# `ServiceExt::oneshot`, so the catalog façade's routes are exercised as HTTP —
+# a method and a path in, a status and a parsed error envelope out — without
+# binding a port. Already in the graph via axum; declared for the `util` feature.
+tower = { version = "0.5", features = ["util"] }
+# Collects an `axum::body::Body` back into bytes in those tests.
+http-body-util = "0.1"
 
 [features]
 default = ["rest-catalog"]
-rest-catalog = ["dep:iceberg-catalog-rest"]
 # Cold-tier object-store backends for `IcebergSqlCatalog`. `file://`/`memory://`
 # are always available; these add the cloud stores (and their SDKs) on demand.
 object-store-s3 = ["iceberg-storage-opendal/opendal-s3"]
 object-store-gcs = ["iceberg-storage-opendal/opendal-gcs"]
 object-store-azure = ["iceberg-storage-opendal/opendal-azdls"]
 object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
+# The cold tier on an Iceberg REST catalogue — Polaris, Lakekeeper, Nessie,
+# Gravitino. Default, because `CatalogKind::Rest` is what a configuration file
+# that says nothing selects, and a default naming a catalogue the crate could not
+# construct is a default nobody can take.
+rest-catalog = ["dep:iceberg-catalog-rest"]
 # Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
 catalog-facade = ["dep:axum"]
 # AWS S3 Tables as the cold-tier catalogue (§12.1). Optional because it pulls the

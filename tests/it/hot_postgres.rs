@@ -85,7 +85,7 @@ impl Harness {
             .bind(rust_decimal::Decimal::new(1_234_567, 6))
             .bind(metering::QualityFlag::Measured.as_str())
             .bind(Some("PT15M"))
-            .bind("mscons")
+            .bind("MSCONS")
             .bind(Some(source_detail.as_str()))
             .bind(Some("[]"))
             .bind(rust_decimal::Decimal::new(20_260_727_000_001, 0))
@@ -207,7 +207,7 @@ async fn insert_fails_when_no_partition_covers_the_interval() {
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
-           VALUES ('1','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED','mscons',1,
+           VALUES ('1','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED','MSCONS',1,
                    '99:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D22)
@@ -246,6 +246,146 @@ async fn detach_hides_rows_from_the_parent_but_keeps_them_readable() {
     .await;
     let scanned: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(scanned, 8, "archiver must still be able to read it");
+}
+
+#[tokio::test]
+async fn a_partition_being_archived_is_still_readable_through_the_query_path() {
+    // Archival detaches a partition before it reads it and drops it only after
+    // the cold commit lands. The watermark is published *by* that commit, so for
+    // as long as writing a window takes — a day of 9.6 M rows is not an instant —
+    // the rows are in neither place a query looks: not in the parent, because
+    // they are detached; not in Iceberg, because the commit has not landed; and
+    // the boundary still says the hot tier owns the range.
+    //
+    // So `scan_range` reads the parent *and* whatever is detached from it, or a
+    // settlement running at that moment comes back a whole day short with
+    // nothing reporting it.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 8).await;
+
+    h.hot
+        .detach_partition(&PartitionId::new(TABLE, D20))
+        .await
+        .unwrap();
+    assert_eq!(h.row_count().await, 0, "the parent no longer holds them");
+
+    let scanned: usize = collect_stream(
+        h.hot
+            .scan_range(
+                TABLE,
+                meterstore::planner::TimeRange::between(D20, D21),
+                &ScanSpec::core(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await
+    .iter()
+    .map(|b| b.num_rows())
+    .sum();
+
+    assert_eq!(scanned, 8, "a query must not lose a window mid-archival");
+}
+
+#[tokio::test]
+async fn a_detached_window_the_scan_does_not_ask_for_is_not_read_twice() {
+    // The other half of the argument. Once the commit has landed the watermark
+    // is past the window, so the hot half of any split starts above it — and the
+    // rows, which are now in Iceberg, must not also come back from the orphan
+    // that is still waiting to be dropped.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D22, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 8).await;
+    h.insert_readings(D21, 4).await;
+
+    h.hot
+        .detach_partition(&PartitionId::new(TABLE, D20))
+        .await
+        .unwrap();
+
+    let scanned: usize = collect_stream(
+        h.hot
+            .scan_range(
+                TABLE,
+                // What the split hands the hot tier once the watermark is D21.
+                meterstore::planner::TimeRange::between(D21, D22),
+                &ScanSpec::core(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await
+    .iter()
+    .map(|b| b.num_rows())
+    .sum();
+
+    assert_eq!(scanned, 4, "the archived window is Iceberg's now");
+}
+
+#[tokio::test]
+async fn a_changed_merge_key_is_refused_rather_than_silently_ignored() {
+    // `create_tables` runs on every start and is a no-op on an existing table,
+    // which is what makes a *changed* declaration dangerous rather than merely
+    // ineffective. Widen the merge key and restart: resolution partitions by the
+    // new key while the table enforces the old primary key, so the second
+    // reading the wider key exists to admit conflicts on the narrower one and is
+    // skipped — invisible to the divergence check too, which joins on the new
+    // key.
+    let h = Harness::start().await;
+
+    let widened: Vec<String> = ["malo_id", "melo_id", "obis_code", "from"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let err = h
+        .hot
+        .create_table_with_key(
+            TABLE,
+            &widened,
+            &[],
+            meterstore::config::TimeModel::Interval,
+        )
+        .await
+        .expect_err("a merge key cannot change under an existing table")
+        .to_string();
+
+    assert!(err.contains("primary key"), "{err}");
+    assert!(
+        err.contains("melo_id"),
+        "the message names the difference: {err}"
+    );
+
+    // The declaration it was created with is still accepted, so an ordinary
+    // restart is unaffected.
+    h.hot.create_table(TABLE).await.expect("idempotent");
+}
+
+#[tokio::test]
+async fn a_changed_time_model_is_refused_too() {
+    // `value` is interval energy on one table and a cumulative register reading
+    // on the other. Switching the declaration under an existing table would
+    // leave a column no aggregate can interpret.
+    let h = Harness::start().await;
+
+    let key: Vec<String> = ["malo_id", "obis_code", "from"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let err = h
+        .hot
+        .create_table_with_key(TABLE, &key, &[], meterstore::config::TimeModel::Point)
+        .await
+        .expect_err("an interval table cannot become a point table")
+        .to_string();
+
+    assert!(err.contains("INTERVAL") && err.contains("POINT"), "{err}");
 }
 
 #[tokio::test]
@@ -403,7 +543,7 @@ async fn a_non_canonical_obis_code_is_rejected_at_the_write() {
             r#"INSERT INTO readings
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                 source_kind, version, version_scope, recorded_at, balancing_day)
-               VALUES ('1',$1,'STROM',$2,$3,1.0,'KWH','MEASURED','mscons',1,
+               VALUES ('1',$1,'STROM',$2,$3,1.0,'KWH','MEASURED','MSCONS',1,
                        '99:2026-07',$2,CAST(($2 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(bad)
@@ -430,7 +570,7 @@ async fn a_storage_group_that_carries_information_is_accepted() {
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
-           VALUES ('1','1-0:1.8.0*1','STROM',$1,$2,1.0,'KWH','MEASURED','mscons',1,
+           VALUES ('1','1-0:1.8.0*1','STROM',$1,$2,1.0,'KWH','MEASURED','MSCONS',1,
                    '99:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D20)
@@ -500,7 +640,7 @@ fn batch(start: OffsetDateTime, count: usize, kwh: i64, version: i64) -> RecordB
         Arc::new(StringArray::from(vec!["KWH"; count])),
         Arc::new(StringArray::from(vec!["MEASURED"; count])),
         Arc::new(StringArray::from(vec!["PT15M"; count])),
-        Arc::new(StringArray::from(vec!["mscons"; count])),
+        Arc::new(StringArray::from(vec!["MSCONS"; count])),
         Arc::new(StringArray::from(vec!["{}"; count])),
         Arc::new(StringArray::from(vec!["[]"; count])),
         Arc::new(
@@ -720,7 +860,7 @@ async fn corrections_coexist_with_the_values_they_supersede() {
         r#"INSERT INTO readings
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
-           VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,9.9,'KWH','CORRECTED','mscons',
+           VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,9.9,'KWH','CORRECTED','MSCONS',
                    20260728000002,'99:2026-07',$3,
                    CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
@@ -775,7 +915,7 @@ async fn a_chunk_boundary_inside_a_tie_does_not_drop_rows() {
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
-                   VALUES ($1,NULL,$2,'STROM',$3,$4,1,'KWH','MEASURED','PT15M','mscons',
+                   VALUES ($1,NULL,$2,'STROM',$3,$4,1,'KWH','MEASURED','PT15M','MSCONS',
                            $5,'[]',$6,'99:2026-07',$7,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
             )
@@ -883,7 +1023,7 @@ async fn overlapping_intervals_in_one_version_are_refused() {
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                 source_kind, version, version_scope, recorded_at, balancing_day)
                VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
-                       'mscons',$3,'99:2026-07',$1,
+                       'MSCONS',$3,'99:2026-07',$1,
                        CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(from)
@@ -937,7 +1077,7 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                 source_kind, version, version_scope, recorded_at, balancing_day)
                VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
-                       'mscons',1,$3,$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
+                       'MSCONS',1,$3,$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(D20)
         .bind(D20 + Duration::minutes(15))

@@ -33,24 +33,33 @@ use tracing::{info, warn};
 use crate::error::Result;
 use crate::tiering::ArchivalOutcome;
 
-/// What one maintenance cycle did.
+/// What one maintenance cycle did to **one** table.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MaintenanceOutcome {
+pub struct TableMaintenance {
+    /// The table this row describes.
+    pub table: String,
     /// Archival runs performed, in order.
     pub archival: Vec<ArchivalOutcome>,
     /// Cold snapshots expired, when expiry was enabled for this cycle.
     pub snapshots_expired: usize,
     /// Rows found in the wrong tier. **Non-zero means results may be wrong.**
     pub invariant_violations: u64,
+    /// Why this table's cycle did not complete, if it did not.
+    ///
+    /// Rendered rather than typed because it is a *report*: the cycle has already
+    /// moved on to the next table, and what is left to do with this is log it and
+    /// alert on it. A caller wanting to act on the error programmatically runs
+    /// that table's [`archive`](crate::MeterStore::archive) itself.
+    pub failure: Option<String>,
 }
 
-impl MaintenanceOutcome {
-    /// Rows moved from hot to cold this cycle.
+impl TableMaintenance {
+    /// Rows moved from hot to cold.
     pub fn rows_archived(&self) -> u64 {
         self.archival.iter().map(|o| o.rows).sum()
     }
 
-    /// Windows archived this cycle.
+    /// Windows archived.
     pub fn windows_archived(&self) -> usize {
         self.archival
             .iter()
@@ -58,21 +67,93 @@ impl MaintenanceOutcome {
             .count()
     }
 
-    /// Whether another process was doing the work.
+    /// Whether another process was doing this table's work.
     pub fn lease_contended(&self) -> bool {
         self.archival.iter().any(|o| o.lease_contended)
     }
 
-    /// Whether the tiers still partition the data as they should.
+    /// Whether this table's cycle completed and its tiers still partition its
+    /// data as they should.
     pub fn healthy(&self) -> bool {
-        self.invariant_violations == 0
+        self.invariant_violations == 0 && self.failure.is_none()
     }
 }
 
-/// Upkeep for one store, run on demand or on a schedule.
+/// What one maintenance cycle did.
+///
+/// **Per table**, because §15.3 makes every table its own unit. A cycle that only
+/// summed would report a deployment healthy while one of its tables was
+/// quarantined, and would give an operator no name to act on. The aggregate
+/// accessors fold the rows rather than replacing them, because "did anything
+/// move" is a real question too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MaintenanceOutcome {
+    /// One entry per table the cycle ran over, in name order.
+    pub tables: Vec<TableMaintenance>,
+}
+
+impl MaintenanceOutcome {
+    /// Rows moved from hot to cold this cycle, across every table.
+    pub fn rows_archived(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(TableMaintenance::rows_archived)
+            .sum()
+    }
+
+    /// Windows archived this cycle, across every table.
+    pub fn windows_archived(&self) -> usize {
+        self.tables
+            .iter()
+            .map(TableMaintenance::windows_archived)
+            .sum()
+    }
+
+    /// Cold snapshots expired this cycle, across every table.
+    pub fn snapshots_expired(&self) -> usize {
+        self.tables.iter().map(|t| t.snapshots_expired).sum()
+    }
+
+    /// Rows found in the wrong tier, across every table.
+    ///
+    /// **Non-zero means results may be wrong**, and
+    /// [`unhealthy`](Self::unhealthy) names which table.
+    pub fn invariant_violations(&self) -> u64 {
+        self.tables.iter().map(|t| t.invariant_violations).sum()
+    }
+
+    /// Whether another process was doing the work for any table.
+    pub fn lease_contended(&self) -> bool {
+        self.tables.iter().any(TableMaintenance::lease_contended)
+    }
+
+    /// Whether every table's tiers still partition their data as they should.
+    pub fn healthy(&self) -> bool {
+        self.tables.iter().all(TableMaintenance::healthy)
+    }
+
+    /// The tables that are not healthy — what an alert should name.
+    pub fn unhealthy(&self) -> impl Iterator<Item = &TableMaintenance> {
+        self.tables.iter().filter(|t| !t.healthy())
+    }
+
+    /// The tables whose cycle failed, with the reason.
+    pub fn failures(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tables
+            .iter()
+            .filter_map(|t| Some((t.table.as_str(), t.failure.as_deref()?)))
+    }
+}
+
+/// Upkeep for one store or a whole catalog, run on demand or on a schedule.
+///
+/// **One loop over N tables**, not N loops. Each table keeps its own watermark,
+/// archiver and lease (§15.3); only the *scheduling* is shared, which is what
+/// gives a deployment one place to ask whether upkeep is keeping up.
 #[derive(Debug, Clone)]
 pub struct Maintenance {
-    store: crate::session::MeterStore,
+    /// The tables this loop maintains, in the order they are visited.
+    stores: Vec<crate::session::MeterStore>,
     interval: Duration,
     max_windows: usize,
     expire_snapshots: bool,
@@ -90,14 +171,34 @@ impl Maintenance {
     /// commit and independently recoverable, so stopping early costs nothing.
     pub const DEFAULT_MAX_WINDOWS: usize = 32;
 
-    /// Build maintenance for a store, with defaults.
+    /// Build maintenance for one store, with defaults.
     pub fn new(store: crate::session::MeterStore) -> Self {
+        Self::over(vec![store])
+    }
+
+    /// Build maintenance over several stores — every table of a catalog.
+    ///
+    /// Visited in the order given, one after another. Sequential rather than
+    /// concurrent for the reason `archive_all` is: each table's archival holds
+    /// its own lease and its own PostgreSQL connections, and running twenty at
+    /// once turns a background job into a load spike on the operational database
+    /// it is meant to be relieving.
+    ///
+    /// A table whose cycle fails does not stop the others — the outcome names it
+    /// and the next tick tries again — because the tables share nothing a partial
+    /// run could corrupt.
+    pub fn over(stores: Vec<crate::session::MeterStore>) -> Self {
         Self {
-            store,
+            stores,
             interval: Self::DEFAULT_INTERVAL,
             max_windows: Self::DEFAULT_MAX_WINDOWS,
             expire_snapshots: false,
         }
+    }
+
+    /// The tables this loop maintains.
+    pub fn tables(&self) -> Vec<&str> {
+        self.stores.iter().map(|s| s.table()).collect()
     }
 
     /// How often [`spawn`](Self::spawn) runs a cycle.
@@ -123,46 +224,94 @@ impl Maintenance {
         self
     }
 
-    /// Run one cycle.
+    /// Run one cycle over every table.
     ///
-    /// Archival first, then the invariant check, so the check sees the state the
-    /// cycle produced rather than the one it started from. A failed archival
-    /// aborts the cycle: expiring snapshots or reporting health on top of a
-    /// half-finished archival would describe a state that does not exist.
+    /// Per table: archival first, then the invariant check, so the check sees the
+    /// state the cycle produced rather than the one it started from. A failed
+    /// archival ends *that table's* half — expiring snapshots or reporting health
+    /// on top of a half-finished archival would describe a state that does not
+    /// exist — and the cycle moves on to the next table.
+    ///
+    /// # A failure is reported, not returned
+    ///
+    /// `Ok` with [`MaintenanceOutcome::failures`] populated, rather than `Err`.
+    /// The tables share nothing a partial run could corrupt, and what fails here
+    /// persists until an operator acts — a quarantined schema, an unreachable
+    /// catalogue — so stopping would let one such table freeze archival for every
+    /// other, whose hot tier then grows without bound for the length of the
+    /// incident.
+    ///
+    /// [`healthy`](MaintenanceOutcome::healthy) is false while any table failed,
+    /// so a caller checking only that still notices.
     pub async fn run_once(&self, now: OffsetDateTime) -> Result<MaintenanceOutcome> {
-        let archival = self.store.archive(now, self.max_windows).await?;
-
-        let snapshots_expired = if self.expire_snapshots {
-            self.store.expire_snapshots(now).await?
-        } else {
-            0
-        };
-
-        let status = self.store.status(now).await?;
-        let invariant_violations = status.invariant_violations.max(0) as u64;
-
-        if invariant_violations > 0 {
-            warn!(
-                table = self.store.table(),
-                invariant_violations, "rows are in the wrong tier: query results may be wrong"
-            );
+        let mut tables = Vec::with_capacity(self.stores.len());
+        for store in &self.stores {
+            // **A failing table does not end the cycle.** The tables share
+            // nothing a partial run could corrupt, and the states that fail here
+            // — a quarantined schema, an unreachable catalogue — persist until an
+            // operator acts. Aborting would mean one quarantined table freezing
+            // archival for every other, whose hot tier then grows without bound
+            // for as long as the quarantine lasts: a second, larger incident
+            // caused by the reporting of the first.
+            tables.push(match self.run_table(store, now).await {
+                Ok(done) => done,
+                Err(e) => {
+                    warn!(
+                        table = store.table(),
+                        error = %e,
+                        "maintenance failed for this table; the cycle continues with the rest"
+                    );
+                    TableMaintenance {
+                        table: store.table().to_string(),
+                        failure: Some(e.to_string()),
+                        ..Default::default()
+                    }
+                }
+            });
         }
 
-        let outcome = MaintenanceOutcome {
-            archival,
-            snapshots_expired,
-            invariant_violations,
-        };
-
+        let outcome = MaintenanceOutcome { tables };
         info!(
-            table = self.store.table(),
+            tables = outcome.tables.len(),
             windows = outcome.windows_archived(),
             rows = outcome.rows_archived(),
-            snapshots_expired,
+            snapshots_expired = outcome.snapshots_expired(),
+            failed = outcome.failures().count(),
             healthy = outcome.healthy(),
             "maintenance cycle"
         );
         Ok(outcome)
+    }
+
+    /// One table's half of a cycle.
+    async fn run_table(
+        &self,
+        store: &crate::session::MeterStore,
+        now: OffsetDateTime,
+    ) -> Result<TableMaintenance> {
+        let archival = store.archive(now, self.max_windows).await?;
+
+        let snapshots_expired = match self.expire_snapshots {
+            true => store.expire_snapshots(now).await?,
+            false => 0,
+        };
+
+        let status = store.status(now).await?;
+        let invariant_violations = status.invariant_violations.max(0) as u64;
+        if invariant_violations > 0 {
+            warn!(
+                table = store.table(),
+                invariant_violations, "rows are in the wrong tier: query results may be wrong"
+            );
+        }
+
+        Ok(TableMaintenance {
+            table: store.table().to_string(),
+            archival,
+            snapshots_expired,
+            invariant_violations,
+            failure: None,
+        })
     }
 
     /// Run cycles on the configured interval, on the caller's runtime.
@@ -180,7 +329,7 @@ impl Maintenance {
         let period = std::time::Duration::from_secs(
             u64::try_from(self.interval.whole_seconds().max(1)).unwrap_or(900),
         );
-        let table = self.store.table().to_string();
+        let tables = self.tables().join(", ");
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
@@ -189,7 +338,7 @@ impl Maintenance {
             loop {
                 tokio::select! {
                     _ = &mut rx => {
-                        info!(table = %table, "maintenance stopped");
+                        info!(tables = %tables, "maintenance stopped");
                         return;
                     }
                     _ = ticker.tick() => {
@@ -197,7 +346,7 @@ impl Maintenance {
                         // decision in a cycle is made against one instant.
                         let now = OffsetDateTime::now_utc();
                         if let Err(e) = self.run_once(now).await {
-                            warn!(table = %table, error = %e, "maintenance cycle failed; retrying next tick");
+                            warn!(tables = %tables, error = %e, "maintenance cycle failed; retrying next tick");
                         }
                     }
                 }
@@ -283,24 +432,91 @@ mod tests {
         }
     }
 
+    fn table(name: &str, archival: Vec<ArchivalOutcome>) -> TableMaintenance {
+        TableMaintenance {
+            table: name.to_string(),
+            archival,
+            snapshots_expired: 0,
+            invariant_violations: 0,
+            failure: None,
+        }
+    }
+
     #[test]
     fn an_outcome_sums_only_the_windows_that_moved_data() {
         let outcome = MaintenanceOutcome {
-            archival: vec![archived(96), archived(4), idle()],
-            snapshots_expired: 0,
-            invariant_violations: 0,
+            tables: vec![table(
+                "readings_versions",
+                vec![archived(96), archived(4), idle()],
+            )],
         };
         assert_eq!(outcome.rows_archived(), 100);
         assert_eq!(outcome.windows_archived(), 2);
     }
 
     #[test]
+    fn an_outcome_over_several_tables_folds_them_and_keeps_them_apart() {
+        // The aggregate answers "did anything move"; the rows answer "which
+        // table". A cycle that only summed would report a deployment healthy
+        // while one of its tables was quarantined, and would give an operator no
+        // name to act on.
+        let outcome = MaintenanceOutcome {
+            tables: vec![
+                table("readings_versions", vec![archived(96)]),
+                TableMaintenance {
+                    invariant_violations: 3,
+                    ..table("esa_typ2_versions", vec![archived(4)])
+                },
+            ],
+        };
+
+        assert_eq!(outcome.rows_archived(), 100);
+        assert_eq!(outcome.windows_archived(), 2);
+        assert_eq!(outcome.invariant_violations(), 3);
+        assert!(!outcome.healthy());
+
+        let named: Vec<&str> = outcome.unhealthy().map(|t| t.table.as_str()).collect();
+        assert_eq!(named, vec!["esa_typ2_versions"]);
+        assert!(outcome.tables[0].healthy(), "the other table is fine");
+    }
+
+    #[test]
+    fn a_failed_table_is_reported_rather_than_ending_the_cycle() {
+        // Returning early would let one quarantined table freeze archival for
+        // every other, whose hot tier then grows without bound for the length of
+        // the quarantine — a second and larger incident caused by how the first
+        // was reported. So a failure is a row, and `healthy` is false.
+        let outcome = MaintenanceOutcome {
+            tables: vec![
+                table("readings_versions", vec![archived(96)]),
+                TableMaintenance {
+                    failure: Some("quarantined: column \"tenant\" …".to_string()),
+                    ..table("esa_typ2_versions", Vec::new())
+                },
+            ],
+        };
+
+        assert!(!outcome.healthy());
+        assert_eq!(
+            outcome.failures().map(|(t, _)| t).collect::<Vec<_>>(),
+            vec!["esa_typ2_versions"],
+        );
+        // The table that did work still reports what it did.
+        assert_eq!(outcome.rows_archived(), 96);
+        assert!(outcome.tables[0].healthy());
+    }
+
+    #[test]
     fn health_is_exactly_the_absence_of_violations() {
         let bad = MaintenanceOutcome {
-            invariant_violations: 1,
-            ..Default::default()
+            tables: vec![TableMaintenance {
+                invariant_violations: 1,
+                ..table("readings_versions", Vec::new())
+            }],
         };
         assert!(!bad.healthy());
+        // A cycle over no tables is vacuously healthy, which is right: it is what
+        // a catalog reports before anything has been added to it.
         assert!(MaintenanceOutcome::default().healthy());
     }
 
@@ -309,8 +525,7 @@ mod tests {
         // Every replica runs the schedule and one wins. The others must not look
         // like failures, or the alert fires on a healthy deployment.
         let outcome = MaintenanceOutcome {
-            archival: vec![contended()],
-            ..Default::default()
+            tables: vec![table("readings_versions", vec![contended()])],
         };
         assert!(outcome.lease_contended());
         assert!(outcome.healthy());

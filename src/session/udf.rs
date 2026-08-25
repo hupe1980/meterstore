@@ -33,6 +33,7 @@ use datafusion::logical_expr::{
 use metering::IntervalResolution;
 use metering::calendar;
 use metering::interval::Sparte;
+use metering::obis::ObisCode;
 use time::{Date, OffsetDateTime};
 
 use crate::arrow::array::{
@@ -42,13 +43,21 @@ use crate::arrow::datatypes::{DataType, TimeUnit};
 use crate::planner::calendar as balancing;
 
 /// Days between the Unix epoch and a date, for `Date32`.
+///
+/// The storage encoding's own, so a day one of these functions returns and a day
+/// the encoder wrote into `balancing_day` are the same number by construction
+/// rather than by two conversions agreeing.
 fn to_date32(date: Date) -> i32 {
-    (date - Date::from_ordinal_date(1970, 1).expect("epoch is a valid date")).whole_days() as i32
+    crate::encode::schema::date32(date)
 }
 
 /// The instant a microsecond timestamp represents.
+///
+/// [`schema::instant`](crate::encode::schema::instant) in DataFusion's error
+/// type: the value comes off a column, so a file this crate did not write can
+/// put anything there and failing beats panicking.
 fn from_micros(micros: i64) -> DfResult<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000)
+    crate::encode::schema::instant(micros)
         .map_err(|e| DataFusionError::Execution(format!("timestamp out of range: {e}")))
 }
 
@@ -122,6 +131,193 @@ fn as_micros(args: &ScalarFunctionArgs) -> DfResult<TimestampMicrosecondArray> {
         .downcast_ref::<TimestampMicrosecondArray>()
         .ok_or_else(|| DataFusionError::Execution("expected a timestamp argument".into()))?
         .clone())
+}
+
+/// Read a `Utf8` argument and parse each row as an OBIS code.
+///
+/// Nulls pass through as nulls; anything else that is not an OBIS code is an
+/// error rather than a null, for the same reason a bad `sparte` is: storage
+/// holds canonical codes and only canonical codes, so an unparseable one means
+/// the row was written by something that did not honour that.
+fn as_obis(args: &ScalarFunctionArgs) -> DfResult<(StringArray, Vec<Option<ObisCode>>)> {
+    let raw = as_strings(args, 0)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        if raw.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let text = raw.value(i);
+        out.push(Some(text.parse::<ObisCode>().map_err(|e| {
+            DataFusionError::Execution(format!("{text:?} is not an OBIS code: {e}"))
+        })?));
+    }
+    Ok((raw, out))
+}
+
+/// One of `metering::obis`'s predicates, as a SQL function.
+///
+/// # Why these are wrappers and nothing more
+///
+/// Exactly as the calendar functions are. "Which registers may be summed into
+/// one kWh figure" is a rule about OBIS, and OBIS belongs to `metering` — the
+/// direction lives in value group C *and only for electricity*, `E = 63` is a
+/// fault counter rather than tariff 63, `D = 6` is a kW maximum and `D = 29` the
+/// kWh load profile it is derived from. Each of those is one line here and a
+/// paragraph of Codeliste citation upstream.
+///
+/// So there is deliberately no `obis_is_energy`: it would be a *composition* —
+/// "not reactive, not a maximum, not a fault counter" — and composing a new
+/// domain rule in the storage layer is how a second implementation starts. The
+/// composition is spelled out in the documentation as SQL, where a reader can
+/// see which three rules it rests on.
+///
+/// # The medium is already in the code
+///
+/// [`ObisCode::is_import`] tests `a == 1 && c == 1`, so it is false for a gas
+/// code without being told the commodity: value group C is a Messgröße for gas,
+/// not a direction, and value group A says which medium it is. Taking a `sparte`
+/// argument would put a second source for that fact beside the one already in
+/// the code, and the two could disagree.
+struct ObisPredicate {
+    name: &'static str,
+    test: fn(&ObisCode) -> bool,
+    signature: Signature,
+}
+
+impl std::fmt::Debug for ObisPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObisPredicate")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PartialEq for ObisPredicate {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+impl Eq for ObisPredicate {}
+impl std::hash::Hash for ObisPredicate {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl ObisPredicate {
+    fn new(name: &'static str, test: fn(&ObisCode) -> bool) -> Self {
+        Self {
+            name,
+            test,
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ObisPredicate {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, codes) = as_obis(&args)?;
+        let out: crate::arrow::array::BooleanArray =
+            codes.iter().map(|c| c.map(|c| (self.test)(&c))).collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// `obis_tariff_register(code)` — the tariff number, or null.
+///
+/// Null for the **total** register (`E = 0`) and null for the
+/// **Fehlerregister** (`E = 63`), which is `metering`'s own rule: reporting the
+/// fault counter as `63` invites a caller to bill it as tariff 63's consumption.
+/// `obis_is_total_register` and `obis_is_fehlerregister` tell the two apart.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ObisTariffRegister {
+    signature: Signature,
+}
+
+impl Default for ObisTariffRegister {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ObisTariffRegister {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "obis_tariff_register"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::UInt8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, codes) = as_obis(&args)?;
+        let out: crate::arrow::array::UInt8Array = codes
+            .iter()
+            .map(|c| c.and_then(|c| c.tariff_register()))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// `obis_normalise(code)` — the canonical spelling storage holds.
+///
+/// The SQL counterpart of [`canonical_obis`](crate::canonical_obis). Useful for
+/// joining against a table that was not written through this crate: the merge
+/// key includes `obis_code`, so `1-0:1.8.0` and `1-0:1.8.0*255` are one channel
+/// and a literal comparison against the wrong spelling returns nothing.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ObisNormalise {
+    signature: Signature,
+}
+
+impl Default for ObisNormalise {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ObisNormalise {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "obis_normalise"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, codes) = as_obis(&args)?;
+        let out: StringArray = codes.iter().map(|c| c.map(|c| c.to_string())).collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
 }
 
 /// `meter_local_day(ts)` — the Berlin calendar day an instant falls on.
@@ -446,10 +642,8 @@ impl ScalarUDFImpl for ExpectedIntervals {
 
             match (days.is_null(i), resolution, commodity) {
                 (false, Some(res), Some(sparte)) => {
-                    let date = Date::from_ordinal_date(1970, 1)
-                        .expect("epoch")
-                        .checked_add(time::Duration::days(i64::from(days.value(i))))
-                        .ok_or_else(|| DataFusionError::Execution("date out of range".into()))?;
+                    let date = crate::encode::schema::date_of(days.value(i))
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                     match balancing::expected_intervals_in_balancing_day(date, res, sparte) {
                         Some(n) => out.append_value(n),
                         // Calendar resolutions have no fixed interval count
@@ -472,13 +666,35 @@ fn parse_resolution(s: &str) -> DfResult<IntervalResolution> {
 
 /// Every calendar function, ready to register.
 pub fn all() -> Vec<ScalarUDF> {
-    vec![
+    let mut udfs = vec![
         ScalarUDF::from(LocalDay::default()),
         ScalarUDF::from(GasDay::default()),
         ScalarUDF::from(BalancingDay::default()),
         ScalarUDF::from(LocalMonth::default()),
         ScalarUDF::from(ExpectedIntervals::default()),
-    ]
+        ScalarUDF::from(ObisTariffRegister::default()),
+        ScalarUDF::from(ObisNormalise::default()),
+    ];
+    // One-to-one with `metering::obis`'s own predicates. Listed rather than
+    // generated so that adding one upstream is a deliberate act here, and so the
+    // SQL name and the method it wraps sit on the same line.
+    for (name, test) in [
+        (
+            "obis_is_import",
+            ObisCode::is_import as fn(&ObisCode) -> bool,
+        ),
+        ("obis_is_export", ObisCode::is_export),
+        ("obis_is_reactive", ObisCode::is_reactive),
+        ("obis_is_lastgang", ObisCode::is_lastgang),
+        ("obis_is_zaehlerstand", ObisCode::is_zaehlerstand),
+        ("obis_is_vorschub", ObisCode::is_vorschub),
+        ("obis_is_maximum", ObisCode::is_maximum),
+        ("obis_is_fehlerregister", ObisCode::is_fehlerregister),
+        ("obis_is_total_register", ObisCode::is_total_register),
+    ] {
+        udfs.push(ScalarUDF::from(ObisPredicate::new(name, test)));
+    }
+    udfs
 }
 
 #[cfg(test)]
@@ -503,12 +719,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Date32Array>()
             .expect("date32 result");
-        (!array.is_null(0)).then(|| {
-            Date::from_ordinal_date(1970, 1)
-                .unwrap()
-                .checked_add(time::Duration::days(i64::from(array.value(0))))
-                .unwrap()
-        })
+        (!array.is_null(0)).then(|| crate::encode::schema::date_of(array.value(0)).unwrap())
     }
 
     async fn one_u32(sql: &str) -> Option<u32> {
@@ -550,6 +761,129 @@ mod tests {
                 "wrapper disagreed with metering for {instant}"
             );
         }
+    }
+
+    async fn one_bool(sql: &str) -> Option<bool> {
+        use crate::arrow::array::AsArray;
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let column = batches[0].column(0).as_boolean();
+        (!column.is_null(0)).then(|| column.value(0))
+    }
+
+    #[tokio::test]
+    async fn obis_predicates_answer_what_metering_answers() {
+        // Wrappers, so what is asserted is that the wrapper preserves the
+        // upstream answer — not that the answer is right, which is `metering`'s
+        // suite's job.
+        for (sql, want) in [
+            ("obis_is_import('1-0:1.8.0')", true),
+            ("obis_is_import('1-0:2.8.0')", false),
+            ("obis_is_export('1-0:2.29.0')", true),
+            // The Lastgang is the commonest code in MSCONS interval data, and
+            // requiring D = 8 would report it as neither direction.
+            ("obis_is_import('1-0:1.29.0')", true),
+            ("obis_is_lastgang('1-0:1.29.0')", true),
+            ("obis_is_zaehlerstand('1-0:1.8.0')", true),
+            ("obis_is_vorschub('1-0:1.9.0')", true),
+            // A kW peak, not a kWh quantity.
+            ("obis_is_maximum('1-0:1.6.0')", true),
+            ("obis_is_maximum('1-0:1.29.0')", false),
+            // kvarh — the quadrant registers count too, not only C = 3/4.
+            ("obis_is_reactive('1-0:5.8.0')", true),
+            ("obis_is_reactive('1-0:1.8.0')", false),
+            ("obis_is_fehlerregister('1-0:1.8.63')", true),
+            ("obis_is_total_register('1-0:1.8.0')", true),
+            ("obis_is_total_register('1-0:1.8.1')", false),
+        ] {
+            assert_eq!(
+                one_bool(&format!("SELECT {sql}")).await,
+                Some(want),
+                "{sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direction_is_medium_aware_without_being_told_the_commodity() {
+        // Value group A carries the medium and value group C is a Messgröße for
+        // gas rather than a direction, so `is_import` is false for a gas code
+        // with no `sparte` argument. Taking one would be a second source for a
+        // fact the code already states.
+        assert_eq!(
+            one_bool("SELECT obis_is_import('7-1:99.33.0')").await,
+            Some(false)
+        );
+        assert_eq!(
+            one_bool("SELECT obis_is_export('7-1:99.33.0')").await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fault_counter_is_not_tariff_sixty_three() {
+        use crate::arrow::array::AsArray;
+        let batches = ctx()
+            .sql(
+                "SELECT obis_tariff_register('1-0:1.8.1') AS ht, \
+                        obis_tariff_register('1-0:1.8.0') AS total, \
+                        obis_tariff_register('1-0:1.8.63') AS fault",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &batches[0];
+        let value = |name: &str| {
+            let c = b
+                .column_by_name(name)
+                .unwrap()
+                .as_primitive::<crate::arrow::datatypes::UInt8Type>();
+            (!c.is_null(0)).then(|| c.value(0))
+        };
+        assert_eq!(value("ht"), Some(1));
+        assert_eq!(value("total"), None, "the total register is not a tariff");
+        assert_eq!(
+            value("fault"),
+            None,
+            "E = 63 is a fault counter, and reporting it as tariff 63 invites \
+             billing it as consumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn obis_normalise_matches_the_stored_spelling() {
+        use crate::arrow::array::AsArray;
+        let batches = ctx()
+            .sql("SELECT obis_normalise('1-0:1.8.0*255') AS c")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0].column(0).as_string::<i32>().value(0),
+            "1-0:1.8.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_code_is_null_and_a_bad_one_is_an_error() {
+        assert_eq!(
+            one_bool("SELECT obis_is_import(CAST(NULL AS VARCHAR))").await,
+            None
+        );
+        assert!(
+            ctx()
+                .sql("SELECT obis_is_import('not-an-obis-code')")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .is_err(),
+            "storage holds canonical codes, so an unparseable one is a statement \
+             about the row rather than a null"
+        );
     }
 
     #[tokio::test]

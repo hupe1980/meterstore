@@ -167,6 +167,11 @@ pub struct TieredTableProvider {
     /// Carries the merge key, because a chunked scan resumes by keyset and the
     /// cursor has to be unique per row — see [`ScanSpec::cursor_columns`].
     spec: crate::tiering::store::ScanSpec,
+    /// Identity-column equalities every scan is confined to.
+    ///
+    /// Empty for an unscoped provider. See
+    /// [`with_row_scope`](Self::with_row_scope).
+    row_scope: Vec<(String, datafusion::scalar::ScalarValue)>,
 }
 
 impl fmt::Debug for TieredTableProvider {
@@ -222,7 +227,52 @@ impl TieredTableProvider {
                     .collect(),
                 extra,
             ),
+            row_scope: Vec::new(),
         }
+    }
+
+    /// Confine every scan to rows matching these identity-column equalities.
+    ///
+    /// The predicate is **enforced**, not offered. A filter handed to
+    /// `TableProvider::scan` is advisory — DataFusion normally re-applies it
+    /// above the scan, so a provider may prune on it and return the rows anyway.
+    /// This one is injected here, so the engine does not know it exists and would
+    /// never re-apply it; it is therefore placed by this crate, below the
+    /// projection, exactly as the transaction-time ceiling is.
+    ///
+    /// That is the whole point: it is what lets a service expose **caller-supplied
+    /// SQL** over one tenant's rows. A predicate the caller could omit is not a
+    /// boundary.
+    ///
+    /// # Only merge-key columns
+    ///
+    /// [`MeterStore::scoped`] refuses anything else, and the reason is version
+    /// resolution rather than taste. A merge-key column partitions *readings*:
+    /// filtering before ranking and filtering after give the same winner. An
+    /// attribute column is not, so a correction that changed it would have its
+    /// versions sliced apart by the filter, and the scoped read would resolve to
+    /// a different value than the unscoped one.
+    ///
+    /// [`MeterStore::scoped`]: crate::session::MeterStore::scoped
+    pub fn with_row_scope(mut self, scope: Vec<(String, datafusion::scalar::ScalarValue)>) -> Self {
+        self.row_scope = scope;
+        self
+    }
+
+    /// The identity equalities every scan through this provider is confined to.
+    pub fn row_scope(&self) -> &[(String, datafusion::scalar::ScalarValue)] {
+        &self.row_scope
+    }
+
+    /// The row scope as filter expressions.
+    fn row_scope_filters(&self) -> Vec<Expr> {
+        self.row_scope
+            .iter()
+            .map(|(column, value)| {
+                datafusion::logical_expr::col(column)
+                    .eq(datafusion::logical_expr::lit(value.clone()))
+            })
+            .collect()
     }
 
     /// Declare how the hot half must page through a range.
@@ -353,7 +403,7 @@ impl TieredTableProvider {
         // quietly ignored its version ceiling would return today's corrections
         // under the heading of a past settlement.
         let scanned = pinned.scan(state, None, &all, None).await?;
-        self.enforce(state, ceiling, scanned, projection, limit)
+        self.enforce(state, vec![ceiling], scanned, projection, limit)
     }
 
     /// Scan both tiers against an already-read watermark.
@@ -391,22 +441,29 @@ impl TieredTableProvider {
         // It therefore sits below the projection, since the projection need not
         // include `recorded_at`, and the limit moves above it, since a limit
         // applied first counts rows the filter would have removed.
-        let ceiling = self
+        //
+        // The row scope joins it for the same reason and with more force: it is
+        // what makes caller-supplied SQL safe to run over one tenant's rows, so
+        // a predicate the engine could drop would not be a boundary at all.
+        let mut enforced: Vec<Expr> = self
             .mode
             .recorded_at_ceiling()
-            .map(predicate::recorded_at_ceiling);
-        let (tier_projection, tier_limit) = match ceiling {
-            Some(_) => (None, None),
-            None => (projection, limit),
+            .map(predicate::recorded_at_ceiling)
+            .into_iter()
+            .collect();
+        enforced.extend(self.row_scope_filters());
+
+        let (tier_projection, tier_limit) = match enforced.is_empty() {
+            false => (None, None),
+            true => (projection, limit),
         };
 
-        // Handed to the tiers as an ordinary filter as well, so Iceberg can prune
-        // whole files whose `recorded_at` bounds lie entirely above the ceiling.
-        // That is the optimisation; the filter below is the correctness.
+        // Handed to the tiers as ordinary filters as well, so Iceberg can prune
+        // whole files — by `recorded_at` bounds, and by the identity partition
+        // field a scoped read is confined to. That is the optimisation; the
+        // filter below is the correctness.
         let mut tier_filters = filters.to_vec();
-        if let Some(expr) = &ceiling {
-            tier_filters.push(expr.clone());
-        }
+        tier_filters.extend(enforced.iter().cloned());
 
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if let Some(range) = split.cold {
@@ -420,7 +477,7 @@ impl TieredTableProvider {
         }
 
         // Planning latency, not scan latency: at this point nothing has been
-        // read. The two used to share one instrument, which made a slow scan
+        // read. Sharing one instrument with the scan would make a slow scan
         // invisible and a slow catalog look like a slow query.
         crate::observe::metrics().plan_duration.record(
             started.elapsed().as_secs_f64(),
@@ -440,27 +497,36 @@ impl TieredTableProvider {
             _ => UnionExec::try_new(plans)?,
         };
 
-        match ceiling {
-            None => Ok(scanned),
-            Some(expr) => self.enforce(state, expr, scanned, projection, limit),
+        match enforced.is_empty() {
+            true => Ok(scanned),
+            false => self.enforce(state, enforced, scanned, projection, limit),
         }
     }
 
-    /// Apply `filter` to `input` below the projection, restoring `projection`
+    /// Apply `filters` to `input` below the projection, restoring `projection`
     /// and `limit` above it.
     ///
     /// The shape every *enforced* — as opposed to merely pushed-down — predicate
     /// needs: a filter DataFusion does not know about cannot be re-applied by
     /// DataFusion, so this crate has to place it, and it has to place it where
     /// the column it reads still exists.
+    ///
+    /// Several are conjoined into one `FilterExec` rather than stacked, so a
+    /// transaction-time ceiling and a tenant scope cost one pass between them.
     fn enforce(
         &self,
         state: &dyn Session,
-        filter: Expr,
+        filters: Vec<Expr>,
         input: Arc<dyn ExecutionPlan>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let filter = filters
+            .into_iter()
+            .reduce(datafusion::logical_expr::and)
+            .ok_or_else(|| {
+                DataFusionError::Internal("enforce called with no predicate".to_string())
+            })?;
         let df_schema = datafusion::common::DFSchema::try_from(self.schema.as_ref().clone())?;
         let physical = state.create_physical_expr(filter, &df_schema)?;
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(
@@ -804,6 +870,7 @@ mod tests {
             _table: &str,
             _key: &[String],
             _extra: &[crate::arrow::datatypes::Field],
+            _model: crate::config::TimeModel,
         ) -> crate::Result<()> {
             Ok(())
         }
@@ -963,10 +1030,7 @@ mod tests {
     }
 
     fn ts(t: OffsetDateTime) -> Expr {
-        lit(datafusion::common::ScalarValue::TimestampMicrosecond(
-            Some((t.unix_timestamp_nanos() / 1_000) as i64),
-            Some("UTC".into()),
-        ))
+        lit(crate::encode::schema::timestamp_scalar(t))
     }
 
     async fn row_count(p: TieredTableProvider, filters: Vec<Expr>) -> usize {

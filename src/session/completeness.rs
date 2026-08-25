@@ -72,6 +72,18 @@ pub struct Completeness {
     pub malo_id: String,
     /// The measured channel.
     pub obis_code: String,
+    /// The merge-key columns beyond `(malo_id, obis_code, from)`, in key order.
+    ///
+    /// A declared identity column, and `melo_id` where the table identifies a
+    /// reading by its Messlokation. Empty on a plain single-tenant Lastgang.
+    ///
+    /// **Reported because it is grouped on**, and grouped on because a merge key
+    /// is what makes two rows two readings. Folded together, two tenants — or
+    /// the two meters of a Mehrfamilienhaus — put 192 intervals against an
+    /// expectation of 96 and the report claims a surplus of 96 on a range where
+    /// nothing is wrong. The reverse is worse: one tenant complete and the other
+    /// missing a day reads as complete overall.
+    pub identity: Vec<(String, String)>,
     /// The commodity, which decides **which day** the channel is balanced on:
     /// the Gastag for [`Sparte::Gas`], the Berlin calendar day for the rest.
     pub sparte: Sparte,
@@ -79,6 +91,13 @@ pub struct Completeness {
     ///
     /// Without it there is no expectation to compare against, and the row says
     /// so rather than assuming 15 minutes.
+    ///
+    /// **Grouped on, so this is the row's grid rather than one of several.** A
+    /// channel converted from an hourly profile to a quarter-hourly one mid-range
+    /// holds both, and it is the grid that decides whether a day of 24 values is
+    /// complete or 72 short. Folded, the report would name an arbitrary one of
+    /// them against a count drawn from both — arbitrary literally, since the
+    /// aggregate yields its groups in no defined order.
     pub resolution: Option<String>,
     /// Intervals the calendar says the range should hold.
     pub expected: u64,
@@ -126,6 +145,8 @@ impl Completeness {
 struct DailyRow {
     malo_id: String,
     obis_code: String,
+    /// The merge-key discriminators, in key order.
+    identity: Vec<(String, String)>,
     sparte: Sparte,
     resolution: Option<String>,
     day: Date,
@@ -135,10 +156,23 @@ struct DailyRow {
 }
 
 /// The result schema, in the order §9.6 documents.
-pub fn completeness_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+///
+/// `discriminators` are the table's merge-key columns beyond
+/// `(malo_id, obis_code, from)`. They sit next to the identifiers they extend,
+/// because a report is read rather than indexed: a row naming a Marktlokation
+/// and a channel but not the tenant or the meter it belongs to is not
+/// actionable.
+pub fn completeness_schema(discriminators: &[String]) -> SchemaRef {
+    let mut fields = vec![
         Field::new("malo_id", DataType::Utf8, false),
         Field::new("obis_code", DataType::Utf8, false),
+    ];
+    fields.extend(
+        discriminators
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, false)),
+    );
+    fields.extend([
         Field::new("sparte", DataType::Utf8, false),
         Field::new("resolution", DataType::Utf8, true),
         Field::new("expected", DataType::Int64, false),
@@ -149,68 +183,89 @@ pub fn completeness_schema() -> SchemaRef {
         Field::new("substituted", DataType::Int64, false),
         Field::new("not_billable", DataType::Int64, false),
         Field::new("complete", DataType::Boolean, false),
-    ]))
+    ]);
+    Arc::new(Schema::new(fields))
 }
 
 /// Encode completeness rows as a batch.
-pub fn completeness_batch(rows: &[Completeness]) -> Result<RecordBatch> {
+pub fn completeness_batch(rows: &[Completeness], discriminators: &[String]) -> Result<RecordBatch> {
     use crate::arrow::array::BooleanArray;
 
-    let epoch = Date::from_ordinal_date(1970, 1).expect("epoch is a valid date");
     let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
 
+    let mut columns: Vec<crate::arrow::array::ArrayRef> = vec![
+        Arc::new(StringArray::from(
+            rows.iter().map(|r| r.malo_id.as_str()).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|r| r.obis_code.as_str())
+                .collect::<Vec<_>>(),
+        )),
+    ];
+    for (i, name) in discriminators.iter().enumerate() {
+        columns.push(Arc::new(StringArray::from(
+            rows.iter()
+                .map(|r| match r.identity.get(i) {
+                    Some((held, value)) if held == name => Ok(value.as_str()),
+                    // Unreachable through `compute`, which builds both from the
+                    // one list. An error rather than a null, because a report
+                    // whose columns and values had come apart would name the
+                    // wrong tenant rather than no tenant.
+                    _ => Err(Error::encode(
+                        name,
+                        "completeness row carries no value for this merge-key column",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )));
+    }
+    columns.extend::<Vec<crate::arrow::array::ArrayRef>>(vec![
+        Arc::new(StringArray::from(
+            rows.iter().map(|r| r.sparte.as_str()).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|r| r.resolution.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| as_i64(r.expected)).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| as_i64(r.actual)).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| as_i64(r.missing)).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| as_i64(r.surplus)).collect::<Vec<_>>(),
+        )),
+        Arc::new(Date32Array::from(
+            rows.iter()
+                .map(|r| r.first_gap.map(crate::encode::schema::date32))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|r| as_i64(r.substituted))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|r| as_i64(r.not_billable))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(BooleanArray::from(
+            rows.iter()
+                .map(Completeness::is_complete)
+                .collect::<Vec<_>>(),
+        )),
+    ]);
+
     Ok(RecordBatch::try_new(
-        completeness_schema(),
-        vec![
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.malo_id.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.obis_code.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|r| r.sparte.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|r| r.resolution.as_deref())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| as_i64(r.expected)).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| as_i64(r.actual)).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| as_i64(r.missing)).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter().map(|r| as_i64(r.surplus)).collect::<Vec<_>>(),
-            )),
-            Arc::new(Date32Array::from(
-                rows.iter()
-                    .map(|r| r.first_gap.map(|d| (d - epoch).whole_days() as i32))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|r| as_i64(r.substituted))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|r| as_i64(r.not_billable))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(BooleanArray::from(
-                rows.iter()
-                    .map(Completeness::is_complete)
-                    .collect::<Vec<_>>(),
-            )),
-        ],
+        completeness_schema(discriminators),
+        columns,
     )?)
 }
 
@@ -242,17 +297,13 @@ fn is_billable(quality: &str) -> bool {
 fn daily_plan(
     resolved: Arc<dyn TableProvider>,
     table: &str,
+    discriminators: &[String],
     from: OffsetDateTime,
     to: OffsetDateTime,
 ) -> DfResult<datafusion::logical_expr::LogicalPlan> {
     use datafusion::functions_aggregate::expr_fn::count;
 
-    let ts = |t: OffsetDateTime| {
-        lit(ScalarValue::TimestampMicrosecond(
-            Some((t.unix_timestamp_nanos() / 1_000) as i64),
-            Some("UTC".into()),
-        ))
-    };
+    let ts = |t: OffsetDateTime| lit(crate::encode::schema::timestamp_scalar(t));
 
     // `quality` is a **group key**, not an aggregate. Substitution and
     // billability are domain rules — § 60 Abs. 2 MsbG for the latter — so the
@@ -270,23 +321,33 @@ fn daily_plan(
             .and(col(column::FROM).lt(ts(to))),
     )?
     .aggregate(
-        vec![
-            col(column::MALO_ID),
-            col(column::OBIS_CODE),
-            // Grouped on, not merely selected: the roll-up needs it to ask for
-            // the right expected count. A measuring point has one commodity, so
-            // this adds no cardinality.
-            col(column::SPARTE),
-            col(column::RESOLUTION),
-            // The **stored** balancing day, not a UDF over `from` and `sparte`.
-            // The encoder already asked `metering`'s calendar for it, once, at
-            // the point the row was written; recomputing it here would be a
-            // second derivation to keep in step. It is also plainly faster — a
-            // column the engine can group on and collect statistics for, rather
-            // than a scalar function it must invoke per row.
-            col(column::BALANCING_DAY).alias("day"),
-            col(column::QUALITY),
-        ],
+        {
+            let mut keys = vec![
+                col(column::MALO_ID),
+                col(column::OBIS_CODE),
+                // Grouped on, not merely selected: the roll-up needs it to ask for
+                // the right expected count. A measuring point has one commodity, so
+                // this adds no cardinality.
+                col(column::SPARTE),
+                col(column::RESOLUTION),
+                // The **stored** balancing day, not a UDF over `from` and `sparte`.
+                // The encoder already asked `metering`'s calendar for it, once, at
+                // the point the row was written; recomputing it here would be a
+                // second derivation to keep in step. It is also plainly faster — a
+                // column the engine can group on and collect statistics for, rather
+                // than a scalar function it must invoke per row.
+                col(column::BALANCING_DAY).alias("day"),
+                col(column::QUALITY),
+            ];
+            // The merge key is what makes two rows two readings, so it is what a
+            // per-channel count has to be grouped by. Without these, two tenants
+            // reporting one measuring point put 192 intervals against an
+            // expectation of 96 and the report claims a surplus that is not
+            // there — and one tenant complete beside another missing a day reads
+            // as complete overall.
+            keys.extend(discriminators.iter().map(col));
+            keys
+        },
         vec![count(lit(1i64)).alias("actual")],
     )?
     .build()
@@ -297,6 +358,7 @@ pub(crate) async fn compute(
     state: &dyn Session,
     resolved: Arc<dyn TableProvider>,
     table: &str,
+    discriminators: &[String],
     from: OffsetDateTime,
     to: OffsetDateTime,
 ) -> Result<Vec<Completeness>> {
@@ -306,22 +368,20 @@ pub(crate) async fn compute(
         )));
     }
 
-    let plan = daily_plan(resolved, table, from, to)?;
+    let plan = daily_plan(resolved, table, discriminators, from, to)?;
     let physical = state.create_physical_plan(&plan).await?;
     let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
     let mut daily: Vec<DailyRow> = Vec::new();
     for batch in &batches {
-        daily.extend(decode_daily(batch)?);
+        daily.extend(decode_daily(batch, discriminators)?);
     }
 
     Ok(roll_up(daily, from, to))
 }
 
 /// Read the aggregate's output back into typed rows.
-fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
-    let epoch = Date::from_ordinal_date(1970, 1).expect("epoch is a valid date");
-
+fn decode_daily(batch: &RecordBatch, discriminators: &[String]) -> Result<Vec<DailyRow>> {
     let text = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
@@ -334,6 +394,10 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
     let sparte = text(column::SPARTE)?;
     let resolution = text(column::RESOLUTION)?;
     let quality = text(column::QUALITY)?;
+    let identity_columns = discriminators
+        .iter()
+        .map(|name| text(name))
+        .collect::<Result<Vec<_>>>()?;
     let day = batch
         .column_by_name("day")
         .and_then(|c| c.as_any().downcast_ref::<Date32Array>())
@@ -355,6 +419,11 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
         out.push(DailyRow {
             malo_id: malo.value(i).to_string(),
             obis_code: obis.value(i).to_string(),
+            identity: discriminators
+                .iter()
+                .zip(&identity_columns)
+                .map(|(name, column)| (name.clone(), column.value(i).to_string()))
+                .collect(),
             // The commodity decides which day the row was bucketed into and
             // which expectation it is measured against, so an unrecognised one
             // is an error rather than an assumed `STROM`.
@@ -362,9 +431,7 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
                 Error::decode(column::SPARTE, format!("{:?}: {e}", sparte.value(i)))
             })?,
             resolution: (!resolution.is_null(i)).then(|| resolution.value(i).to_string()),
-            day: epoch
-                .checked_add(time::Duration::days(i64::from(day.value(i))))
-                .ok_or_else(|| Error::decode("day", "date out of range"))?,
+            day: crate::encode::schema::date_of(day.value(i))?,
             actual: count,
             substituted: if is_substitute(flag) { count } else { 0 },
             not_billable: if is_billable(flag) { 0 } else { count },
@@ -380,24 +447,40 @@ fn decode_daily(batch: &RecordBatch) -> Result<Vec<DailyRow>> {
 /// it, which is what makes a range that is not day-aligned report honestly rather
 /// than claiming a gap at each end.
 ///
-/// The channel key carries the Sparte. A measuring point has one commodity, so
-/// this normally changes nothing — but if a channel ever held two, folding them
-/// into one row would measure gas rows against the electricity day, and the
-/// resulting report would be wrong without saying so. Two rows is the honest
-/// answer.
+/// The channel key carries the Sparte **and the declared resolution**, because a
+/// row is measured against an expectation and both of them decide which one
+/// applies.
+///
+/// A measuring point has one commodity, so the Sparte normally changes nothing —
+/// but if a channel ever held two, folding them into one row would measure gas
+/// rows against the electricity day.
+///
+/// The resolution is the same argument and less hypothetical: a meter converted
+/// from an hourly profile to a quarter-hourly one mid-month holds both, and it is
+/// the *grid* that says whether a day of 24 values is complete or 72 short. Split
+/// by grid, each row measures its own days and a clean conversion comes back as
+/// two complete rows.
 fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Vec<Completeness> {
     use std::collections::BTreeMap;
 
-    /// `(malo_id, obis_code, sparte)` — what one reported row describes.
+    /// `(malo_id, obis_code, identity, sparte, resolution)` — what one reported
+    /// row describes.
     ///
     /// The Sparte enters as its canonical code rather than as the enum, because
     /// the maps are ordered — a `BTreeMap` keeps the report deterministic — and
     /// `Sparte` is deliberately not `Ord`. The enum itself rides in the
     /// accumulator, so nothing has to parse the code back.
-    type ChannelKey = (String, String, &'static str);
+    type ChannelKey = (
+        String,
+        String,
+        Vec<(String, String)>,
+        &'static str,
+        Option<String>,
+    );
 
     // Key by channel; within a channel, days are folded together.
     struct Accumulator {
+        identity: Vec<(String, String)>,
         sparte: Sparte,
         resolution: Option<String>,
         expected: u64,
@@ -421,9 +504,12 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         let key: ChannelKey = (
             row.malo_id.clone(),
             row.obis_code.clone(),
+            row.identity.clone(),
             row.sparte.as_str(),
+            row.resolution.clone(),
         );
         let entry = by_channel.entry(key.clone()).or_insert(Accumulator {
+            identity: row.identity.clone(),
             sparte: row.sparte,
             resolution: row.resolution.clone(),
             expected: 0,
@@ -437,9 +523,6 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         entry.actual += row.actual;
         entry.substituted += row.substituted;
         entry.not_billable += row.not_billable;
-        if entry.resolution.is_none() {
-            entry.resolution = row.resolution.clone();
-        }
 
         let day_key = (key, row.day);
         let expected = if counted.insert(day_key.clone()) {
@@ -483,19 +566,22 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
 
     by_channel
         .into_iter()
-        .map(|((malo_id, obis_code, _), a)| Completeness {
-            malo_id,
-            obis_code,
-            sparte: a.sparte,
-            resolution: a.resolution,
-            expected: a.expected,
-            actual: a.actual,
-            missing: a.missing,
-            surplus: a.surplus,
-            first_gap: a.first_gap,
-            substituted: a.substituted,
-            not_billable: a.not_billable,
-        })
+        .map(
+            |((malo_id, obis_code, ..), a): (ChannelKey, Accumulator)| Completeness {
+                malo_id,
+                obis_code,
+                identity: a.identity,
+                sparte: a.sparte,
+                resolution: a.resolution,
+                expected: a.expected,
+                actual: a.actual,
+                missing: a.missing,
+                surplus: a.surplus,
+                first_gap: a.first_gap,
+                substituted: a.substituted,
+                not_billable: a.not_billable,
+            },
+        )
         .collect()
 }
 
@@ -557,14 +643,25 @@ fn expected_in_day(
 pub struct CompletenessFunction {
     resolved: Arc<dyn TableProvider>,
     table: String,
+    discriminators: Vec<String>,
 }
 
 impl CompletenessFunction {
     /// Bind the function to a store's resolved table.
-    pub fn new(resolved: Arc<dyn TableProvider>, table: impl Into<String>) -> Self {
+    ///
+    /// `discriminators` are the table's merge-key columns beyond
+    /// `(malo_id, obis_code, from)` — what the report groups by and reports, so
+    /// that two tenants' or two meters' rows are two rows rather than one wrong
+    /// one.
+    pub fn new(
+        resolved: Arc<dyn TableProvider>,
+        table: impl Into<String>,
+        discriminators: Vec<String>,
+    ) -> Self {
         Self {
             resolved,
             table: table.into(),
+            discriminators,
         }
     }
 
@@ -599,6 +696,7 @@ impl datafusion::catalog::TableFunctionImpl for CompletenessFunction {
         Ok(Arc::new(CompletenessProvider {
             resolved: Arc::clone(&self.resolved),
             table: self.table.clone(),
+            discriminators: self.discriminators.clone(),
             from: as_instant(from)?,
             to: as_instant(to)?,
         }))
@@ -660,6 +758,7 @@ fn as_instant(expr: &Expr) -> DfResult<OffsetDateTime> {
 struct CompletenessProvider {
     resolved: Arc<dyn TableProvider>,
     table: String,
+    discriminators: Vec<String>,
     from: OffsetDateTime,
     to: OffsetDateTime,
 }
@@ -681,7 +780,7 @@ impl TableProvider for CompletenessProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        completeness_schema()
+        completeness_schema(&self.discriminators)
     }
 
     fn table_type(&self) -> TableType {
@@ -699,15 +798,16 @@ impl TableProvider for CompletenessProvider {
             state,
             Arc::clone(&self.resolved),
             &self.table,
+            &self.discriminators,
             self.from,
             self.to,
         )
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let batch =
-            completeness_batch(&rows).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        MemTable::try_new(completeness_schema(), vec![vec![batch]])?
+        let batch = completeness_batch(&rows, &self.discriminators)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        MemTable::try_new(completeness_schema(&self.discriminators), vec![vec![batch]])?
             .scan(state, projection, filters, limit)
             .await
     }
@@ -736,6 +836,7 @@ mod tests {
         DailyRow {
             malo_id: "12345678905".into(),
             obis_code: "1-0:1.8.0".into(),
+            identity: Vec::new(),
             sparte,
             resolution: Some("PT15M".into()),
             day,
@@ -870,6 +971,36 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_that_changes_grid_reports_one_row_per_grid() {
+        // A meter converted from an hourly profile to a quarter-hourly one holds
+        // both, and it is the grid that says whether a day of 24 values is
+        // complete or 72 short. Folded into one row the report named an
+        // arbitrary one of them — arbitrary because the aggregate yields groups
+        // in no defined order — against a count drawn from both. Split, each row
+        // measures its own days against its own grid, and both are complete,
+        // which is what they are.
+        let mut hourly = row(date!(2026 - 03 - 02), 24, "MEASURED");
+        hourly.resolution = Some("PT1H".into());
+        let quarterly = row(date!(2026 - 03 - 03), 96, "MEASURED");
+
+        let out = roll_up(vec![hourly, quarterly], FROM, TO);
+
+        assert_eq!(out.len(), 2, "one row per grid: {out:?}");
+        let by_grid: std::collections::BTreeMap<_, _> = out
+            .iter()
+            .map(|r| (r.resolution.clone().unwrap(), r))
+            .collect();
+
+        let hourly = by_grid["PT1H"];
+        assert_eq!((hourly.expected, hourly.actual), (24, 24));
+        assert!(hourly.is_complete() && hourly.is_measurable());
+
+        let quarterly = by_grid["PT15M"];
+        assert_eq!((quarterly.expected, quarterly.actual), (96, 96));
+        assert!(quarterly.is_complete() && quarterly.is_measurable());
+    }
+
+    #[test]
     fn a_calendar_resolution_has_no_daily_expectation() {
         let mut r = row(date!(2026 - 03 - 02), 1, "MEASURED");
         r.resolution = Some("P1M".into());
@@ -925,9 +1056,47 @@ mod tests {
     #[test]
     fn a_batch_matches_the_published_schema() {
         let rows = roll_up(vec![row(date!(2026 - 03 - 02), 90, "MEASURED")], FROM, TO);
-        let batch = completeness_batch(&rows).unwrap();
-        assert_eq!(batch.schema(), completeness_schema());
+        let batch = completeness_batch(&rows, &[]).unwrap();
+        assert_eq!(batch.schema(), completeness_schema(&[]));
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn two_readings_of_one_channel_are_two_rows() {
+        // Two tenants — or the two meters of a Mehrfamilienhaus — each deliver a
+        // full day for one measuring point and one channel. Folded, that is 192
+        // intervals against an expectation of 96 and a surplus that is not there.
+        // Worse in the other direction: one of them missing a day nets against
+        // the other's full one and the channel reads as complete.
+        let of = |tenant: &str, actual: u64| {
+            let mut r = row(date!(2026 - 03 - 02), actual, "MEASURED");
+            r.identity = vec![("tenant".to_string(), tenant.to_string())];
+            r
+        };
+
+        let out = roll_up(vec![of("a", 96), of("b", 92)], FROM, TO);
+        assert_eq!(out.len(), 2, "two readings, two rows");
+
+        let tenant_a = out.iter().find(|r| r.identity[0].1 == "a").unwrap();
+        let tenant_b = out.iter().find(|r| r.identity[0].1 == "b").unwrap();
+        assert!(tenant_a.is_complete(), "a delivered the whole day");
+        assert_eq!(tenant_b.missing, 4, "and b is four short, on its own row");
+        assert_eq!(tenant_a.surplus, 0, "neither is a duplicate of the other");
+    }
+
+    #[test]
+    fn the_reported_columns_follow_the_merge_key() {
+        let mut r = row(date!(2026 - 03 - 02), 96, "MEASURED");
+        r.identity = vec![("melo_id".to_string(), "DE00012345".to_string())];
+        let rows = roll_up(vec![r], FROM, TO);
+
+        let key = ["melo_id".to_string()];
+        let batch = completeness_batch(&rows, &key).unwrap();
+        assert_eq!(batch.schema(), completeness_schema(&key));
+
+        use crate::arrow::array::AsArray;
+        let column = batch.column_by_name("melo_id").expect("reported");
+        assert_eq!(column.as_string::<i32>().value(0), "DE00012345");
     }
 
     #[test]

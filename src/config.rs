@@ -39,6 +39,66 @@ pub fn coded_column(name: &str, allowed: &[&str], nullable: bool) -> Field {
     )]))
 }
 
+/// What a row's timestamps mean: a span, or an instant.
+///
+/// A **Lastgang** is energy over `[from, to)`. A **Zählerstandsgang** is a
+/// cumulative register value at an instant, and BK6-24-174 (in force 06.06.2025)
+/// means a German MSB holds one per measuring point at the Lastgang's own
+/// cadence — so it is exactly as voluminous, and § 146 Abs. 4 AO forbids
+/// discarding it after differencing.
+///
+/// Both tier the same way, because the watermark, the partition step, the merge
+/// key and the balancing day all read the *start* timestamp. Three things
+/// differ:
+///
+/// | | [`Interval`](Self::Interval) | [`Point`](Self::Point) |
+/// |---|---|---|
+/// | `to` | the span's exclusive end | **null** — an instant has no end |
+/// | `value` | energy *in* the span | the register's cumulative reading |
+/// | overlap exclusion | on: spans may not overlap | off: instants cannot |
+///
+/// **They are never one table.** `value` would mean two things in one column,
+/// and summing Zählerstände gives a number with no meaning that looks exactly
+/// like a consumption total. `to IS NULL` is the row-level signal, so an
+/// external engine holding only the Parquet can tell them apart too.
+///
+/// A zero-width interval is the tempting shortcut and makes `MeterInterval` a
+/// lie: `metering` computes `demand_kw` as energy over duration. A point series
+/// carries [`MeterReading`](metering::reading::MeterReading).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeModel {
+    /// `[from, to)` — a Lastgang. `value` is the energy in the span.
+    #[default]
+    Interval,
+    /// An instant — a Zählerstandsgang. `value` is the register's reading, `to`
+    /// is null.
+    Point,
+}
+
+impl TimeModel {
+    /// Whether rows carry a span end.
+    pub const fn has_interval_end(self) -> bool {
+        matches!(self, Self::Interval)
+    }
+
+    /// The stable code, for `system.config` and error messages.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interval => "INTERVAL",
+            Self::Point => "POINT",
+        }
+    }
+}
+
+impl std::fmt::Display for TimeModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Defaults chosen for German 15-minute metering at utility scale.
 pub mod defaults {
     use time::Duration;
@@ -51,9 +111,14 @@ pub mod defaults {
     pub const SETTLEMENT_LAG: Duration = Duration::weeks(1);
     /// How far ahead of the write frontier partitions are pre-created.
     pub const PARTITION_HEADROOM: Duration = Duration::weeks(2);
-    /// Rows per Parquet file before rolling over.
-    pub const MAX_ROWS_PER_FILE: usize = 5_000_000;
-    /// Target Parquet data file size.
+    /// Target Parquet data file size, in bytes.
+    ///
+    /// **A cold-tier setting, not a table setting**, and here only as the
+    /// recommended value. It is passed where it takes effect —
+    /// [`IcebergSqlCatalog::file_target_bytes`] — because that is the object the
+    /// Parquet writer belongs to.
+    ///
+    /// [`IcebergSqlCatalog::file_target_bytes`]: crate::cold::IcebergSqlCatalog::file_target_bytes
     pub const TARGET_FILE_SIZE: usize = 512 * 1024 * 1024;
     /// Rows fetched per round trip when streaming a scan.
     ///
@@ -75,15 +140,15 @@ pub mod defaults {
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     name: String,
+    time_model: TimeModel,
     partition_step: Duration,
     archival_step: Duration,
     settlement_lag: Duration,
     partition_headroom: Duration,
-    max_rows_per_file: usize,
-    target_file_size: usize,
     scan_chunk_rows: usize,
     snapshot_retention: Duration,
     min_snapshots_to_keep: usize,
+    melo_in_merge_key: Option<bool>,
     identity_columns: Vec<Field>,
     attribute_columns: Vec<Field>,
     subject_column: Option<String>,
@@ -94,19 +159,51 @@ impl TableConfig {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            time_model: TimeModel::Interval,
             partition_step: defaults::PARTITION_STEP,
             archival_step: defaults::ARCHIVAL_STEP,
             settlement_lag: defaults::SETTLEMENT_LAG,
             partition_headroom: defaults::PARTITION_HEADROOM,
-            max_rows_per_file: defaults::MAX_ROWS_PER_FILE,
-            target_file_size: defaults::TARGET_FILE_SIZE,
             scan_chunk_rows: defaults::SCAN_CHUNK_ROWS,
             snapshot_retention: defaults::SNAPSHOT_RETENTION,
             min_snapshots_to_keep: defaults::MIN_SNAPSHOTS_TO_KEEP,
+            melo_in_merge_key: None,
             identity_columns: Vec::new(),
             attribute_columns: Vec::new(),
             subject_column: None,
         }
+    }
+
+    /// Make the **Messlokation** part of what identifies a reading.
+    ///
+    /// A Marktlokation may be measured by several Messlokationen, so which of
+    /// them a row belongs to is either a label or the identity, depending on the
+    /// shape. A load profile belongs to the market location — one channel
+    /// however many meters produce it — while a register belongs to the *meter*,
+    /// and two meters carry the same OBIS register at the same instants. Keyed
+    /// on the Marktlokation alone the second reads as a restatement of the
+    /// first.
+    ///
+    /// So this **defaults to the time model**: on for [`TimeModel::Point`], off
+    /// for [`TimeModel::Interval`]. Calling it pins the choice either way.
+    ///
+    /// `melo_id` then joins [`merge_key`](ValidatedTableConfig::merge_key) — and
+    /// so the hot table's primary key, its integrity constraints, the keyset
+    /// cursor and the published resolution SQL — becomes `NOT NULL`, and a
+    /// delivery naming none is refused.
+    pub fn identify_by_melo(mut self, yes: bool) -> Self {
+        self.melo_in_merge_key = Some(yes);
+        self
+    }
+
+    /// Declare whether this table holds spans or instants.
+    ///
+    /// [`TimeModel::Interval`] by default — a Lastgang. Set
+    /// [`TimeModel::Point`] for a Zählerstandsgang, whose rows are register
+    /// values at an instant rather than energy over a span. See [`TimeModel`].
+    pub fn time_model(mut self, model: TimeModel) -> Self {
+        self.time_model = model;
+        self
     }
 
     /// Set the hot-table partition granularity.
@@ -198,18 +295,70 @@ impl TableConfig {
     ///
     /// Erasure does not need it in the key. It destroys the *mapping*, which
     /// leaves every row unattributable regardless of where the column sits.
+    ///
+    /// # Idempotent, because the column may already be declared
+    ///
+    /// A deployment that spells the column out —
+    /// [`attribute_column`](Self::attribute_column), or an `extra_columns` entry
+    /// in TOML — and *then* names it here is saying one thing, not two. An
+    /// existing attribute column of that name is adopted rather than re-declared,
+    /// which keeps a [`coded_column`]'s vocabulary intact.
+    ///
+    /// The marker is set either way, and it is the half that matters: without it
+    /// [`ValidatedTableConfig::subject_column`] is `None`, the write-path check
+    /// against the [`SubjectRegistry`](crate::erasure::SubjectRegistry) never
+    /// runs, and a store holding pseudonymous references validates none of them.
     pub fn subject_column(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
-        self.attribute_columns
-            .push(Field::new(&name, DataType::Utf8, true));
+        if !self.attribute_columns.iter().any(|f| *f.name() == name) {
+            self.attribute_columns
+                .push(Field::new(&name, DataType::Utf8, true));
+        }
         self.subject_column = Some(name);
         self
     }
 
     /// Validate and freeze.
     pub fn build(self) -> Result<ValidatedTableConfig> {
-        if self.name.is_empty() {
-            return Err(Error::config("table name must not be empty"));
+        // The same rule the declared columns get, and for a stronger reason: the
+        // table name reaches PostgreSQL DDL, the partition relation names, the
+        // resolution SQL and every scan, always as a quoted identifier and never
+        // as a parameter — an identifier cannot be one. Validating it at the one
+        // place it enters the system is what lets every one of those sites
+        // interpolate it without thinking about quoting.
+        //
+        // It also keeps the partition-name round trip honest: a partition is
+        // named `<table>_<yyyy>_<mm>_<dd>_<hhmm>` and parsed back by stripping the
+        // table's own prefix, which a name carrying a quote or a space would make
+        // ambiguous.
+        if !is_plain_identifier(&self.name) {
+            return Err(Error::config(format!(
+                "table name {:?} must be a plain identifier — a letter or underscore \
+                 followed by letters, digits or underscores. The name is written into \
+                 DDL, partition relation names and SQL as an identifier, which cannot \
+                 be parameterised",
+                self.name
+            )));
+        }
+        // PostgreSQL truncates an identifier at 63 bytes, silently. Every name
+        // this crate derives from the table's is longer than the table's own: a
+        // partition is `<table>_YYYY_MM_DD_HHMM` (+16) and its integrity
+        // constraints add `_one_operator` (+13) on top. At 35 characters the two
+        // constraint names on one partition start to truncate to the same
+        // string, and `ADD CONSTRAINT` then fails on the second — on the *first
+        // write of a new day*, long after the table was declared. Refusing here
+        // is the difference between a configuration error and a 3 a.m. one.
+        const MAX_TABLE_NAME: usize = 63 - PARTITION_SUFFIX_LEN - LONGEST_CONSTRAINT_SUFFIX;
+        if self.name.len() > MAX_TABLE_NAME {
+            return Err(Error::config(format!(
+                "table name {:?} is {} characters; at most {MAX_TABLE_NAME} fit. \
+                 PostgreSQL truncates an identifier at 63 bytes and this crate derives \
+                 longer ones from it — a partition relation adds {PARTITION_SUFFIX_LEN} \
+                 characters and its integrity constraints another \
+                 {LONGEST_CONSTRAINT_SUFFIX}",
+                self.name,
+                self.name.len(),
+            )));
         }
         if self.partition_step <= Duration::ZERO {
             return Err(Error::config("partition_step must be positive"));
@@ -257,9 +406,6 @@ impl TableConfig {
                 "scan_chunk_rows must be positive: a zero-row chunk would page forever",
             ));
         }
-        if self.max_rows_per_file == 0 {
-            return Err(Error::config("max_rows_per_file must be positive"));
-        }
         if self.snapshot_retention <= Duration::ZERO {
             return Err(Error::config("snapshot_retention must be positive"));
         }
@@ -289,6 +435,20 @@ impl TableConfig {
                     f.name()
                 )));
             }
+        }
+
+        // A pseudonymous reference must never join the merge key. A correction
+        // whose reference was derived slightly differently — a re-registration,
+        // a pipeline reading a stale mapping — would get a different key and
+        // silently fail to supersede the value it corrects. Declared both ways,
+        // `build` would otherwise fail with a duplicate-column error about a
+        // mistake that is not the one being made.
+        if let Some(subject) = &self.subject_column
+            && self.identity_columns.iter().any(|f| f.name() == subject)
+        {
+            return Err(Error::config(format!(
+                "{subject:?} is declared both as an identity column and as the subject                  column. A pseudonymous reference must not join the merge key: a correction                  carrying a re-derived reference would get a different key and silently fail                  to supersede the value it corrects. Erasure does not need it in the key — it                  destroys the mapping, which leaves every row unattributable wherever the                  column sits"
+            )));
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -338,6 +498,10 @@ impl ValidatedTableConfig {
     pub fn name(&self) -> &str {
         &self.0.name
     }
+    /// Whether this table holds spans or instants.
+    pub fn time_model(&self) -> TimeModel {
+        self.0.time_model
+    }
     /// Hot-table partition granularity.
     pub fn partition_step(&self) -> Duration {
         self.0.partition_step
@@ -353,14 +517,6 @@ impl ValidatedTableConfig {
     /// How far ahead partitions are pre-created.
     pub fn partition_headroom(&self) -> Duration {
         self.0.partition_headroom
-    }
-    /// Rows per Parquet file before rolling over.
-    pub fn max_rows_per_file(&self) -> usize {
-        self.0.max_rows_per_file
-    }
-    /// Target Parquet data file size.
-    pub fn target_file_size(&self) -> usize {
-        self.0.target_file_size
     }
     /// Rows fetched per round trip when streaming a scan.
     pub fn scan_chunk_rows(&self) -> usize {
@@ -434,16 +590,58 @@ impl ValidatedTableConfig {
             .collect()
     }
 
-    /// The full merge key: the core columns plus any identity columns.
+    /// Whether the Messlokation is part of what identifies a reading.
+    ///
+    /// **Defaults to the time model** where
+    /// [`identify_by_melo`](TableConfig::identify_by_melo) was not called: on
+    /// for [`TimeModel::Point`], off for [`TimeModel::Interval`]. A register
+    /// belongs to a meter and a load profile belongs to a market location, so
+    /// that is the right answer for each shape, and the wrong one is the sort
+    /// that shows up as one of two meters' readings quietly not being stored.
+    pub fn melo_in_merge_key(&self) -> bool {
+        self.0
+            .melo_in_merge_key
+            .unwrap_or(matches!(self.0.time_model, TimeModel::Point))
+    }
+
+    /// The full merge key: the core columns, the Messlokation if it identifies
+    /// a reading here, and any identity columns.
     ///
     /// This is what decides whether one reading supersedes another, so it is
     /// derived in one place and used by the schema, the hot-table primary key
     /// and the resolution SQL alike.
+    ///
+    /// `melo_id` sits directly after `malo_id` rather than at the end: the key
+    /// is also the hot table's primary index, and the dominant read narrows by
+    /// measuring point first.
     pub fn merge_key(&self) -> Vec<String> {
-        crate::encode::schema::MERGE_KEY
-            .iter()
-            .map(|s| (*s).to_string())
-            .chain(self.0.identity_columns.iter().map(|f| f.name().clone()))
+        let mut key = vec![crate::encode::schema::col::MALO_ID.to_string()];
+        if self.melo_in_merge_key() {
+            key.push(crate::encode::schema::col::MELO_ID.to_string());
+        }
+        key.extend(
+            crate::encode::schema::MERGE_KEY
+                .iter()
+                .filter(|c| **c != crate::encode::schema::col::MALO_ID)
+                .map(|s| (*s).to_string()),
+        );
+        key.extend(self.0.identity_columns.iter().map(|f| f.name().clone()));
+        key
+    }
+
+    /// The merge-key columns beyond the three every table shares.
+    ///
+    /// What separates two rows that agree on `(malo_id, obis_code, from)`: the
+    /// Messlokation where it identifies a reading, then the declared identity
+    /// columns. Every path that has to name a reading — the cold tier's
+    /// reconciliation, the displacement report, the keyset cursor — asks for
+    /// this rather than for `identity_column_names`, which is the same list only
+    /// where `melo_id` is not in the key.
+    pub fn discriminator_columns(&self) -> Vec<String> {
+        let core = crate::encode::schema::MERGE_KEY;
+        self.merge_key()
+            .into_iter()
+            .filter(|c| !core.contains(&c.as_str()))
             .collect()
     }
 
@@ -455,6 +653,17 @@ impl ValidatedTableConfig {
         (span.whole_seconds() / self.0.partition_step.whole_seconds()).max(1)
     }
 }
+
+/// Characters a partition relation name adds to its table's: `_YYYY_MM_DD_HHMM`.
+///
+/// Kept next to the check that uses it rather than derived from
+/// [`PartitionId::relation_name`](crate::tiering::store::PartitionId::relation_name),
+/// because the format is a constant there and a length is what is needed here.
+const PARTITION_SUFFIX_LEN: usize = "_2026_07_20_0000".len();
+
+/// Characters the longest integrity-constraint name adds to a partition's:
+/// `_one_operator`, from `hot::postgres`.
+const LONGEST_CONSTRAINT_SUFFIX: usize = "_one_operator".len();
 
 /// Whether `name` is a bare SQL identifier needing no quoting or escaping.
 ///
@@ -500,6 +709,48 @@ mod tests {
             f.metadata().get(CHECK_VALUES_KEY).map(String::as_str),
             Some("MSCONS,DIRECT_PUSH")
         );
+    }
+
+    #[test]
+    fn naming_an_already_declared_column_as_the_subject_column_adopts_it() {
+        // One statement, not two. Pushing a second field of the same name would
+        // fail `build` with a duplicate-column error about a mistake nobody
+        // made, and would discard the deployment's own declaration — its
+        // vocabulary included.
+        let c = base()
+            .attribute_column(coded_column("subject_ref", &["A", "B"], true))
+            .subject_column("subject_ref")
+            .build()
+            .unwrap();
+
+        assert_eq!(c.subject_column(), Some("subject_ref"));
+        let declared: Vec<_> = c
+            .attribute_columns()
+            .iter()
+            .filter(|f| f.name() == "subject_ref")
+            .collect();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(
+            declared[0]
+                .metadata()
+                .get(CHECK_VALUES_KEY)
+                .map(String::as_str),
+            Some("A,B"),
+        );
+    }
+
+    #[test]
+    fn a_subject_column_may_not_be_an_identity_column() {
+        // In the merge key it looks harmless and is not: a correction whose
+        // reference was re-derived — a re-registration, a stale mapping — gets a
+        // different key and silently fails to supersede the value it corrects.
+        let err = base()
+            .identity_column(Field::new("subject_ref", DataType::Utf8, false))
+            .subject_column("subject_ref")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merge key"), "{err}");
     }
 
     #[test]
@@ -565,8 +816,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_name_is_rejected() {
+    fn a_table_name_must_be_a_plain_identifier() {
+        // The name reaches DDL, partition relation names and every scan as a
+        // quoted identifier and never as a parameter. Declared *column* names
+        // were already held to this rule; the table name carries more of it.
         assert!(TableConfig::new("").build().is_err());
+        assert!(
+            TableConfig::new("readings\"; DROP TABLE x --")
+                .build()
+                .is_err()
+        );
+        assert!(TableConfig::new("has space").build().is_err());
+        assert!(TableConfig::new("1_leading_digit").build().is_err());
+        assert!(TableConfig::new("Messwerte_Ä").build().is_err());
+
+        assert!(TableConfig::new("readings").build().is_ok());
+        assert!(TableConfig::new("readings_versions").build().is_ok());
+        assert!(TableConfig::new("_private2").build().is_ok());
     }
 
     #[test]
@@ -663,6 +929,95 @@ mod tests {
             c.merge_key(),
             vec!["malo_id", "obis_code", "from", "tenant"]
         );
+    }
+
+    #[test]
+    fn a_point_table_identifies_a_reading_by_its_messlokation_by_default() {
+        // A register belongs to a meter. A Marktlokation may be measured by
+        // several — a Mehrfamilienhaus, a house with an Einliegerwohnung — and
+        // each of them carries the same OBIS register at the same instants, so
+        // keyed on the Marktlokation alone the two are one reading.
+        let point = base().time_model(TimeModel::Point).build().unwrap();
+        assert!(point.melo_in_merge_key());
+        assert_eq!(
+            point.merge_key(),
+            vec!["malo_id", "melo_id", "obis_code", "from"]
+        );
+        assert_eq!(point.discriminator_columns(), vec!["melo_id"]);
+    }
+
+    #[test]
+    fn an_interval_table_does_not() {
+        // A market location's load profile is one channel however many meters
+        // produce it, so the Messlokation labels the row and does not name it.
+        let lastgang = base().build().unwrap();
+        assert!(!lastgang.melo_in_merge_key());
+        assert_eq!(lastgang.merge_key(), vec!["malo_id", "obis_code", "from"]);
+        assert!(lastgang.discriminator_columns().is_empty());
+    }
+
+    #[test]
+    fn identify_by_melo_pins_the_choice_either_way() {
+        // The default follows the time model; declaring it overrides that, for
+        // a single-meter portfolio one way and a sub-metering one the other.
+        assert!(
+            !base()
+                .time_model(TimeModel::Point)
+                .identify_by_melo(false)
+                .build()
+                .unwrap()
+                .melo_in_merge_key()
+        );
+        assert!(
+            base()
+                .identify_by_melo(true)
+                .build()
+                .unwrap()
+                .melo_in_merge_key()
+        );
+    }
+
+    #[test]
+    fn the_messlokation_leads_the_key_and_identity_columns_follow() {
+        // The merge key is also the hot table's primary index, and the dominant
+        // read narrows by measuring point first.
+        let c = base()
+            .identify_by_melo(true)
+            .identity_column(Field::new("tenant", DataType::Utf8, false))
+            .build()
+            .unwrap();
+        assert_eq!(
+            c.merge_key(),
+            vec!["malo_id", "melo_id", "obis_code", "from", "tenant"]
+        );
+        assert_eq!(c.discriminator_columns(), vec!["melo_id", "tenant"]);
+        // The keyset cursor keeps the declared sort order as its prefix.
+        assert_eq!(
+            c.scan_spec().cursor_columns(),
+            [
+                "malo_id",
+                "from",
+                "melo_id",
+                "obis_code",
+                "tenant",
+                "version"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_name_too_long_for_postgres_identifiers_is_refused() {
+        // A partition adds 16 characters and its constraints another 13. Past
+        // 34, PostgreSQL truncates at 63 bytes and the second constraint on a
+        // partition collides with the first — on the day's first write, not at
+        // declaration.
+        let longest = "a".repeat(34);
+        assert!(TableConfig::new(&longest).build().is_ok());
+
+        let err = TableConfig::new("a".repeat(35)).build().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("63"), "{msg}");
+        assert!(msg.contains("34"), "message must name the limit: {msg}");
     }
 
     #[test]

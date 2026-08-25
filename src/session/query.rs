@@ -109,6 +109,20 @@ impl QueryResult {
     /// than folded into every row.
     ///
     /// An empty result is an empty `Vec`, not `[null]`.
+    ///
+    /// # Every decimal is a JSON **string**
+    ///
+    /// `value`, `version` and any `SUM` over them come back as `"123.456789"`,
+    /// not `123.456789`. That is the one shape in which JSON carries an exact
+    /// decimal, and exactness is this crate's premise.
+    ///
+    /// A JSON *number* cannot keep it. Arrow renders the decimal exactly, and
+    /// then every ordinary reader — `serde_json` without `arbitrary_precision`,
+    /// every JavaScript engine, Python's `json` — parses it into an `f64`: at the
+    /// full 18 digits `123456789012.345678` reads back `123456789012.34567`, with
+    /// no error and a settlement figure that no longer reconciles.
+    /// `arbitrary_precision` would fix `serde_json` and none of the consumers,
+    /// who are the point of a JSON surface. Timestamps are already strings.
     pub fn to_json(&self) -> Result<Vec<serde_json::Value>> {
         if self.num_rows() == 0 {
             return Ok(Vec::new());
@@ -117,7 +131,7 @@ impl QueryResult {
         let mut writer = crate::arrow::json::ArrayWriter::new(&mut buf);
         for batch in &self.batches {
             writer
-                .write(batch)
+                .write(&decimals_as_text(batch)?)
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         writer.finish().map_err(|e| Error::Storage(e.to_string()))?;
@@ -254,6 +268,187 @@ impl QueryDescription {
     pub fn read_mode(&self) -> ReadMode {
         self.read_mode
     }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+    use crate::arrow::array::{Decimal128Array, Int64Array, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema};
+
+    fn result_of(batch: RecordBatch) -> QueryResult {
+        let schema = batch.schema();
+        QueryResult::new(
+            vec![batch],
+            schema,
+            Vec::new(),
+            Vec::new(),
+            ReadMode::Unified,
+        )
+    }
+
+    #[test]
+    fn a_decimal_survives_json_at_full_width() {
+        // The bug this exists to stop: Arrow renders the decimal exactly, then
+        // any ordinary JSON reader parses it into an f64 and the eighteenth
+        // digit is gone — 123456789012.345678 reads back 123456789012.34567,
+        // with no error anywhere. A settlement figure that no longer reconciles.
+        let raw = 123_456_789_012_345_678i128;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Decimal128(18, 6),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![raw])
+                    .with_precision_and_scale(18, 6)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+
+        let rows = result_of(batch).to_json().unwrap();
+        assert_eq!(
+            rows[0]["value"].as_str(),
+            Some("123456789012.345678"),
+            "a decimal is an exact string, not a number: {}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn negative_and_tiny_decimals_round_trip() {
+        for (raw, want) in [
+            (-1i128, "-0.000001"),
+            (0, "0.000000"),
+            (999_999_999_999_999_999, "999999999999.999999"),
+        ] {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "v",
+                    DataType::Decimal128(18, 6),
+                    false,
+                )])),
+                vec![Arc::new(
+                    Decimal128Array::from(vec![raw])
+                        .with_precision_and_scale(18, 6)
+                        .unwrap(),
+                )],
+            )
+            .unwrap();
+            assert_eq!(
+                result_of(batch).to_json().unwrap()[0]["v"].as_str(),
+                Some(want)
+            );
+        }
+    }
+
+    #[test]
+    fn non_decimal_columns_keep_their_json_types() {
+        // Only decimals change shape. A count is still a number and an
+        // identifier is still a string, so a consumer's decoder is unaffected
+        // everywhere the exactness argument does not apply.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("malo_id", DataType::Utf8, false),
+                Field::new("n", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["41373559241"])),
+                Arc::new(Int64Array::from(vec![96i64])),
+            ],
+        )
+        .unwrap();
+
+        let rows = result_of(batch).to_json().unwrap();
+        assert_eq!(rows[0]["malo_id"].as_str(), Some("41373559241"));
+        assert_eq!(rows[0]["n"].as_i64(), Some(96));
+    }
+
+    #[test]
+    fn a_null_decimal_stays_null() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                DataType::Decimal128(18, 6),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![None::<i128>])
+                    .with_precision_and_scale(18, 6)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let rows = result_of(batch).to_json().unwrap();
+        assert!(
+            rows[0].get("v").is_none() || rows[0]["v"].is_null(),
+            "{}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn an_empty_result_is_an_empty_array() {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Decimal128(18, 6),
+            false,
+        )])));
+        assert!(result_of(batch).to_json().unwrap().is_empty());
+    }
+}
+
+/// Re-type a batch's decimal columns as text, exactly.
+///
+/// Arrow's decimal → `Utf8` cast is a digit-for-digit rendering of the unscaled
+/// integer with the point put in — no float anywhere on the path — so this is the
+/// last point at which the value is still exact and the first at which JSON can
+/// hold it. See [`QueryResult::to_json`].
+///
+/// A batch with no decimal column is returned untouched, which is the common case
+/// for a projection that selects timestamps and identifiers.
+fn decimals_as_text(batch: &RecordBatch) -> Result<RecordBatch> {
+    use crate::arrow::datatypes::{DataType, Field, Schema};
+
+    let is_decimal = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Decimal32(..)
+                | DataType::Decimal64(..)
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+        )
+    };
+    if !batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| is_decimal(f.data_type()))
+    {
+        return Ok(batch.clone());
+    }
+
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if is_decimal(field.data_type()) {
+            columns.push(crate::arrow::compute::cast(column, &DataType::Utf8)?);
+            fields.push(Field::new(
+                field.name(),
+                DataType::Utf8,
+                field.is_nullable(),
+            ));
+        } else {
+            columns.push(column.clone());
+            fields.push(field.as_ref().clone());
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 /// Which tiers a physical plan reads from.

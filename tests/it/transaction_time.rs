@@ -51,7 +51,8 @@ fn stored(
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", from).unwrap(),
+            meterstore::VersionScope::for_interval("99", from, metering::interval::Sparte::Strom)
+                .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         recorded_at,
@@ -181,11 +182,9 @@ async fn as_known_at_reads_the_same_after_archival_to_cold() {
 
 #[tokio::test]
 async fn the_ceiling_reaches_the_raw_versions_relation_too() {
-    // The ceiling used to live only inside the resolution plan, so `readings`
-    // honoured it and `readings_versions` — the audit relation, and the one a
-    // correction history is read from — did not. A session that says it
-    // reproduces a past state must not hand back rows it had not yet been told
-    // about, whichever of its two relations is queried.
+    // A session that reproduces a past state must not hand back rows it had not
+    // been told about, whichever of its two relations is queried — including
+    // `readings_versions`, which is where a correction history is read from.
     let (_h, store) = store().await;
     store
         .append(&[stored(START, 10, 20_260_726_060_000, T1)])

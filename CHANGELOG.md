@@ -7,6 +7,655 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.5.0] — 2026-08-25
+
+Three audits, the `metering` 0.19 upgrade, and consumer feedback from an MSB
+running this against a real workload.
+
+The first audit found that the cold tier had no equivalent of the hot tier's
+primary key: a replayed late correction was stored twice, and the optimisation
+that makes historical scans fast is the one that then returns both copies — a
+settlement sum came back **doubled**, with nothing reporting a problem.
+`metering` 0.19 named a rule the crate had been getting wrong for a whole
+commodity. The feedback found a silent precision loss, a documented feature that
+could not be expressed, and a whole record type the crate had no place for.
+
+The second audit went after the seams rather than the contents. It found three
+ways to get a number that is silently short: a query running while a window was
+being archived read **neither** tier for it; an append routed against a boundary
+archival moved underneath it wrote rows nowhere any query looks; and the
+Zählerstandsgang added above was keyed on the Marktlokation, while a register
+belongs to the *Messlokation* — of which a Marktlokation may have several.
+
+Following that last one outwards found the same mistake in three more places, all
+of which fold two readings into one: the typed series read, the completeness
+report, and — where a merge key was widened in configuration under an existing
+table — the hot table's own primary key.
+
+And it found that **read-only was not**. `query`, `sql` and `stream` ran whatever
+SQL they were handed, and DataFusion's surface is wider than `SELECT`:
+`CREATE EXTERNAL TABLE … LOCATION` reads any path the process can, `COPY … TO`
+writes one, and an external table over the warehouse's own Parquet returns every
+tenant's rows without ever touching the provider that enforces a scope. Over
+Flight SQL that was one round trip from anyone who could reach the port.
+
+The third audit went after the crate's *own* standards, on the theory that a rule
+stated in one place and honoured in six is a rule with a seventh place it is not.
+It found a promise the configuration file could not keep — a subject column named
+in TOML **and** in `extra_columns` was registered as neither, so the deployment
+that spelled its intent out twice got no reference checking at all — a schema
+check that quarantined a merge key being widened but not one being narrowed, and
+a Parquet footer declaring a sort order that only one of the two cold writers
+actually produced. It also found the unit conversion at the centre of the storage
+encoding written out **seven** times, five of them with an unchecked cast, a
+credential printed verbatim by a derived `Debug` in the one constructor every
+deployment writes, and — the largest of them — an optimisation that had been
+argued for at length and fired on essentially nothing: version elision required
+every cold file in range to carry the *same* version, which a year of daily
+archival windows at ascending MSCONS versions never does.
+
+Following the same theory through the **surfaces** found three things the crate
+had built for one shape and not the other. The correctness oracle — the thing
+§17.3 rests its whole argument on — keyed on a merge key that predated `melo_id`
+joining it, and had no notion of register readings at all, so the record type
+this release added was checked by hand-written cases alone. A multi-table
+catalogue could be queried, could report its status and could be isolated, but
+could not be **served**, streamed or maintained: three of the four costs a
+handle-per-table pays, closed, and the fourth left open. And `[hot]` and `[cold]`
+were parsed, exposed and consumed by nothing at all — a configuration file could
+describe a deployment the crate had no way to build, and no way to tell it could
+not.
+
+**Breaking throughout**, as every pre-1.0 release here is.
+
+### Added
+
+- **Zählerstandsgänge.** A table declares its `TimeModel` — `Interval` (a
+  Lastgang, energy over `[from, to)`) or `Point` (register values at instants).
+  `StoredReadings`, `append_readings` and `readings` are the point-series
+  counterparts of `StoredSeries`, `append` and `series`, carrying `metering`'s
+  own `MeterReading`.
+
+  The gap was structural: the crate was interval-shaped throughout, so the
+  *derived* Lastgang tiered into Iceberg while its **source readings could not** —
+  leaving the hot tier to grow without bound in the one table nobody may delete
+  from. BK6-24-174 (in force 06.06.2025) means a German MSB holds a
+  Zählerstandsgang per measuring point at the same cadence as the Lastgang, so the
+  primary record is exactly as voluminous as the derived one, and § 146 Abs. 4 AO
+  means it cannot be discarded after differencing.
+
+  Everything else is unchanged — identity, attribute and subject columns, version
+  scoping, watermark, partitioning, routed writes, late corrections — because all
+  of it reads the *start* timestamp. Three things differ: `to` is null, `value` is
+  a cumulative register reading, and the overlap exclusion is off because instants
+  cannot overlap. Each write path refuses the other's shape.
+
+- **`MeterStore::append_authoritative`** — for a value the operator *authors*
+  rather than receives. Through `append` an Ersatzwert that a higher version
+  already beats was stored and silently shadowed: the row landing, the audit trail
+  written, the confirmation closing, and the value never becoming current. The
+  version a row carries is a floor now; where a higher one holds the reading the
+  store re-appends at `ScopedVersion::next` (also new) of the one in force,
+  continuing the stored sequence under the stored scope.
+
+- **`TableConfig::identify_by_melo`** and `time_model` in TOML. A **point table
+  identifies a reading by its Messlokation** by default, and an interval table
+  does not — see the fix below. `TimeModel` itself was unreachable from a
+  configuration file, so a deployment configured from TOML could not declare a
+  Zählerstandsgang at all, against the stated rule that TOML is a front end over
+  the same validated types.
+
+- **`ValidatedTableConfig::discriminator_columns`** — the merge-key columns
+  beyond `(malo_id, obis_code, from)`. `identity_column_names` was that list only
+  while `melo_id` could not be part of the key. `MeterStore::scoped` and
+  `SeriesQuery::column_eq` accept them all, so a single meter of a
+  Mehrfamilienhaus can be handed to code that must not see the others.
+
+- **`Version::arrival`** — the version to give a delivery that states none. Unix
+  milliseconds: 13 digits, so below the ≥14-digit MSCONS band until 2286 and
+  always outranked by a stated version, and still sub-second.
+
+- **`MeterStore::scoped`** and **`MeterCatalog::isolated`** — a session confined to
+  one identity value, and one confined to a single table. Both inject into the
+  plan and are enforced below the projection, so caller-supplied SQL cannot omit,
+  alias or `UNION` past them.
+
+- **`MeterStore::stream`** — plans a statement, returns the `QueryDescription`
+  before the first row, then streams batches. Flight SQL uses it.
+
+- **OBIS predicates in SQL** — `obis_is_import`/`_export`, `_reactive`,
+  `_lastgang`/`_zaehlerstand`/`_vorschub`/`_maximum`,
+  `_fehlerregister`/`_total_register`, `obis_tariff_register`, `obis_normalise`.
+  Thin wrappers over `metering::obis`, like the calendar functions.
+
+- **Cold-tier displacement reporting.** `AppendOutcome::displacements` covers both
+  tiers; only the hot tier ever produced it.
+
+- **`IcebergRestCatalog`, and `Settings::connect`.** Two gaps that turned out to
+  be one.
+
+  The `rest-catalog` feature is **on by default** and pulls the whole REST client
+  and its HTTP stack — and nothing in the crate used it. Its stated justification
+  was the read-only catalogue façade, which is built on axum and `dyn Catalog`
+  and does not touch it. Meanwhile `CatalogKind::Rest` is what a configuration
+  file that says nothing selects, and there was no constructor behind it: a
+  default naming a catalogue the crate could not build. `IcebergRestCatalog` is
+  that constructor, and it earns the dependency the default was already paying
+  for.
+
+  And `[hot]` and `[cold]` were parsed, exposed as public fields, and consumed by
+  nothing. The page describing this front end claims "no setting reachable from
+  one and not the other", while the two sections naming the *infrastructure* were
+  reachable from a file and from nowhere else — so a TOML-configured deployment
+  still hand-wired a pool and a catalogue, re-deriving what the file had already
+  said, and settings the builder has (`file_target_bytes`,
+  `metadata_pool_max_connections`, the non-secret half of the object-store
+  credentials) had no TOML spelling at all.
+
+  `Settings::connect()` now returns a `Deployment` — the pool, both tiers and
+  every validated table. It stops short of a `MeterStore`, which needs a cold
+  table provider and therefore an existing table, and which a multi-table
+  deployment does not want one of anyway.
+
+- **A typed read path for registers.** `MeterStore::readings(malo)` returns a
+  `ReadingsQuery` — the point counterpart of `SeriesQuery` — where it took
+  `(malo, from, to)` and returned every delivery in range.
+
+  A builder because a point table has two needs a Lastgang does not. It
+  **identifies a reading by its Messlokation**, so a Marktlokation with two meters
+  returns two registers at every instant: `.melo(..)` names one, and an unnarrowed
+  `.collect()` is refused rather than folded — interleaving two cumulative
+  sequences does not produce a doubled sum, it produces advances belonging to
+  neither meter. And `latest()` is the question a register is actually asked:
+  "what does the meter read now" is an `ORDER BY … DESC LIMIT 1` at the storage
+  layer, not a decade of quarter-hours folded in memory, on the one table § 146
+  Abs. 4 AO forbids discarding.
+
+  `.obis(..)`, `.column_eq(..)`, `.quality_in(..)`, `.range`/`.since`/`.until`,
+  `.values()`, `.collect_with_provenance()` and `.deliveries()` — the last being
+  the unfolded audit shape the old signature returned.
+
+- **`MeterCatalog::maintenance`** — one scheduled loop over every table, where a
+  deployment ran a timer per table. Each table keeps its own watermark, archiver
+  and lease; what is shared is the scheduling, which is the third of the three
+  costs a handle-per-table paid and the last one left. Tables are visited
+  sequentially, because twenty archivals at once turns a background job into a
+  load spike on the database it exists to relieve.
+
+  `MaintenanceOutcome` is therefore **per table**: `tables: Vec<TableMaintenance>`
+  with the aggregates folded on top, and `unhealthy()` naming the tables an alert
+  should mention. A cycle that only summed would report a deployment healthy while
+  one of its tables was quarantined — the failure `system.tables` showing one row
+  already had.
+
+  And a failing table is now a **row rather than an early return**. The states
+  that fail here persist until an operator acts, so aborting would let one
+  quarantined table freeze archival for every other — whose hot tier then grows
+  without bound for the length of the quarantine, a second and larger incident
+  caused by how the first was reported. `healthy()` is false while any table
+  failed, and `failures()` names them.
+
+- **`MeterCatalog::stream` and `describe`, and Flight SQL over a catalog.** The
+  server took a `MeterStore`, so the deployment §15.3 calls ordinary — the
+  authoritative readings beside a non-authoritative second stream — was the one
+  shape with no serving surface at all. A statement mentioning both tables is the
+  *second* thing an external client cannot assemble for itself, since each table
+  has its own watermark and its own hot half; and `information_schema` on the
+  same session was already listing every table such a client could not then
+  query. `FlightSqlServer::new` now takes a `SqlSurface` — the pair of methods
+  serving actually needs, implemented by both `MeterStore` and `MeterCatalog`.
+
+  A catalog response carries a `meterstore.watermarks` entry naming each table
+  the statement touched and the boundary it was at, beside the conservative
+  minimum. Two tables genuinely have two boundaries.
+
+- **The oracle covers Zählerstandsgänge, and Messlokationen.**
+  `MeteringWorkload::generate_readings` produces register readings that are
+  cumulative and monotonic — because that is what a register is, and a generator
+  emitting independent draws would produce a series no meter could have — and
+  `Oracle::record_readings` resolves them through the same fold the interval path
+  uses. `MeteringWorkload::messlokationen` gives a Marktlokation several meters,
+  which is the shape a merge key without `melo_id` folds into one reading.
+
+  §17.3's property is stated about *any* query over the unified view, and half
+  the shapes the store accepts were outside it: the store gained a whole write
+  path for register readings in this release and nothing but hand-written cases
+  checked it.
+
+- **The catalog façade is tested as HTTP.** It was a documented serving surface
+  whose only tests were over its helper functions, so neither of the two claims
+  that make it usable — that a client can walk `GET /v1/config` to table metadata,
+  and that a mutating verb is refused with the reason — had ever been exercised
+  through the route table. Both are, along with `HEAD` (`tableExists`), an unknown
+  table answering `NoSuchTableException` rather than a 500, and a path outside the
+  served subset saying which subset that is.
+
+### Security
+
+- **Caller-supplied SQL could reach the filesystem and past every row scope.**
+  `MeterStore::query`, `sql` and `stream` passed their text to `ctx.sql`, which
+  *executes* DDL as it plans it. `CREATE EXTERNAL TABLE t STORED AS PARQUET
+  LOCATION '<warehouse>'` therefore read the cold tier's own files — every
+  tenant's rows, unscoped, because an external table never touches the provider
+  a scope is enforced in — and `COPY (…) TO '…'` wrote a file wherever the
+  process could. `MeterStore::scoped` and `MeterCatalog::isolated` were
+  documented as boundaries caller-supplied SQL could not step past, and both
+  could be stepped past. The Flight SQL endpoint, documented as read-only,
+  refused only the *mutating calls*: these arrive as ordinary statement queries.
+
+  The three surfaces now build the plan without running it, refuse anything that
+  is not a query — DDL, DML, `COPY`, `SET`, and the same wrapped in `EXPLAIN`,
+  since planning a `COPY` is what performs it — and only then execute.
+  `MeterStore::context` remains the unrestricted door for the in-process caller
+  who wants DataFusion itself.
+
+### Fixed
+
+- **The `[hot]` and `[cold]` sections were never validated.** `Settings::validate`
+  checked the tables and returned them, which is all a caller wiring the tiers by
+  hand needs — but its documentation says "the full cross-field validation", and
+  an empty `url`, an empty `warehouse`, a zero pool size or a warehouse scheme the
+  build did not compile in all passed. `validate_all` checks them, `connect` runs
+  it first, and each refusal names the setting rather than surfacing later as
+  sqlx's opinion of a relative URL.
+
+- **`refresh_system_tables` could be called exactly once.**
+  `MemorySchemaProvider::register_table` refuses a name it already holds, so the
+  *second* call failed with "The table tables already exists" — and the second
+  call is the first one a maintenance loop or an operator dashboard makes. A
+  method whose whole purpose is to be called again worked only on a session that
+  never had been. The relations are deregistered before being re-registered,
+  which is what "refresh" meant.
+
+- **A catalog query naming a table only inside a subquery was attributed to no
+  boundary at all.** Attribution walks the logical plan for table scans, and a
+  scalar subquery's plan hangs off an *expression* rather than off the plan's
+  inputs — so `SELECT (SELECT COUNT(*) FROM readings)` named nothing,
+  `QueryResult::watermark` fell back to the epoch, and a statement of perfectly
+  ordinary shape came back claiming that nothing had been settled. That is the
+  exact fiction carrying provenance exists to prevent, produced by the mechanism
+  meant to prevent it. The walk descends into subqueries now, and a CTE is
+  covered by the same test.
+
+- **`Oracle::for_table` used the wrong half of the merge key.** It read
+  `identity_columns`, which is `discriminator_columns` only while `melo_id`
+  cannot join the key — and on a point table it always does. So the reference
+  folded two meters of one Marktlokation into a single reading and would have
+  reported a mismatch against a store behaving correctly, which is the worst way
+  for a reference to be wrong: it accuses the thing it exists to check. Its
+  documentation promised "the table's **actual** merge key", which is now what it
+  reads.
+
+- **The erasure key was redacted but not wiped.** `SubjectRegistry` is `Clone`
+  and every derived session — `as_of`, `as_known_at`, `scoped`,
+  `in_own_session` — clones it, so a deployment doing reproducible reads left a
+  copy of a cryptographic key in a freed heap page for each one. The buffer is
+  `Zeroizing` now.
+
+  Hygiene rather than a claim the key exists in one place: it does not reach the
+  caller's own buffer, an environment variable the process still holds, or the key
+  schedule `hmac` derives per tombstone. Object-store credentials stay redacted
+  and **un**wiped on purpose — an explicit S3 key is forwarded into the object
+  store's client, which holds it for the life of the process, so wiping this
+  crate's copy would imply a protection that does not hold.
+
+- **A PostgreSQL password and an S3 secret key could reach a log line.**
+  `IcebergSqlCatalog` and `WarehouseAuth` derived `Debug`, so the primary
+  constructor a deployment writes printed `database_url` — the same connection URL
+  as the hot tier's, password and all — and `secret_access_key` verbatim into any
+  `tracing` field or error context that carried it. The rule was already
+  established twice, for `HotSettings` and for `SubjectRegistry`'s erasure key,
+  and the redaction helper both used is now shared rather than local to one of
+  them. The shape survives (`postgresql://<redacted>`, `secret_access_key: true`),
+  because that is the half an operator reads it for.
+
+- **A subject column declared twice was registered as neither.** TOML's
+  `subject_column` skipped its own registration when the name also appeared in
+  `extra_columns` — on the reasoning that the column was already declared, which
+  was true of the *column* and not of the **marker**. Without the marker
+  `ValidatedTableConfig::subject_column` is `None`, so the write-path check
+  against the `SubjectRegistry` never runs and the builder's "a subject column is
+  declared but no subject registry was provided" refusal never fires. A
+  deployment that spelled its intent out in both places — the natural thing to do
+  when the column also carries a `values` vocabulary — held pseudonymous
+  references and validated none of them, with the column present and every row
+  looking right. `TableConfig::subject_column` is idempotent now: it adopts an
+  attribute column of that name rather than declaring a second one, keeping a
+  `coded_column`'s vocabulary, and sets the marker either way. Declaring it as an
+  *identity* column is refused by `build()` as well as by TOML.
+
+- **Undeclaring an identity column was classified as a safe schema change.**
+  `evolution::compare` called every `Dropped` column safe, on Iceberg's rule that
+  a dropped column is retained for time travel — true for a nullable one. Every
+  identity column is non-nullable by validation, so *removing* one from
+  configuration arrived as a dropped required column and passed, while *adding*
+  one arrived as a non-nullable addition and quarantined the table. The direction
+  that passed is the more dangerous of the two: the resolution view then
+  partitions by the narrower merge key, two tenants' readings for one measuring
+  point compete, and one supersedes the other with no error anywhere — the exact
+  failure `identity_column` exists to prevent, reached from the other side.
+  Dropping a **required** column now quarantines, and the message names the
+  consequence rather than the column.
+
+- **A late correction declared a sort order it was not in.** Every data file
+  carries `sorting_columns = (malo_id, from)` in its Parquet footer, and a reader
+  is entitled to act on it — skip a row group whose `malo_id` range cannot hold
+  the meter it wants. Archival satisfies that for free, because the hot scan pages
+  by a keyset cursor whose prefix is exactly those columns; a **late correction**
+  is written straight from the delivery, in whatever order the delivery carried.
+  The two cold writers were making one claim on different grounds and only one of
+  them held, and a footer that declares an order the rows are not in produces a
+  silently skipped row group rather than a slow scan. `encode::sorted_for_storage`
+  puts the correction batch in that order before it is written — it is in memory
+  and proportional to what changed — which sharpens the file's own row-group
+  statistics as a side effect.
+
+- **Completeness reported one arbitrary grid for a channel that held two.**
+  `resolution` was grouped on in the aggregate and then dropped from the key the
+  roll-up folds by, so a meter converted from an hourly profile to a
+  quarter-hourly one mid-month came back as one row naming whichever grid the
+  aggregate happened to yield first, against a count drawn from both. Arbitrary
+  literally: DataFusion defines no order over group output, so the same data could
+  report differently on two runs. It is the *grid* that decides whether a day of
+  24 values is complete or 72 short — the same argument `sparte` was already in
+  the key for — so it reports one row per grid, each measuring its own days.
+
+- **Mutating requests to the catalog façade got a bare `405`.** Only the
+  single-table route carried the refusal, so `createNamespace`, `createTable` and
+  `dropNamespace` — the three an external writer actually attempts — were answered
+  by axum's default with an empty body. An Iceberg client parses the spec's error
+  envelope, so an empty body reads to it as a broken endpoint rather than as a
+  read-only one, which is precisely the confusion `ApiError` exists to prevent.
+  Every served route now answers with the reason, and `HEAD` still reaches the
+  read handlers, because `namespaceExists` and `tableExists` are reads.
+
+- **`SeriesQuery::latest` ordered partially.** `ORDER BY "from" DESC LIMIT 1` is
+  not a total order, and the reads most likely to ask for "the current reading"
+  are exactly the ones where the newest instant carries more than one row: a
+  measuring point with import and export, a table keyed by Messlokation, a
+  tenant-extended key. Two identical calls could return different rows. The rest
+  of the merge key completes the order, as the published resolution SQL already
+  did for the same reason.
+
+- **`VersionScope::parse` accepted what `VersionScope::new` refuses.** It split on
+  the *last* separator, so `"a:b:2026-03"` parsed to an operator the constructor
+  rejects — and the hot tier's one-operator exclusion reads the operator back with
+  `split_part(version_scope, ':', 1)`, which takes the other half. It also checked
+  the period's length rather than its shape, so `"99:2026-99"` parsed. Neither
+  failed loudly afterwards: `covers` answers `false` for a period it cannot read,
+  so such a scope refuses **every** delivery it is checked against, with an encode
+  error blaming the caller's Bilanzierungsmonat for a value that was malformed in
+  the table.
+
+- **A query lost a whole window while it was being archived.** Archival detaches
+  a hot partition before it reads it and drops it only after the cold commit; the
+  watermark is published *by* that commit, so throughout the scan the range still
+  belonged to the hot tier while the rows were in neither the parent table nor
+  Iceberg. A settlement running at that moment came back a day short — for as
+  long as writing a day of 9.6 M rows takes — with nothing anywhere reporting it.
+  The hot scan reads the parent **and** whatever is detached from it. It cannot
+  double-count: a committed partition is below the watermark, and the hot half of
+  a split starts at it.
+
+- **An append could write rows below the watermark.** Routing is decided against
+  a boundary read before the write, and archival advances that boundary from
+  another system. Detaching before scanning closes most of the gap — an insert
+  into a partition being archived fails outright — but not the moment after the
+  drop, when the partition is recreated and the insert succeeds into a range the
+  cold tier now owns. `append` reads the boundary again after writing and
+  re-routes if it moved; both writes are idempotent, so the second pass restores
+  rather than duplicates.
+
+- **A Zählerstandsgang could not hold a Mehrfamilienhaus.** A Marktlokation may
+  be measured by several Messlokationen, and each carries the same OBIS register
+  at the same instants — so on a merge key of `(malo_id, obis_code, from)` the
+  second meter is a restatement of the first. Where the two readings *agree*,
+  which two freshly installed meters do, `ON CONFLICT DO NOTHING` dropped one
+  with nothing to notice. `melo_id` now joins the merge key on a point table,
+  where it is `NOT NULL` and a delivery naming none is refused. Where it is off,
+  both tiers compare the column on a redelivery and refuse the collision by name
+  rather than leaving the silent drop available.
+
+- **A typed series read folded two readings into one.** `series()` filters by
+  measuring point, so a meter reporting import *and* export, a shared store
+  carrying a row per tenant, and a Mehrfamilienhaus carrying a row per meter each
+  produced a second interval at the same instant — and `MeasurementSeries` has no
+  way to say so. `metering::aggregate` summed both and the month came back
+  doubled, with one party's readings inside another's series. `collect` refuses
+  it and names the fix: `.obis(..)`, `.column_eq(..)`, or a scoped session. A
+  column that is *not* in the merge key still never splits a series, so a
+  Bilanzkreis reassigned between two deliveries reads as one.
+
+- **Completeness reported a surplus that was not there.** The aggregate grouped
+  by `(malo_id, obis_code, sparte, resolution, day, quality)` and not by the
+  merge key, so two tenants each delivering a full day put 192 intervals against
+  an expectation of 96. The other direction was worse: one of them four intervals
+  short netted against the other's full day and the channel read as **complete**,
+  which is the one answer a completeness report must never give. It groups by the
+  merge key and reports it — `Completeness::identity`, and one column per
+  merge-key column in `meter_completeness`.
+
+- **A merge key changed in configuration was silently ignored.** `create_tables`
+  runs on every start and `CREATE TABLE IF NOT EXISTS` is a no-op, so a widened
+  key left resolution partitioning by the new one while the table enforced the
+  old — and the second reading the wider key exists to admit conflicted on the
+  narrower primary key, was skipped, and was invisible to the divergence check,
+  which joins on the new key. The declaration is read back and compared, along
+  with the time model, both of which the DDL cannot alter in place.
+
+- **A cold commit that never landed left its data files behind.** They are the
+  only orphans an append-only warehouse can produce, and the writer holds every
+  path, so it deletes them — after re-reading the table, because a commit can
+  fail *after* landing and deleting on that reading would take files out from
+  under a live snapshot.
+
+- **A typed read returned one delivery per row** on any table whose merge key is
+  wider than three columns. `series` and `readings` ordered by
+  `(malo_id, obis_code, from)`, which leaves two tenants' — or two meters' — rows
+  interleaved, so every contiguous run was one row long and a meter-day came back
+  as ninety-six deliveries of one reading. Both order by the whole merge key.
+
+- **`append_authoritative` could re-author the wrong reading.** It located a
+  displacement's series by `(malo_id, from)`, which names several rows on a table
+  with an identity column or two Messlokationen: the wrong value was written, at
+  a version derived from a reading it was not about, and the one that needed
+  authoring stayed shadowed. It matches the full merge key and the channel.
+
+- **A non-canonical OBIS code was accepted on decode.** `sparte`, `unit`,
+  `quality` and `resolution` were checked against the spelling storage writes;
+  `obis_code` — the one of them in the merge key — was parsed leniently, so
+  `1-0:1.8.0*255` or a leading zero read back as a well-formed channel that a
+  correction keyed on the canonical form would never supersede. A malformed code
+  at series level was worse: `.parse().ok()` turned it into a series carrying no
+  channel at all.
+
+- **The planner could narrow a range rather than widen it.** A cast around the
+  *literal* side of a comparison was seen through unconditionally, so
+  `from >= CAST(t AS TIMESTAMP(0))` was read as a bound at `t` rather than at the
+  truncated second below it — dropping the rows in between. §17.1 permits error
+  in the widening direction only, and the rule the column side already applied
+  now applies to both.
+
+- **A misaligned watermark walked past rows.** Changing `partition_step` on a
+  table that had already archived left the watermark off the step grid, so every
+  window named a partition relation nothing creates, every window looked empty,
+  and the boundary advanced over rows still in PostgreSQL. `next_window` refuses
+  it and says why.
+
+- **A long table name broke the first write of a new day.** PostgreSQL truncates
+  an identifier at 63 bytes silently; a partition adds 16 characters to the table
+  name and its integrity constraints another 13, so past 34 the two constraint
+  names on one partition collide and the second `ADD CONSTRAINT` fails. Refused
+  at `build()`.
+
+- **A replayed late correction was stored twice.** `append` routes a
+  below-watermark interval to Iceberg, which has no constraints, so nothing
+  stopped the same `(merge key, version)` landing twice — and version resolution
+  cannot collapse two rows at one version. Worse, resolution is elided entirely
+  when the cold files in range provably hold a single version, which is exactly
+  the shape a replay produces: the raw rows were returned and every `SUM` doubled.
+  `append` now reconciles against what is stored before writing, keyed on the full
+  merge key including identity columns.
+
+- **A different value under an existing cold version is refused.** The hot tier
+  already did this; the cold tier kept both copies.
+
+- **The gas Bilanzierungsmonat is cut at 06:00.** EDI@Energy *Allgemeine
+  Festlegungen* v6.1c, Kap. 3.1 defines the gas month as 01.06 06:00 to 01.07
+  06:00, so an interval at 02:00 local on 1 March belongs to February's scope.
+  `VersionScope` used the calendar month for every commodity, which **refused** a
+  correctly-scoped gas delivery at the write and accepted the wrong one. Every
+  constructor takes a `Sparte`.
+
+- **A daily gas series was reported unmeasurable.** `intervals_in_gas_day` derived
+  its count from `IntervalResolution::fixed_seconds`, which is `None` for `P1D`.
+
+- **`to_json` lost the eighteenth digit of a decimal.** Arrow renders a
+  `Decimal128` exactly and then every ordinary JSON reader parses it into an
+  `f64`: `123456789012.345678` read back `123456789012.34567`, with no error.
+  Decimals are JSON strings now.
+
+- **`source_kind` was a second spelling of a domain vocabulary.** A hand-written
+  list produced `mscons` while the JSON in the next column read `{"MSCONS": …}`,
+  so an external engine filtering on the only spelling it could see matched
+  nothing. The tag is read off the serialised form.
+
+- **A non-canonical code is refused rather than normalised.** `metering` 0.19 made
+  `FromStr` lenient — trims, ignores case, takes `WÄRME` for `WAERME`. These
+  columns are `GROUP BY` keys, so two spellings of one commodity are two rows in a
+  completeness report. The hot tier's `CHECK` already refused them; the decode path
+  does now too.
+
+- **The version-resolution SQL ordered partially.** `ORDER BY version DESC` alone
+  lets `ROW_NUMBER` pick either of two tied rows. `recorded_at DESC` breaks it.
+
+- **A pinned session refuses to be written through.** Every check the write path
+  makes is a query against the session that is writing.
+
+- **Table names are validated as plain identifiers**, as declared column names
+  already were. `SeriesQuery::column_eq` checks its column against the declared
+  set and returns `Result`.
+
+- **`VersionScope::covers` allocated once per row** on the encode path.
+
+- **The `testkit` generator produced a gas workload the store was right to
+  refuse** — it split deliveries on calendar months.
+
+- **`h2` advisory RUSTSEC-2026-0258**, reached through `hyper`/`tonic`.
+
+- **`site/config.toml` failed to parse on zola ≥ 0.23** while CI's 0.22 pin
+  stayed green.
+
+- **`HotStore::invariant_violations`** documented two directions and checks one.
+  **`write.rows_deduplicated`** counted only the hot tier.
+
+### Changed
+
+- **Version-resolution elision now fires on the shape real data has.** The rule
+  was "every cold file in range holds a single version, and they all agree on
+  which" — sound, and true of almost nothing. MSCONS versions ascend per
+  *delivery* and archival commits one day per window, so a year of history is 365
+  files at 365 different versions: every scan wider than a single day resolved,
+  and the argument for a table provider rather than a SQL view bought nothing.
+
+  The missing observation is that `from` is **in the merge key**, so two files
+  whose `from` bounds do not overlap cannot hold the same key however their
+  versions differ — and consecutive archival windows are exactly that. Versions
+  now only have to agree among files that could share a key, which a late
+  correction (a second file over an already-archived day, at a higher version)
+  still does.
+
+  `ColdStore::version_stats` therefore returns `planner::FileStats` — the file's
+  version bounds *and* its interval span — rather than `Option<VersionStats>`.
+  Unknown bounds are read as "overlaps everything", which collapses to the old
+  rule, and files are grouped into runs of overlap rather than compared pairwise,
+  so the approximation can only ever cost a window function rather than skip one
+  that was needed. Asserted as a property in both directions: eliding implies no
+  key can appear twice, and disjoint windows at arbitrary versions always elide.
+
+- **The storage encoding's unit conversion is one function, not seven.** Every
+  layer that had to put a timestamp into the schema's own type — the encoder, the
+  hot tier's bind path, the predicate builder, the typed series read, the
+  completeness aggregate, the system tables, the transaction-time ceiling —
+  spelled `unix_timestamp_nanos() / 1_000` out for itself, and **five of them cast
+  the `i128` result with `as i64`**, which wraps rather than fails. `Date32` had
+  three copies and the `ScalarValue` literal four, two of which had independently
+  got the `"UTC"` zone spelling right. `encode::schema` now owns `micros`,
+  `instant`, `date32`, `date_of` and `timestamp_scalar`, and a test asserts what
+  makes the first infallible — that `time`'s ±9999-year range fits `i64`
+  microseconds — so a graph that enables `large-dates` through feature unification
+  fails at this crate's boundary rather than as a wrapped timestamp inside a
+  committed Parquet file.
+
+- **`metering` 0.19 is the floor.** `calendar::DayBoundary` is what makes the gas
+  Bilanzierungsmonat expressible. `planner::calendar` delegates to it, so five
+  hand-rolled `match sparte` arms become one mapping — `planner::day_boundary`.
+  `planner::balancing_month` is new.
+
+### Removed
+
+- **`tiering::ChangeSource`, `ChangeBatch` and `Position`** — a CDC seam with no
+  implementation, caller or test. The argument it carried is now prose in
+  `tiering`'s module documentation.
+
+- **`TableConfig::target_file_size` and `max_rows_per_file`** — neither had a
+  setter or a TOML key. `max_rows_per_file` was read by nothing;
+  `target_file_size` was echoed in `system.config` while the value that reached
+  the Parquet writer came from `IcebergSqlCatalog::file_target_bytes`.
+
+### Documentation
+
+- **"Compaction would recover version elision" was backwards.** Elision is a
+  property of the *data*: a corrected reading has two versions stored and appears
+  twice however the bytes are arranged, and nothing short of dropping the
+  superseded version recovers it — which an audit trail may not do. What the
+  layout affects is collateral loss, since a scan reads whole files and a
+  **coarser** file makes more uncorrected keys share one with a corrected one. So
+  compaction moves the elided ratio the wrong way; the one-file-per-window layout
+  archival already produces is the one elision likes. The case for compaction is
+  the ordinary one — less manifest to plan against — and that is what the page
+  says now.
+
+- **The overlap exclusion's motivating example did not motivate it.** The storage
+  model introduced it with "an hourly delivery followed by a quarter-hourly one",
+  which is a *correction* and therefore carries a higher version — and the
+  constraint is scoped to one version, as it must be, since a correction is by
+  definition a higher version covering the same span. The example is now a single
+  delivery carrying both grids, and the corollary is stated rather than left
+  implicit: two rows at different versions may overlap and usually should,
+  resolution collapses the ordinary case, and a *partial* re-grid surfaces as
+  `surplus` in completeness because it is only visible across rows.
+
+- **The completeness report's column table omitted `resolution`**, which the
+  schema has always carried and which is now also a grouping key.
+
+- **Snapshot expiry reclaims metadata, not bytes of readings**, and now says so.
+  Upstream's action rewrites metadata only, and the table is append-only anyway —
+  every data file an old snapshot referenced is still referenced by the current
+  one. What expiry bounds is the metadata JSON, whose snapshot array is parsed on
+  every table load. That is the growth that compounds.
+
+- **Scoping is stated over the merge key** rather than over the word "identity",
+  since a table keyed by Messlokation puts a *core* column in the key and must be
+  scopable on it.
+
+- **A chunked scan is not a single snapshot**, and now says so. Each chunk is its
+  own statement on its own connection — the deliberate trade against holding a
+  transaction open for minutes on the busiest table in the schema. What it costs
+  is bounded by what the hot tier is for: writes are appends at the frontier,
+  which sorts last, while the reads that must reconcile are over closed periods.
+  Where a read must see one instant, the answer is `ReadMode::AsKnownAt` or a
+  pinned snapshot, both of which reproduce.
+
+- **`hot_writer`'s stale-boundary margin is a margin, not a proof.** It is
+  thinnest in a backfill and in an archival catch-up, neither of which the writer
+  is for; `append` is safe in both, and the second boundary read is what that
+  costs.
+
+- **One `SubjectRegistry` spans every table in a deployment.** The mapping lives
+  in one `meterstore_subject_map` keyed by natural identifier, so two tables
+  registering the same id share a subject and one `erase` unlinks both.
+
 ## [0.4.0] — 2026-08-16
 
 `metering` 0.18 typed two identifiers and named a second kind of day. Both were

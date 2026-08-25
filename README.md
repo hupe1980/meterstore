@@ -129,6 +129,30 @@ result.watermark();        // where cold ended and hot began
 result.touched_hot_tier(); // whether the answer is only valid for now
 ```
 
+A table declares whether it holds **spans or instants**. A *Lastgang* is energy
+over `[from, to)`; a *Zählerstandsgang* is a cumulative register value at an
+instant, which BK6-24-174 (in force 06.06.2025) has made a primary record exactly
+as voluminous as the Lastgang differenced out of it — and § 146 Abs. 4 AO means
+it cannot be discarded afterwards. Both tier the same way, because everything
+that does the tiering reads the start timestamp:
+
+```rust
+TableConfig::new("meter_reads_versions").time_model(TimeModel::Point)
+store.append_readings(&[zaehlerstandsgang]).await?;   // metering::MeterReading
+store.readings(malo)?.melo(melo)?.latest().await?;   // what the meter reads now
+```
+
+They are never the same table: `value` is interval energy on one and a register
+reading on the other, and summing the two together gives a number with no meaning
+that looks exactly like a consumption total.
+
+The shape also decides what **names** a reading. A Marktlokation may be measured
+by several Messlokationen, and both meters carry `1-0:1.8.0` at the same instants.
+A load profile belongs to the market location, so `melo_id` labels it; a register
+belongs to the *meter*, so it joins the merge key — by default on a point table,
+`identify_by_melo` either way. Keyed wrongly, two meters that agree on a number
+store as one reading.
+
 `readings` is version-resolved; `readings_versions` is the raw audit trail. The
 naming is load-bearing — see
 [the version-resolution trap](https://hupe1980.github.io/meterstore/docs/interop/#the-version-resolution-trap)
@@ -152,6 +176,11 @@ The DST anomaly moves with the boundary: the clocks change *before* 06:00, so th
 25-hour gas day is the one named after the **Saturday** while the 25-hour
 calendar day is the Sunday.
 
+And the boundary carries up to the **month**. The gas Bilanzierungsmonat runs
+01.06 06:00 to 01.07 06:00 (EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3.1),
+so an MSCONS version scope for a gas row is cut at 06:00 as well — which is why
+every `VersionScope` constructor takes a `Sparte`.
+
 **An external engine does not get that function — so it gets the answer instead.**
 SQL dialects differ on timestamp arithmetic, so no single published expression is
 right everywhere. The encoder applies the calendar once, at write time, and stores
@@ -170,13 +199,15 @@ SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **14 or later** | Declarative range partitioning, so a purge is `DETACH` + `DROP TABLE` |
-| `metering` | 0.18 or later | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | 0.19 or later | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
 Glue — and that seam is driven end to end by the test suite rather than asserted.
-Two are built for you: a PostgreSQL-backed SQL catalogue on the same database as
-the hot tier, and AWS S3 Tables behind the `s3tables` feature.
+Three are built for you: a PostgreSQL-backed SQL catalogue on the same database as
+the hot tier, a REST catalogue (`rest-catalog`, on by default), and AWS S3 Tables
+behind the `s3tables` feature. A configuration file builds whichever it names —
+`Settings::connect()` returns the pool, both tiers and every validated table.
 [Details](https://hupe1980.github.io/meterstore/docs/getting-started/).
 
 MeterStore needs only `SELECT` plus ownership of its own tables: no server
@@ -217,25 +248,21 @@ drift.
 
 ## Status
 
-Working end to end against real infrastructure: encoding, both tiers, streaming
-archival, tier-split queries, version resolution with statistics-based elision,
-reproducible reads on both time axes, completeness, multi-table sessions, routed
-writes, erasure, schema quarantine, and both serving surfaces.
+Everything the documentation describes works end to end against real
+infrastructure — both tiers, streaming archival, tier-split queries, reproducible
+reads, completeness, multi-table sessions and both serving surfaces.
 
-**587 tests** — unit, property, and integration against real PostgreSQL 16 and a
+**734 tests**: unit, property, and integration against real PostgreSQL 16 and a
 real Iceberg warehouse, plus an independently implemented correctness oracle over
-generated workloads. **DuckDB** and **PyIceberg** read the output and agree with
-it.
+generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
+read the output and agree with it. Compression against PostgreSQL row storage is
+**measured** rather than targeted — ~109× (457 B/row against 4.2 B/row; the
+measurement suite carries the caveats).
 
-Measured rather than targeted: **~109× compression** against PostgreSQL row
-storage (457 B/row against 4.2 B/row — the measurement suite carries the
-caveats), and archival memory bounded by the chunk, not the window.
-
-Not yet done: query-latency benchmarks on reference hardware, so the p99 targets
-remain aspirational; Spark and Trino interop; a CLI. Compaction
-and orphan-file cleanup are
-[blocked upstream](https://hupe1980.github.io/meterstore/docs/operations/#maintenance-that-is-not-implemented)
-rather than deferred.
+Missing: query-latency benchmarks on reference hardware, so the p99 targets remain
+aspirational; Spark and Trino interop; a CLI. Compaction and general orphan-file
+cleanup are
+[blocked upstream](https://hupe1980.github.io/meterstore/docs/operations/#maintenance-that-is-not-implemented).
 
 ## Development
 

@@ -21,7 +21,12 @@ github_alerts = true
 insert_anchor_links = "heading"
 
 [markdown.highlighting]
-enabled = true
+# `style`, not the `enabled` boolean it replaced in zola 0.23. The old spelling
+# is a hard parse error on a current zola, so `just site` failed on a developer
+# machine while CI — pinned to 0.22 — was green. Two versions of the tool
+# disagreeing about the config is the kind of drift the pin exists to prevent,
+# so the pin moved with the file.
+style = "inline"
 theme = "ayu-dark"
 
 [extra]

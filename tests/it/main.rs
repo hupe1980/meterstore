@@ -16,6 +16,7 @@
 
 mod archival_end_to_end;
 mod calendar_delegation;
+mod catalog_facade;
 mod cold_partitioning;
 mod commodities;
 mod containers;
@@ -33,9 +34,11 @@ mod multi_table;
 mod purge_table;
 mod query_end_to_end;
 mod reproducibility_end_to_end;
+mod settings_deployment;
 mod sub_quarter_hour;
 mod subject_erasure_store;
 mod tenant_isolation;
 mod tiering_oracle;
 mod transaction_time;
 mod typed_reads;
+mod zaehlerstandsgang;

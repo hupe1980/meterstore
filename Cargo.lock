@@ -3131,9 +3131,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4146,9 +4146,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metering"
-version = "0.18.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6da36a18cf64f4152bd454004f51948b3eb45e837e78ed6bb713a01d5335e058"
+checksum = "a22f7ddf64aac54c9d73df0a2f6321d34f81069ec39123bbb0e6ce0f046d6c85"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -4160,7 +4160,7 @@ dependencies = [
 
 [[package]]
 name = "meterstore"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4173,6 +4173,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hmac 0.12.1",
+ "http-body-util",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-catalog-s3tables",
@@ -4199,7 +4200,9 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

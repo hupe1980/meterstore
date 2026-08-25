@@ -1,50 +1,46 @@
 //! Arrow Flight SQL over the **unified** hot + cold view.
 //!
-//! Everything else an external consumer needs is better served by the Iceberg
-//! catalog: engines read history straight from object storage, in parallel, with
-//! MeterStore nowhere in the data path (§13.7). Putting analytics through a
-//! Flight server would be actively *worse* — it adds a proxy hop and serialises
-//! parallel reads through one process.
-//!
-//! So this exists for one case, and the documentation deliberately leads with the
-//! catalog rather than with this:
-//!
-//! | Consumer need | Right surface |
-//! |---|---|
-//! | Analytics over history | Iceberg catalog, direct read |
-//! | A Rust application, in-process | the typed API (§13.4) |
-//! | Anything inside mako | `cargo add meterstore` |
-//! | **Unified hot + cold from a non-Rust client** | **this** |
-//! | **A BI tool over live data** | **this**, via a Flight SQL JDBC/ODBC driver |
-//!
-//! The hot tier lives in PostgreSQL and is not in the catalog, so **the unified
-//! view is the one thing an external client cannot assemble for itself**. That is
-//! the whole justification — real, and narrow.
+//! The hot tier lives in PostgreSQL and is not in the Iceberg catalog, so the
+//! unified view is the one thing an external client cannot assemble for itself.
+//! That is the whole justification — real, and narrow. Analytics over settled
+//! history belong on the catalog, read directly: routing them through here adds a
+//! proxy hop and serialises parallel reads through one process.
 //!
 //! # Read-only, structurally
 //!
-//! There is no write path, for the same reason the catalog façade has none and
-//! one more besides. A write arriving here would bypass [`MeterStore::append`],
-//! and with it the two things that make a write safe: routing each interval to
-//! the tier that owns it (§8.3 — a correction below the watermark written to
-//! PostgreSQL is silently invisible), and the subject-reference check that stops
-//! a replay re-linking an erased subject (§19.4). Neither is recoverable
-//! afterwards, so every mutating call is refused with that reason.
+//! A write here would bypass [`MeterStore::append`] and with it the two things
+//! that make a write safe — routing each interval to the tier that owns it (§8.3)
+//! and the subject-reference check that stops a replay re-linking an erased
+//! subject (§19.4). Neither is recoverable afterwards, so every mutating call is
+//! refused with that reason.
+//!
+//! Refusing the mutating *calls* is not the whole of it: Flight SQL's statement
+//! query carries arbitrary text, and DataFusion's surface is wider than `SELECT`
+//! — `CREATE EXTERNAL TABLE … LOCATION` reads any path the process can, `COPY …
+//! TO` writes one, and both arrive as *queries*. [`MeterStore::sql`] plans
+//! without running and refuses anything that is not a query, which is where the
+//! check lives.
+//!
+//! [`MeterStore::sql`]: crate::session::MeterStore::sql
 //!
 //! # Results carry their boundary
 //!
-//! P1 says a result carries the tier boundary it was computed against, and a
-//! client on the far end of a socket needs that as much as one in-process. The
-//! watermark and the tiers scanned travel as **schema metadata** on every
-//! response, so a BI tool that keeps the schema keeps the provenance. A number
-//! pulled over Flight is otherwise indistinguishable from one pulled a minute
-//! later against a different boundary.
+//! The watermark and the tiers scanned travel as **schema metadata** on every
+//! response (P1), so a BI tool that keeps the schema keeps the provenance. A
+//! number pulled over Flight is otherwise indistinguishable from one pulled a
+//! minute later against a different boundary.
+//!
+//! # One table or many
+//!
+//! The server takes a [`SqlSurface`] — a [`MeterStore`] or a whole
+//! [`MeterCatalog`](crate::MeterCatalog). A catalog result carries **every**
+//! boundary the statement touched, because two tables genuinely have two.
 //!
 //! # Authentication is the deployment's
 //!
 //! `into_service` returns a tonic service rather than a bound port, so a
 //! deployment wraps it in its own interceptor, TLS and tracing. §19.7 requires
-//! authentication before this leaves a trusted network and this crate has no
+//! authentication before this leaves a trusted network, and this crate has no
 //! business deciding what kind.
 
 use std::pin::Pin;
@@ -64,33 +60,59 @@ use arrow_flight::{
     Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
     IpcMessage, SchemaAsIpc, Ticket,
 };
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
 use crate::arrow::array::RecordBatch;
 use crate::arrow::datatypes::SchemaRef;
+// `MeterStore` is imported for the intra-doc links above and below; the
+// server itself holds a `SqlSurface`, which it may equally be a catalog.
+#[allow(unused_imports)]
 use crate::session::MeterStore;
+use crate::session::SqlSurface;
 
-/// A Flight SQL server over one store's unified view.
+/// A Flight SQL server over a unified hot + cold view.
+///
+/// Serves any [`SqlSurface`]: a single [`MeterStore`], or a whole
+/// [`MeterCatalog`](crate::MeterCatalog).
 #[derive(Clone)]
 pub struct FlightSqlServer {
-    store: MeterStore,
+    surface: Arc<dyn SqlSurface>,
 }
 
 impl std::fmt::Debug for FlightSqlServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlightSqlServer")
-            .field("table", &self.store.resolved_table())
+            .field("serving", &self.surface.label())
             .finish_non_exhaustive()
     }
 }
 
 impl FlightSqlServer {
-    /// Serve the given store.
-    pub fn new(store: MeterStore) -> Self {
-        Self { store }
+    /// Serve a store or a catalog.
+    ///
+    /// ```no_run
+    /// # use meterstore::serve::FlightSqlServer;
+    /// # fn example(store: meterstore::MeterStore, catalog: meterstore::MeterCatalog) {
+    /// let one_table = FlightSqlServer::new(store);
+    /// let every_table = FlightSqlServer::new(catalog);
+    /// # let _ = (one_table, every_table);
+    /// # }
+    /// ```
+    pub fn new(surface: impl SqlSurface) -> Self {
+        Self {
+            surface: Arc::new(surface),
+        }
+    }
+
+    /// Serve a surface someone else already owns.
+    ///
+    /// The same server over an `Arc` a deployment is also using elsewhere — a
+    /// catalog that a maintenance loop archives through, say.
+    pub fn shared(surface: Arc<dyn SqlSurface>) -> Self {
+        Self { surface }
     }
 
     /// The tonic service, ready to be added to a server or wrapped in layers.
@@ -107,27 +129,39 @@ impl FlightSqlServer {
     /// A client on the far end of a socket needs the boundary as much as one
     /// in-process: a number pulled over Flight is otherwise indistinguishable
     /// from one pulled a minute later against a different boundary.
-    fn with_provenance(
-        schema: SchemaRef,
-        watermark: crate::watermark::TieringWatermark,
-        tiers: &[crate::watermark::Tier],
-        mode: crate::planner::ReadMode,
-    ) -> SchemaRef {
-        let tiers = tiers
+    ///
+    /// **Every** boundary, not one. A statement over a catalog spans tables with
+    /// different watermarks, and collapsing them would tell a client a figure was
+    /// settled to a point only one of its inputs had reached. The conservative
+    /// minimum is carried too, since that is the number a reconciliation uses
+    /// directly.
+    fn with_provenance(described: &crate::session::QueryDescription) -> SchemaRef {
+        let tiers = described
+            .tiers_scanned()
             .iter()
             .map(|t| format!("{t:?}").to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        let watermarks = described
+            .watermarks()
+            .iter()
+            .map(|(table, at)| format!("{table}={at}"))
             .collect::<Vec<_>>()
             .join(",");
 
         let metadata = std::collections::HashMap::from([
             (
                 crate::watermark::WATERMARK_PROPERTY.to_string(),
-                watermark.to_string(),
+                described.watermark().to_string(),
             ),
+            ("meterstore.watermarks".to_string(), watermarks),
             ("meterstore.tiers_scanned".to_string(), tiers),
-            ("meterstore.read_mode".to_string(), format!("{mode:?}")),
+            (
+                "meterstore.read_mode".to_string(),
+                format!("{:?}", described.read_mode()),
+            ),
         ]);
-        Arc::new(schema.as_ref().clone().with_metadata(metadata))
+        Arc::new(described.schema().as_ref().clone().with_metadata(metadata))
     }
 
     /// Plan a statement and return the schema it would produce, **without
@@ -136,57 +170,57 @@ impl FlightSqlServer {
         debug!(%sql, "flight sql describe");
 
         let described = self
-            .store
-            .describe(sql)
+            .surface
+            .describe_sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
 
-        Ok(Self::with_provenance(
-            described.schema(),
-            described.watermark(),
-            described.tiers_scanned(),
-            described.read_mode(),
-        ))
+        Ok(Self::with_provenance(&described))
     }
 
-    /// Run a query and return its batches with the schema that describes them.
-    async fn run(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+    /// Execute `sql` and answer with a Flight stream carrying its provenance.
+    ///
+    /// **Streamed, never collected.** This is the one surface built for a BI
+    /// tool, and a BI tool's query is the one whose rows genuinely are the
+    /// answer: a year of quarter-hour readings for a portfolio is millions of
+    /// them. Materialising the result to send it would make the server's peak
+    /// memory the size of whatever a client asked for, on a socket the client
+    /// controls — the same mistake the archival path is built to avoid, on the
+    /// path where an outsider chooses the size.
+    ///
+    /// [`MeterStore::stream`] returns the provenance *before* the first batch,
+    /// which is what makes that possible here: the schema — with the watermark
+    /// and the tiers on it — has to be written before any row.
+    async fn respond(
+        &self,
+        sql: &str,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         debug!(%sql, "flight sql query");
 
-        let result = self
-            .store
-            .query(sql)
+        let (described, rows) = self
+            .surface
+            .stream_sql(sql, Vec::new())
             .await
             .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
 
-        let schema = Self::with_provenance(
-            result.schema(),
-            result.watermark(),
-            result.tiers_scanned(),
-            result.read_mode(),
-        );
-        Ok((schema, result.into_batches()))
-    }
+        let schema = Self::with_provenance(&described);
 
-    /// Wrap batches as a Flight stream under `schema`.
-    fn stream(
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        // Re-stamped onto every batch so the provenance survives even a client
-        // that inspects a batch rather than the stream schema. Metadata does not
-        // change a column, so this cannot fail — and if it ever did, sending the
-        // batch anyway would drop the provenance silently, which is the one thing
-        // this is here to prevent.
-        let batches: Vec<RecordBatch> = batches
-            .into_iter()
-            .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| Status::internal(format!("attaching provenance to a batch: {e}")))?;
+        // Re-stamped onto every batch so the provenance survives a client that
+        // inspects a batch rather than the stream schema. Metadata does not
+        // change a column, so this cannot fail — and sending the batch anyway if
+        // it did would drop the provenance silently, which is the one thing this
+        // is here to prevent.
+        let stamped = schema.clone();
+        let batches = rows.map(move |batch| {
+            let batch =
+                batch.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))?;
+            RecordBatch::try_new(stamped.clone(), batch.columns().to_vec())
+                .map_err(arrow_flight::error::FlightError::Arrow)
+        });
 
         let flight = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(stream::iter(batches.into_iter().map(Ok)))
+            .build(batches)
             .map_err(|e| Status::internal(format!("encoding flight data: {e}")));
 
         Ok(Response::new(Box::pin(flight)))
@@ -198,11 +232,10 @@ impl FlightSqlServer {
     /// error, an unknown column or an unknown relation here rather than halfway
     /// through a stream, and the rows are produced once, on `do_get`.
     ///
-    /// That distinction is the difference between one scan and two. Answering
-    /// this by running the query — which is what an earlier version did, while
-    /// this comment claimed otherwise — makes a BI tool's ordinary
-    /// `GetFlightInfo` → `DoGet` sequence cost two full scans, on the one surface
-    /// built for BI tools.
+    /// That distinction is the difference between one scan and two: answering
+    /// this by *running* the query makes a BI tool's ordinary `GetFlightInfo` →
+    /// `DoGet` sequence cost two full scans, on the one surface built for BI
+    /// tools.
     ///
     /// Holding the result between the two calls would fix the double scan and
     /// introduce a worse problem: a stateful server needs eviction and leaks on a
@@ -286,8 +319,7 @@ impl FlightSqlService for FlightSqlServer {
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("statement handle: {e}")))?;
 
-        let (schema, batches) = self.run(&sql).await?;
-        Self::stream(schema, batches)
+        self.respond(&sql).await
     }
 
     // --- prepared statements -------------------------------------------------
@@ -334,8 +366,7 @@ impl FlightSqlService for FlightSqlServer {
         let sql = String::from_utf8(query.prepared_statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("statement handle: {e}")))?;
 
-        let (schema, batches) = self.run(&sql).await?;
-        Self::stream(schema, batches)
+        self.respond(&sql).await
     }
 
     async fn do_action_close_prepared_statement(
@@ -368,13 +399,11 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetCatalogs,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let (schema, batches) = self
-            .run(
-                "SELECT DISTINCT table_catalog AS catalog_name FROM information_schema.tables \
-                 ORDER BY 1",
-            )
-            .await?;
-        Self::stream(schema, batches)
+        self.respond(
+            "SELECT DISTINCT table_catalog AS catalog_name FROM information_schema.tables \
+             ORDER BY 1",
+        )
+        .await
     }
 
     async fn get_flight_info_schemas(
@@ -391,8 +420,7 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetDbSchemas,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let (schema, batches) = self.run(SCHEMAS_SQL).await?;
-        Self::stream(schema, batches)
+        self.respond(SCHEMAS_SQL).await
     }
 
     async fn get_flight_info_tables(
@@ -409,8 +437,7 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetTables,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let (schema, batches) = self.run(TABLES_SQL).await?;
-        Self::stream(schema, batches)
+        self.respond(TABLES_SQL).await
     }
 
     async fn get_flight_info_table_types(
@@ -427,8 +454,7 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetTableTypes,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let (schema, batches) = self.run(TABLE_TYPES_SQL).await?;
-        Self::stream(schema, batches)
+        self.respond(TABLE_TYPES_SQL).await
     }
 
     // --- everything that writes ----------------------------------------------

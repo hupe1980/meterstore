@@ -113,18 +113,28 @@ pub struct Displacement {
     pub obis_code: String,
     /// Interval start.
     pub from: OffsetDateTime,
-    /// Interval end (exclusive).
+    /// Interval end (exclusive), or `None` for a register reading.
     ///
     /// Not part of the merge key — a reading is named by its start — but carried
     /// so an audit row can report the interval it covered without collapsing to a
     /// zero-width `[from, from)`. Threaded from the written row, not the key.
-    pub to: OffsetDateTime,
-    /// The deployment's identity column values, in configuration order.
+    ///
+    /// `None` on a [`Point`](crate::config::TimeModel::Point) table, where the
+    /// row is a Zählerstand at an instant and there is no span to report. An
+    /// `Option` rather than a repeat of `from`, because a zero-width span is a
+    /// span that reads as real.
+    pub to: Option<OffsetDateTime>,
+    /// The merge-key columns beyond `(malo_id, obis_code, from)`, in key order.
+    ///
+    /// The deployment's declared identity columns, and `melo_id` where the table
+    /// [identifies a reading by its
+    /// Messlokation](crate::config::TableConfig::identify_by_melo).
     ///
     /// Part of what names the reading, not decoration: with a `tenant` identity
     /// column, `(malo_id, obis_code, from)` alone can name two different
     /// readings, and a report keyed on it would attribute one tenant's
-    /// correction to another's value.
+    /// correction to another's value. The same is true of the two meters of a
+    /// Mehrfamilienhaus.
     pub identity: Vec<(String, String)>,
     /// What this write did.
     pub effect: Effect,
@@ -209,7 +219,7 @@ mod tests {
             malo_id: "12345678905".into(),
             obis_code: "1-0:1.8.0".into(),
             from: datetime!(2026-07-20 00:00 UTC),
-            to: datetime!(2026-07-20 00:15 UTC),
+            to: Some(datetime!(2026-07-20 00:15 UTC)),
             identity: Vec::new(),
             effect,
             superseded: prior,

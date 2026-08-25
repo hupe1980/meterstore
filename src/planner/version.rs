@@ -7,8 +7,39 @@
 //! The important optimisation is **not doing it**. Corrections are rare and
 //! concentrated in recent months, so most historical partitions contain exactly
 //! one version per key. Iceberg records per-file `min`/`max` statistics, so when
-//! those are equal for `version` the partition provably has no corrections and
-//! can be scanned directly — no window function, no sort, no repartition.
+//! those are equal for `version` the file provably has no corrections and can be
+//! scanned directly — no window function, no sort, no repartition.
+//!
+//! # Why the file's interval range is read as well as its versions
+//!
+//! One file at one version proves nothing on its own; what has to be proved is
+//! that no *key* appears twice across the files a scan reads. `from` is **in the
+//! merge key**, so two files whose `from` bounds do not overlap cannot hold the
+//! same key whatever versions they carry.
+//!
+//! That is what makes the optimisation fire at all. MSCONS versions ascend per
+//! delivery and archival commits one day per window, so a year of history is 365
+//! files at 365 different versions — disjoint by construction. Requiring them all
+//! to carry the *same* version is sound and true of almost nothing.
+//!
+//! Files whose bounds are unknown are treated as overlapping everything, which
+//! collapses to that stricter rule. Iceberg bounds may only ever widen, never
+//! narrow, so an overlap this sees that is not real costs a window function
+//! rather than a wrong row.
+//!
+//! # What it deliberately does not use
+//!
+//! A **multi-tenant** table writes one file per identity value per window, all
+//! covering the same day, so their bounds overlap and their versions usually
+//! differ — such a scan still resolves. The partition tuple would settle it,
+//! since every partition field this crate writes is derived from a merge-key
+//! column.
+//!
+//! It is not used, because that rests on the spec being the one this crate wrote.
+//! A table repartitioned out of band — the compaction §10.3.1 tells an operator
+//! to run with Spark — could carry a field on an attribute column, and the
+//! inference would then be silently wrong in the direction that returns a
+//! superseded row.
 
 use time::OffsetDateTime;
 
@@ -54,32 +85,128 @@ impl VersionStats {
     }
 }
 
+/// What one data file's statistics say, as far as elision is concerned.
+///
+/// Two facts, and neither is sufficient alone: the versions the file holds, and
+/// the span of `from` it covers. `None` means the file records no bound for that
+/// column, which is read as "anything" — see [`plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStats {
+    /// The file's `version` bounds.
+    pub version: Option<VersionStats>,
+    /// The file's inclusive `from` bounds.
+    ///
+    /// Inclusive because that is what Iceberg records: the lowest and highest
+    /// value actually present. Two files overlap when each one's lower bound is
+    /// at or below the other's upper bound.
+    pub interval: Option<(OffsetDateTime, OffsetDateTime)>,
+}
+
+impl FileStats {
+    /// A file nothing is known about — the pessimistic default.
+    pub const fn unknown() -> Self {
+        Self {
+            version: None,
+            interval: None,
+        }
+    }
+
+    /// A file holding one version over one interval span.
+    pub const fn single(version: i128, from: (OffsetDateTime, OffsetDateTime)) -> Self {
+        Self {
+            version: Some(VersionStats::single(version)),
+            interval: Some(from),
+        }
+    }
+}
+
 /// Decide whether a scan over `files` needs version resolution.
 ///
-/// Resolution is elided only when **every** file provably holds one version and
-/// no two files disagree — a key corrected in a later file would otherwise be
-/// silently returned twice.
+/// Resolution is elided only when no merge key can appear twice among the files
+/// the scan reads. Two things would let it:
+///
+/// 1. **A file that spans versions**, which is a corrected key inside one file.
+/// 2. **Two files at different versions that could share a key.** They could
+///    share one exactly when their `from` bounds overlap, because `from` is in
+///    the merge key — so files covering disjoint spans are free to disagree
+///    about versions, and consecutive archival windows always do.
 ///
 /// Missing statistics mean resolution is required. Statistics must *prove* the
-/// absence of corrections; the absence of statistics proves nothing.
-pub fn plan(files: &[Option<VersionStats>]) -> Resolution {
+/// absence of corrections; the absence of statistics proves nothing — so a file
+/// with no version bounds forces resolution outright, and one with no interval
+/// bounds is treated as overlapping every other file.
+///
+/// # What the proof rests on
+///
+/// One version among files that could share a key means no key appears twice
+/// **only if no key is stored twice at that version**. Per-file statistics cannot
+/// show that, and it is not assumed: the hot table's primary key is the merge key
+/// plus `version`, and the cold tier's late-correction append reconciles against
+/// what is stored, under a lease, before it writes.
+///
+/// # Grouping is conservative, not exact
+///
+/// Files are swept into *maximal runs* of overlap rather than compared pairwise,
+/// so three files where the first and third are disjoint but both meet the second
+/// land in one group. That can require resolution where a pairwise test would
+/// not; it can never permit it where a pairwise test would not. §17.1's rule
+/// again: the error may only ever be in the slow direction.
+pub fn plan(files: &[FileStats]) -> Resolution {
     if files.is_empty() {
         return Resolution::Elided;
     }
 
-    let mut seen: Option<i128> = None;
+    // Every file must be readable and hold exactly one version. Checked over all
+    // of them before anything else: a file that spans versions holds a correction
+    // on its own, whatever the others do, and stopping at the first file that
+    // merely lacks a *span* would skip that check for the ones after it.
+    let mut single: Vec<(i128, Option<(OffsetDateTime, OffsetDateTime)>)> =
+        Vec::with_capacity(files.len());
     for file in files {
-        let Some(stats) = file else {
+        let Some(stats) = file.version else {
             return Resolution::Required;
         };
         if stats.may_contain_corrections() {
             return Resolution::Required;
         }
-        match seen {
-            // Two files at different versions may hold the same key twice.
-            Some(v) if v != stats.min => return Resolution::Required,
-            _ => seen = Some(stats.min),
+        single.push((stats.min, file.interval));
+    }
+
+    // A file that will not say which intervals it covers could share a key with
+    // any other, so every file has to agree on one version. That is the original
+    // rule, and it is what a store supplying no interval bounds falls back to.
+    if single.iter().any(|(_, span)| span.is_none()) {
+        let first = single[0].0;
+        return match single.iter().all(|(v, _)| *v == first) {
+            true => Resolution::Elided,
+            false => Resolution::Required,
+        };
+    }
+
+    // Sweep into maximal runs of overlapping spans. A run break means every
+    // remaining file starts strictly after everything seen so far ends, so no key
+    // can cross it.
+    let mut known: Vec<(OffsetDateTime, OffsetDateTime, i128)> = single
+        .into_iter()
+        .map(|(version, span)| {
+            let (lo, hi) = span.expect("checked above");
+            (lo, hi, version)
+        })
+        .collect();
+    known.sort_by_key(|(lo, ..)| *lo);
+
+    let mut run_end = known[0].1;
+    let mut run_version = known[0].2;
+    for &(lo, hi, version) in &known[1..] {
+        if lo > run_end {
+            run_end = hi;
+            run_version = version;
+            continue;
         }
+        if version != run_version {
+            return Resolution::Required;
+        }
+        run_end = run_end.max(hi);
     }
 
     Resolution::Elided
@@ -100,6 +227,16 @@ pub fn plan(files: &[Option<VersionStats>]) -> Resolution {
 /// operator per month, so versions from different scopes are not comparable and
 /// must not be ranked against each other.
 ///
+/// # The ordering is total, not just correct
+///
+/// `version DESC` alone leaves a tie unbroken, and `ROW_NUMBER` then picks
+/// arbitrarily — a different row on a different plan, engine or file order. Both
+/// write paths refuse two rows at one `(merge key, version)`, so a tie should be
+/// unreachable; this text is nevertheless *published* for engines reading a
+/// warehouse whose files something else may have written. `recorded_at DESC`
+/// costs nothing when there is no tie and makes the answer reproducible when
+/// there is.
+///
 /// [`MeterStore`]: crate::session::MeterStore
 pub fn resolution_sql(table: &str) -> String {
     resolution_sql_with_key(table, &default_merge_key(), &[], None)
@@ -116,7 +253,7 @@ fn recorded_at_ceiling_clause(ceiling: Option<OffsetDateTime>) -> String {
     match ceiling {
         None => String::new(),
         Some(at) => {
-            let micros = at.unix_timestamp_nanos() / 1_000;
+            let micros = crate::encode::schema::micros(at);
             format!(
                 "\n  WHERE \"{rec}\" <= arrow_cast({micros}, 'Timestamp(Microsecond, Some(\"UTC\"))')",
                 rec = col::RECORDED_AT,
@@ -176,11 +313,12 @@ pub fn resolution_sql_with_key(
         r#"SELECT {columns} FROM (
   SELECT *, ROW_NUMBER() OVER (
     PARTITION BY {partition}
-    ORDER BY "{version}" DESC
+    ORDER BY "{version}" DESC, "{recorded}" DESC
   ) AS _meterstore_rank
   FROM {table}{ceiling}
 ) AS _meterstore_resolved WHERE _meterstore_rank = 1"#,
         version = col::VERSION,
+        recorded = col::RECORDED_AT,
         ceiling = recorded_at_ceiling_clause(recorded_at_ceiling),
     )
 }
@@ -192,6 +330,14 @@ mod tests {
     const V1: i128 = 20_260_701_000_001;
     const V2: i128 = 20_260_715_000_002;
 
+    /// Day `n` of July 2026, as an archival window's inclusive `from` bounds.
+    fn day(n: i64) -> (OffsetDateTime, OffsetDateTime) {
+        let start = time::macros::datetime!(2026-07-01 00:00 UTC) + time::Duration::days(n);
+        // The last interval of the day starts a quarter-hour before it ends,
+        // which is what Iceberg records as the file's upper bound.
+        (start, start + time::Duration::minutes(60 * 24 - 15))
+    }
+
     #[test]
     fn an_empty_scan_needs_no_resolution() {
         assert_eq!(plan(&[]), Resolution::Elided);
@@ -199,40 +345,105 @@ mod tests {
 
     #[test]
     fn single_version_files_elide_resolution() {
-        let files = vec![Some(VersionStats::single(V1)); 4];
+        let files = vec![FileStats::single(V1, day(0)); 4];
         assert!(plan(&files).is_elided());
     }
 
     #[test]
     fn a_file_spanning_versions_requires_resolution() {
         let files = vec![
-            Some(VersionStats::single(V1)),
-            Some(VersionStats { min: V1, max: V2 }),
+            FileStats::single(V1, day(0)),
+            FileStats {
+                version: Some(VersionStats { min: V1, max: V2 }),
+                interval: Some(day(1)),
+            },
         ];
         assert_eq!(plan(&files), Resolution::Required);
     }
 
     #[test]
-    fn files_at_differing_versions_require_resolution() {
-        // Each file holds one version, but a key corrected in the later file
-        // would appear in both.
-        let files = vec![
-            Some(VersionStats::single(V1)),
-            Some(VersionStats::single(V2)),
-        ];
-        assert_eq!(plan(&files), Resolution::Required);
+    fn files_at_differing_versions_over_disjoint_days_still_elide() {
+        // The ordinary case: archival commits one day per window and MSCONS
+        // versions ascend per delivery, so a year of history is 365 files at 365
+        // versions. `from` is in the merge key, so files covering different days
+        // cannot hold the same key however their versions differ.
+        let files: Vec<FileStats> = (0..365)
+            .map(|n| FileStats::single(V1 + i128::from(n), day(n)))
+            .collect();
+        assert!(plan(&files).is_elided(), "a year of daily windows");
     }
 
     #[test]
-    fn missing_statistics_require_resolution() {
+    fn files_at_differing_versions_that_overlap_require_resolution() {
+        // A late correction appends a file covering a day already archived, at a
+        // higher version. The two overlap on `from`, so a key really can appear
+        // in both — this is what resolution is for.
+        let files = vec![FileStats::single(V1, day(0)), FileStats::single(V2, day(0))];
+        assert_eq!(plan(&files), Resolution::Required);
+
+        // Partial overlap counts too: a correction spanning two days.
+        let straddling = (day(0).0 + time::Duration::hours(12), day(1).1);
+        assert_eq!(
+            plan(&[
+                FileStats::single(V1, day(0)),
+                FileStats::single(V2, straddling),
+            ]),
+            Resolution::Required
+        );
+    }
+
+    #[test]
+    fn adjacent_days_do_not_count_as_overlapping() {
+        // The boundary condition. Iceberg bounds are inclusive of the values
+        // present, so one day's upper bound is strictly below the next day's
+        // lower bound and the two are disjoint. Reading them as touching would
+        // give up elision on every consecutive pair, which is every pair.
+        assert!(plan(&[FileStats::single(V1, day(0)), FileStats::single(V2, day(1)),]).is_elided());
+
+        // But a file whose span reaches exactly to the next file's first instant
+        // does overlap it, and must not elide.
+        let touching = (day(0).0, day(1).0);
+        assert_eq!(
+            plan(&[
+                FileStats::single(V1, touching),
+                FileStats::single(V2, day(1)),
+            ]),
+            Resolution::Required
+        );
+    }
+
+    #[test]
+    fn missing_version_statistics_require_resolution() {
         // Statistics must prove absence; their absence proves nothing.
-        let files = vec![Some(VersionStats::single(V1)), None];
+        let files = vec![
+            FileStats::single(V1, day(0)),
+            FileStats {
+                version: None,
+                interval: Some(day(1)),
+            },
+        ];
         assert_eq!(plan(&files), Resolution::Required);
+    }
+
+    #[test]
+    fn an_unknown_span_falls_back_to_requiring_one_version_everywhere() {
+        // A file that will not say which intervals it covers could share a key
+        // with any other, so the original rule applies: every file has to agree.
+        let unknown = FileStats {
+            version: Some(VersionStats::single(V1)),
+            interval: None,
+        };
+        assert!(plan(&[unknown, FileStats::single(V1, day(9))]).is_elided());
+        assert_eq!(
+            plan(&[unknown, FileStats::single(V2, day(9))]),
+            Resolution::Required
+        );
+        assert_eq!(plan(&[FileStats::unknown()]), Resolution::Required);
     }
 
     #[test]
     fn a_single_file_with_one_version_elides() {
-        assert!(plan(&[Some(VersionStats::single(V1))]).is_elided());
+        assert!(plan(&[FileStats::single(V1, day(0))]).is_elided());
     }
 
     #[test]
@@ -247,6 +458,18 @@ mod tests {
         assert!(sql.contains("ROW_NUMBER()"));
         assert!(sql.contains(r#"ORDER BY "version" DESC"#));
         assert!(sql.contains("_meterstore_rank = 1"));
+    }
+
+    #[test]
+    fn resolution_sql_breaks_ties_deterministically() {
+        // `version DESC` alone leaves ROW_NUMBER free to pick either of two tied
+        // rows, and this text is published for engines reading files this crate
+        // did not write. A settlement that reproduces only sometimes is not one.
+        let sql = resolution_sql("readings_versions");
+        assert!(
+            sql.contains(r#"ORDER BY "version" DESC, "recorded_at" DESC"#),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -328,48 +551,125 @@ mod properties {
     use super::*;
     use proptest::prelude::*;
 
-    fn stats() -> impl Strategy<Value = Option<VersionStats>> {
-        prop_oneof![
+    fn at(hours: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::hours(hours)
+    }
+
+    fn file() -> impl Strategy<Value = FileStats> {
+        let version = prop_oneof![
             1 => Just(None),
-            6 => (0i128..4, 0i128..4)
+            6 => (0i128..3, 0i128..3)
                 .prop_map(|(a, b)| Some(VersionStats { min: a.min(b), max: a.max(b) })),
-        ]
+        ];
+        let interval = prop_oneof![
+            1 => Just(None),
+            6 => (0i64..8, 0i64..8)
+                .prop_map(|(a, b)| Some((at(a.min(b)), at(a.max(b))))),
+        ];
+        (version, interval).prop_map(|(version, interval)| FileStats { version, interval })
+    }
+
+    /// Whether two files could hold the same merge key.
+    ///
+    /// Unknown bounds mean "anything", so they could.
+    fn may_share_a_key(a: &FileStats, b: &FileStats) -> bool {
+        match (a.interval, b.interval) {
+            (Some((a_lo, a_hi)), Some((b_lo, b_hi))) => a_lo <= b_hi && b_lo <= a_hi,
+            _ => true,
+        }
+    }
+
+    /// The condition eliding rests on, stated independently of how [`plan`]
+    /// computes it: every file holds one version, and no two files that could
+    /// share a key disagree about which version that is.
+    ///
+    /// Pairwise, where `plan` sweeps into runs — deliberately, because the sweep
+    /// is the *conservative* approximation of this and the property below is
+    /// one-directional for exactly that reason.
+    fn at_most_one_row_per_key(files: &[FileStats]) -> bool {
+        if !files
+            .iter()
+            .all(|f| f.version.is_some_and(|v| v.min == v.max))
+        {
+            return false;
+        }
+        for (i, a) in files.iter().enumerate() {
+            for b in &files[i + 1..] {
+                let (Some(va), Some(vb)) = (a.version, b.version) else {
+                    return false;
+                };
+                if va.min != vb.min && may_share_a_key(a, b) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     proptest! {
         /// **Statistics must prove absence; their absence proves nothing.**
-        /// Eliding resolution returns the raw rows, so eliding wrongly hands back
-        /// every superseded version of a corrected interval and every `SUM` over
-        /// them is overstated. The condition is therefore stated independently
-        /// here and compared against the planner's answer.
+        /// Eliding returns the raw rows, so eliding wrongly hands back every
+        /// superseded version of a corrected interval and every `SUM` over them
+        /// is overstated.
+        ///
+        /// One-directional on purpose. `plan` groups files into maximal runs of
+        /// overlap rather than comparing them pairwise, so it can refuse to elide
+        /// where the pairwise condition holds — three files where the outer two
+        /// are disjoint but both meet the middle one. That costs a window
+        /// function. The converse would cost a wrong number, and is what this
+        /// asserts cannot happen.
         #[test]
-        fn resolution_is_skipped_only_when_one_version_is_provable(
-            files in prop::collection::vec(stats(), 0..8),
+        fn eliding_implies_no_key_can_appear_twice(
+            files in prop::collection::vec(file(), 0..8),
         ) {
-            // Independently: every file must be readable, hold a single version,
-            // and agree with the others on which version that is.
-            let provable = files.iter().all(|f| f.is_some_and(|s| s.min == s.max))
-                && files
-                    .iter()
-                    .filter_map(|f| f.map(|s| s.min))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    <= 1;
+            prop_assert!(
+                !plan(&files).is_elided() || at_most_one_row_per_key(&files),
+                "elided over {files:?}",
+            );
+        }
 
-            prop_assert_eq!(plan(&files).is_elided(), provable, "{:?}", files);
+        /// And the optimisation has to actually fire, or the argument for a
+        /// provider rather than a view is worth nothing. Disjoint spans at
+        /// arbitrary versions are what consecutive archival windows produce, and
+        /// they must always elide.
+        #[test]
+        fn disjoint_windows_at_any_versions_always_elide(
+            versions in prop::collection::vec(0i128..1_000, 1..40),
+        ) {
+            let files: Vec<FileStats> = versions
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let day = i as i64 * 24;
+                    FileStats::single(v, (at(day), at(day + 23)))
+                })
+                .collect();
+            prop_assert!(plan(&files).is_elided(), "{files:?}");
         }
 
         /// Adding a file can only ever *remove* the right to elide. A scan that
         /// widens to cover more files must not become cheaper.
         #[test]
         fn widening_a_scan_never_grants_elision(
-            files in prop::collection::vec(stats(), 1..6),
-            extra in stats(),
+            files in prop::collection::vec(file(), 1..6),
+            extra in file(),
         ) {
             let before = plan(&files).is_elided();
             let mut wider = files.clone();
             wider.push(extra);
             prop_assert!(before || !plan(&wider).is_elided());
+        }
+
+        /// The answer must not depend on the order the catalogue happened to
+        /// list the files in.
+        #[test]
+        fn the_decision_is_independent_of_file_order(
+            files in prop::collection::vec(file(), 0..8),
+        ) {
+            let forward = plan(&files);
+            let mut reversed = files.clone();
+            reversed.reverse();
+            prop_assert_eq!(forward, plan(&reversed), "{:?}", files);
         }
     }
 }

@@ -201,8 +201,29 @@ pub fn next_window(
         return Err(Error::config("settlement lag must not be negative"));
     }
 
-    let horizon = now - settlement_lag;
     let from = watermark.get();
+
+    // A window must correspond to exactly one hot partition (§7.2), and
+    // partitions are created on `align_to_step` boundaries. A watermark that is
+    // not on one produces windows whose `PartitionId` names a relation nothing
+    // ever creates — so every window looks empty, the watermark walks straight
+    // past rows that are still in PostgreSQL, and they are stranded below it
+    // with nothing but `invariant_violations` to say so.
+    //
+    // The only way to get there is to change `partition_step` on a table that
+    // has already archived. That is a migration, not a setting, and it fails
+    // here rather than in the data.
+    if align_to_step(from, step) != from {
+        return Err(Error::config(format!(
+            "watermark {from} is not aligned to an archival step of {} seconds, so an \
+             archival window would not correspond to a hot partition. The step of a \
+             table that has already archived cannot be changed in place: create a new \
+             table at the new step",
+            step.whole_seconds(),
+        )));
+    }
+
+    let horizon = now - settlement_lag;
     let to = from + step;
 
     if to > horizon {
@@ -373,6 +394,28 @@ mod tests {
         assert_eq!(
             align_to_step(datetime!(1969-12-31 13:00 UTC), DAY),
             datetime!(1969-12-31 00:00 UTC)
+        );
+    }
+
+    #[test]
+    fn a_watermark_off_the_step_grid_is_refused_rather_than_walked_past() {
+        // The only way here is changing `partition_step` on a table that has
+        // already archived. Left to run, every window would name a partition
+        // relation nothing creates, so each would look empty, the watermark
+        // would advance over rows still in PostgreSQL, and they would be
+        // stranded below it with nothing but `invariant_violations` to say so.
+        let misaligned = TieringWatermark::new(datetime!(2026-07-20 06:00 UTC));
+        let now = datetime!(2026-08-01 00:00 UTC);
+
+        let err = next_window(misaligned, now, Duration::ZERO, DAY).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("aligned"), "{msg}");
+
+        // The same instant is aligned to a six-hour step, and that still works.
+        assert!(
+            next_window(misaligned, now, Duration::ZERO, Duration::hours(6))
+                .unwrap()
+                .is_some()
         );
     }
 
