@@ -35,7 +35,7 @@ subject_column = "subject_ref"
 # so two rows differing in it are different readings.
 extra_columns = [
   { name = "tenant",        identity = true },
-  { name = "bilanzkreis" },
+  { name = "bilanzkreis",   check = "EIC" },                 # check-character validated
   { name = "ingest_source", values = ["MSCONS", "SMGW"] },   # renders a CHECK
 ]
 

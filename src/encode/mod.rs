@@ -706,9 +706,55 @@ fn resolve_extra(
                 "value is null but the column is not nullable".to_string(),
             ));
         }
-        out.push(value);
+        out.push(check_declared_value(field, value)?);
     }
     Ok(out)
+}
+
+/// Parse a declared column's value with the domain type it names, and store
+/// that type's canonical spelling.
+///
+/// The write is the only place a check character is worth anything: a wrong one
+/// found in a settlement run a month later names a row and nothing that could
+/// correct it. See [`eic_column`](crate::config::eic_column).
+///
+/// Canonicalising rather than merely accepting, because a checked column may be
+/// an identity column — one identifier in two spellings would be two merge keys,
+/// the failure [`canonical_obis`](crate::canonical_obis) prevents for OBIS.
+fn check_declared_value(field: &Field, value: ScalarValue) -> Result<ScalarValue> {
+    let Some(check) = crate::config::declared_value_check(field) else {
+        return Ok(value);
+    };
+    // The declaration is validated before the value, and unconditionally. A
+    // metadata value this build does not know is refused rather than ignored —
+    // a column declared as checked and silently written unchecked is the one
+    // outcome the declaration exists to rule out — and doing it here rather
+    // than in the parse arm means a delivery that happens to leave the column
+    // null does not slip past the same mistake.
+    if check != crate::config::VALUE_CHECK_EIC {
+        return Err(Error::encode(
+            field.name(),
+            format!(
+                "declares an unknown value check {check:?}; this build knows {:?}",
+                crate::config::VALUE_CHECK_EIC
+            ),
+        ));
+    }
+    // A null passed the nullability check above, so there is nothing to parse.
+    let ScalarValue::Utf8(Some(text)) = &value else {
+        return Ok(value);
+    };
+    let eic: metering::ids::Eic = text.parse().map_err(|e| {
+        Error::encode(
+            field.name(),
+            format!(
+                "{text:?} is not an EIC: {e}. The check character is part of the \
+                 code, so a transposition is detectable here — and only here, \
+                 while the delivery that carried it is still in hand"
+            ),
+        )
+    })?;
+    Ok(ScalarValue::Utf8(Some(eic.as_str().to_string())))
 }
 
 /// The version scope check every write path makes, once per row.
@@ -1527,6 +1573,110 @@ mod tests {
         assert!(err.to_string().contains("null"), "{err}");
     }
 
+    #[test]
+    fn a_checked_column_parses_its_value_and_stores_the_canonical_spelling() {
+        // The write is where a check character is still worth something: the
+        // delivery that carried the code is in hand, and a settlement run a
+        // month later can only name the row.
+        let s = series(vec![quarter(
+            datetime!(2026-07-20 00:00 UTC),
+            "1.5",
+            QualityFlag::Measured,
+        )])
+        // Lowercase and padded — a shape a CSV or a hand-edited mapping
+        // produces, and one that would be a *second* merge key if the column
+        // were an identity one.
+        .with_extra(
+            "bilanzkreis",
+            ScalarValue::Utf8(Some("  11xbk0000000001a  ".to_string())),
+        );
+        let field = crate::config::eic_column("bilanzkreis", true);
+
+        let batch = to_record_batch_with(&[s], std::slice::from_ref(&field)).unwrap();
+        let stored = batch
+            .column_by_name("bilanzkreis")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(stored.value(0), "11XBK0000000001A");
+    }
+
+    #[test]
+    fn a_transposed_check_character_is_refused_at_the_write() {
+        // `11XBK0000000001A` is a valid EIC; `...1B` is the same sixteen
+        // characters with the check character wrong, which is exactly what a
+        // typo or a transposition upstream produces. A plain string column
+        // would have stored it.
+        let s = series(vec![quarter(
+            datetime!(2026-07-20 00:00 UTC),
+            "1.5",
+            QualityFlag::Measured,
+        )])
+        .with_extra(
+            "bilanzkreis",
+            ScalarValue::Utf8(Some("11XBK0000000001B".to_string())),
+        );
+        let field = crate::config::eic_column("bilanzkreis", true);
+
+        let err = to_record_batch_with(&[s], std::slice::from_ref(&field))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bilanzkreis"), "{err}");
+        assert!(err.contains("EIC"), "{err}");
+    }
+
+    #[test]
+    fn a_null_in_a_nullable_checked_column_is_not_parsed() {
+        // Nullable means "may be absent", and absent is not "the empty string is
+        // not an EIC".
+        let s = series(vec![quarter(
+            datetime!(2026-07-20 00:00 UTC),
+            "1.5",
+            QualityFlag::Measured,
+        )]);
+        let field = crate::config::eic_column("bilanzkreis", true);
+        let batch = to_record_batch_with(&[s], std::slice::from_ref(&field)).unwrap();
+        assert!(batch.column_by_name("bilanzkreis").unwrap().is_null(0));
+    }
+
+    #[test]
+    fn a_value_check_this_build_does_not_know_is_refused_rather_than_ignored() {
+        // A column declared as checked and written unchecked is the one outcome
+        // the declaration exists to rule out — so an unrecognised declaration
+        // fails the write rather than degrading to a plain string column.
+        let s = series(vec![quarter(
+            datetime!(2026-07-20 00:00 UTC),
+            "1.5",
+            QualityFlag::Measured,
+        )])
+        .with_extra("odd", ScalarValue::Utf8(Some("anything".to_string())));
+        let field = Field::new("odd", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                crate::config::VALUE_CHECK_KEY.to_string(),
+                "IBAN".to_string(),
+            )]),
+        );
+
+        let err = to_record_batch_with(&[s], std::slice::from_ref(&field))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("odd"), "{err}");
+        assert!(err.contains("IBAN"), "{err}");
+
+        // And a delivery that leaves the column null must not slip past it: the
+        // declaration is wrong whatever this particular row holds.
+        let absent = series(vec![quarter(
+            datetime!(2026-07-20 00:00 UTC),
+            "1.5",
+            QualityFlag::Measured,
+        )]);
+        assert!(
+            to_record_batch_with(&[absent], std::slice::from_ref(&field)).is_err(),
+            "an unrecognised declaration is a configuration fault, not a row's"
+        );
+    }
+
     fn quarter(from: OffsetDateTime, kwh: &str, q: QualityFlag) -> MeterInterval {
         MeterInterval {
             from,
@@ -2000,6 +2150,23 @@ mod tests {
             MeasurementSource::AutoSubstitute {
                 method: SubstituteMethod::ZeroFill,
                 reason: SubstitutionReason::GatewayCommFailure,
+            },
+            // The session-derived provenance `metering` 0.21 added. Nothing in
+            // `encode_source` needed an edit for them — which is the property
+            // this test exists to keep true — but the `Option` field is worth
+            // exercising both ways, since a `None` that serialised to an absent
+            // key rather than a null would be a stored-shape change.
+            MeasurementSource::ChargeDetailRecord {
+                cdr_id: "CDR-1".into(),
+                evse_id: Some("DE*ABC*E1234*1".into()),
+            },
+            MeasurementSource::ClockAlignedMeterValue {
+                transaction_id: "TX-9".into(),
+                evse_id: None,
+            },
+            MeasurementSource::DeviceLog {
+                device_id: "wallbox-7".into(),
+                register: Some("1-0:1.8.0".into()),
             },
         ];
 

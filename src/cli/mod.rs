@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use metering::interval::Sparte;
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -167,6 +168,79 @@ pub enum Command {
         /// Read only the recent hot window.
         #[arg(long, conflicts_with = "historical")]
         operational: bool,
+    },
+
+    /// Report which channels are short, and which delivered nothing at all.
+    ///
+    /// The question a settlement run asks before it trusts a `SUM`: an
+    /// incomplete month returns a smaller number and no reason. The expectation
+    /// is the DST-aware calendar's — 92 intervals on the spring day, 100 on the
+    /// autumn one, and for gas both on the **Gastag** rather than the Sunday —
+    /// over every day of the range, including days nothing arrived on.
+    ///
+    /// `--month` states the period the way the market does. `--seen-since` adds
+    /// the finding the range cannot make about itself: a channel that delivered
+    /// *nothing* produces no rows to aggregate, so it is absent from the report
+    /// unless a roster is drawn from an earlier window.
+    ///
+    /// This exits zero whatever it finds. A gap is a fact to triage, not a
+    /// broken deployment — `status` is the check that fails, because a stranded
+    /// row means query results are wrong rather than incomplete.
+    Completeness {
+        /// Only this table.
+        #[arg(long, value_name = "NAME")]
+        table: Option<String>,
+        /// Range start, RFC 3339 — `2026-06-01T00:00:00Z`.
+        #[arg(
+            long,
+            value_name = "TS",
+            conflicts_with = "month",
+            required_unless_present = "month",
+            requires = "to"
+        )]
+        from: Option<String>,
+        /// Range end, RFC 3339, exclusive.
+        #[arg(
+            long,
+            value_name = "TS",
+            conflicts_with = "month",
+            required_unless_present = "month",
+            requires = "from"
+        )]
+        to: Option<String>,
+        /// A whole Bilanzierungsmonat instead of `--from`/`--to`, as `YYYY-MM`.
+        #[arg(long, value_name = "YYYY-MM")]
+        month: Option<String>,
+        /// Which commodity's month boundary `--month` means.
+        ///
+        /// A gas Bilanzierungsmonat runs 06:00 to 06:00 local, so the range is
+        /// six hours later than the electricity one. Rows are still counted
+        /// against their own `sparte`; this decides where the *range* is cut,
+        /// which one value cannot do for a table holding both.
+        #[arg(
+            long,
+            value_name = "SPARTE",
+            default_value = "STROM",
+            requires = "month"
+        )]
+        sparte: String,
+        /// Also report channels that reported this long before the range and are
+        /// silent inside it — `30d`, `12h`.
+        ///
+        /// There is no default: too short and a meter read monthly looks
+        /// decommissioned, too long and every terminated measuring point is a
+        /// standing finding.
+        #[arg(long, value_name = "DURATION")]
+        seen_since: Option<String>,
+        /// Report one measuring point, by MaLo-ID.
+        #[arg(long, value_name = "MALO")]
+        malo: Option<String>,
+        /// Report one channel, by OBIS code.
+        #[arg(long, value_name = "OBIS")]
+        obis: Option<String>,
+        /// Report only the channels that are not complete.
+        #[arg(long)]
+        gaps_only: bool,
     },
 
     /// Show the query plan and the tiers it would read, without running it.
@@ -321,6 +395,35 @@ async fn run(cli: &Cli) -> Result<()> {
             historical,
             operational,
         } => query(cli, sql, *historical, *operational).await,
+        Command::Completeness {
+            table,
+            from,
+            to,
+            month,
+            sparte,
+            seen_since,
+            malo,
+            obis,
+            gaps_only,
+        } => {
+            completeness(
+                cli,
+                table.as_deref(),
+                Period {
+                    from: from.as_deref(),
+                    to: to.as_deref(),
+                    month: month.as_deref(),
+                    sparte,
+                },
+                seen_since.as_deref(),
+                Narrowing {
+                    malo: malo.as_deref(),
+                    obis: obis.as_deref(),
+                },
+                *gaps_only,
+            )
+            .await
+        }
         Command::Explain { sql } => explain(cli, sql).await,
         Command::Snapshots { table } => snapshots(cli, table.as_deref()).await,
         Command::Serve { addr, catalog_addr } => serve(cli, addr, catalog_addr.as_deref()).await,
@@ -495,6 +598,152 @@ async fn query(cli: &Cli, sql: &str, historical: bool, operational: bool) -> Res
         }
     };
     render::query(&result, cli.format)
+}
+
+/// The range a `completeness` invocation reports on.
+///
+/// `--month` and `--from`/`--to` are the two spellings, and clap has already
+/// refused both at once — so this is a parse rather than a precedence rule.
+fn completeness_range(period: Period<'_>) -> Result<(OffsetDateTime, OffsetDateTime)> {
+    let Period {
+        from,
+        to,
+        month,
+        sparte,
+    } = period;
+    if let Some(month) = month {
+        let sparte: Sparte = sparte.parse().map_err(|e| {
+            Error::config(format!(
+                "--sparte {sparte:?}: {e} — expected one of {:?}",
+                Sparte::CODES
+            ))
+        })?;
+        let (year, month) = parse_year_month(month)?;
+        return Ok(crate::planner::bilanzierungsmonat(year, month, sparte));
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        // clap enforces this, so reaching it means the argument declaration and
+        // this function have drifted apart.
+        return Err(Error::config(
+            "completeness needs either --month or both --from and --to",
+        ));
+    };
+    let (from, to) = (parse_instant("--from", from)?, parse_instant("--to", to)?);
+    match from < to {
+        true => Ok((from, to)),
+        false => Err(Error::config(format!(
+            "--from {from} is not before --to {to}; the range is half-open [from, to)"
+        ))),
+    }
+}
+
+/// `YYYY-MM`, the way a settlement period is named.
+fn parse_year_month(text: &str) -> Result<(i32, time::Month)> {
+    let bad = || {
+        Error::config(format!(
+            "--month {text:?} is not a settlement month; write it as YYYY-MM, for \
+             example 2026-06"
+        ))
+    };
+    let (year, month) = text.split_once('-').ok_or_else(bad)?;
+    let year: i32 = year.parse().map_err(|_| bad())?;
+    let month: u8 = month.parse().map_err(|_| bad())?;
+    Ok((year, time::Month::try_from(month).map_err(|_| bad())?))
+}
+
+/// An RFC 3339 instant, naming the flag it came from.
+fn parse_instant(flag: &str, text: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).map_err(|e| {
+        Error::config(format!(
+            "{flag} {text:?} is not an instant: {e}. Write it as RFC 3339, for \
+             example 2026-06-01T00:00:00Z"
+        ))
+    })
+}
+
+/// The period a `completeness` invocation reports on.
+///
+/// A struct rather than four parameters: `--from`, `--to` and `--month` are one
+/// decision spelled three ways, and three `Option<&str>` passed positionally are
+/// an invitation to transpose two that mean different things.
+#[derive(Debug, Clone, Copy)]
+struct Period<'a> {
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+    month: Option<&'a str>,
+    sparte: &'a str,
+}
+
+/// What a `completeness` invocation reports **about**.
+///
+/// Transposing these is silent: a MaLo-ID in the OBIS slot narrows to nothing
+/// and the report comes back empty, which reads as "everything is fine".
+#[derive(Debug, Clone, Copy, Default)]
+struct Narrowing<'a> {
+    malo: Option<&'a str>,
+    obis: Option<&'a str>,
+}
+
+async fn completeness(
+    cli: &Cli,
+    only: Option<&str>,
+    period: Period<'_>,
+    seen_since: Option<&str>,
+    narrowing: Narrowing<'_>,
+    gaps_only: bool,
+) -> Result<()> {
+    let (from, to) = completeness_range(period)?;
+    // A duration before the range rather than an absolute instant: the roster
+    // window is stated relative to the period being checked, and `--month`
+    // leaves the caller with no start date to subtract from.
+    let roster = match seen_since {
+        None => None,
+        Some(text) => {
+            let window = crate::settings::parse_human_duration(text)?;
+            // A roster drawn from the range itself can only hold channels the
+            // range already reports, so it finds nothing — and "no silent
+            // channels" is exactly what a zero window would appear to say.
+            if window <= time::Duration::ZERO {
+                return Err(Error::config(format!(
+                    "--seen-since {text:?} is not a window before the range. A roster \
+                     drawn from the range itself can only hold channels the range \
+                     already reports, so it would find nothing and read as \
+                     \"nothing went silent\""
+                )));
+            }
+            Some(from - window)
+        }
+    };
+
+    let catalog = load(cli).await?;
+    let mut rows = Vec::new();
+    for store in selected(&catalog, only)? {
+        let mut query = store.completeness(from, to);
+        if let Some(since) = roster {
+            query = query.seen_since(since);
+        }
+        // Narrowed in the scan rather than in the printed result: filtering the
+        // output would still have computed the whole portfolio to answer a
+        // question about one meter.
+        if let Some(malo) = narrowing.malo {
+            query = query.malo(malo)?;
+        }
+        if let Some(obis) = narrowing.obis {
+            query = query.obis(obis)?;
+        }
+        for row in query.await? {
+            // `is_silent` is not implied by `!is_complete`. A channel with no
+            // declared resolution has no expectation, so it reports `missing =
+            // 0` and calls itself complete — including when it delivered
+            // nothing at all. Dropping that row from a `--gaps-only` run would
+            // hide the strongest finding the report can make.
+            if gaps_only && row.is_complete() && !row.is_silent() {
+                continue;
+            }
+            rows.push((store.table().to_string(), row));
+        }
+    }
+    render::completeness(&rows, from, to, cli.format)
 }
 
 async fn explain(cli: &Cli, sql: &str) -> Result<()> {
@@ -739,6 +988,159 @@ mod tests {
         let err = bind_address("50051").expect_err("a port alone is not an address");
         assert!(err.to_string().contains("host:port"), "{err}");
         assert!(bind_address("0.0.0.0:50051").is_ok());
+    }
+
+    #[test]
+    fn a_completeness_range_is_stated_once() {
+        // `--month` and an explicit range are two spellings of the same thing,
+        // and accepting both would leave a precedence rule for a reader to
+        // guess at.
+        let err = Cli::try_parse_from([
+            "meterstore",
+            "completeness",
+            "--month",
+            "2026-06",
+            "--from",
+            "2026-06-01T00:00:00Z",
+        ])
+        .expect_err("--month and --from contradict each other");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Half a range is not a range: a missing `--to` would otherwise have to
+        // default to something, and every candidate is wrong for some caller.
+        assert!(
+            Cli::try_parse_from([
+                "meterstore",
+                "completeness",
+                "--from",
+                "2026-06-01T00:00:00Z",
+            ])
+            .is_err(),
+            "--from alone does not describe a period"
+        );
+
+        // And one of the two has to be given.
+        assert!(
+            Cli::try_parse_from(["meterstore", "completeness"]).is_err(),
+            "a report with no period is a full-table scan nobody asked for"
+        );
+    }
+
+    #[test]
+    fn an_explicit_range_needs_no_month_despite_the_sparte_default() {
+        // `--sparte` has a default, and a defaulted argument is "present" as far
+        // as some of clap's relations are concerned. If `requires = "month"`
+        // fired on the default, the `--from`/`--to` spelling would be
+        // unreachable from a shell — which the unit tests calling
+        // `completeness_range` directly would never notice.
+        let parsed = Cli::try_parse_from([
+            "meterstore",
+            "completeness",
+            "--from",
+            "2026-06-01T00:00:00Z",
+            "--to",
+            "2026-07-01T00:00:00Z",
+        ])
+        .expect("an explicit range is a complete invocation");
+        let Command::Completeness { month, sparte, .. } = parsed.command else {
+            panic!("expected completeness");
+        };
+        assert_eq!(month, None);
+        assert_eq!(sparte, "STROM");
+
+        // And `--month` alone, likewise.
+        assert!(Cli::try_parse_from(["meterstore", "completeness", "--month", "2026-06"]).is_ok());
+    }
+
+    /// A period naming a settlement month.
+    fn month_of<'a>(month: &'a str, sparte: &'static str) -> Period<'a> {
+        Period {
+            from: None,
+            to: None,
+            month: Some(month),
+            sparte,
+        }
+    }
+
+    /// A period stated as two instants.
+    fn between<'a>(from: &'a str, to: &'a str) -> Period<'a> {
+        Period {
+            from: Some(from),
+            to: Some(to),
+            month: None,
+            sparte: "STROM",
+        }
+    }
+
+    #[test]
+    fn a_settlement_month_is_cut_where_the_commodity_balances() {
+        // The market names a period "Juni 2026"; the store has to turn that into
+        // an instant, and the gas month is the same span six hours later. Both
+        // ends move, so a gas month is a whole number of Gastage rather than a
+        // calendar month shifted at one end.
+        let (from, to) = completeness_range(month_of("2026-06", "STROM")).unwrap();
+        assert_eq!(from, time::macros::datetime!(2026-05-31 22:00 UTC));
+        assert_eq!(to, time::macros::datetime!(2026-06-30 22:00 UTC));
+
+        let (gas_from, gas_to) = completeness_range(month_of("2026-06", "GAS")).unwrap();
+        assert_eq!(gas_from, time::macros::datetime!(2026-06-01 4:00 UTC));
+        assert_eq!(gas_to, time::macros::datetime!(2026-07-01 4:00 UTC));
+        assert_eq!(gas_from - from, time::Duration::hours(6));
+    }
+
+    #[test]
+    fn a_month_needs_a_month_number_that_exists() {
+        // `time::Month::try_from` is the only thing that knows 13 is not one.
+        assert!(parse_year_month("2026-06").is_ok());
+        for bad in [
+            "2026-00",
+            "2026-13",
+            "2026-6-15",
+            "2026",
+            "-1-06",
+            "20xx-06",
+        ] {
+            assert!(parse_year_month(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_period_that_is_not_one_says_what_it_should_look_like() {
+        for (bad, wanted) in [
+            ("2026-13", "YYYY-MM"),
+            ("June 2026", "YYYY-MM"),
+            ("2026", "YYYY-MM"),
+        ] {
+            let err = completeness_range(month_of(bad, "STROM"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains(wanted), "{bad}: {err}");
+        }
+
+        let err = completeness_range(month_of("2026-06", "OEL"))
+            .expect_err("there is no such commodity")
+            .to_string();
+        assert!(err.contains("--sparte"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_range_must_run_forwards() {
+        // Reversed, the report would come back empty and read as "nothing is
+        // missing" — the one answer a completeness check must never give by
+        // accident.
+        let err = completeness_range(between("2026-06-30T00:00:00Z", "2026-06-01T00:00:00Z"))
+            .expect_err("the range is half-open [from, to)")
+            .to_string();
+        assert!(err.contains("half-open"), "{err}");
+
+        let ok =
+            completeness_range(between("2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z")).unwrap();
+        assert_eq!(ok.0, time::macros::datetime!(2026-06-01 0:00 UTC));
+
+        let err = completeness_range(between("yesterday", "today"))
+            .expect_err("not an instant")
+            .to_string();
+        assert!(err.contains("RFC 3339"), "{err}");
     }
 
     #[test]

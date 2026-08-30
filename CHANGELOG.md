@@ -7,6 +7,266 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.8.0] — 2026-08-30
+
+Three silent wrong answers — a completeness report that could not see a missing
+day, a correction that changed a reading's unit without reporting a change, and a
+version scope buildable in a shape nothing else accepted — plus `metering` 0.21
+and the four things it makes possible that this crate had been doing without: a
+settlement month in SQL, a direction that can say *neither*, a Bilanzkreis that
+is checked rather than believed, and the completeness verb the command line never
+had. Completeness also gained the narrowing every other read on a store already
+has.
+
+### A meter that stopped reported the month complete
+
+`meterstore.completeness` is the answer to *"can this period be invoiced"*, and
+it was summing its expectation over the days the aggregate returned. A `GROUP BY`
+yields no group for a balancing day with nothing in it, so those days were not
+merely uncounted — they were **not in the arithmetic at all**.
+
+A channel that delivered the 2nd of March and then stopped therefore reported
+`expected = 96, actual = 96, missing = 0, complete` for the whole of March. A
+`SUM` over that month was short by twenty-nine days, and the report whose entire
+purpose is to say so said nothing. `first_gap` was `None`.
+
+The report's own documentation was already right — *"intervals the calendar says
+the **range** should hold"* — and the code disagreed with it. The walk is now over
+the range's balancing days, which is the same enumeration the silent-channel path
+already used: the two shared nothing before, and a second walk is a second chance
+to disagree about what a range contains.
+
+Nothing here was reachable through the roster (`seen_since`), which finds the
+channel that delivered *nothing*. This was the channel that delivered *something*
+— which is the harder case to notice by eye and the commoner one in a real
+portfolio.
+
+**An absent day belongs to a grid.** The report is one row per channel per
+interval grid, so a day nobody delivered on has to be charged somewhere: to every
+grid would report a clean hourly→quarter-hourly conversion as two badly
+incomplete halves, and to none is the bug itself. It goes to the grid **last in
+force before it**, and a gap before the channel's first delivery to the first grid
+it used. For a single-grid channel that is simply "the whole range".
+
+**A range reaching past the last delivery now says so** — a report over a whole
+month run mid-month reports the remainder as missing. That is the honest answer
+to the question asked, and the alternative is worse: consulting a clock would make
+one report answer differently on two runs. Written down rather than left to be
+discovered.
+
+The tests are the other half of the story. Most of them ran a one-day fixture
+against a **one-month** range and asserted `is_complete()` — which, stated that
+way, is asserting the opposite of what the report means. Each now states the
+period it is about, and the helper that builds one is named for that reason.
+
+The per-day walk was also the wrong shape for a portfolio. The expectation depends
+on `(Sparte, resolution)` and never on the channel, so it is computed once per
+grid rather than once per channel, and the days of a channel are walked once for
+all of its grids together — a year-long report over 100 000 channels would
+otherwise have materialised 36 million dates.
+
+### The gas month had no function, and the gas day did
+
+`meter_balancing_day(ts, sparte)` has always read the commodity per row, because
+grouping a gas Lastgang on the calendar day books six hours a day into the
+neighbouring Bilanzierungstag. One period up there was only
+`meter_local_month`, which is the *calendar* month for every row — so the same
+error, twelve times a year instead of three hundred and sixty-five, and every
+total still plausible.
+
+`meter_balancing_month(ts, sparte)` is the missing half. An interval at 02:00
+local on 1 March belongs to **February** for gas and to March for everything
+else, which is also the month an MSCONS version scope is keyed to — so this is
+how a reader reproduces `version_scope`'s month half in SQL. In Rust:
+`planner::balancing_month_bounds` for the half-open UTC range, and
+`planner::bilanzierungsmonat(year, month, sparte)` for the range addressed the
+way the market addresses it, *"Juni 2026"* — both `metering` 0.21's
+`DayBoundary::month_range_utc` and `::bilanzierungsmonat` under the boundary the
+commodity balances on.
+
+Leaving the day covered and the month not was an asymmetry rather than a
+decision, and it survived because the month is only wrong at its two ends.
+
+### Direction cannot be two booleans
+
+`obis_is_import` and `obis_is_export` are **both false** for a register that has
+no direction at all — Blindarbeit, a gas volume, a Zustandszahl — and false is
+also what `obis_is_import` says about a feed-in register. So
+`NOT obis_is_import(obis_code)` does not mean *export*: it sweeps the undirected
+registers in with it, which is how a Bezug total ends up carrying kvarh.
+
+`metering` 0.21 made `direction()` the primitive and derived the two predicates
+from it. `obis_direction(obis_code)` is that primitive in SQL — `'IMPORT'`,
+`'EXPORT'` or **null** — and the three-way `GROUP BY` it enables is the shape a
+bidirectional Zählpunkt wants. The strings are `Direction::as_str`, which is also
+the `serde` tag, so a value from the function and one out of a JSON payload
+compare literally. The booleans stay, because a `WHERE` clause over a
+three-valued column needs an `IS NOT DISTINCT FROM` and nobody writes one.
+
+### A Bilanzkreis was sixteen arbitrary characters
+
+`TableConfig::attribute_column` has named *"Bilanzkreis, grid area"* in its own
+documentation since it existed, and both were plain `Utf8`. They are not plain
+strings: a Bilanzkreis and a Bilanzierungsgebiet are addressed by an **EIC**,
+and an EIC carries a check character.
+
+`config::eic_column(name, nullable)` — `check = "EIC"` in TOML — declares a
+column whose values the write path parses with `metering::ids::Eic`. This is the
+argument that already makes `malo_id` a `MaloId` rather than eleven digits, and
+it is *stronger* here: the BDEW Codenummer's Bildungsvorschrift exempts
+GS1-issued GLNs, which is why `version_scope` deliberately does not check its
+digit, and the EIC scheme has no such carve-out.
+
+The stored value is `Eic`'s **canonical spelling** — trimmed and uppercase — for
+the reason the OBIS code is canonicalised: a checked column may be an identity
+column, and an identifier arriving in two spellings would be two readings that
+never supersede each other.
+
+Two checks, and where each stops is written down rather than implied. The hot
+table gets a `CHECK` for the *shape*; the check character is arithmetic over the
+other fifteen and no regular expression expresses it, so it is enforced on the
+write path. A row PostgreSQL accepts from another writer is well-shaped and not
+necessarily well-formed. A `value_check` this build does not recognise fails the
+write and renders a pattern nothing matches, rather than degrading the column to
+an unconstrained one — which is the single outcome the declaration exists to
+rule out.
+
+### Completeness had no verb
+
+It is one of the five things a caller usually wants, it has a documentation page,
+and an operator holding a terminal during an incident could not ask it. Now:
+
+```bash
+meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
+```
+
+`--month YYYY-MM` is the Bilanzierungsmonat, which is what the new
+`planner::bilanzierungsmonat` is for — cut at midnight local for electricity and
+at 06:00 for gas, `--sparte` choosing which. The flag decides where the *range*
+is cut; every row is still counted against its own `sparte`, so a table holding
+both commodities is reported once per commodity rather than once wrongly.
+`--seen-since` is a duration before the range, because `--month` leaves a caller
+with no start date to subtract from.
+
+It exits **zero** whatever it finds. A gap is a fact to triage; `status` is the
+check that fails, because a stranded row means query results are *wrong* rather
+than incomplete. `--format json` carries `channels_incomplete`,
+`channels_silent` and the range, for the monitoring check that wants an exit code
+from `jq`.
+
+### A completeness report could not be narrowed
+
+`series` and `readings` both take a MaLo-ID and both narrow by channel, by
+Messlokation and by any declared column. `completeness` took a range and nothing
+else, so the only way to ask about one meter was to compute the whole portfolio's
+report and filter the answer — a scan of everything for a question about one
+thing, and the question an operator asks first during an incident.
+
+`CompletenessQuery::malo`, `::obis` and `::column_eq` narrow it, and
+`meterstore completeness --malo … --obis …` from a shell. The predicate goes into
+**both** scans: the reported range and the `seen_since` roster. Drawn only over
+the range, a narrowed report would find every channel outside the narrowing
+missing from it and call each one silent.
+
+Identifiers are parsed and canonicalised at the call, so a mistyped MaLo-ID fails
+there rather than returning an empty report — which reads as *"this meter is
+fine"*, the same failure the write path parses to prevent.
+
+### A restatement in another unit read as no change at all
+
+`Displacement::value_changed` compared the two quantities' **numbers** and not
+their dimension, while the struct beside it carried the unit and its own
+documentation said why: *"a value without it is dimensionless"*. Gas is the
+commodity that makes that reachable — a delivery may hold Betriebsvolumen in m³
+or the converted energy in kWh, both legitimate, and a correction may switch. A
+reading restated from `100 m³` to `100 kWh` is the largest change a value can
+undergo, and it reported `value_changed() == false`: a caller gating its audit
+row on that predicate wrote nothing.
+
+`Displacement::quality_changed`'s first line also claimed it answered *"whether
+the quality changed while the quantity did not"*, which is not what it does and
+not what its § 60 Abs. 2 use wants. The predicate is unchanged; the sentence is.
+
+### A version scope could be built in a shape nothing else accepted
+
+`VersionScope::new` renders its period as `{year:04}`, which pads and does not
+truncate — so a year outside `0..=9999` came out as five characters or with a
+sign. Three places anchor on four digits: this constructor, `VersionScope::parse`
+(whose whole job is to accept *exactly* what `new` produces), and the hot table's
+`version_scope_canonical` CHECK. A scope built from a year outside the range was
+accepted by the first, refused by the second, and rejected by PostgreSQL at the
+write with a constraint name instead of a reason.
+
+`new` now names the range, and `parse` checks four **digits** rather than four
+characters — `"-100"` is four characters and parses as an `i32`.
+
+### Changed — breaking
+
+- **`metering` 0.21 is the floor.** `ObisCode::is_import` and `is_export` moved
+  to a by-value receiver upstream, being `const fn` derived from `direction()`;
+  `settings::ExtraColumn` gained a `check` field.
+- `check` and `values` on one extra column are refused: a closed vocabulary and
+  an open identifier scheme are two different claims about the same column.
+- **`session::calendar_udfs` is `session::sql_udfs`.** The set has held the OBIS
+  predicates for some time and now holds the EIC accessor as well, so the old
+  name described a third of what it returned.
+
+### Smaller, from the same pass
+
+- **`eic_regelzone(code)`** completes the EIC column: a Bilanzierungsgebiet's
+  Regelzone is position 4 of its code (BDEW *Anwendungshilfe EIC* v1.0 §2.2.2),
+  which is the grouping key of a MaBiS Summenzeitreihe and had needed a mapping
+  table. Null rather than an error for a string that is not an EIC — unlike
+  `obis_code`, the argument comes from a deployment column that may not be
+  declared `check = "EIC"`, and one row of free text must not take a report down.
+- **`planner::balancing_month_bounds` and `planner::bilanzierungsmonat`** —
+  `balancing_day_bounds` one period up, and the same range addressed by name.
+- The three session-derived `MeasurementSource` variants `metering` 0.21 added —
+  `ChargeDetailRecord`, `ClockAlignedMeterValue`, `DeviceLog` — needed no
+  encoder change, which is the property `encode_source` was written for. The
+  round-trip test now covers them anyway, `evse_id` both present and absent: a
+  `None` serialising to an absent key rather than a null would be a stored-shape
+  change nothing else would catch.
+- `meterstore init`'s template and the configuration documentation both show
+  `check = "EIC"`, so the two spellings of a declaration stay in step.
+- **A new integration suite runs the shape `CHECK` against a real server.**
+  PostgreSQL's regular expressions are POSIX rather than PCRE, and the EIC
+  pattern leans on bounded repetition and a trailing `-` inside a character
+  class — exactly where a dialect difference would hide and produce a
+  constraint that quietly admits everything. The suite reads the constraint
+  back out of `pg_constraint` and evaluates the **deployed** pattern in the
+  server, then asserts the seam in both directions: a badly-shaped code is
+  refused by the database, and a well-shaped one with a wrong check character
+  is *accepted* by it and refused by the write path.
+- **A DB constraint is created with the table, and the documentation now says
+  so.** `create_tables` is `CREATE TABLE IF NOT EXISTS`, so adding `values` or
+  `check` to a column of a deployment that has already created its table starts
+  the write-path validation and does not add the `CHECK`. Schema evolution does
+  not flag it either, by design: the declaration rides in Arrow field metadata,
+  which comparison ignores so that a vocabulary is not a schema change.
+- **A new end-to-end suite drives the completeness report through both tiers.**
+  The unit tests feed the roll-up hand-built daily rows, so what they cannot show
+  is that the aggregate behaves the way the roll-up assumes — which is precisely
+  where the missing-day bug lived. `completeness_end_to_end` writes real
+  deliveries with real holes in them and checks the report against days that were
+  never written.
+- The contract test against `metering`'s calendar now covers the month:
+  consecutive Bilanzierungsmonate abut with no gap for both boundaries, and the
+  twelve of them are exactly 365 × 24 hours — the two DST transitions cancel
+  over a year, which is what makes `date_trunc('month', balancing_day)` a safe
+  roll-up for an external engine.
+
+### Nothing changed on disk
+
+A checked column is a plain `Utf8` column carrying one more piece of Arrow field
+metadata, exactly as a coded column is — inert to schema evolution and to the
+cold tier. The three new SQL functions are functions, and the completeness fix
+changes an arithmetic, not a schema. No stored bytes moved.
+
+The **answers** changed, and that is the point: a completeness report over a
+range a channel did not fill will now say so, where it previously did not. A
+deployment alerting on `missing == 0` should expect findings it was not getting.
+
 ## [0.7.0] — 2026-08-30
 
 An audit of the seams where this crate meets its dependencies, one setting fewer,

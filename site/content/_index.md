@@ -92,7 +92,9 @@ row and picks the day that commodity is actually settled on.
 
 An external engine has neither function, and the Gastag has no single portable
 SQL spelling, so every row also stores its `balancing_day`. Reading the Iceberg
-files directly needs a `GROUP BY` and no calendar arithmetic.
+files directly needs a `GROUP BY` and no calendar arithmetic — and because a
+Bilanzierungsmonat is a whole number of balancing days,
+`date_trunc('month', balancing_day)` gives the settlement month too.
 
 ## What you get that a general lakehouse does not
 

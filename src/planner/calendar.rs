@@ -40,13 +40,15 @@
 //! 00:00 for Strom and 01.06 **06:00** to 01.07 **06:00** for Gas. That is what
 //! [`balancing_month`] returns, and it is the month an MSCONS version scope is
 //! keyed to — see [`VersionScope`](crate::version::VersionScope).
+//! [`balancing_month_bounds`] gives it as a half-open UTC range, and
+//! [`bilanzierungsmonat`] that range addressed by name — *"Juni 2026"*.
 //!
 //! [`DayBoundary`]: metering::calendar::DayBoundary
 
 use metering::IntervalResolution;
 use metering::calendar::DayBoundary;
 use metering::interval::Sparte;
-use time::{Date, Duration, OffsetDateTime};
+use time::{Date, Duration, Month, OffsetDateTime};
 
 /// The daily boundary a commodity is balanced on.
 ///
@@ -130,6 +132,68 @@ pub fn balancing_month(instant: OffsetDateTime, sparte: Sparte) -> Date {
 pub fn balancing_day_bounds(day: Date, sparte: Sparte) -> (OffsetDateTime, OffsetDateTime) {
     let boundary = day_boundary(sparte);
     (boundary.day_start_utc(day), boundary.day_end_utc(day))
+}
+
+/// The half-open UTC bounds `[start, end)` of a **balancing month**.
+///
+/// [`balancing_day_bounds`] one period up: the month containing `day`, cut on
+/// the boundary the commodity is balanced on. A gas month is a whole number of
+/// Gastage — 01.06 06:00 to 01.07 06:00 — rather than a calendar month shifted,
+/// and neither is a fixed number of hours, because a month may contain a DST
+/// transition.
+///
+/// The range a settlement rerun or a completeness report over a settlement
+/// period is stated in.
+///
+/// ```rust
+/// use meterstore::planner::balancing_month_bounds;
+/// use metering::interval::Sparte;
+/// use time::macros::{date, datetime};
+///
+/// let (from, to) = balancing_month_bounds(date!(2026 - 06 - 15), Sparte::Strom);
+/// assert_eq!(from, datetime!(2026-05-31 22:00 UTC));
+/// assert_eq!(to, datetime!(2026-06-30 22:00 UTC));
+///
+/// // The same span, six hours later.
+/// let (gas_from, gas_to) = balancing_month_bounds(date!(2026 - 06 - 15), Sparte::Gas);
+/// assert_eq!(gas_from, datetime!(2026-06-01 4:00 UTC));
+/// assert_eq!(gas_to, datetime!(2026-07-01 4:00 UTC));
+/// ```
+#[must_use]
+pub fn balancing_month_bounds(day: Date, sparte: Sparte) -> (OffsetDateTime, OffsetDateTime) {
+    day_boundary(sparte).month_range_utc(day)
+}
+
+/// The **Bilanzierungsmonat** the market names — *"Juni 2026"* — as a half-open
+/// UTC range.
+///
+/// [`balancing_month_bounds`] addressed by name rather than by a date inside it.
+/// Both boundaries are EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3.1:
+/// Strom runs 00:00 to 00:00 and Gas 06:00 to 06:00.
+///
+/// ```rust
+/// use meterstore::planner::bilanzierungsmonat;
+/// use metering::interval::Sparte;
+/// use time::Month;
+/// use time::macros::datetime;
+///
+/// // March contains the spring-forward Sunday, so the month is an hour short
+/// // of 31 days — for both commodities.
+/// let (from, to) = bilanzierungsmonat(2026, Month::March, Sparte::Strom);
+/// assert_eq!(from, datetime!(2026-02-28 23:00 UTC));
+/// assert_eq!((to - from).whole_hours(), 31 * 24 - 1);
+///
+/// let (gas_from, gas_to) = bilanzierungsmonat(2026, Month::March, Sparte::Gas);
+/// assert_eq!(gas_from, datetime!(2026-03-01 5:00 UTC));
+/// assert_eq!((gas_to - gas_from).whole_hours(), 31 * 24 - 1);
+/// ```
+#[must_use]
+pub fn bilanzierungsmonat(
+    year: i32,
+    month: Month,
+    sparte: Sparte,
+) -> (OffsetDateTime, OffsetDateTime) {
+    day_boundary(sparte).bilanzierungsmonat(year, month)
 }
 
 /// How long a balancing day is — 23, 24 or 25 hours.

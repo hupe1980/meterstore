@@ -86,6 +86,22 @@ to 01.07 06:00, so `version_scope`'s `YYYY-MM` for a gas row is cut at 06:00 too
 A row at 02:00 local on 1 March carries February's scope. Reading it as a
 calendar month splits one operator-month in two.
 
+**And the stored column already answers that too.** A Bilanzierungsmonat is a
+whole number of balancing days, so its first day is the first of the month
+`balancing_day` falls in — which makes the monthly roll-up a `DATE` operation
+with no zone conversion, no DST reasoning and no dialect:
+
+```sql
+-- Right for gas and for electricity, on every engine.
+SELECT date_trunc('month', balancing_day) AS bilanzierungsmonat, SUM(value)
+FROM readings
+GROUP BY 1;
+```
+
+`date_trunc('month', "from")` is not the same expression, and is wrong for the
+same two reasons the daily one is. MeterStore's own SQL has
+`meter_balancing_month("from", sparte)`; the test suite pins the two to agree.
+
 At a DST transition the long and short gas days are the ones named after the
 **Saturday**, because the clocks change before the 06:00 boundary:
 

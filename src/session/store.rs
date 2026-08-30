@@ -487,6 +487,23 @@ impl MeterStore {
     /// a range can never make about itself: a channel that delivered **nothing**
     /// produces no rows, so it is absent from the report rather than reported as
     /// empty — the strongest form of incompleteness, and the invisible one.
+    ///
+    /// [`malo`](super::CompletenessQuery::malo),
+    /// [`obis`](super::CompletenessQuery::obis) and
+    /// [`column_eq`](super::CompletenessQuery::column_eq) narrow it, in the scan
+    /// rather than in the answer — a question about one meter should not cost a
+    /// scan of the portfolio.
+    ///
+    /// # The range is the whole of what is judged
+    ///
+    /// Every balancing day between `from` and `to` counts, including days the
+    /// channel delivered nothing on — which is what makes the report a check
+    /// rather than a summary of what arrived.
+    ///
+    /// So a range reaching past the last delivery says so: run mid-month over a
+    /// whole month, it reports the remainder as missing. Ask about a period that
+    /// is over, or set `to` to the last settled instant. Consulting a clock
+    /// instead would make one query answer differently over time.
     pub fn completeness(
         &self,
         from: time::OffsetDateTime,

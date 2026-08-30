@@ -95,7 +95,8 @@
 //! the neighbouring Bilanzierungstag — six hours a day, every day — so the
 //! bucketing and the expected interval count both follow the row's Sparte, in
 //! SQL through `meter_balancing_day` and in Rust through
-//! [`planner::balancing_day`].
+//! [`planner::balancing_day`]. The month is the same choice one period up —
+//! `meter_balancing_month` and [`planner::balancing_month`].
 //!
 //! The boundary carries up to the **month**, which is the market's own rule:
 //! EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3.1 defines the gas
@@ -115,8 +116,17 @@
 //! store that accepted eleven arbitrary digits would throw that away at the one
 //! point it still mattered.
 //!
+//! A deployment's own columns get the same treatment when they hold an
+//! identifier. [`eic_column`] declares one whose values must parse as an
+//! [`Eic`] — the ENTSO-E code a Bilanzkreis is addressed by, whose **check
+//! character** has none of the BDEW Codenummer's GS1 carve-out. Values are
+//! stored canonicalised, so such a column may sit in the merge key without two
+//! spellings becoming two readings.
+//!
 //! [`MaloId`]: metering::ids::MaloId
 //! [`MeloId`]: metering::ids::MeloId
+//! [`Eic`]: metering::ids::Eic
+//! [`eic_column`]: crate::config::eic_column
 //!
 //! ## Tiers and surfaces
 //!
@@ -134,9 +144,9 @@
 //! readily as one table.
 //!
 //! And a command line, behind `cli`: [`cli`] is `meterstore init`, `check`,
-//! `create`, `status`, `archive`, `maintain`, `query` and `serve` over the same
-//! public API, for the questions an operator asks during an incident and the
-//! archival loop a deployment has to run somewhere.
+//! `create`, `status`, `archive`, `maintain`, `query`, `completeness` and
+//! `serve` over the same public API, for the questions an operator asks during
+//! an incident and the archival loop a deployment has to run somewhere.
 //!
 //! [`Settings::connect`]: crate::settings::Settings::connect
 //!
@@ -231,7 +241,10 @@ pub use cold::IcebergRestCatalog;
 #[cfg(feature = "s3tables")]
 pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
-pub use config::{CHECK_VALUES_KEY, TableConfig, TimeModel, ValidatedTableConfig, coded_column};
+pub use config::{
+    CHECK_VALUES_KEY, TableConfig, TimeModel, VALUE_CHECK_EIC, VALUE_CHECK_KEY,
+    ValidatedTableConfig, coded_column, declared_value_check, eic_column,
+};
 pub use encode::{StoredReadings, canonical_obis, parse_malo};
 pub use erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
 pub use error::{Error, Result};
@@ -239,8 +252,8 @@ pub use evolution::{Compatibility, SchemaChange};
 pub use hot::PostgresHot;
 pub use planner::{
     ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
-    balancing_day, balancing_day_bounds, balancing_day_length, balancing_month, day_boundary,
-    expected_intervals_in_balancing_day,
+    balancing_day, balancing_day_bounds, balancing_day_length, balancing_month,
+    balancing_month_bounds, bilanzierungsmonat, day_boundary, expected_intervals_in_balancing_day,
 };
 pub use session::{
     AUTHORITATIVE_ATTEMPTS, Completeness, CompletenessQuery, HotWriter, Maintenance,
@@ -261,7 +274,8 @@ pub mod prelude {
     pub use crate::cold::S3TablesCatalog;
     pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
     pub use crate::config::{
-        CHECK_VALUES_KEY, TableConfig, TimeModel, ValidatedTableConfig, coded_column,
+        CHECK_VALUES_KEY, TableConfig, TimeModel, VALUE_CHECK_EIC, VALUE_CHECK_KEY,
+        ValidatedTableConfig, coded_column, declared_value_check, eic_column,
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
     pub use crate::erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
@@ -270,7 +284,8 @@ pub mod prelude {
     pub use crate::hot::PostgresHot;
     pub use crate::planner::{
         ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
-        balancing_day, balancing_day_bounds, balancing_day_length, balancing_month, day_boundary,
+        balancing_day, balancing_day_bounds, balancing_day_length, balancing_month,
+        balancing_month_bounds, bilanzierungsmonat, day_boundary,
         expected_intervals_in_balancing_day,
     };
     pub use crate::session::{

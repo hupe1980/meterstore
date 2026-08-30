@@ -17,9 +17,11 @@
 mod archival_end_to_end;
 mod calendar_delegation;
 mod catalog_facade;
+mod checked_columns;
 mod cli;
 mod cold_partitioning;
 mod commodities;
+mod completeness_end_to_end;
 mod containers;
 mod displacement;
 mod erasure;

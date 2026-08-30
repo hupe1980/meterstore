@@ -22,4 +22,6 @@ pub use series::{ResolvedSeries, SeriesQuery};
 pub use store::{AUTHORITATIVE_ATTEMPTS, AppendOutcome, HotWriter, MeterStore, MeterStoreBuilder};
 pub use surface::SqlSurface;
 pub use system::{ConfigEntry, SystemTables, TableStatus, register_all as register_system_tables};
-pub use udf::all as calendar_udfs;
+/// Every SQL function this crate registers — the calendar, OBIS and EIC ones —
+/// ready for a caller's own `SessionContext`.
+pub use udf::all as sql_udfs;

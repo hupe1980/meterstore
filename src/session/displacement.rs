@@ -165,22 +165,34 @@ impl Displacement {
         }
     }
 
-    /// Whether the quantity changed, ignoring version and quality.
+    /// Whether the **quantity** changed, ignoring version and quality.
     ///
     /// A redelivery that restates the same number under a new version is a
     /// correction in the MSCONS sense and *not* a change in the settled amount.
     /// Callers that reconcile money care about the difference.
+    ///
+    /// # The unit is part of the quantity
+    ///
+    /// Comparing the numbers alone would call `100 m³` and `100 kWh` unchanged,
+    /// and for gas both are legitimate: a delivery may carry Betriebsvolumen or
+    /// the converted energy, and a correction may switch. [`StoredValue::unit`]
+    /// carries the dimension for that reason, so this reads it.
     pub fn value_changed(&self) -> bool {
         match &self.superseded {
-            Some(prior) => self.effect.changed_current_value() && prior.value != self.written.value,
+            Some(prior) => {
+                self.effect.changed_current_value()
+                    && (prior.value != self.written.value || prior.unit != self.written.unit)
+            }
             None => self.effect.changed_current_value(),
         }
     }
 
-    /// Whether the quality changed while the quantity did not.
+    /// Whether the **quality** changed, ignoring the quantity.
     ///
     /// The § 60 Abs. 2 shape: a substitute value replaced by a measured one,
-    /// where the number may be identical and the obligation still discharges.
+    /// where the number may be identical and the obligation still discharges —
+    /// so this does not require the quantity to have stayed the same. Pair it
+    /// with [`value_changed`](Self::value_changed) to tell the two apart.
     pub fn quality_changed(&self) -> bool {
         match &self.superseded {
             Some(prior) => {
@@ -277,6 +289,25 @@ mod tests {
         );
         assert!(d.quality_changed());
         assert!(!d.value_changed());
+    }
+
+    #[test]
+    fn a_restatement_in_another_unit_is_a_change_in_the_quantity() {
+        // Gas is the one commodity that legitimately holds either side of the
+        // Brennwert conversion, so a correction may restate a volume as energy.
+        // Comparing the numbers alone would call 100 m³ and 100 kWh unchanged —
+        // the largest change a reading can undergo, and the one a number-only
+        // comparison is blindest to.
+        let mut restated = value(100, 20_260_728_000_002, QualityFlag::Measured);
+        restated.unit = MeasurementUnit::CubicMetre;
+
+        let d = displacement(
+            Effect::Superseded,
+            Some(value(100, 20_260_720_000_001, QualityFlag::Measured)),
+            restated,
+        );
+        assert!(d.value_changed(), "the dimension is part of the quantity");
+        assert!(!d.quality_changed());
     }
 
     #[test]

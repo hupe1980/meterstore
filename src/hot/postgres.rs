@@ -198,6 +198,21 @@ impl PostgresHot {
                         list = sql_code_list(&codes),
                     )
                 })
+                // A checked-identifier column (`config::eic_column`) gets the
+                // half of its rule a regular expression can carry: the shape.
+                // The check *character* is arithmetic over the other fifteen, so
+                // the write path enforces that half — a row PostgreSQL accepts
+                // from another writer is well-shaped, not necessarily well-formed.
+                .or_else(|| {
+                    crate::config::declared_value_check(f).map(|kind| {
+                        format!(
+                            " CONSTRAINT {constraint:?} CHECK ({col:?} ~ '{pattern}')",
+                            constraint = format!("{}_shape", f.name()),
+                            col = f.name(),
+                            pattern = value_check_pattern(kind),
+                        )
+                    })
+                })
                 .unwrap_or_default();
             extra_ddl.push_str(&format!(
                 "{:?} {} {}{},\n                ",
@@ -1453,6 +1468,23 @@ fn key_column<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a 
     Ok(column.value(row))
 }
 
+/// The POSIX regular expression for a declared value check's *shape*.
+///
+/// The EIC one is the ENTSO-E Reference Manual's own alphabet: sixteen
+/// characters of `0-9`, `A-Z` or `-`, an uppercase letter in position 3 (the
+/// object type), and a check character that is never `-` — §5.2 forbids it, so
+/// a body computing to one is never issued a code.
+///
+/// An unknown kind renders a pattern nothing matches. A column declared as
+/// checked must not become an unconstrained one because this build did not
+/// recognise the declaration; the write path refuses it too, so the two agree.
+fn value_check_pattern(kind: &str) -> &'static str {
+    match kind {
+        crate::config::VALUE_CHECK_EIC => "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$",
+        _ => "$^",
+    }
+}
+
 /// Render a domain code list as a SQL `IN` list.
 ///
 /// The codes come from `metering` rather than being spelled out in the DDL, so a
@@ -2244,6 +2276,52 @@ mod tests {
             crate::watermark::align_to_step(datetime!(2026-07-20 13:47:03 UTC), Duration::DAY),
             datetime!(2026-07-20 00:00 UTC)
         );
+    }
+
+    #[test]
+    fn the_eic_shape_pattern_admits_what_metering_parses_and_no_less() {
+        // The DDL check is a regular expression over the *shape*; the check
+        // character is arithmetic and is enforced on the write path. So the
+        // pattern must not be narrower than the domain type — a code PostgreSQL
+        // refuses and `metering` accepts is a row that cannot be stored at all.
+        let pattern = value_check_pattern(crate::config::VALUE_CHECK_EIC);
+        let matches = |code: &str| {
+            // The pattern is `^..$`-anchored and uses only classes and counts,
+            // so it is checked here against the same alphabet PostgreSQL would.
+            let body: Vec<char> = code.chars().collect();
+            let ok_char = |c: char| c.is_ascii_digit() || c.is_ascii_uppercase() || c == '-';
+            body.len() == 16
+                && body.iter().copied().all(ok_char)
+                && body[2].is_ascii_uppercase()
+                && body[15] != '-'
+        };
+        assert_eq!(pattern, "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$");
+
+        for valid in [
+            "10X168Y4E6H0041Z",
+            "10X---ENTSOE---L",
+            "11XBK0000000001A",
+            "11YN000000000016",
+        ] {
+            assert!(valid.parse::<metering::ids::Eic>().is_ok(), "{valid}");
+            assert!(matches(valid), "the DDL would refuse {valid}");
+        }
+        for bad in [
+            "11XBK0000000001",  // fifteen characters
+            "11xbk0000000001a", // the DDL sees what was stored, not what was typed
+            "11-BK0000000001A", // position 3 is the object type, and it is a letter
+            "11XBK0000000001-", // §5.2 forbids `-` as the check character
+        ] {
+            assert!(!matches(bad), "the DDL would accept {bad}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_value_check_renders_a_pattern_nothing_matches() {
+        // A column declared as checked must not become an unconstrained one
+        // because this build did not recognise the declaration. The write path
+        // refuses it too, so the two halves agree.
+        assert_eq!(value_check_pattern("IBAN"), "$^");
     }
 
     #[test]

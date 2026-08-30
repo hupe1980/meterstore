@@ -240,6 +240,19 @@ impl VersionScope {
         if !(1..=12).contains(&month) {
             return Err(Error::config(format!("month {month} out of range 1..=12")));
         }
+        // Four digits, because that is what the canonical form is and what three
+        // other places anchor on: [`parse`](Self::parse), the hot table's
+        // `version_scope_canonical` CHECK, and every reader that splits the
+        // stored string. `{year:04}` pads but does not truncate, so a year
+        // outside this range renders as five characters or with a sign — a value
+        // this constructor accepted, `parse` would refuse, and PostgreSQL would
+        // reject at the write with a constraint name rather than a reason.
+        if !(0..=9999).contains(&year) {
+            return Err(Error::config(format!(
+                "year {year} is outside 0..=9999, which is what a canonical scope's \
+                 YYYY-MM period can hold"
+            )));
+        }
         Ok(Self(format!("{operator}:{year:04}-{month:02}")))
     }
 
@@ -375,10 +388,14 @@ impl VersionScope {
         let canonical = operator
             .parse::<BdewCode>()
             .is_ok_and(|code| code.as_str() == operator);
+        // Four *digits*, not four characters: `"-100"` is four characters and
+        // parses as an `i32`, and it is not something `new` can produce nor
+        // something the stored column's `CHECK` accepts.
         if !canonical
             || year.len() != 4
+            || !year.bytes().all(|b| b.is_ascii_digit())
             || month.len() != 2
-            || year.parse::<i32>().is_err()
+            || !month.bytes().all(|b| b.is_ascii_digit())
             || !month.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
         {
             return Err(malformed());
@@ -498,6 +515,45 @@ impl ScopedVersion {
 mod tests {
     use super::*;
     use time::Duration;
+
+    #[test]
+    fn a_scope_is_exactly_what_the_stored_column_can_hold() {
+        // Three places anchor on `YYYY-MM` with four digits: this constructor,
+        // `parse`, and the hot table's `version_scope_canonical` CHECK. A year
+        // outside 0..=9999 renders as five characters or with a sign, which the
+        // other two refuse — so it has to fail here, where the message can say
+        // why.
+        assert!(VersionScope::new("9900000000001", 2026, 7).is_ok());
+        assert!(VersionScope::new("9900000000001", 0, 1).is_ok());
+        assert!(VersionScope::new("9900000000001", 9999, 12).is_ok());
+
+        for year in [-1, -100, 10_000, i32::MAX, i32::MIN] {
+            let err = VersionScope::new("9900000000001", year, 7)
+                .expect_err("outside the canonical form")
+                .to_string();
+            assert!(err.contains("0..=9999"), "{year}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_exactly_what_new_produces() {
+        // The invariant `parse` documents. `"-100"` is four characters and
+        // parses as an `i32`, which is why the check is on *digits*.
+        let canonical = VersionScope::new("9900000000001", 2026, 7).unwrap();
+        assert_eq!(
+            VersionScope::parse(canonical.as_str().to_string()).unwrap(),
+            canonical
+        );
+        for bad in [
+            "9900000000001:-100-07",
+            "9900000000001:20260-07",
+            "9900000000001:2026-7",
+            "9900000000001:2026-0a",
+            "9900000000001:202a-07",
+        ] {
+            assert!(VersionScope::parse(bad).is_err(), "{bad}");
+        }
+    }
 
     /// A real BDEW Marktpartner-ID: thirteen digits, `99` = BDEW/Strom.
     const OPERATOR: &str = "9900000000001";

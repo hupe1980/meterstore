@@ -355,7 +355,8 @@ SELECT meter_local_day("from") AS day, SUM(value) FROM readings GROUP BY 1;
 | `meter_local_day(ts)` | The Berlin calendar day, as `Date32` |
 | `meter_gas_day(ts)` | The **Gastag** — 06:00 to 06:00 local |
 | `meter_balancing_day(ts, sparte)` | Whichever of the two the commodity uses |
-| `meter_local_month(ts)` | The Berlin month, as its first day |
+| `meter_local_month(ts)` | The Berlin calendar month, as its first day |
+| `meter_balancing_month(ts, sparte)` | The **Bilanzierungsmonat** — the same choice one period up |
 | `meter_expected_intervals(day, resolution[, sparte])` | 96 normally, 92 in spring, 100 in autumn |
 
 Every row also stores its balancing day, so `GROUP BY balancing_day` gives the
@@ -409,10 +410,33 @@ defines the Bilanzierungsmonat Juni 2021 as 01.06 00:00 to 01.07 00:00 for Strom
 and 01.06 **06:00** to 01.07 **06:00** for Gas, so a gas month is a whole number
 of Gastage rather than a calendar month shifted.
 
-`planner::balancing_month` is the Rust form, and it is what an MSCONS version
-scope is keyed to — see
-[the storage model](@/docs/storage-model.md). In Rust the mapping from a
-commodity to its boundary is `planner::day_boundary`, and everything below it is
+`meter_balancing_month(ts, sparte)` is `meter_balancing_day` one period up.
+`meter_local_month` is the *calendar* month for every row, so grouping a gas
+Lastgang by it books six hours into the neighbouring settlement month twelve
+times a year, with totals that still look plausible.
+
+```sql
+SELECT sparte,
+       meter_balancing_month("from", sparte) AS bilanzierungsmonat,
+       SUM(value)
+FROM readings
+GROUP BY 1, 2;
+```
+
+An interval at 02:00 local on 1 March belongs to **February** for gas and to
+March for everything else.
+
+An external engine has no such function and needs none: a Bilanzierungsmonat is
+a whole number of balancing days, so `date_trunc('month', balancing_day)` over
+the stored column gives the same buckets with no calendar reasoning
+([external engines](@/docs/interop.md#the-gas-day-trap)).
+
+In Rust: `planner::balancing_month` is the month as its first day,
+`planner::balancing_month_bounds` its half-open UTC range, and
+`planner::bilanzierungsmonat(year, month, sparte)` that range addressed the way
+the market addresses it — *"Juni 2026"*. It is the month an MSCONS version scope
+is keyed to (see [the storage model](@/docs/storage-model.md)). The mapping from
+a commodity to its boundary is `planner::day_boundary`; everything below it is
 `metering`'s own `DayBoundary`.
 
 ## Confining a session
@@ -492,7 +516,8 @@ SELECT malo_id, SUM(value)
 
 | Function | |
 |---|---|
-| `obis_is_import` / `obis_is_export` | Direction. Value group **C**, and only for electricity |
+| `obis_direction` | `'IMPORT'`, `'EXPORT'` or **null**. Value group **C**, and only for electricity |
+| `obis_is_import` / `obis_is_export` | The same rule as two booleans, for a `WHERE` clause |
 | `obis_is_reactive` | Blindarbeit — C = 3…8, the four quadrants included |
 | `obis_is_lastgang` / `obis_is_zaehlerstand` / `obis_is_vorschub` / `obis_is_maximum` | Messart. D = 29 / 8 / 9 / 6 |
 | `obis_is_fehlerregister` / `obis_is_total_register` | E = 63 is a fault counter; E = 0 is the total |
@@ -503,12 +528,59 @@ SELECT malo_id, SUM(value)
 it is false for a gas code without being told — C is a *Messgröße* for gas, not a
 direction. A second source for the medium could disagree with the one in the code.
 
+### `obis_direction` is the primitive, and the two booleans are derived
+
+**Both predicates are false for a register that has no direction at all** —
+Blindarbeit, a gas volume, a Zustandszahl — and false is also what
+`obis_is_import` says about a feed-in register. So `NOT obis_is_import(obis_code)`
+does not mean *export*: it sweeps the undirected registers in with it, which is
+how a Bezug total ends up carrying kvarh.
+
+`obis_direction` is the primitive the two are derived from, and the three-way
+grouping it enables is the shape a bidirectional Zählpunkt wants:
+
+```sql
+SELECT COALESCE(obis_direction(obis_code), 'UNDIRECTED') AS direction,
+       SUM(value)
+FROM readings
+GROUP BY 1;
+```
+
+The strings are `metering::interval::Direction`'s own — `IMPORT`, `EXPORT` —
+which is also its `serde` tag, so a value from this function and one out of a
+JSON payload compare literally. Use the booleans in a `WHERE` clause, where a
+three-valued column would need an `IS NOT DISTINCT FROM`.
+
+`metering::aggregation::sum_by_direction` is the Rust counterpart: it folds a
+series' intervals into the same three buckets.
+
 **There is deliberately no `obis_is_energy`.** It would be a composition — not
 reactive, not a maximum, not a fault counter — and composing a domain rule in the
 storage layer is how a second implementation starts. Spell it out as above, where
 a reader can see which three rules it rests on. The total-vs-tariff rule stays in
 application code for the same reason: it describes two registers' coverage, not
 one row.
+
+## The other stored identifier
+
+A deployment declaring a `bilanzierungsgebiet` column ([checked
+columns](@/docs/storage-model.md#checked-columns)) can group by its **Regelzone**
+without a mapping table:
+
+```sql
+SELECT eic_regelzone(bilanzierungsgebiet) AS regelzone, SUM(value)
+FROM readings
+GROUP BY 1;
+```
+
+`'TENNET'`, `'AMPRION'`, `'FIFTY_HERTZ'`, `'TRANSNET_BW'`, or null. The rule is
+BDEW *Anwendungshilfe Energy Identification Codes* v1.0 §2.2.2: a
+Bilanzierungsgebiet is a `Y` code under the German LIO `11`, and position 4 is
+the Regelzone letter.
+
+Null for a Bilanzkreis, for another issuing office's code, and for a string that
+is not an EIC — the argument comes from a deployment column that may not be
+declared `check = "EIC"`, so one row of free text must not take a report down.
 
 ## Several tables in one session
 

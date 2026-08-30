@@ -36,6 +36,10 @@
 //! which is small: a month of 100 k meters is ~3 M rows in and ~3 M rows out at
 //! day granularity, and the roll-up to one row per channel happens in Rust,
 //! where the calendar lives.
+//!
+//! The roll-up walks the **range's** balancing days rather than the aggregate's
+//! rows: a `GROUP BY` yields no group for a day with nothing in it, and a day
+//! with no rows is a day whose whole expectation is missing.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -60,6 +64,12 @@ use crate::encode::schema::col as column;
 use crate::error::{Error, Result};
 
 /// The completeness of one channel over a queried range.
+///
+/// One row per *reading* and per *grid*: see [`identity`](Self::identity) and
+/// [`resolution`](Self::resolution) for why neither may be folded away.
+///
+/// The range is judged in full — a balancing day the channel delivered nothing
+/// on counts as a day whose whole expectation is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completeness {
     /// Marktlokation.
@@ -100,6 +110,10 @@ pub struct Completeness {
     /// aggregate yields its groups in no defined order.
     pub resolution: Option<String>,
     /// Intervals the calendar says the range should hold.
+    ///
+    /// Every balancing day of the range, not only the days that produced rows: a
+    /// day the channel delivered nothing on is a day whose whole expectation is
+    /// [`missing`](Self::missing).
     pub expected: u64,
     /// Intervals actually stored.
     pub actual: u64,
@@ -314,6 +328,7 @@ fn daily_plan(
     discriminators: &[String],
     from: OffsetDateTime,
     to: OffsetDateTime,
+    narrowing: &[(String, ScalarValue)],
 ) -> DfResult<datafusion::logical_expr::LogicalPlan> {
     use datafusion::functions_aggregate::expr_fn::count;
 
@@ -329,11 +344,12 @@ fn daily_plan(
         datafusion::datasource::provider_as_source(resolved),
         None,
     )?
-    .filter(
+    .filter(narrow(
         col(column::FROM)
             .gt_eq(ts(from))
             .and(col(column::FROM).lt(ts(to))),
-    )?
+        narrowing,
+    ))?
     .aggregate(
         {
             let mut keys = vec![
@@ -367,6 +383,20 @@ fn daily_plan(
     .build()
 }
 
+/// Conjoin a query's narrowing predicates onto a range filter.
+///
+/// The **same** list is applied to the reported range and to the roster window:
+/// a roster drawn without it would name channels the report cannot contain, and
+/// every one would come back as silent.
+///
+/// Names come from [`CompletenessQuery::column_eq`], which checks them against
+/// the store's declared columns.
+fn narrow(range: Expr, narrowing: &[(String, ScalarValue)]) -> Expr {
+    narrowing.iter().fold(range, |acc, (name, value)| {
+        acc.and(col(name).eq(lit(value.clone())))
+    })
+}
+
 /// The channels a range is expected to hold, drawn from an earlier window.
 ///
 /// One row per `(malo_id, obis_code, discriminators, sparte, resolution)` — the
@@ -378,6 +408,7 @@ fn roster_plan(
     discriminators: &[String],
     since: OffsetDateTime,
     until: OffsetDateTime,
+    narrowing: &[(String, ScalarValue)],
 ) -> DfResult<datafusion::logical_expr::LogicalPlan> {
     let ts = |t: OffsetDateTime| lit(crate::encode::schema::timestamp_scalar(t));
 
@@ -386,11 +417,12 @@ fn roster_plan(
         datafusion::datasource::provider_as_source(resolved),
         None,
     )?
-    .filter(
+    .filter(narrow(
         col(column::FROM)
             .gt_eq(ts(since))
             .and(col(column::FROM).lt(ts(until))),
-    )?
+        narrowing,
+    ))?
     // Group keys only, no measure: what is wanted is the *set* of channels, and
     // counting them would make the reference window as expensive as the reported
     // one for an answer nothing reads.
@@ -410,6 +442,22 @@ fn roster_plan(
     .build()
 }
 
+/// What one completeness run is asked for, beyond the table it reads.
+///
+/// A struct rather than four parameters: three of them are instants or
+/// instant-ish, which a positional call would happily transpose.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Request<'a> {
+    /// Range start, inclusive.
+    pub from: OffsetDateTime,
+    /// Range end, exclusive.
+    pub to: OffsetDateTime,
+    /// The reference window a roster of channels is drawn from, if asked for.
+    pub seen_since: Option<OffsetDateTime>,
+    /// Equality predicates conjoined onto both scans.
+    pub narrowing: &'a [(String, ScalarValue)],
+}
+
 /// Run the aggregate and roll it up to one row per channel.
 ///
 /// `seen_since`, when set, is the start of a **reference window** ending at
@@ -421,10 +469,14 @@ pub(crate) async fn compute(
     resolved: Arc<dyn TableProvider>,
     table: &str,
     discriminators: &[String],
-    from: OffsetDateTime,
-    to: OffsetDateTime,
-    seen_since: Option<OffsetDateTime>,
+    request: Request<'_>,
 ) -> Result<Vec<Completeness>> {
+    let Request {
+        from,
+        to,
+        seen_since,
+        narrowing,
+    } = request;
     if to <= from {
         return Err(Error::config(format!(
             "completeness range end {to} must be after start {from}"
@@ -440,7 +492,14 @@ pub(crate) async fn compute(
         )));
     }
 
-    let plan = daily_plan(Arc::clone(&resolved), table, discriminators, from, to)?;
+    let plan = daily_plan(
+        Arc::clone(&resolved),
+        table,
+        discriminators,
+        from,
+        to,
+        narrowing,
+    )?;
     let physical = state.create_physical_plan(&plan).await?;
     let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
@@ -452,7 +511,7 @@ pub(crate) async fn compute(
     let mut rows = roll_up(daily, from, to);
 
     if let Some(since) = seen_since {
-        let plan = roster_plan(resolved, table, discriminators, since, from)?;
+        let plan = roster_plan(resolved, table, discriminators, since, from, narrowing)?;
         let physical = state.create_physical_plan(&plan).await?;
         let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
@@ -585,30 +644,64 @@ fn silent_rows(
 /// How many intervals a range should hold for a channel that delivered none, and
 /// the first balancing day it is short.
 ///
-/// Summed per balancing day exactly as [`roll_up`] does, so a silent channel's
-/// `expected` is the number a channel delivering everything would have reported
-/// — including the 92- and 100-interval DST days, and the Gastag for gas.
+/// The same [`expectations`] walk [`roll_up`] uses, so a silent channel's
+/// `expected` is what a channel delivering everything would have reported —
+/// including the 92- and 100-interval DST days, and the Gastag for gas.
 fn expected_over_range(
     from: OffsetDateTime,
     to: OffsetDateTime,
     resolution: Option<&str>,
     sparte: Sparte,
 ) -> (u64, Option<Date>) {
+    let days = expectations(from, to, resolution, sparte);
+    let expected = days.iter().map(|(_, n)| n).sum();
+    // Every day is short, because nothing was delivered — so the first day that
+    // expects anything is the first gap. A day expecting nothing is not one:
+    // that is an unmeasurable grid, not a shortfall.
+    let first_gap = days.iter().find(|(_, n)| *n > 0).map(|(day, _)| *day);
+    (expected, first_gap)
+}
+
+/// Every balancing day the range touches, with what one is expected to hold.
+///
+/// **The one enumeration of a range's days**, shared by [`roll_up`] and
+/// [`expected_over_range`]: a second walk is a second chance to disagree about
+/// what a range contains.
+///
+/// Ascending, and inclusive of both end days — a day partly covered by the range
+/// is expected to hold only the covered part ([`expected_in_day`]), which is not
+/// the same as being left out.
+fn expectations(
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    resolution: Option<&str>,
+    sparte: Sparte,
+) -> Vec<(Date, u64)> {
+    day_span(from, to, sparte)
+        .into_iter()
+        .map(|day| (day, expected_in_day(day, resolution, sparte, from, to)))
+        .collect()
+}
+
+/// Every balancing day the range touches, ascending.
+///
+/// Depends on the commodity and on nothing else — the days are the calendar's,
+/// and only how many intervals each holds is the grid's. Separating the two is
+/// what lets [`roll_up`] compute the span once for a channel and the
+/// expectations once per grid, rather than either of them once per reported row.
+fn day_span(from: OffsetDateTime, to: OffsetDateTime, sparte: Sparte) -> Vec<Date> {
     let mut day = balancing::balancing_day(from, sparte);
+    // `to` is exclusive, so the last day is the one holding the final instant
+    // inside the range rather than the one `to` itself falls on.
     let last = balancing::balancing_day(to - time::Duration::nanoseconds(1), sparte);
 
-    let mut expected = 0u64;
-    let mut first_gap = None;
+    let mut out = Vec::new();
     while day <= last {
-        let n = expected_in_day(day, resolution, sparte, from, to);
-        expected += n;
-        if n > 0 && first_gap.is_none() {
-            first_gap = Some(day);
-        }
+        out.push(day);
         let Some(next) = day.next_day() else { break };
         day = next;
     }
-    (expected, first_gap)
+    out
 }
 
 /// Read the aggregate's output back into typed rows.
@@ -675,145 +768,249 @@ fn decode_daily(batch: &RecordBatch, discriminators: &[String]) -> Result<Vec<Da
 ///
 /// The expectation is asked of `metering` once per (day, resolution, sparte). A
 /// day partly outside the queried range is expected to hold only the part inside
-/// it, which is what makes a range that is not day-aligned report honestly rather
-/// than claiming a gap at each end.
+/// it, so a range that is not day-aligned does not claim a gap at each end.
 ///
-/// The channel key carries the Sparte **and the declared resolution**, because a
-/// row is measured against an expectation and both of them decide which one
-/// applies.
+/// # Every day of the range
 ///
-/// A measuring point has one commodity, so the Sparte normally changes nothing —
-/// but if a channel ever held two, folding them into one row would measure gas
-/// rows against the electricity day.
+/// Including days that produced no rows: the aggregate is a `GROUP BY` and an
+/// empty day yields no group, so summing over the days that are present would
+/// measure a channel against the days it happened to deliver. A meter that
+/// stopped on the 2nd of March would report the month complete.
 ///
-/// The resolution is the same argument and less hypothetical: a meter converted
-/// from an hourly profile to a quarter-hourly one mid-month holds both, and it is
-/// the *grid* that says whether a day of 24 values is complete or 72 short. Split
-/// by grid, each row measures its own days and a clean conversion comes back as
-/// two complete rows.
+/// [`expectations`] is the one enumeration, shared with [`expected_over_range`].
+///
+/// # Which grid an absent day belongs to
+///
+/// The channel key carries the Sparte **and** the declared resolution. A
+/// measuring point has one commodity, so the Sparte normally changes nothing —
+/// but a channel that held two would measure its gas rows against the
+/// electricity day. The resolution is less hypothetical: a meter converted from
+/// an hourly profile to a quarter-hourly one holds both, and it is the *grid*
+/// that says whether a day of 24 values is complete or 72 short.
+///
+/// So an absent day has to be charged to one of them. It goes to the grid **last
+/// in force before it**, and a gap preceding the channel's first delivery to the
+/// first grid it used. Charging it to every grid would report a clean conversion
+/// as two badly incomplete halves. For a single-grid channel this is simply "the
+/// whole range".
 fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Vec<Completeness> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    /// `(malo_id, obis_code, identity, sparte, resolution)` — what one reported
-    /// row describes.
+    /// `(malo_id, obis_code, identity, sparte)` — the unit an **absent** day is
+    /// attributed within.
+    ///
+    /// Everything that decides which *calendar* applies, and nothing that
+    /// decides how many intervals a day holds. Sparte is in here rather than
+    /// alongside the resolution because it fixes the day span itself: two
+    /// commodities on one channel do not share a set of days to attribute
+    /// between, they have different days.
     ///
     /// The Sparte enters as its canonical code rather than as the enum, because
     /// the maps are ordered — a `BTreeMap` keeps the report deterministic — and
-    /// `Sparte` is deliberately not `Ord`. The enum itself rides in the
-    /// accumulator, so nothing has to parse the code back.
-    type ChannelKey = (
-        String,
-        String,
-        Vec<(String, String)>,
-        &'static str,
-        Option<String>,
-    );
+    /// `Sparte` is deliberately not `Ord`. The enum itself rides in the cell, so
+    /// nothing has to parse the code back.
+    type Attribution = (String, String, Vec<(String, String)>, &'static str);
+    /// An [`Attribution`] plus the grid: one reported row.
+    type ChannelKey = (Attribution, Option<String>);
 
-    // Key by channel; within a channel, days are folded together.
-    struct Accumulator {
+    /// One (channel, grid): its totals, and what it delivered on each day.
+    struct Cell {
         identity: Vec<(String, String)>,
         sparte: Sparte,
         resolution: Option<String>,
-        expected: u64,
         actual: u64,
-        missing: u64,
-        surplus: u64,
-        first_gap: Option<Date>,
         substituted: u64,
         not_billable: u64,
+        /// Days this grid produced rows on, and how many. Bounded by the data
+        /// rather than by the range, so a decade-long report over a channel that
+        /// delivered a week holds a week.
+        delivered: BTreeMap<Date, u64>,
     }
 
-    let mut by_channel: BTreeMap<ChannelKey, Accumulator> = BTreeMap::new();
-    // Days are visited once per quality flag, so the expectation must only be
-    // added the first time a (channel, day) pair is seen.
-    let mut counted: std::collections::BTreeSet<(ChannelKey, Date)> = Default::default();
-    // A day is short only once every flag for it has been folded in, so gaps are
-    // decided after the fold rather than per row.
-    let mut per_day: BTreeMap<(ChannelKey, Date), (u64, u64)> = BTreeMap::new();
+    let mut cells: BTreeMap<ChannelKey, Cell> = BTreeMap::new();
+    // For each attribution, the grids that reported on each day.
+    //
+    // A **set**, not the first grid seen: the aggregate yields its groups in no
+    // defined order, and the grid in force after a day two grids both reported
+    // on decides who inherits the days nobody reported on. A gap that moves
+    // between rows with scan order is not one an operator can act on.
+    let mut reported: BTreeMap<Attribution, BTreeMap<Date, BTreeSet<Option<String>>>> =
+        BTreeMap::new();
 
     for row in daily {
-        let key: ChannelKey = (
+        let attribution: Attribution = (
             row.malo_id.clone(),
             row.obis_code.clone(),
             row.identity.clone(),
             row.sparte.as_str(),
-            row.resolution.clone(),
         );
-        let entry = by_channel.entry(key.clone()).or_insert(Accumulator {
+        let key: ChannelKey = (attribution.clone(), row.resolution.clone());
+
+        let cell = cells.entry(key).or_insert_with(|| Cell {
             identity: row.identity.clone(),
             sparte: row.sparte,
             resolution: row.resolution.clone(),
-            expected: 0,
             actual: 0,
-            missing: 0,
-            surplus: 0,
-            first_gap: None,
             substituted: 0,
             not_billable: 0,
+            delivered: BTreeMap::new(),
         });
-        entry.actual += row.actual;
-        entry.substituted += row.substituted;
-        entry.not_billable += row.not_billable;
+        cell.actual += row.actual;
+        cell.substituted += row.substituted;
+        cell.not_billable += row.not_billable;
+        // A day is visited once per quality flag, so its rows arrive in several
+        // pieces and the count is a sum rather than an assignment.
+        *cell.delivered.entry(row.day).or_insert(0) += row.actual;
 
-        let day_key = (key, row.day);
-        let expected = if counted.insert(day_key.clone()) {
-            let n = expected_in_day(row.day, row.resolution.as_deref(), row.sparte, from, to);
-            entry.expected += n;
-            n
-        } else {
-            0
-        };
-
-        let slot = per_day.entry(day_key).or_insert((0, 0));
-        slot.0 += row.actual;
-        slot.1 += expected;
+        reported
+            .entry(attribution)
+            .or_default()
+            .entry(row.day)
+            .or_default()
+            .insert(row.resolution);
     }
 
-    for ((channel, day), (actual, expected)) in per_day {
-        let Some(entry) = by_channel.get_mut(&channel) else {
-            continue;
-        };
-        // Zero expected means the day is unmeasurable — no declared resolution,
-        // or a calendar one with no fixed count within a day. Every row in the
-        // result is inside the queried range by construction, so this is never a
-        // day that merely fell outside it. Judging such a day would report the
-        // whole series as surplus, which reads as a duplicate problem when the
-        // real state is "nothing to compare against".
-        if expected == 0 {
-            continue;
-        }
-        if expected > actual {
-            entry.first_gap = Some(entry.first_gap.map_or(day, |d| d.min(day)));
-        }
-        // Both directions are summed **per day** and neither is derived from the
-        // channel totals. Over the totals a surplus on one day would net against
-        // a shortfall on another and the channel would report as complete —
-        // which is exactly the answer §9.6 says surplus must never be able to
-        // produce, since the two are different conditions rather than opposite
-        // signs of one.
-        entry.missing += expected.saturating_sub(actual);
-        entry.surplus += actual.saturating_sub(expected);
+    // The range's days depend only on the Sparte, and a day's expectation only
+    // on (Sparte, resolution) — never on the channel. A portfolio-wide report has
+    // a handful of grids and hundreds of thousands of channels, and the zone
+    // conversion is the expensive half, so both are computed once and shared as
+    // vectors indexed in step rather than copied into a map per channel.
+    let mut spans: BTreeMap<&'static str, Vec<Date>> = BTreeMap::new();
+    let mut grids: BTreeMap<(&'static str, Option<String>), Vec<u64>> = BTreeMap::new();
+    for (key, cell) in &cells {
+        let span = spans
+            .entry(key.0.3)
+            .or_insert_with(|| day_span(from, to, cell.sparte));
+        grids
+            .entry((key.0.3, cell.resolution.clone()))
+            .or_insert_with(|| {
+                span.iter()
+                    .map(|day| {
+                        expected_in_day(*day, cell.resolution.as_deref(), cell.sparte, from, to)
+                    })
+                    .collect()
+            });
     }
 
-    by_channel
-        .into_iter()
-        .map(
-            |((malo_id, obis_code, ..), a): (ChannelKey, Accumulator)| Completeness {
-                malo_id,
-                obis_code,
-                identity: a.identity,
-                sparte: a.sparte,
-                resolution: a.resolution,
-                expected: a.expected,
-                actual: a.actual,
-                missing: a.missing,
-                surplus: a.surplus,
-                first_gap: a.first_gap,
-                substituted: a.substituted,
-                not_billable: a.not_billable,
-            },
-        )
-        .collect()
+    /// What one reported row accumulates as the range's days are walked.
+    #[derive(Default)]
+    struct Tally {
+        expected: u64,
+        missing: u64,
+        surplus: u64,
+        first_gap: Option<Date>,
+    }
+
+    // `cells` is ordered and `Attribution` leads its key, so every grid of one
+    // channel is contiguous — which is what lets a channel's days be walked once
+    // for all of its grids, with no absent day materialised.
+    let ordered: Vec<(ChannelKey, Cell)> = cells.into_iter().collect();
+    let mut out = Vec::with_capacity(ordered.len());
+
+    let mut start = 0;
+    while start < ordered.len() {
+        let attribution = ordered[start].0.0.clone();
+        let mut end = start;
+        while end < ordered.len() && ordered[end].0.0 == attribution {
+            end += 1;
+        }
+        let group = &ordered[start..end];
+        start = end;
+
+        let span = spans.get(&attribution.3).map(Vec::as_slice).unwrap_or(&[]);
+        let days_reported = reported.get(&attribution);
+        // The grid the channel opened on, for a gap preceding its first
+        // delivery: nothing was in force before it, and naming the grid that
+        // followed is the only reading that names one at all.
+        //
+        // `reported` comes from the same rows as `cells`, so the fallback is
+        // unreachable — and it is a fallback rather than a `continue`, whose
+        // failure mode would be a channel silently absent from a report whose
+        // whole subject is what is absent.
+        let mut in_force = days_reported
+            .and_then(|d| d.values().next())
+            .and_then(|grids| grids.first().cloned())
+            .unwrap_or_else(|| group[0].1.resolution.clone());
+        // Borrowed once per channel rather than looked up per day: the key holds
+        // a `String`, and cloning it per day is a report-sized pile of
+        // allocations for a value that does not change.
+        let expectations: Vec<&[u64]> = group
+            .iter()
+            .map(|(_, cell)| {
+                grids
+                    .get(&(attribution.3, cell.resolution.clone()))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            })
+            .collect();
+
+        let mut tallies: Vec<Tally> = (0..group.len()).map(|_| Tally::default()).collect();
+        for (index, day) in span.iter().enumerate() {
+            let delivered_by = days_reported.and_then(|d| d.get(day));
+            // A conversion takes effect on the first day only the new grid
+            // reports. While the old one is still delivering it stays in force,
+            // which is both the operational reading and the only one that does
+            // not depend on which group the aggregate yielded first.
+            if let Some(today) = delivered_by
+                && !today.contains(&in_force)
+                && let Some(next) = today.first()
+            {
+                in_force = next.clone();
+            }
+            for ((slot, (key, cell)), values) in tallies.iter_mut().zip(group).zip(&expectations) {
+                let actual = cell.delivered.get(day).copied();
+                // A grid judges a day it delivered on. A day nobody delivered on
+                // is judged once, by the grid that was in force.
+                let judges = actual.is_some() || (delivered_by.is_none() && in_force == key.1);
+                if !judges {
+                    continue;
+                }
+                let expected = values.get(index).copied().unwrap_or(0);
+                // Zero expected means the day is unmeasurable — no declared
+                // resolution, or a calendar one with no fixed count within a
+                // day. Judging such a day would report the whole series as
+                // surplus, which reads as a duplicate problem when the real
+                // state is "nothing to compare against".
+                if expected == 0 {
+                    continue;
+                }
+                let actual = actual.unwrap_or(0);
+                slot.expected += expected;
+                // Both directions are summed **per day** and neither is derived
+                // from the channel totals. Over the totals a surplus on one day
+                // would net against a shortfall on another and the channel would
+                // report as complete — which is exactly the answer §9.6 says
+                // surplus must never be able to produce, since the two are
+                // different conditions rather than opposite signs of one.
+                slot.missing += expected.saturating_sub(actual);
+                slot.surplus += actual.saturating_sub(expected);
+                // The span is ascending, so the first day that is short is the
+                // earliest one.
+                if expected > actual && slot.first_gap.is_none() {
+                    slot.first_gap = Some(*day);
+                }
+            }
+        }
+
+        for ((key, cell), tally) in group.iter().zip(tallies) {
+            out.push(Completeness {
+                malo_id: key.0.0.clone(),
+                obis_code: key.0.1.clone(),
+                identity: cell.identity.clone(),
+                sparte: cell.sparte,
+                resolution: cell.resolution.clone(),
+                expected: tally.expected,
+                actual: cell.actual,
+                missing: tally.missing,
+                surplus: tally.surplus,
+                first_gap: tally.first_gap,
+                substituted: cell.substituted,
+                not_billable: cell.not_billable,
+            });
+        }
+    }
+
+    out
 }
 
 /// How many intervals a balancing day should hold, clipped to the queried range.
@@ -898,11 +1095,20 @@ fn expected_in_day(
 /// meter read monthly looks decommissioned, too long and every terminated
 /// measuring point is a standing finding. What a roster means — "still in
 /// service" — is master data this crate does not hold.
+///
+/// # Every day of the range is judged
+///
+/// Including days no row arrived on, so a channel that stopped halfway through
+/// is short by every day after. A range reaching past the last settled instant
+/// therefore reports its remainder as missing — see
+/// [`MeterStore::completeness`](crate::MeterStore::completeness).
 pub struct CompletenessQuery<'a> {
     store: &'a crate::session::MeterStore,
     from: OffsetDateTime,
     to: OffsetDateTime,
     seen_since: Option<OffsetDateTime>,
+    /// Equality predicates conjoined onto **both** scans, in declaration order.
+    narrowing: Vec<(String, ScalarValue)>,
 }
 
 impl std::fmt::Debug for CompletenessQuery<'_> {
@@ -911,6 +1117,7 @@ impl std::fmt::Debug for CompletenessQuery<'_> {
             .field("from", &self.from)
             .field("to", &self.to)
             .field("seen_since", &self.seen_since)
+            .field("narrowing", &self.narrowing)
             .finish_non_exhaustive()
     }
 }
@@ -926,7 +1133,75 @@ impl<'a> CompletenessQuery<'a> {
             from,
             to,
             seen_since: None,
+            narrowing: Vec::new(),
         }
+    }
+
+    /// Report one measuring point.
+    ///
+    /// Narrowed in the **scan**: filtering the result afterwards would still have
+    /// computed the whole portfolio to answer a question about one meter.
+    ///
+    /// Parsed, so a mistyped identifier fails here rather than returning an empty
+    /// report that reads as *"this meter is fine"*.
+    pub fn malo(self, malo_id: &str) -> Result<Self> {
+        let malo = crate::encode::parse_malo(malo_id)?;
+        self.column_eq(column::MALO_ID, ScalarValue::Utf8(Some(malo.to_string())))
+    }
+
+    /// Report one channel.
+    ///
+    /// Canonicalised immediately, so a caller may pass whichever spelling they
+    /// hold: `1-0:1.8.0*255` and `1-0:1.8.0` are one channel, and storage holds
+    /// the canonical form.
+    pub fn obis(self, obis_code: &str) -> Result<Self> {
+        let code = crate::encode::canonical_obis(obis_code)?;
+        self.column_eq(column::OBIS_CODE, ScalarValue::Utf8(Some(code)))
+    }
+
+    /// Report only rows whose `name` column equals `value`.
+    ///
+    /// A tenant discriminator, a Bilanzkreis, a Messlokation — the identity a
+    /// report is usually wanted *within*. Repeatable; each call conjoins one
+    /// equality.
+    ///
+    /// Applied to the reported range **and** to the
+    /// [`seen_since`](Self::seen_since) roster, or every channel outside the
+    /// narrowing would come back as silent.
+    ///
+    /// The **name** cannot be a bound parameter — no SQL dialect parameterises an
+    /// identifier — so it is checked against the store's declared columns, plus
+    /// the core `malo_id`, `melo_id`, `obis_code` and `sparte`.
+    pub fn column_eq(mut self, name: &str, value: ScalarValue) -> Result<Self> {
+        let mut accepted: Vec<String> = vec![
+            column::MALO_ID.to_string(),
+            column::MELO_ID.to_string(),
+            column::OBIS_CODE.to_string(),
+            column::SPARTE.to_string(),
+        ];
+        accepted.extend(
+            self.store
+                .config()
+                .extra_columns()
+                .iter()
+                .map(|f| f.name().clone()),
+        );
+        for column in self.store.config().discriminator_columns() {
+            if !accepted.contains(&column) {
+                accepted.push(column);
+            }
+        }
+        if !accepted.iter().any(|c| c == name) {
+            return Err(Error::config(format!(
+                "{name:?} is not a filterable column of {}: this store accepts [{}]. \
+                 Column names are written into SQL as identifiers, which cannot be \
+                 parameterised, so only declared ones are accepted",
+                self.store.table(),
+                accepted.join(", "),
+            )));
+        }
+        self.narrowing.push((name.to_string(), value));
+        Ok(self)
     }
 
     /// Also report channels that reported since `since` and are **silent** in the
@@ -952,9 +1227,12 @@ impl<'a> CompletenessQuery<'a> {
             resolved,
             &table,
             &discriminators,
-            self.from,
-            self.to,
-            self.seen_since,
+            Request {
+                from: self.from,
+                to: self.to,
+                seen_since: self.seen_since,
+                narrowing: &self.narrowing,
+            },
         )
         .await
     }
@@ -1146,14 +1424,21 @@ impl TableProvider for CompletenessProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // No narrowing: a SQL caller writes a `WHERE` clause, and DataFusion
+        // applies it above this provider. The typed builder's `malo`/`obis`
+        // narrowing exists because a Rust caller has no `WHERE` to write and
+        // would otherwise compute a portfolio to read one meter.
         let rows = compute(
             state,
             Arc::clone(&self.resolved),
             &self.table,
             &self.discriminators,
-            self.from,
-            self.to,
-            self.seen_since,
+            Request {
+                from: self.from,
+                to: self.to,
+                seen_since: self.seen_since,
+                narrowing: &[],
+            },
         )
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1181,6 +1466,24 @@ mod tests {
     const FROM: OffsetDateTime = datetime!(2026-03-01 00:00 UTC);
     const TO: OffsetDateTime = datetime!(2026-04-01 00:00 UTC);
 
+    /// The exact balancing-day range covering `[first, last]` inclusive.
+    ///
+    /// A report is measured against **its range**, so a test about one day's
+    /// arithmetic has to say that one day is the range — otherwise it is also a
+    /// test about the days around it, and asserting `is_complete` there asserts
+    /// the opposite of what the report means.
+    fn over(first: Date, last: Date, sparte: Sparte) -> (OffsetDateTime, OffsetDateTime) {
+        (
+            balancing::balancing_day_bounds(first, sparte).0,
+            balancing::balancing_day_bounds(last, sparte).1,
+        )
+    }
+
+    /// [`over`] for one electricity day.
+    fn day(d: Date) -> (OffsetDateTime, OffsetDateTime) {
+        over(d, d, Sparte::Strom)
+    }
+
     fn row(day: Date, actual: u64, quality: &str) -> DailyRow {
         sparte_row(Sparte::Strom, day, actual, quality)
     }
@@ -1201,7 +1504,8 @@ mod tests {
 
     #[test]
     fn a_full_ordinary_day_is_complete() {
-        let out = roll_up(vec![row(date!(2026 - 03 - 02), 96, "MEASURED")], FROM, TO);
+        let (from, to) = day(date!(2026 - 03 - 02));
+        let out = roll_up(vec![row(date!(2026 - 03 - 02), 96, "MEASURED")], from, to);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].expected, 96);
         assert_eq!(out[0].actual, 96);
@@ -1210,9 +1514,59 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_that_stopped_mid_range_is_short_by_every_day_after() {
+        // The failure a walk over the aggregate's own days produces: a `GROUP
+        // BY` yields no group for a day with nothing in it, so a meter that
+        // stopped on the 2nd of March is measured against the 2nd of March and
+        // reports the month complete — the one answer this report must never
+        // give.
+        let (from, to) = over(date!(2026 - 03 - 01), date!(2026 - 03 - 31), Sparte::Strom);
+        let out = roll_up(
+            vec![
+                row(date!(2026 - 03 - 01), 96, "MEASURED"),
+                row(date!(2026 - 03 - 02), 96, "MEASURED"),
+            ],
+            from,
+            to,
+        );
+
+        assert!(!out[0].is_complete(), "two days out of thirty-one");
+        assert_eq!(out[0].actual, 192);
+        // March 2026 holds the spring-forward Sunday, so the month is 2 972
+        // quarter-hours rather than 2 976.
+        assert_eq!(out[0].expected, 96 * 30 + 92);
+        assert_eq!(out[0].missing, 96 * 30 + 92 - 192);
+        assert_eq!(
+            out[0].surplus, 0,
+            "a day nobody delivered is not a duplicate"
+        );
+        assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 03)));
+    }
+
+    #[test]
+    fn a_day_missing_from_the_middle_is_missing() {
+        // The same bug in its least visible form: a channel that delivers before
+        // and after a gap, so nothing about its totals looks unusual.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 04), Sparte::Strom);
+        let out = roll_up(
+            vec![
+                row(date!(2026 - 03 - 02), 96, "MEASURED"),
+                row(date!(2026 - 03 - 04), 96, "MEASURED"),
+            ],
+            from,
+            to,
+        );
+        assert_eq!(out[0].expected, 96 * 3);
+        assert_eq!(out[0].actual, 96 * 2);
+        assert_eq!(out[0].missing, 96);
+        assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 03)));
+    }
+
+    #[test]
     fn the_spring_forward_day_expects_92_not_96() {
         // The false alarm a hardcoded 96 raises for every meter every spring.
-        let out = roll_up(vec![row(date!(2026 - 03 - 29), 92, "MEASURED")], FROM, TO);
+        let (from, to) = day(date!(2026 - 03 - 29));
+        let out = roll_up(vec![row(date!(2026 - 03 - 29), 92, "MEASURED")], from, to);
         assert_eq!(out[0].expected, 92);
         assert!(out[0].is_complete(), "92 intervals is a complete DST day");
     }
@@ -1221,11 +1575,8 @@ mod tests {
     fn the_autumn_day_expects_100_so_a_gap_is_visible() {
         // The dangerous direction: assuming 96 would call a four-interval gap
         // complete, and the shortfall would reach a bill.
-        let out = roll_up(
-            vec![row(date!(2026 - 10 - 25), 96, "MEASURED")],
-            datetime!(2026-10-01 00:00 UTC),
-            datetime!(2026-11-01 00:00 UTC),
-        );
+        let (from, to) = day(date!(2026 - 10 - 25));
+        let out = roll_up(vec![row(date!(2026 - 10 - 25), 96, "MEASURED")], from, to);
         assert_eq!(out[0].expected, 100);
         assert_eq!(out[0].missing, 4);
         assert!(!out[0].is_complete());
@@ -1234,17 +1585,20 @@ mod tests {
 
     #[test]
     fn the_first_gap_is_the_earliest_short_day() {
+        // Rows out of order, and the 4th missing entirely — so the walk has to
+        // be over the range's days rather than over the input's.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 05), Sparte::Strom);
         let out = roll_up(
             vec![
                 row(date!(2026 - 03 - 05), 90, "MEASURED"),
                 row(date!(2026 - 03 - 02), 80, "MEASURED"),
                 row(date!(2026 - 03 - 03), 96, "MEASURED"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 02)));
-        assert_eq!(out[0].missing, 96 * 3 - (90 + 80 + 96));
+        assert_eq!(out[0].missing, 96 * 4 - (90 + 80 + 96));
     }
 
     #[test]
@@ -1253,13 +1607,14 @@ mod tests {
         // intervals too many on the 2nd and four short on the 3rd net to zero, so
         // a channel with a real gap reported as complete. They are different
         // conditions — a duplicate and a shortfall — not opposite signs of one.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 03), Sparte::Strom);
         let out = roll_up(
             vec![
                 row(date!(2026 - 03 - 02), 100, "MEASURED"),
                 row(date!(2026 - 03 - 03), 92, "MEASURED"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
 
         assert_eq!(out[0].expected, 192);
@@ -1274,13 +1629,14 @@ mod tests {
     fn substitutes_and_unbillable_rows_are_counted_separately() {
         // A day can be complete and still not billable, and an operator needs
         // to see both — a full month of substitutes is not the same as a gap.
+        let (from, to) = day(date!(2026 - 03 - 02));
         let out = roll_up(
             vec![
                 row(date!(2026 - 03 - 02), 90, "MEASURED"),
                 row(date!(2026 - 03 - 02), 6, "SUBSTITUTED"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert_eq!(out[0].actual, 96);
         assert!(out[0].is_complete());
@@ -1293,13 +1649,14 @@ mod tests {
 
     #[test]
     fn a_faulty_reading_is_present_but_not_billable() {
+        let (from, to) = day(date!(2026 - 03 - 02));
         let out = roll_up(
             vec![
                 row(date!(2026 - 03 - 02), 90, "MEASURED"),
                 row(date!(2026 - 03 - 02), 6, "FAULTY"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert!(out[0].is_complete(), "the intervals are present");
         assert_eq!(out[0].not_billable, 6, "and six of them cannot be billed");
@@ -1309,9 +1666,10 @@ mod tests {
     fn a_series_with_no_resolution_is_not_measurable() {
         // Without a declared resolution there is no expectation. Assuming 15
         // minutes would invent a gap or invent completeness.
+        let (from, to) = day(date!(2026 - 03 - 02));
         let mut r = row(date!(2026 - 03 - 02), 24, "MEASURED");
         r.resolution = None;
-        let out = roll_up(vec![r], FROM, TO);
+        let out = roll_up(vec![r], from, to);
         assert!(!out[0].is_measurable());
         assert_eq!(out[0].expected, 0);
         assert_eq!(out[0].actual, 24);
@@ -1332,11 +1690,12 @@ mod tests {
         // in no defined order — against a count drawn from both. Split, each row
         // measures its own days against its own grid, and both are complete,
         // which is what they are.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 03), Sparte::Strom);
         let mut hourly = row(date!(2026 - 03 - 02), 24, "MEASURED");
         hourly.resolution = Some("PT1H".into());
         let quarterly = row(date!(2026 - 03 - 03), 96, "MEASURED");
 
-        let out = roll_up(vec![hourly, quarterly], FROM, TO);
+        let out = roll_up(vec![hourly, quarterly], from, to);
 
         assert_eq!(out.len(), 2, "one row per grid: {out:?}");
         let by_grid: std::collections::BTreeMap<_, _> = out
@@ -1354,10 +1713,142 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_day_goes_to_the_grid_that_was_in_force() {
+        // A converted meter and a real gap. The 2nd is hourly, the 5th and 6th
+        // quarter-hourly, and the 3rd and 4th are missing entirely. Charging
+        // those two days to *both* grids would report a clean conversion as two
+        // badly incomplete halves, and to neither would lose them: they belong
+        // to the grid in force, which on the 3rd and 4th is still the hourly one.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 06), Sparte::Strom);
+        let mut hourly = row(date!(2026 - 03 - 02), 24, "MEASURED");
+        hourly.resolution = Some("PT1H".into());
+
+        let out = roll_up(
+            vec![
+                hourly,
+                row(date!(2026 - 03 - 05), 96, "MEASURED"),
+                row(date!(2026 - 03 - 06), 96, "MEASURED"),
+            ],
+            from,
+            to,
+        );
+
+        let by_grid: std::collections::BTreeMap<_, _> = out
+            .iter()
+            .map(|r| (r.resolution.clone().unwrap(), r))
+            .collect();
+
+        let hourly = by_grid["PT1H"];
+        assert_eq!(
+            hourly.expected,
+            24 * 3,
+            "the 2nd it delivered, plus the 3rd and 4th"
+        );
+        assert_eq!(hourly.missing, 24 * 2);
+        assert_eq!(hourly.first_gap, Some(date!(2026 - 03 - 03)));
+
+        let quarterly = by_grid["PT15M"];
+        assert_eq!(quarterly.expected, 96 * 2, "only the days it was in force");
+        assert!(quarterly.is_complete(), "{quarterly:?}");
+    }
+
+    #[test]
+    fn a_conversion_day_does_not_move_the_grid_while_the_old_one_still_delivers() {
+        // The 3rd holds both grids — a meter converted part-way through a day —
+        // and the 4th holds nothing. Reading the day's grid as "whichever the
+        // aggregate yielded first" would put the 4th on one row or the other
+        // depending on scan order, which the aggregate does not define. The old
+        // grid is still delivering on the 3rd, so it is still in force; the
+        // change takes effect on the first day only the new grid reports.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 04), Sparte::Strom);
+        let hourly = |day: Date, actual: u64| {
+            let mut r = row(day, actual, "MEASURED");
+            r.resolution = Some("PT1H".into());
+            r
+        };
+
+        // Both orders of the same two rows must produce the same report.
+        let forward = roll_up(
+            vec![
+                hourly(date!(2026 - 03 - 02), 24),
+                hourly(date!(2026 - 03 - 03), 12),
+                row(date!(2026 - 03 - 03), 48, "MEASURED"),
+            ],
+            from,
+            to,
+        );
+        let reversed = roll_up(
+            vec![
+                row(date!(2026 - 03 - 03), 48, "MEASURED"),
+                hourly(date!(2026 - 03 - 03), 12),
+                hourly(date!(2026 - 03 - 02), 24),
+            ],
+            from,
+            to,
+        );
+        assert_eq!(
+            forward, reversed,
+            "the report must not depend on scan order"
+        );
+
+        let by_grid: std::collections::BTreeMap<_, _> = forward
+            .iter()
+            .map(|r| (r.resolution.clone().unwrap(), r))
+            .collect();
+        // The 4th is the hourly grid's: it was in force through the 3rd, on
+        // which both delivered.
+        assert_eq!(by_grid["PT1H"].expected, 24 * 3);
+        assert_eq!(by_grid["PT1H"].first_gap, Some(date!(2026 - 03 - 03)));
+        // The quarter-hourly row judges only the day it delivered on.
+        assert_eq!(by_grid["PT15M"].expected, 96);
+    }
+
+    #[test]
+    fn a_gap_before_the_first_delivery_goes_to_the_grid_that_followed_it() {
+        // Nothing was in force before the channel's first delivery, so there is
+        // no last-observation to carry forward. Attributing the days to the grid
+        // the channel opened on is the only reading that names a grid at all,
+        // and leaving them out would be the same silent under-count in a
+        // different place.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 04), Sparte::Strom);
+        let out = roll_up(vec![row(date!(2026 - 03 - 04), 96, "MEASURED")], from, to);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].expected, 96 * 3);
+        assert_eq!(out[0].missing, 96 * 2);
+        assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 02)));
+    }
+
+    #[test]
+    fn a_gas_channel_that_stopped_is_short_on_gastage() {
+        // The same walk, on the other calendar. The days counted are Gastage, so
+        // a gas channel that stopped is short by 06:00-to-06:00 days rather than
+        // by calendar ones — and the count includes the long autumn Gastag,
+        // which is the **Saturday**.
+        let (from, to) = over(date!(2026 - 10 - 23), date!(2026 - 10 - 25), Sparte::Gas);
+        let out = roll_up(
+            vec![sparte_row(
+                Sparte::Gas,
+                date!(2026 - 10 - 23),
+                96,
+                "MEASURED",
+            )],
+            from,
+            to,
+        );
+
+        // 23 Oct: 96. 24 Oct: 100, the long Gastag. 25 Oct: 96.
+        assert_eq!(out[0].expected, 96 + 100 + 96);
+        assert_eq!(out[0].missing, 100 + 96);
+        assert_eq!(out[0].first_gap, Some(date!(2026 - 10 - 24)));
+    }
+
+    #[test]
     fn a_calendar_resolution_has_no_daily_expectation() {
+        let (from, to) = day(date!(2026 - 03 - 02));
         let mut r = row(date!(2026 - 03 - 02), 1, "MEASURED");
         r.resolution = Some("P1M".into());
-        let out = roll_up(vec![r], FROM, TO);
+        let out = roll_up(vec![r], from, to);
         assert_eq!(out[0].expected, 0, "a month is not n intervals in a day");
         assert!(!out[0].is_measurable());
         assert_eq!(out[0].surplus, 0);
@@ -1368,13 +1859,14 @@ mod tests {
         // More rows than the calendar allows is a real condition — a duplicate,
         // or a mis-declared resolution — and it must not cancel out a gap
         // elsewhere in the range.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 03), Sparte::Strom);
         let out = roll_up(
             vec![
                 row(date!(2026 - 03 - 02), 120, "MEASURED"),
                 row(date!(2026 - 03 - 03), 90, "MEASURED"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert_eq!(out[0].surplus, 24);
         assert_eq!(out[0].first_gap, Some(date!(2026 - 03 - 03)));
@@ -1388,7 +1880,7 @@ mod tests {
         let out = roll_up(
             vec![row(date!(2026 - 03 - 02), 48, "MEASURED")],
             datetime!(2026-03-02 11:00 UTC), // 12:00 Berlin
-            datetime!(2026-03-03 00:00 UTC),
+            datetime!(2026-03-02 23:00 UTC), // 00:00 Berlin, the 3rd
         );
         assert_eq!(out[0].expected, 48);
         assert!(out[0].is_complete());
@@ -1398,17 +1890,19 @@ mod tests {
     fn channels_are_reported_separately() {
         let mut second = row(date!(2026 - 03 - 02), 96, "MEASURED");
         second.obis_code = "1-0:2.8.0".into();
+        let (from, to) = day(date!(2026 - 03 - 02));
         let out = roll_up(
             vec![row(date!(2026 - 03 - 02), 96, "MEASURED"), second],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert_eq!(out.len(), 2);
     }
 
     #[test]
     fn a_batch_matches_the_published_schema() {
-        let rows = roll_up(vec![row(date!(2026 - 03 - 02), 90, "MEASURED")], FROM, TO);
+        let (from, to) = day(date!(2026 - 03 - 02));
+        let rows = roll_up(vec![row(date!(2026 - 03 - 02), 90, "MEASURED")], from, to);
         let batch = completeness_batch(&rows, &[]).unwrap();
         assert_eq!(batch.schema(), completeness_schema(&[]));
         assert_eq!(batch.num_rows(), 1);
@@ -1427,7 +1921,8 @@ mod tests {
             r
         };
 
-        let out = roll_up(vec![of("a", 96), of("b", 92)], FROM, TO);
+        let (from, to) = day(date!(2026 - 03 - 02));
+        let out = roll_up(vec![of("a", 96), of("b", 92)], from, to);
         assert_eq!(out.len(), 2, "two readings, two rows");
 
         let tenant_a = out.iter().find(|r| r.identity[0].1 == "a").unwrap();
@@ -1441,7 +1936,8 @@ mod tests {
     fn the_reported_columns_follow_the_merge_key() {
         let mut r = row(date!(2026 - 03 - 02), 96, "MEASURED");
         r.identity = vec![("melo_id".to_string(), "DE00012345".to_string())];
-        let rows = roll_up(vec![r], FROM, TO);
+        let (from, to) = day(date!(2026 - 03 - 02));
+        let rows = roll_up(vec![r], from, to);
 
         let key = ["melo_id".to_string()];
         let batch = completeness_batch(&rows, &key).unwrap();
@@ -1510,6 +2006,7 @@ mod tests {
         // 100 intervals on the long Gastag is exactly right. Measured against
         // the calendar day it would read as four in surplus — a duplicate
         // finding, on a channel with no duplicates.
+        let (from, to) = over(date!(2026 - 10 - 24), date!(2026 - 10 - 24), Sparte::Gas);
         let out = roll_up(
             vec![sparte_row(
                 Sparte::Gas,
@@ -1517,8 +2014,8 @@ mod tests {
                 100,
                 "MEASURED",
             )],
-            datetime!(2026-10-01 00:00 UTC),
-            datetime!(2026-11-01 00:00 UTC),
+            from,
+            to,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sparte, Sparte::Gas);
@@ -1571,16 +2068,34 @@ mod tests {
     fn two_commodities_on_one_channel_are_reported_separately() {
         // Not an expected state, but folding them would measure the gas rows
         // against the electricity day and say nothing about it.
+        // The range is one Berlin calendar day, which is *not* one Gastag: it
+        // covers the last six hours of the Gastag that began on the 1st and the
+        // first eighteen of the one that began on the 2nd. So the same range
+        // holds 96 electricity intervals on one day and 24 + 72 gas intervals
+        // across two, and a channel delivering both continuously is complete on
+        // both counts. Folded into one row it would be neither.
+        let (from, to) = over(date!(2026 - 03 - 02), date!(2026 - 03 - 02), Sparte::Strom);
         let out = roll_up(
             vec![
                 sparte_row(Sparte::Strom, date!(2026 - 03 - 02), 96, "MEASURED"),
-                sparte_row(Sparte::Gas, date!(2026 - 03 - 02), 96, "MEASURED"),
+                sparte_row(Sparte::Gas, date!(2026 - 03 - 01), 24, "MEASURED"),
+                sparte_row(Sparte::Gas, date!(2026 - 03 - 02), 72, "MEASURED"),
             ],
-            FROM,
-            TO,
+            from,
+            to,
         );
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(Completeness::is_complete));
+
+        let strom = out.iter().find(|r| r.sparte == Sparte::Strom).unwrap();
+        assert_eq!((strom.expected, strom.actual), (96, 96));
+        assert!(strom.is_complete());
+
+        let gas = out.iter().find(|r| r.sparte == Sparte::Gas).unwrap();
+        assert_eq!((gas.expected, gas.actual), (96, 96));
+        assert!(
+            gas.is_complete(),
+            "clipped on the Gastag rather than on the calendar day: {gas:?}"
+        );
     }
 
     fn channel(sparte: Sparte, resolution: Option<&str>) -> Channel {

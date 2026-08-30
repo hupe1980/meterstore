@@ -12,7 +12,8 @@ use metering::calendar::{
 };
 use metering::interval::Sparte;
 use meterstore::planner::{
-    balancing_day, balancing_day_length, expected_intervals_in_balancing_day,
+    balancing_day, balancing_day_length, balancing_month, bilanzierungsmonat,
+    expected_intervals_in_balancing_day,
 };
 use time::Duration;
 use time::macros::{date, datetime};
@@ -177,6 +178,54 @@ fn balancing_day_delegates_to_whichever_calendar_the_commodity_uses() {
     ] {
         assert_eq!(balancing_day(at, sparte), local_day(at), "{sparte}");
     }
+}
+
+#[test]
+fn a_balancing_month_delegates_the_same_way_and_tiles_the_same_timeline() {
+    // The month is the same dispatch as the day, and the two have to agree:
+    // `date_trunc('month', balancing_day)` is what an external engine reading
+    // the Iceberg files uses to reach the Bilanzierungsmonat, and that is only
+    // right because a settlement month is a whole number of balancing days.
+    let at = datetime!(2026-03-01 01:00 UTC); // 02:00 local — the March/February seam
+    assert_eq!(
+        balancing_month(at, Sparte::Gas),
+        first_of(local_gas_day(at)),
+        "a gas month is the month of the Gastag, not of the calendar day"
+    );
+    assert_eq!(balancing_month(at, Sparte::Strom), first_of(local_day(at)));
+
+    // Consecutive months tile with no gap and no overlap, for both boundaries
+    // and across both transitions — the property a settlement rerun over
+    // `bilanzierungsmonat` rests on.
+    for sparte in [Sparte::Strom, Sparte::Gas] {
+        let mut previous_end = None;
+        for month in 1u8..=12 {
+            let month = time::Month::try_from(month).unwrap();
+            let (from, to) = bilanzierungsmonat(2026, month, sparte);
+            assert!(from < to, "{sparte} {month:?}");
+            if let Some(end) = previous_end {
+                assert_eq!(from, end, "{sparte} {month:?} does not abut the previous");
+            }
+            previous_end = Some(to);
+        }
+        // And the twelve of them are exactly the year.
+        let (year_from, _) = bilanzierungsmonat(2026, time::Month::January, sparte);
+        assert_eq!(
+            previous_end,
+            Some(bilanzierungsmonat(2027, time::Month::January, sparte).0),
+            "{sparte}"
+        );
+        assert_eq!(
+            (previous_end.unwrap() - year_from).whole_hours(),
+            365 * 24,
+            "{sparte}: the two DST transitions cancel over a whole year"
+        );
+    }
+}
+
+/// The first of the month a date falls in.
+fn first_of(day: time::Date) -> time::Date {
+    day.replace_day(1).expect("the first is always valid")
 }
 
 #[test]

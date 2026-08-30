@@ -784,6 +784,16 @@ pub struct ExtraColumn {
     /// not the other.
     #[serde(default)]
     pub values: Option<Vec<String>>,
+    /// The domain identifier this column's values must parse as, if any.
+    ///
+    /// `"EIC"` is the only one, and it is
+    /// [`eic_column`](crate::config::eic_column) from a file: a Bilanzkreis or a
+    /// Bilanzierungsgebiet is a check-character-validated ENTSO-E code, not
+    /// sixteen arbitrary characters. Mutually exclusive with `values` — a fixed
+    /// vocabulary and an open identifier scheme are two different claims about
+    /// the same column.
+    #[serde(default)]
+    pub check: Option<String>,
 }
 
 fn default_column_type() -> String {
@@ -797,6 +807,35 @@ impl ExtraColumn {
     /// a reading, and in SQL it does not compare equal to itself.
     fn field(&self) -> Result<Field> {
         let nullable = !self.identity;
+
+        if let Some(check) = &self.check {
+            if self.values.is_some() {
+                return Err(Error::config(format!(
+                    "extra column {:?} declares both `values` and `check`: a closed \
+                     vocabulary and an identifier scheme are two different claims about \
+                     one column, and there is no order in which both can hold",
+                    self.name
+                )));
+            }
+            if self.data_type()? != DataType::Utf8 {
+                return Err(Error::config(format!(
+                    "extra column {:?} declares `check` but is not a string column",
+                    self.name
+                )));
+            }
+            return match check.as_str() {
+                crate::config::VALUE_CHECK_EIC => {
+                    Ok(crate::config::eic_column(&self.name, nullable))
+                }
+                other => Err(Error::config(format!(
+                    "extra column {:?} declares check {other:?}; the supported checks \
+                     are {:?}",
+                    self.name,
+                    [crate::config::VALUE_CHECK_EIC],
+                ))),
+            };
+        }
+
         let Some(values) = &self.values else {
             return Ok(Field::new(&self.name, self.data_type()?, nullable));
         };
@@ -1261,6 +1300,65 @@ extra_columns = [{ name = "subject_ref", values = ["A", "B"] }]
             Some("A,B"),
         );
         assert!(!table.merge_key().contains(&"subject_ref".to_string()));
+    }
+
+    #[test]
+    fn a_checked_column_is_declarable_from_a_file() {
+        // §14's claim for this format is that it is a front end over the same
+        // validated types, with no setting reachable from Rust and not from
+        // here.
+        let toml = r#"
+[[tables]]
+name = "readings"
+extra_columns = [
+  { name = "bilanzkreis",         check = "EIC" },
+  { name = "bilanzierungsgebiet", check = "EIC" },
+]
+"#;
+        let table = Settings::from_toml(toml).unwrap().single_table().unwrap();
+        assert_eq!(table.attribute_columns().len(), 2);
+        for f in table.attribute_columns() {
+            assert_eq!(
+                crate::config::declared_value_check(f),
+                Some(crate::config::VALUE_CHECK_EIC),
+                "{}",
+                f.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_cannot_be_both_a_vocabulary_and_an_identifier_scheme() {
+        // A closed set of codes and an open check-character-validated scheme
+        // are two different claims about one column, and there is no order in
+        // which both can hold.
+        let toml = r#"
+[[tables]]
+name = "readings"
+extra_columns = [{ name = "bilanzkreis", check = "EIC", values = ["A", "B"] }]
+"#;
+        let err = Settings::from_toml(toml)
+            .unwrap()
+            .single_table()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bilanzkreis"), "{err}");
+    }
+
+    #[test]
+    fn an_unsupported_check_names_the_ones_that_exist() {
+        let toml = r#"
+[[tables]]
+name = "readings"
+extra_columns = [{ name = "iban", check = "IBAN" }]
+"#;
+        let err = Settings::from_toml(toml)
+            .unwrap()
+            .single_table()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IBAN"), "{err}");
+        assert!(err.contains("EIC"), "{err}");
     }
 
     #[test]

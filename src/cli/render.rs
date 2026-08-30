@@ -11,7 +11,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::error::{Error, Result};
 use crate::session::system::TableStatus;
-use crate::session::{QueryDescription, QueryResult};
+use crate::session::{Completeness, QueryDescription, QueryResult};
 use crate::tiering::ArchivalOutcome;
 use crate::tiering::store::SnapshotInfo;
 use crate::watermark::Tier;
@@ -186,6 +186,135 @@ pub fn archive(lines: &[ArchiveLine], format: Format) -> Result<()> {
             );
         }
     })
+}
+
+/// A completeness report, over one or more tables.
+///
+/// The range is carried in both formats, for the reason the watermark is:
+/// `missing = 4` means nothing without the period it was counted over.
+pub fn completeness(
+    rows: &[(String, Completeness)],
+    from: time::OffsetDateTime,
+    to: time::OffsetDateTime,
+    format: Format,
+) -> Result<()> {
+    let document = json!({
+        "from": instant(from),
+        "to": instant(to),
+        "channels": rows
+            .iter()
+            .map(|(table, r)| json!({
+                "table": table,
+                "malo_id": r.malo_id,
+                "obis_code": r.obis_code,
+                "identity": r.identity
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect::<serde_json::Map<_, _>>(),
+                "sparte": r.sparte.as_str(),
+                "resolution": r.resolution,
+                "expected": r.expected,
+                "actual": r.actual,
+                "missing": r.missing,
+                "surplus": r.surplus,
+                "first_gap": r.first_gap.map(|d| d.to_string()),
+                "substituted": r.substituted,
+                "not_billable": r.not_billable,
+                "complete": r.is_complete(),
+                "measurable": r.is_measurable(),
+                "silent": r.is_silent(),
+            }))
+            .collect::<Vec<_>>(),
+        "channels_reported": rows.len(),
+        "channels_incomplete": rows.iter().filter(|(_, r)| !r.is_complete()).count(),
+        "channels_silent": rows.iter().filter(|(_, r)| r.is_silent()).count(),
+        // Not `missing`: every channel object carries one of those, and a
+        // top-level key of the same name reads as a duplicate rather than as a
+        // total.
+        "intervals_missing": rows.iter().map(|(_, r)| r.missing).sum::<u64>(),
+    });
+
+    emit(format, &document, || {
+        println!(
+            "{:<20} {:<13} {:<14} {:<7} {:<7} {:>9} {:>9} {:>9} {:>9}  {:<12}  NOTE",
+            "TABLE",
+            "MALO",
+            "OBIS",
+            "SPARTE",
+            "RES",
+            "EXPECTED",
+            "ACTUAL",
+            "MISSING",
+            "SURPLUS",
+            "FIRST GAP",
+        );
+        for (table, r) in rows {
+            println!(
+                "{:<20} {:<13} {:<14} {:<7} {:<7} {:>9} {:>9} {:>9} {:>9}  {:<12}  {}",
+                table,
+                r.malo_id,
+                r.obis_code,
+                r.sparte.as_str(),
+                r.resolution.as_deref().unwrap_or("—"),
+                r.expected,
+                r.actual,
+                r.missing,
+                r.surplus,
+                r.first_gap
+                    .map_or_else(|| "—".to_string(), |d| d.to_string()),
+                note(r),
+            );
+        }
+        println!();
+        println!(
+            "{} channel(s) over [{}, {}) — {} incomplete, {} silent, {} interval(s) missing",
+            rows.len(),
+            instant(from),
+            instant(to),
+            rows.iter().filter(|(_, r)| !r.is_complete()).count(),
+            rows.iter().filter(|(_, r)| r.is_silent()).count(),
+            rows.iter().map(|(_, r)| r.missing).sum::<u64>(),
+        );
+        // The discriminators are printed under the row rather than as columns:
+        // how many there are is the deployment's choice, and a table whose width
+        // depends on configuration cannot be read by a fixed-width eye.
+        if rows.iter().any(|(_, r)| !r.identity.is_empty()) {
+            println!();
+            for (table, r) in rows.iter().filter(|(_, r)| !r.identity.is_empty()) {
+                println!(
+                    "{table} {} {}: {}",
+                    r.malo_id,
+                    r.obis_code,
+                    r.identity
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
+    })
+}
+
+/// What is worth saying about one channel beyond its numbers.
+///
+/// Ordered by how much it changes the reading. A silent channel is not "100 %
+/// missing" — it may have been decommissioned, and the report only knows about
+/// it because a roster was asked for. An unmeasurable one has no expectation at
+/// all, and `missing = 0` without a note would read as complete.
+///
+/// "no expectation" covers both of `is_measurable`'s cases: no declared
+/// resolution, and a calendar one like `P1M` with no fixed count within a day.
+fn note(r: &Completeness) -> &'static str {
+    match r {
+        r if r.is_silent() => "delivered nothing in the range",
+        r if !r.is_measurable() => "no expectation: no resolution, or a calendar one",
+        r if r.surplus > 0 && r.missing > 0 => "short on one day and over on another",
+        r if r.surplus > 0 => "more rows than the calendar allows — a duplicate?",
+        r if r.not_billable > 0 => "holds intervals whose quality bars them from billing",
+        r if r.substituted > 0 => "holds substitute values",
+        _ => "",
+    }
 }
 
 /// A query result, with the boundary it was computed against.
@@ -381,6 +510,61 @@ mod tests {
             settled["watermarks"][0]["watermark"],
             json!("2026-07-20T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn a_silent_channel_is_named_as_one_before_anything_else() {
+        // The finding order is the point. A channel that delivered nothing has
+        // no resolution to judge it by *and* no rows, so two of these arms match
+        // it — and "no declared resolution" is the less useful of the two.
+        let channel = |actual: u64, resolution: Option<&str>, surplus: u64| Completeness {
+            malo_id: "12345678905".to_string(),
+            obis_code: "1-0:1.8.0".to_string(),
+            identity: Vec::new(),
+            sparte: metering::interval::Sparte::Strom,
+            resolution: resolution.map(str::to_string),
+            expected: resolution.map_or(0, |_| 96),
+            actual,
+            missing: 96_u64.saturating_sub(actual),
+            surplus,
+            first_gap: None,
+            substituted: 0,
+            not_billable: 0,
+        };
+
+        assert_eq!(
+            note(&channel(0, None, 0)),
+            "delivered nothing in the range",
+            "a silent channel with no resolution is silent first"
+        );
+        assert_eq!(
+            note(&channel(50, None, 0)),
+            "no expectation: no resolution, or a calendar one"
+        );
+        // The other half of `is_measurable`: a resolution the calendar cannot
+        // count within a day. The note has to cover it, or it names a condition
+        // the operator does not have.
+        let monthly = Completeness {
+            resolution: Some("P1M".to_string()),
+            expected: 0,
+            missing: 0,
+            ..channel(1, None, 0)
+        };
+        assert_eq!(
+            note(&monthly),
+            "no expectation: no resolution, or a calendar one"
+        );
+        // More rows than the calendar allows is a different condition from a
+        // gap, and a channel with both must not read as only one of them.
+        assert_eq!(
+            note(&channel(96, Some("PT15M"), 4)),
+            "more rows than the calendar allows — a duplicate?"
+        );
+        assert_eq!(
+            note(&channel(90, Some("PT15M"), 4)),
+            "short on one day and over on another"
+        );
+        assert_eq!(note(&channel(96, Some("PT15M"), 0)), "");
     }
 
     #[test]

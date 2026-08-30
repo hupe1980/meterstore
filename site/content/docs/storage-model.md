@@ -269,7 +269,7 @@ behave differently:
 ```rust
 TableConfig::new("readings_versions")
     .identity_column(Field::new("tenant", DataType::Utf8, false))   // joins the merge key
-    .attribute_column(Field::new("bilanzkreis", DataType::Utf8, true))
+    .attribute_column(eic_column("bilanzkreis", true))              // carries data
 ```
 
 **Identity columns join the merge key.** Two rows differing in one are different
@@ -319,6 +319,55 @@ That renders a `CHECK … IN (…)` on the hot table, exactly like the built-in
 rather than being read back later as an unknown code. MeterStore stays
 domain-agnostic: it enforces whatever set you supply, carried in the field's
 Arrow metadata so it disturbs neither the type nor schema evolution.
+
+### Checked columns
+
+A Bilanzkreis or a Bilanzierungsgebiet is not an arbitrary string. It is an
+**EIC** — the sixteen-character ENTSO-E Energy Identification Code — and it
+carries a **check character**:
+
+```rust
+.attribute_column(eic_column("bilanzkreis", true))
+.attribute_column(eic_column("bilanzierungsgebiet", true))
+```
+
+```toml
+extra_columns = [
+  { name = "bilanzkreis",         check = "EIC" },
+  { name = "bilanzierungsgebiet", check = "EIC" },
+]
+```
+
+The same argument that makes `malo_id` a `MaloId` rather than eleven digits.
+Unlike the BDEW-Codenummer — whose Bildungsvorschrift exempts GS1-issued GLNs,
+which is why `version_scope` deliberately does **not** check its digit — the EIC
+scheme has no carve-out, so a mistyped code is detectable.
+
+The write path parses every value with `metering::ids::Eic` and stores its
+**canonical spelling**, trimmed and uppercase. That matters most on an identity
+column, where a Bilanzkreis arriving in two spellings would be two readings that
+never supersede each other.
+
+**Two checks, and each stops somewhere.** The hot table gets a `CHECK` for the
+*shape* — sixteen characters of `0-9`, `A-Z` or `-`, an uppercase letter in
+position 3, and a check character that is never `-`. The check *character* is
+arithmetic over the other fifteen and no regular expression expresses it, so the
+write path enforces that half. A row written to PostgreSQL by something else gets
+the shape check and not the check character.
+
+`check` and `values` are mutually exclusive: a closed vocabulary and an open
+identifier scheme are two different claims about one column.
+
+> **A DB constraint is created with the table.** `create_tables` is
+> `CREATE TABLE IF NOT EXISTS`, so adding `values` or `check` to a column of a
+> table that already exists starts the write-path validation and does not add the
+> `CHECK`. Add it with `ALTER TABLE … ADD CONSTRAINT`, or recreate the table.
+> Schema evolution does not flag it: the declaration rides in Arrow field
+> metadata, which comparison ignores so that a vocabulary is not a schema change.
+
+`eic_regelzone(code)` then reads a Bilanzierungsgebiet's **Regelzone** off
+position 4 — the grouping key of a MaBiS Summenzeitreihe.
+[Querying →](@/docs/querying.md#the-other-stored-identifier)
 
 ## The Messlokation may be part of the identity
 

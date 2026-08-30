@@ -114,6 +114,48 @@ async fn the_commands_drive_a_real_deployment() {
     .run()
     .await
     .expect("explain");
+
+    // A settlement month, named the way the market names one. On an empty table
+    // the report is empty, which is the honest answer: completeness reports on
+    // the channels that exist, and `seen_since` is what finds the ones that do
+    // not.
+    cli(
+        path,
+        Command::Completeness {
+            table: None,
+            from: None,
+            to: None,
+            month: Some("2026-06".to_string()),
+            sparte: "STROM".to_string(),
+            seen_since: Some("30d".to_string()),
+            malo: None,
+            obis: None,
+            gaps_only: false,
+        },
+    )
+    .run()
+    .await
+    .expect("completeness over a Bilanzierungsmonat");
+
+    // And an explicit range, which is the other spelling.
+    cli(
+        path,
+        Command::Completeness {
+            table: Some("readings".to_string()),
+            from: Some("2026-06-01T00:00:00Z".to_string()),
+            to: Some("2026-07-01T00:00:00Z".to_string()),
+            month: None,
+            sparte: "STROM".to_string(),
+            seen_since: None,
+            // Narrowed in the scan: the report is about one meter's one channel.
+            malo: Some("12345678905".to_string()),
+            obis: Some("1-0:1.29.0".to_string()),
+            gaps_only: true,
+        },
+    )
+    .run()
+    .await
+    .expect("completeness over an explicit range");
 }
 
 #[tokio::test]

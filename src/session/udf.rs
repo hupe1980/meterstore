@@ -16,6 +16,23 @@
 //! (`meter_balancing_day`) chooses between them from the row's `sparte`, so a
 //! statement over a mixed table is written once and is right for both.
 //!
+//! The boundary carries up to the **month**, so [`BalancingMonth`]
+//! (`meter_balancing_month`) is the same choice one period up: the gas
+//! Bilanzierungsmonat runs 01.06 06:00 to 01.07 06:00, and grouping it by
+//! [`LocalMonth`] books six hours into the neighbouring settlement month twelve
+//! times a year.
+//!
+//! # And the OBIS functions
+//!
+//! `ObisPredicate` wraps `metering::obis`'s own predicates, [`ObisDirection`]
+//! the primitive the two directional ones are derived from — three-valued,
+//! because a register may have no direction at all — and [`ObisTariffRegister`]
+//! and [`ObisNormalise`] the two accessors a query needs.
+//!
+//! [`EicRegelzone`] does the same for the other identifier a deployment stores:
+//! a Bilanzierungsgebiet's Regelzone is in position 4 of its EIC, which is a
+//! paragraph of BDEW citation upstream and one line here.
+//!
 //! The arithmetic is `metering::calendar`'s. These are wrappers: they convert
 //! between Arrow arrays and the domain functions and nothing else. Their tests
 //! assert that the wrapper preserves the upstream answer, not that the answer is
@@ -32,7 +49,8 @@ use datafusion::logical_expr::{
 };
 use metering::IntervalResolution;
 use metering::calendar;
-use metering::interval::Sparte;
+use metering::ids::{Eic, Regelzone};
+use metering::interval::{Direction, Sparte};
 use metering::obis::ObisCode;
 use time::{Date, OffsetDateTime};
 
@@ -320,6 +338,144 @@ impl ScalarUDFImpl for ObisNormalise {
     }
 }
 
+/// `obis_direction(code)` — `'IMPORT'`, `'EXPORT'`, or null.
+///
+/// The primitive `obis_is_import` and `obis_is_export` are derived from, and the
+/// difference is not presentational: **both are false for a register that has no
+/// direction at all** — Blindarbeit, a gas volume, a Zustandszahl — and false is
+/// also what `obis_is_import` says about a feed-in register. So
+/// `NOT obis_is_import(obis_code)` does not mean "export"; it sweeps the
+/// undirected registers in with it, which is how a Bezug total ends up carrying
+/// kvarh.
+///
+/// The three-way `GROUP BY` is the shape a bidirectional Zählpunkt wants:
+///
+/// ```sql
+/// SELECT COALESCE(obis_direction(obis_code), 'UNDIRECTED') AS direction,
+///        SUM(value)
+/// FROM readings
+/// GROUP BY 1
+/// ```
+///
+/// The strings are `Direction::as_str`, which is also the domain's `serde` tag,
+/// so a value from here and one out of a JSON payload compare literally.
+///
+/// Null for a code with no direction **and** for a null code: SQL has one null,
+/// and a sentinel for the other would be a value a reader has to know about.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ObisDirection {
+    signature: Signature,
+}
+
+impl Default for ObisDirection {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ObisDirection {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "obis_direction"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, codes) = as_obis(&args)?;
+        let out: StringArray = codes
+            .iter()
+            .map(|c| c.and_then(ObisCode::direction).map(Direction::as_str))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// Read a `Utf8` argument and parse each row as an EIC.
+///
+/// Unlike [`as_obis`], a value that is not one is a **null** rather than an
+/// error. An OBIS code is a core column this crate wrote and canonicalised, so
+/// an unparseable one is a statement about a broken writer; an EIC arrives in a
+/// *deployment* column, which a table may or may not declare with
+/// `check = "EIC"`.
+fn as_eic(args: &ScalarFunctionArgs) -> DfResult<Vec<Option<Eic>>> {
+    let raw = as_strings(args, 0)?;
+    Ok((0..raw.len())
+        .map(|i| match raw.is_null(i) {
+            true => None,
+            false => raw.value(i).parse::<Eic>().ok(),
+        })
+        .collect())
+}
+
+/// `eic_regelzone(code)` — the Regelzone a Bilanzierungsgebiet lies in.
+///
+/// `'TENNET'`, `'AMPRION'`, `'FIFTY_HERTZ'`, `'TRANSNET_BW'`, or null. The
+/// grouping key of a MaBiS Summenzeitreihe, read off the code that is already
+/// stored rather than joined in from a mapping table that can go stale.
+///
+/// The rule is `metering`'s, from BDEW *Anwendungshilfe Energy Identification
+/// Codes* v1.0 §2.2.2: a Bilanzierungsgebiet is a `Y` code under the German LIO
+/// `11`, and position 4 identifies the Regelzone — `N` TenneT, `R` Amprion, `V`
+/// 50Hertz, `W` TransnetBW. A `Y` code cannot in general be told from a
+/// Bilanzkreis's, because an EIC function is registry metadata; this one can,
+/// because the same section excludes those four letters at position 4 for every
+/// other `Y` function.
+///
+/// ```sql
+/// SELECT eic_regelzone(bilanzierungsgebiet) AS regelzone, SUM(value)
+/// FROM readings
+/// GROUP BY 1
+/// ```
+///
+/// Null for a Bilanzkreis, for another issuing office's code, and for anything
+/// that is not an EIC — the last is a null rather than an error because the
+/// argument comes from a *deployment* column that may not be declared
+/// `check = "EIC"`, and one row of free text must not take a report down.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct EicRegelzone {
+    signature: Signature,
+}
+
+impl Default for EicRegelzone {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for EicRegelzone {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "eic_regelzone"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let out: StringArray = as_eic(&args)?
+            .iter()
+            .map(|e| e.and_then(|e| e.regelzone()).map(Regelzone::as_str))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
 /// `meter_local_day(ts)` — the Berlin calendar day an instant falls on.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct LocalDay {
@@ -531,6 +687,80 @@ impl ScalarUDFImpl for LocalMonth {
     }
 }
 
+/// `meter_balancing_month(ts, sparte)` — the Bilanzierungsmonat, as its first day.
+///
+/// [`BalancingDay`] one period up, and the same argument. EDI@Energy *Allgemeine
+/// Festlegungen* v6.1c, Kap. 3.1 spells the Bilanzierungsmonat Juni 2021 out as
+/// 01.06 **06:00** to 01.07 **06:00** for Gas and 00:00 to 00:00 for Strom, so an
+/// interval at 02:00 local on 1 March belongs to **February** for gas and to
+/// March for everything else.
+///
+/// [`LocalMonth`] is the *calendar* month for every row, so grouping a gas
+/// Lastgang by it books six hours into the neighbouring Bilanzierungsmonat twelve
+/// times a year, with totals that still look plausible.
+///
+/// It is also the month an MSCONS correction version is scoped to, so this is
+/// how a reader reproduces the month half of `version_scope` in SQL:
+///
+/// ```sql
+/// SELECT sparte,
+///        meter_balancing_month("from", sparte) AS bilanzierungsmonat,
+///        SUM(value)
+/// FROM readings
+/// GROUP BY 1, 2
+/// ```
+///
+/// The commodity is read **per row**, like every other function here.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BalancingMonth {
+    signature: Signature,
+}
+
+impl Default for BalancingMonth {
+    fn default() -> Self {
+        Self {
+            signature: timestamp_signature_with(&[DataType::Utf8]),
+        }
+    }
+}
+
+impl ScalarUDFImpl for BalancingMonth {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "meter_balancing_month"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Date32)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let input = as_micros(&args)?;
+        let sparte = as_strings(&args, 1)?;
+
+        let mut out = Date32Array::builder(input.len());
+        for i in 0..input.len() {
+            // Null rather than a defaulted calendar month, for
+            // `meter_balancing_day`'s reason: defaulting would put gas rows in
+            // the wrong settlement month, which is what this function exists to
+            // prevent.
+            if input.is_null(i) || sparte.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            out.append_value(to_date32(balancing::balancing_month(
+                from_micros(input.value(i))?,
+                parse_sparte(sparte.value(i))?,
+            )));
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
 /// `meter_expected_intervals(day, resolution[, sparte])` — how many intervals a
 /// balancing day contains.
 ///
@@ -671,19 +901,26 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::from(GasDay::default()),
         ScalarUDF::from(BalancingDay::default()),
         ScalarUDF::from(LocalMonth::default()),
+        ScalarUDF::from(BalancingMonth::default()),
         ScalarUDF::from(ExpectedIntervals::default()),
         ScalarUDF::from(ObisTariffRegister::default()),
         ScalarUDF::from(ObisNormalise::default()),
+        ScalarUDF::from(ObisDirection::default()),
+        ScalarUDF::from(EicRegelzone::default()),
     ];
     // One-to-one with `metering::obis`'s own predicates. Listed rather than
     // generated so that adding one upstream is a deliberate act here, and so the
     // SQL name and the method it wraps sit on the same line.
     for (name, test) in [
+        // `is_import` and `is_export` take `self` by value upstream — they are
+        // `const fn` derived from `direction()`, which a `&self` receiver would
+        // prevent. The closure is the coercion and nothing else; every other
+        // predicate is a plain method reference.
         (
             "obis_is_import",
-            ObisCode::is_import as fn(&ObisCode) -> bool,
+            (|c: &ObisCode| c.is_import()) as fn(&ObisCode) -> bool,
         ),
-        ("obis_is_export", ObisCode::is_export),
+        ("obis_is_export", |c: &ObisCode| c.is_export()),
         ("obis_is_reactive", ObisCode::is_reactive),
         ("obis_is_lastgang", ObisCode::is_lastgang),
         ("obis_is_zaehlerstand", ObisCode::is_zaehlerstand),
@@ -761,6 +998,13 @@ mod tests {
                 "wrapper disagreed with metering for {instant}"
             );
         }
+    }
+
+    async fn one_string(sql: &str) -> Option<String> {
+        use crate::arrow::array::AsArray;
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let column = batches[0].column(0).as_string::<i32>();
+        (!column.is_null(0)).then(|| column.value(0).to_string())
     }
 
     async fn one_bool(sql: &str) -> Option<bool> {
@@ -1210,6 +1454,228 @@ mod tests {
                  CAST(NULL AS VARCHAR))"
             )
             .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn balancing_month_follows_the_commodity() {
+        // 01:00 UTC on 1 March is 02:00 local: already March by the calendar,
+        // but still the February Gastag — and so the February
+        // Bilanzierungsmonat. `meter_local_month` cannot see the difference,
+        // which is the whole reason this function exists.
+        let at = "TIMESTAMP '2026-03-01T01:00:00Z'";
+        assert_eq!(
+            one_date(&format!("SELECT meter_balancing_month({at}, 'STROM')")).await,
+            Some(date!(2026 - 03 - 01))
+        );
+        assert_eq!(
+            one_date(&format!("SELECT meter_balancing_month({at}, 'GAS')")).await,
+            Some(date!(2026 - 02 - 01))
+        );
+        assert_eq!(
+            one_date(&format!("SELECT meter_local_month({at})")).await,
+            Some(date!(2026 - 03 - 01)),
+            "the calendar month is the electricity answer for every commodity"
+        );
+        for sparte in ["WAERME", "WASSER"] {
+            assert_eq!(
+                one_date(&format!("SELECT meter_balancing_month({at}, '{sparte}')")).await,
+                Some(date!(2026 - 03 - 01)),
+                "{sparte}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn balancing_month_reads_the_commodity_per_row() {
+        // Same guarantee as `meter_balancing_day`: a mixed table is grouped
+        // correctly by one statement, not by whichever Sparte sorted first.
+        let batches = ctx()
+            .sql(
+                "SELECT sparte, meter_balancing_month(t, sparte) AS m FROM (
+                   SELECT TIMESTAMP '2026-03-01T01:00:00Z' AS t, 'GAS' AS sparte
+                   UNION ALL SELECT TIMESTAMP '2026-03-01T01:00:00Z', 'STROM'
+                 ) ORDER BY sparte",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let epoch = Date::from_ordinal_date(1970, 1).unwrap();
+        let months = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(
+            epoch + time::Duration::days(i64::from(months.value(0))),
+            date!(2026 - 02 - 01),
+            "GAS sorts first"
+        );
+        assert_eq!(
+            epoch + time::Duration::days(i64::from(months.value(1))),
+            date!(2026 - 03 - 01),
+            "STROM must not inherit the gas month"
+        );
+    }
+
+    #[tokio::test]
+    async fn balancing_month_refuses_an_unknown_commodity_and_propagates_nulls() {
+        assert!(
+            ctx()
+                .sql("SELECT meter_balancing_month(TIMESTAMP '2026-03-01T01:00:00Z', 'OEL')")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .is_err(),
+            "an unknown Sparte must not be defaulted"
+        );
+        assert_eq!(
+            one_date("SELECT meter_balancing_month(CAST(NULL AS TIMESTAMP), 'GAS')").await,
+            None
+        );
+        assert_eq!(
+            one_date(
+                "SELECT meter_balancing_month(TIMESTAMP '2026-03-01T01:00:00Z', \
+                 CAST(NULL AS VARCHAR))"
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn obis_direction_separates_undirected_from_export() {
+        use crate::arrow::array::AsArray;
+        let batches = ctx()
+            .sql(
+                "SELECT obis_direction('1-0:1.8.0') AS bezug, \
+                        obis_direction('1-0:2.29.0') AS einspeisung, \
+                        obis_direction('1-0:3.8.0') AS blind, \
+                        obis_direction(CAST(NULL AS VARCHAR)) AS nothing",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &batches[0];
+        let value = |name: &str| {
+            let c = b.column_by_name(name).unwrap().as_string::<i32>();
+            (!c.is_null(0)).then(|| c.value(0).to_string())
+        };
+        assert_eq!(value("bezug").as_deref(), Some("IMPORT"));
+        assert_eq!(value("einspeisung").as_deref(), Some("EXPORT"));
+        // The finding the two booleans cannot make: Blindarbeit is neither, and
+        // `NOT obis_is_import(...)` would have swept it in with the feed-in.
+        assert_eq!(value("blind"), None);
+        assert_eq!(value("nothing"), None);
+    }
+
+    #[tokio::test]
+    async fn obis_direction_agrees_with_the_predicates_it_is_the_primitive_for() {
+        // Upstream derives `is_import`/`is_export` from `direction()`; storage
+        // exposes all three, so they must not be able to disagree in SQL either.
+        for code in [
+            "1-0:1.8.0",
+            "1-0:2.8.0",
+            "1-0:1.29.0",
+            "1-0:2.29.0",
+            "1-0:3.8.0",
+            "7-1:99.33.0",
+        ] {
+            let direction = {
+                use crate::arrow::array::AsArray;
+                let batches = ctx()
+                    .sql(&format!("SELECT obis_direction('{code}')"))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let c = batches[0].column(0).as_string::<i32>();
+                (!c.is_null(0)).then(|| c.value(0).to_string())
+            };
+            assert_eq!(
+                direction.as_deref() == Some("IMPORT"),
+                one_bool(&format!("SELECT obis_is_import('{code}')"))
+                    .await
+                    .unwrap(),
+                "{code}"
+            );
+            assert_eq!(
+                direction.as_deref() == Some("EXPORT"),
+                one_bool(&format!("SELECT obis_is_export('{code}')"))
+                    .await
+                    .unwrap(),
+                "{code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eic_regelzone_reads_position_four_of_a_bilanzierungsgebiet() {
+        for (code, want) in [
+            // `11Y` under the German LIO, position 4 the Regelzone letter.
+            ("11YN000000000016", Some("TENNET")),
+            ("11YV00000000001D", Some("FIFTY_HERTZ")),
+            // An `X` code is a Bilanzkreis, not a grid area — nothing to read.
+            ("11XBK0000000001A", None),
+            // Another issuing office, and the German rule does not apply to it.
+            ("10X168Y4E6H0041Z", None),
+        ] {
+            assert_eq!(
+                one_string(&format!("SELECT eic_regelzone('{code}')"))
+                    .await
+                    .as_deref(),
+                want,
+                "{code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_column_that_is_not_an_eic_is_null_rather_than_a_failed_report() {
+        // Unlike `obis_code`, the argument comes from a *deployment* column that
+        // may or may not be declared `check = "EIC"`. Failing the statement on
+        // one row of free text would make the function unusable exactly where it
+        // is most wanted.
+        use crate::arrow::array::AsArray;
+        let batches = ctx()
+            .sql(
+                "SELECT eic_regelzone(c) AS z FROM (
+                   SELECT '11YN000000000016' AS c
+                   UNION ALL SELECT 'not an eic'
+                   UNION ALL SELECT CAST(NULL AS VARCHAR)
+                 ) ORDER BY c",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for b in &batches {
+            let c = b.column(0).as_string::<i32>();
+            for i in 0..c.len() {
+                seen.push((!c.is_null(i)).then(|| c.value(i).to_string()));
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec![None, None, Some("TENNET".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_transposed_eic_reads_as_no_regelzone_rather_than_the_wrong_one() {
+        // The check character is what makes that possible: `11YN000000000016`
+        // with any other check character is not an EIC, so it cannot be parsed
+        // into a plausible-looking TenneT grid area.
+        assert_eq!(
+            one_string("SELECT eic_regelzone('11YN000000000017')").await,
             None
         );
     }

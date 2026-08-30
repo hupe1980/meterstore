@@ -30,8 +30,8 @@ pub use metering::calendar::{
 };
 
 pub use calendar::{
-    balancing_day, balancing_day_bounds, balancing_day_length, balancing_month, day_boundary,
-    expected_intervals_in_balancing_day,
+    balancing_day, balancing_day_bounds, balancing_day_length, balancing_month,
+    balancing_month_bounds, bilanzierungsmonat, day_boundary, expected_intervals_in_balancing_day,
 };
 pub use predicate::{range_filters, time_range};
 pub use provider::{ReadMode, SnapshotSelector, TieredTableProvider};

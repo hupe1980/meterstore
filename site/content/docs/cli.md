@@ -1,6 +1,6 @@
 +++
 title = "The CLI"
-description = "meterstore init, check, create, status, archive, maintain, query and serve — the same library, without a program to write."
+description = "meterstore init, check, create, status, archive, maintain, query, completeness and serve — the same library, without a program to write."
 weight = 9
 +++
 
@@ -18,6 +18,7 @@ or two library calls, and nothing here is unreachable from Rust.
 | `status` | Boundary, lag, write runway, health. Non-zero exit when unhealthy |
 | `archive` `maintain` | One-shot for cron; foreground loop for a sidecar |
 | `query` `explain` | SQL across both tiers, with the boundary it ran against |
+| `completeness` | Which channels are short, and which delivered nothing |
 | `snapshots` | What a settlement rerun can pin to |
 | `serve` | Flight SQL and the Iceberg REST façade |
 | `purge` | Destroy a table. No recovery path |
@@ -116,6 +117,65 @@ A statement of `-` reads from standard input, so a long query can live in a file
 ```bash
 meterstore query - < settlement.sql
 ```
+
+## Asking whether a month is complete
+
+A `SUM` over an incomplete month returns a smaller number and no reason, so the
+question has its own verb:
+
+```bash
+# The settlement period, named the way the market names one.
+meterstore completeness --month 2026-06 --seen-since 30d
+```
+
+```text
+TABLE                MALO          OBIS           SPARTE  RES      EXPECTED    ACTUAL   MISSING   SURPLUS  FIRST GAP     NOTE
+readings_versions    41373559241   1-0:1.29.0     STROM   PT15M        2880      2880         0         0  —
+readings_versions    56789012345   1-0:1.29.0     STROM   PT15M        2880      2784        96         0  2026-06-14
+readings_versions    99887766554   1-0:1.29.0     STROM   PT15M        2880         0      2880         0  2026-06-01    delivered nothing in the range
+
+3 channel(s) over [2026-05-31T22:00:00Z, 2026-06-30T22:00:00Z) — 2 incomplete, 1 silent, 2976 interval(s) missing
+```
+
+The expectation is the DST-aware calendar's, per balancing day: 92 intervals on
+the spring day, 100 on the autumn one, and for gas both on the **Gastag** rather
+than the Sunday. It covers **every day of the range**, so a channel that stopped
+mid-month is short by every day after — and a report over a month that has not
+finished reports the remainder as missing. Ask about periods that are over.
+`--gaps-only` drops the complete rows.
+
+**`--month YYYY-MM` is a Bilanzierungsmonat, not a calendar month.** The range
+printed above starts at 22:00 UTC on 31 May because that is midnight in Berlin.
+`--sparte GAS` cuts the same span at 06:00 local instead. Rows are always counted
+against their *own* `sparte`; the flag decides where the **range** is cut, which
+one value cannot do for two — so a table holding both is reported once per
+commodity.
+
+`--from`/`--to` take RFC 3339 instants for any other period, and `--malo` /
+`--obis` narrow the report to one measuring point or one channel — in the scan,
+so asking about one meter does not cost a scan of the portfolio.
+
+**`--seen-since` is the finding a range cannot make about itself.** A channel that
+delivered nothing produces no rows to aggregate, so it is absent from the report
+rather than reported as empty — unless a roster is drawn from an earlier window.
+There is no default, because what a roster means is master data this crate does
+not hold: too short and a meter read monthly looks decommissioned, too long and
+every terminated measuring point is a standing finding. `--malo` and `--obis`
+narrow the roster too, or every channel outside them would come back as silent.
+
+This exits **zero** whatever it finds. A gap is a fact to triage; `status` is the
+check that fails, because a stranded row means query results are *wrong* rather
+than incomplete. For a monitoring check, read the JSON — it carries
+`channels_reported`, `channels_incomplete`, `channels_silent` and
+`intervals_missing` beside the rows:
+
+```bash
+meterstore completeness --month 2026-06 --format json \
+  | jq -e '.channels_incomplete == 0'
+```
+
+More on what the numbers mean, and why `missing` is not `expected - actual`, in
+[Completeness](@/docs/completeness.md).
 
 ## Machine output
 

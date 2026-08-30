@@ -39,6 +39,76 @@ pub fn coded_column(name: &str, allowed: &[&str], nullable: bool) -> Field {
     )]))
 }
 
+/// Arrow field-metadata key under which an attribute column declares the domain
+/// identifier its values must parse as.
+///
+/// Read by the write path, which parses every supplied value with `metering`'s
+/// own type and stores that type's canonical spelling. Like [`CHECK_VALUES_KEY`]
+/// it is inert everywhere else, so a checked column stays a plain `Utf8` column.
+/// See [`eic_column`].
+pub const VALUE_CHECK_KEY: &str = "meterstore.value_check";
+
+/// The [`VALUE_CHECK_KEY`] value naming an ENTSO-E Energy Identification Code.
+pub const VALUE_CHECK_EIC: &str = "EIC";
+
+/// A `Utf8` column whose values must be a valid **EIC**.
+///
+/// The sixteen-character ENTSO-E Energy Identification Code, which is what the
+/// German market addresses a **Bilanzkreis**, a **Bilanzierungsgebiet**, a
+/// Regelzone and a Metering Grid Area by — the two columns
+/// [`TableConfig::attribute_column`] names in its own documentation, and the
+/// ones a MaBiS Summenzeitreihe groups on.
+///
+/// # Why this is not just a string column
+///
+/// The argument that makes `malo_id` a [`MaloId`](metering::ids::MaloId) rather
+/// than eleven digits. An EIC carries a **check character**, and unlike the BDEW
+/// Codenummer — whose Bildungsvorschrift exempts GS1-issued GLNs, which is why
+/// `version_scope` deliberately does not check its digit — the EIC scheme has no
+/// carve-out, so a mistyped code is detectable while the message that carried it
+/// is still in hand.
+///
+/// Values are stored **canonicalised** (`Eic`'s uppercase, trimmed form), for the
+/// reason [`canonical_obis`](crate::canonical_obis) exists: on an
+/// [`identity_column`](TableConfig::identity_column), one Bilanzkreis in two
+/// spellings is two readings that never supersede each other.
+///
+/// # Two checks, and each stops somewhere
+///
+/// The hot table gets a `CHECK` for the *shape*: sixteen characters of `0-9`,
+/// `A-Z` or `-`, an uppercase letter in position 3, and a check character that is
+/// not `-`. The check *character* is arithmetic over the other fifteen and no
+/// regular expression expresses it, so the write path enforces that half. A row
+/// written to PostgreSQL by something else gets the shape check and not the check
+/// character.
+///
+/// ```rust
+/// use meterstore::{TableConfig, eic_column};
+///
+/// let table = TableConfig::new("readings_versions")
+///     .attribute_column(eic_column("bilanzkreis", true))
+///     .attribute_column(eic_column("bilanzierungsgebiet", true))
+///     .build()?;
+/// assert_eq!(table.attribute_columns().len(), 2);
+/// # Ok::<(), meterstore::Error>(())
+/// ```
+#[must_use]
+pub fn eic_column(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Utf8, nullable).with_metadata(std::collections::HashMap::from([(
+        VALUE_CHECK_KEY.to_string(),
+        VALUE_CHECK_EIC.to_string(),
+    )]))
+}
+
+/// The domain identifier a field's values must parse as, if it declares one.
+///
+/// One reader for [`VALUE_CHECK_KEY`], so the write path and the DDL cannot
+/// disagree about which columns are checked.
+#[must_use]
+pub fn declared_value_check(field: &Field) -> Option<&str> {
+    field.metadata().get(VALUE_CHECK_KEY).map(String::as_str)
+}
+
 /// What a row's timestamps mean: a span, or an instant.
 ///
 /// A **Lastgang** is energy over `[from, to)`. A **Zählerstandsgang** is a
@@ -704,6 +774,38 @@ mod tests {
         assert_eq!(
             f.metadata().get(CHECK_VALUES_KEY).map(String::as_str),
             Some("MSCONS,DIRECT_PUSH")
+        );
+    }
+
+    #[test]
+    fn an_eic_column_declares_the_identifier_scheme_its_values_must_parse_as() {
+        let f = eic_column("bilanzkreis", true);
+        assert_eq!(f.data_type(), &DataType::Utf8);
+        assert!(f.is_nullable());
+        assert_eq!(declared_value_check(&f), Some(VALUE_CHECK_EIC));
+        // A vocabulary and an identifier scheme are different claims, so the
+        // one key does not carry the other's value.
+        assert!(f.metadata().get(CHECK_VALUES_KEY).is_none());
+        assert_eq!(declared_value_check(&coded_column("s", &["A"], true)), None);
+        assert_eq!(
+            declared_value_check(&Field::new("plain", DataType::Utf8, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_checked_column_may_be_an_identity_column() {
+        // Which is where the check earns most: a Bilanzkreis in the merge key
+        // arriving in two spellings is two readings that never supersede each
+        // other.
+        let c = base()
+            .identity_column(eic_column("bilanzkreis", false))
+            .build()
+            .unwrap();
+        assert!(c.merge_key().contains(&"bilanzkreis".to_string()));
+        assert_eq!(
+            declared_value_check(&c.identity_columns()[0]),
+            Some(VALUE_CHECK_EIC)
         );
     }
 

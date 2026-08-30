@@ -85,8 +85,10 @@ meterstore status    # boundary, lag, write runway, health
 ```
 
 `meterstore query` runs SQL across both tiers and prints the boundary the answer
-was computed against; `meterstore maintain` is the archival loop as a foreground
-process. [The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
+was computed against; `meterstore completeness --month 2026-06` reports which
+channels are short before a settlement run trusts a `SUM`; `meterstore maintain`
+is the archival loop as a foreground process.
+[The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
 
 As a library:
 
@@ -170,6 +172,20 @@ belongs to the *meter*, so it joins the merge key — by default on a point tabl
 `identify_by_melo` either way. Keyed wrongly, two meters that agree on a number
 store as one reading.
 
+A deployment's own columns are declared the same way, and an identifier among
+them is **parsed rather than trusted** — the argument that makes `malo_id` a
+`MaloId` rather than eleven digits. A Bilanzkreis is an ENTSO-E EIC with a check
+character:
+
+```rust
+TableConfig::new("readings_versions")
+    .identity_column(Field::new("tenant", DataType::Utf8, false))   // joins the merge key
+    .attribute_column(eic_column("bilanzkreis", true))              // check character enforced
+```
+
+Values are parsed and stored canonicalised, so one Bilanzkreis in two spellings
+cannot become two readings that never supersede each other.
+
 A `MeasurementSeries` holds one `obis_code`, so a typed read describes **one
 channel** — folding import and export together sums to twice the truth. A
 measuring point is a set of them, so there is a read for that too, in one scan:
@@ -187,13 +203,22 @@ before pointing an external engine at the warehouse.
 A `SUM` over an incomplete month returns a smaller number and no reason, so
 **completeness is a query**. The expected count is the DST-aware calendar's — 92
 on the spring day, 100 on the autumn one, and for gas both on the Gastag rather
-than the Sunday. The strongest finding is the one a range cannot make about
-itself: a channel that delivered *nothing* produces no rows to aggregate, so it
-needs a roster from an earlier window.
+than the Sunday. It covers **every balancing day of the range**, so a channel
+that stopped mid-month is short by every day after it stopped.
+
+The strongest finding is the one a range cannot make about itself: a channel that
+delivered *nothing* produces no rows to aggregate at all, so it needs a roster
+from an earlier window.
 
 ```rust
 store.completeness(from, to).await?;                              // gaps within
 store.completeness(from, to).seen_since(from - month).await?;     // and what went silent
+```
+
+```bash
+# The settlement period, named the way the market names one. --sparte GAS cuts
+# the same span at 06:00 local, where the gas Bilanzierungsmonat begins.
+meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
 ```
 
 Personal data comes with a clock rather than a request. § 60 Abs. 6 MsbG says
@@ -237,6 +262,11 @@ every `VersionScope` constructor takes a `Sparte`:
 VersionScope::for_interval("9900000000001", interval.from, Sparte::Gas)?
 ```
 
+The month has its own function for the same reason the day does:
+`meter_local_month` is the *calendar* month for every row, so grouping a gas
+Lastgang by it books six hours into the neighbouring Bilanzierungsmonat twelve
+times a year. `meter_balancing_month("from", sparte)` reads the commodity.
+
 **An external engine does not get that function — so it gets the answer instead.**
 SQL dialects differ on timestamp arithmetic, so no single published expression is
 right everywhere. The encoder applies the calendar once, at write time, and stores
@@ -245,7 +275,17 @@ the answer:
 ```sql
 -- Every engine. No zone conversion, no DST reasoning, no dialect.
 SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
+
+-- And the settlement month, because a Bilanzierungsmonat is a whole number of
+-- balancing days — so this is a DATE operation rather than a calendar one.
+SELECT date_trunc('month', balancing_day), SUM(value) FROM readings GROUP BY 1;
 ```
+
+Direction is three-valued, not two booleans. **Both** `obis_is_import` and
+`obis_is_export` are false for a register that has no direction at all —
+Blindarbeit, a gas volume, a Zustandszahl — so `NOT obis_is_import(...)` sweeps
+those in with the feed-in. `obis_direction(obis_code)` returns `'IMPORT'`,
+`'EXPORT'` or null.
 
 [Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
@@ -255,7 +295,7 @@ SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
-| `metering` | **0.20 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.21 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
@@ -316,7 +356,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**807 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+**857 tests**: unit, property, doc and integration against real PostgreSQL 16 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
 read the output and agree with it, down to the audit trail's timestamps. The lock

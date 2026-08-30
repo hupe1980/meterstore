@@ -102,7 +102,14 @@ snapshot_retention = "10y"
 # type = "string"
 # identity = true
 #
+# `values` declares a closed vocabulary and renders a `CHECK ... IN (...)`;
+# `check` declares an identifier scheme, and the write path parses every value
+# with it. A Bilanzkreis is an ENTSO-E EIC with a check character, not sixteen
+# arbitrary characters — so a transposition is caught while the delivery that
+# carried it is still in hand. The two are mutually exclusive.
+#
 # [[tables.extra_columns]]
 # name = "bilanzkreis"
 # type = "string"
 # identity = false
+# check = "EIC"

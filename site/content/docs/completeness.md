@@ -22,6 +22,18 @@ for row in store.completeness(from, to).await? {
 }
 ```
 
+`malo`, `obis` and `column_eq` narrow it — in the **scan**, not in the answer, so
+a question about one meter does not cost a scan of the portfolio:
+
+```rust
+store.completeness(from, to).malo("41373559241")?.await?;
+```
+
+Identifiers are parsed and canonicalised, so a mistyped one fails at the call
+rather than returning an empty report that reads as *"this meter is fine"*. The
+narrowing applies to the [roster](#the-finding-a-range-cannot-make-about-itself)
+too, or every channel outside it would come back as silent.
+
 Or as a table function, for the operator holding a SQL client rather than a
 compiler:
 
@@ -35,7 +47,7 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 | *merge-key columns* | One column per declared identity column, and `melo_id` where the table [identifies a reading by its Messlokation](@/docs/storage-model.md#the-messlokation-may-be-part-of-the-identity) |
 | `sparte` | The commodity — and therefore **which day** the row is measured on |
 | `resolution` | The declared interval grid — and therefore **how many** values a day should hold. Grouped on, so it is this row's grid rather than one of several |
-| `expected` | What the DST-aware calendar says the range should hold |
+| `expected` | What the DST-aware calendar says the range should hold — **every** balancing day of it, not only the days that produced rows |
 | `actual` | What is stored |
 | `missing` | Intervals short, **summed per balancing day** |
 | `surplus` | Intervals beyond the expectation, summed per balancing day |
@@ -47,6 +59,32 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 `actual = 0` on a row is a channel that delivered nothing at all — `is_silent()`
 in Rust. Such a row exists only when the query was given a reference window, which
 is the next section.
+
+## Every day of the range
+
+The expectation covers every balancing day between `from` and `to`, including days
+the channel delivered nothing on: a day with no rows is a day whose whole
+expectation is missing.
+
+The aggregate underneath is a `GROUP BY`, which produces no group for an empty
+day — so counting only the days that came back would measure a channel against
+itself, and a meter that stopped on the 2nd of March would report the month
+complete.
+
+> **A range reaching past the last delivery says so.** A report over a whole
+> month, run mid-month, reports the remainder as missing. Consulting a clock
+> instead would make one report answer differently on two runs, which is what the
+> [reproducibility](@/docs/reproducibility.md) machinery exists to prevent — so
+> ask about periods that are over, or end the range at the last settled instant.
+
+### Which grid an absent day belongs to
+
+There is one row per channel **per grid**, so a day nobody delivered on has to be
+charged to one of them. It goes to the grid **last in force before it**, and a gap
+preceding the channel's first delivery to the first grid it used. Charging it to
+every grid would report a clean hourly→quarter-hourly conversion as two badly
+incomplete halves. For a single-grid channel — the ordinary case — this is simply
+"the whole range".
 
 ## The finding a range cannot make about itself
 
@@ -89,6 +127,20 @@ this crate does not hold.
 
 A channel whose *grid* changed is still reporting and is not called silent: the
 match is on what names a reading, not on the resolution it is delivered at.
+
+## From the command line
+
+The same question, without a compiler:
+
+```bash
+meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
+```
+
+`--month YYYY-MM` is the **Bilanzierungsmonat** — cut at midnight local for
+electricity, 06:00 for gas with `--sparte GAS` — and `--malo` / `--obis` narrow
+it. It exits zero whatever it finds; `--format json` carries the rows plus
+`channels_incomplete`, `channels_silent` and `intervals_missing`.
+[The CLI →](@/docs/cli.md#asking-whether-a-month-is-complete)
 
 ## One row per reading, not per measuring point
 
@@ -197,3 +249,8 @@ The roll-up to one row per channel happens in Rust, where the calendar lives and
 where billability can be *asked* of `metering` rather than restated as a `CASE`.
 § 60 Abs. 2 MsbG is a statute; a second copy of it in SQL is a second thing to
 keep in step with it.
+
+The roll-up walks the range's balancing days, so its cost is bounded by the
+*period* as well as by the data. The expectation depends on `(Sparte, resolution)`
+and never on the channel, so it is computed once per grid rather than once per
+channel, and no absent day is materialised.
