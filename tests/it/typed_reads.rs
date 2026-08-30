@@ -50,15 +50,19 @@ fn on_channel(
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-26 06:00 UTC),
     );
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", START, metering::interval::Sparte::Strom)
-                .unwrap(),
+            meterstore::VersionScope::for_interval(
+                "9900000000001",
+                START,
+                metering::interval::Sparte::Strom,
+            )
+            .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-26 06:00 UTC),

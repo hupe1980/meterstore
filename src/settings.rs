@@ -76,9 +76,9 @@ impl Settings {
 
     /// Validate every table, in declaration order.
     ///
-    /// Runs the full cross-field validation, so a file whose `partition_step`
-    /// disagrees with its `archival_step` fails here rather than degrading the
-    /// purge to a row-wise `DELETE` in production (§8.1).
+    /// Runs the full cross-field validation, so a file whose `settlement_lag`
+    /// is shorter than its `archival_step` fails here rather than stranding
+    /// corrections below the watermark in production (§8.1).
     pub fn validate(&self) -> Result<Vec<crate::config::ValidatedTableConfig>> {
         if self.tables.is_empty() {
             return Err(Error::config(
@@ -615,7 +615,6 @@ impl TableSettings {
     pub fn validate(&self) -> Result<crate::config::ValidatedTableConfig> {
         let mut config = TableConfig::new(&self.name)
             .time_model(self.time_model)
-            .partition_step(self.hot.partition_step.0)
             .partition_headroom(self.hot.partition_headroom.0)
             .archival_step(self.archival.archival_step.0)
             .settlement_lag(self.archival.settlement_lag.0)
@@ -667,9 +666,6 @@ impl TableSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableHotSettings {
-    /// Partition granularity. **Must equal `archival.archival_step`** (§7.2).
-    #[serde(default = "default_partition_step")]
-    pub partition_step: HumanDuration,
     /// How far ahead of the write frontier partitions are pre-created.
     #[serde(default = "default_headroom")]
     pub partition_headroom: HumanDuration,
@@ -678,15 +674,11 @@ pub struct TableHotSettings {
 impl Default for TableHotSettings {
     fn default() -> Self {
         Self {
-            partition_step: default_partition_step(),
             partition_headroom: default_headroom(),
         }
     }
 }
 
-fn default_partition_step() -> HumanDuration {
-    HumanDuration(crate::config::defaults::PARTITION_STEP)
-}
 fn default_headroom() -> HumanDuration {
     HumanDuration(crate::config::defaults::PARTITION_HEADROOM)
 }
@@ -699,7 +691,8 @@ pub struct ArchivalSettings {
     /// correction window, or a window closes while corrections are still arriving.
     #[serde(default = "default_settlement_lag")]
     pub settlement_lag: HumanDuration,
-    /// Window size — one partition per commit.
+    /// Window size — **and the hot table's partition granularity**, which is the
+    /// same number: a purge drops exactly one partition per archived window.
     #[serde(default = "default_archival_step")]
     pub archival_step: HumanDuration,
     /// Rows fetched per round trip when streaming a scan.
@@ -1062,7 +1055,6 @@ extra_columns = [
 ]
 
 [tables.hot]
-partition_step = "1d"
 partition_headroom = "14d"
 
 [tables.archival]
@@ -1083,7 +1075,7 @@ min_snapshots_to_keep = 20
 
         let table = settings.single_table().unwrap();
         assert_eq!(table.name(), "readings");
-        assert_eq!(table.partition_step(), Duration::DAY);
+        assert_eq!(table.archival_step(), Duration::DAY);
         assert_eq!(table.settlement_lag(), Duration::days(7));
     }
 
@@ -1290,22 +1282,18 @@ extra_columns = [{ name = "subject_ref", identity = true }]
     }
 
     #[test]
-    fn a_partition_step_that_disagrees_with_archival_is_refused() {
-        // The mismatch that silently degrades purge to row-wise DELETE.
+    fn a_separate_partition_step_is_not_a_setting() {
+        // The partition granularity *is* `archival_step`, so a file naming a
+        // second key for it must fail rather than read as an accepted setting
+        // that changes nothing.
         let toml = r#"
 [[tables]]
 name = "readings"
 [tables.hot]
 partition_step = "1w"
-[tables.archival]
-archival_step = "1d"
 "#;
-        let err = Settings::from_toml(toml)
-            .unwrap()
-            .single_table()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("DELETE"), "{err}");
+        let err = Settings::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("partition_step"), "{err}");
     }
 
     #[test]

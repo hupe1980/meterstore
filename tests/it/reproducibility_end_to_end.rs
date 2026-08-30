@@ -124,7 +124,7 @@ impl Harness {
         let detail = serde_json::to_string(&MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         })
         .unwrap();
 
@@ -142,7 +142,7 @@ impl Harness {
                     quality, resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'MSCONS',
-                           $6,'[]',$7,'99:2026-07',$8,
+                           $6,'[]',$7,'9900000000001:2026-07',$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
             .bind(malo)
@@ -1087,7 +1087,7 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-08-01 06:00 UTC),
     );
@@ -1096,7 +1096,7 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
     let stored = StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D18, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000001", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),
@@ -1257,7 +1257,7 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-08-01 06:00 UTC),
     );
@@ -1266,7 +1266,7 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D18, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000001", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),

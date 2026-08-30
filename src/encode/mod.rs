@@ -444,79 +444,24 @@ fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
 
 /// Encode a series' audit trail for the `provenance` column.
 ///
-/// **Written out rather than `serde_json::to_string`, and the reason is one
-/// field.** `ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose
-/// serde impl is *feature-conditional* — a nine-element ordinal-date array
-/// (`[2026,208,6,0,0,0,0,0,0]`) without `serde-human-readable`, a `time`-formatted
-/// string with it. So the on-disk shape of an audit trail under a decades-long
-/// retention would be decided by Cargo feature unification, and `time` takes the
-/// tuple path on read when the feature is off. Enabling it here would move that
-/// decision rather than remove it, at the cost of a global feature.
-///
-/// Encoded like every other column instead: `metering`'s own stable code for the
-/// event type, RFC 3339 for the instant, and the field names serde produced.
+/// `metering`'s own `serde`, like [`encode_source`], so the stored vocabulary has
+/// one spelling and it is the domain's. The instant lands as RFC 3339 because
+/// `metering::wire` says so — `time`'s own impl is feature-conditional, which
+/// would leave the on-disk shape of a decades-long audit trail to Cargo feature
+/// unification.
 fn encode_provenance(trail: &[ProvenanceEntry]) -> Result<String> {
-    let rows: Vec<serde_json::Value> = trail
-        .iter()
-        .map(|entry| {
-            Ok(serde_json::json!({
-                "occurred_at": entry
-                    .occurred_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|e| Error::encode(col::PROVENANCE, e.to_string()))?,
-                "event_type": entry.event_type.as_str(),
-                "actor": entry.actor,
-                "note": entry.note,
-            }))
-        })
-        .collect::<Result<_>>()?;
-    Ok(serde_json::to_string(&rows)?)
+    serde_json::to_string(trail).map_err(|e| Error::encode(col::PROVENANCE, e.to_string()))
 }
 
 /// The inverse of [`encode_provenance`].
 ///
 /// Fallible where the encoder is total, for the reason every decoder here is:
 /// the input is a string read back out of storage, which a file this crate did
-/// not write may set to anything at all.
+/// not write may set to anything at all. The error names the column, so a
+/// malformed audit trail reads as a storage fault rather than as a serde message
+/// about a Rust type nobody outside this crate has heard of.
 fn decode_provenance(raw: &str) -> Result<Vec<ProvenanceEntry>> {
-    let malformed = |detail: String| Error::decode(col::PROVENANCE, detail);
-
-    let serde_json::Value::Array(rows) = serde_json::from_str::<serde_json::Value>(raw)? else {
-        return Err(malformed(format!("{raw:?} is not a JSON array")));
-    };
-
-    rows.into_iter()
-        .map(|row| {
-            let field = |name: &str| -> Result<&serde_json::Value> {
-                row.get(name)
-                    .ok_or_else(|| malformed(format!("entry is missing {name:?}: {row}")))
-            };
-            let text = |name: &str| -> Result<String> {
-                field(name)?
-                    .as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| malformed(format!("{name:?} is not a string: {row}")))
-            };
-
-            Ok(ProvenanceEntry {
-                occurred_at: time::OffsetDateTime::parse(
-                    &text("occurred_at")?,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .map_err(|e| malformed(format!("occurred_at: {e}")))?,
-                // `decode_code`, so a spelling that merely parses is refused the
-                // same way every other coded column's is.
-                event_type: decode_code(col::PROVENANCE, &text("event_type")?)?,
-                actor: text("actor")?,
-                note: match field("note")? {
-                    serde_json::Value::Null => None,
-                    other => Some(other.as_str().map(str::to_string).ok_or_else(|| {
-                        malformed(format!("note is neither a string nor null: {row}"))
-                    })?),
-                },
-            })
-        })
-        .collect()
+    serde_json::from_str(raw).map_err(|e| Error::decode(col::PROVENANCE, format!("{raw:?}: {e}")))
 }
 
 /// Decode a source from its discriminant and payload.
@@ -1479,7 +1424,7 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSG-1".to_string()),
-            sender_mp_id: "9900000000001".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
@@ -1827,7 +1772,7 @@ mod tests {
         mscons.series.source = MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         };
 
         let mut gateway = series(vec![quarter(
@@ -1965,10 +1910,10 @@ mod tests {
              source_kind still reads VIRTUAL_METER, so nothing else reports it"
         );
 
-        // The audit trail, and its timestamp above all. `serde` would have written
-        // `occurred_at` as `[2026,60,0,0,0,0,0,0,0]` — the shape `time` uses when
-        // `serde-human-readable` is off, which is a decision made by whatever else
-        // is in the binary rather than by this crate. It is written out instead.
+        // The audit trail, and its timestamp above all. `time`'s own serde impl
+        // is feature-conditional — `occurred_at` lands as
+        // `[2026,60,0,0,0,0,0,0,0]` wherever `serde-human-readable` is off — so
+        // this pins `metering::wire`'s decision to write RFC 3339 instead.
         let entry = ProvenanceEntry {
             occurred_at: datetime!(2026-03-01 00:00 UTC),
             event_type: metering::measurement_series::ProvenanceEventType::Ingested,
@@ -1977,10 +1922,11 @@ mod tests {
         };
         assert_eq!(
             encode_provenance(std::slice::from_ref(&entry)).unwrap(),
-            r#"[{"actor":"MSCONS","event_type":"INGESTED","note":null,"occurred_at":"2026-03-01T00:00:00Z"}]"#,
+            r#"[{"occurred_at":"2026-03-01T00:00:00Z","event_type":"INGESTED","actor":"MSCONS","note":null}]"#,
             "the stored shape of a provenance entry changed. Rows already in the \
              provenance column are in the old shape — this is a stored-data \
-             break, and an audit trail is the one column that must stay readable"
+             break, and an audit trail is the one column that must stay readable. \
+             An `occurred_at` that is not RFC 3339 means `metering::wire` changed"
         );
 
         // And it decodes back, which is the half that matters on the read path.

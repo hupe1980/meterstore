@@ -475,13 +475,14 @@ async fn a_foreign_engine_can_read_the_audit_trail() {
     // person during an investigation, and this crate tells operators to point
     // Spark, Trino and DuckDB at these files directly.
     //
-    // Written through `serde`, `ProvenanceEntry::occurred_at` lands as
-    // `[2026,208,6,0,0,0,0,0,0]` — `time`'s ordinal-date tuple, which is what its
-    // serde impl produces unless `serde-human-readable` is on somewhere in the
-    // graph. Unreadable, and worse, decided by feature unification rather than by
-    // this crate. It is written out explicitly instead, and this is the assertion
-    // that the result is genuinely portable: an engine that has never heard of
-    // `time` parses the timestamp as a timestamp.
+    // `ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose own serde
+    // impl lands as `[2026,208,6,0,0,0,0,0,0]` unless `serde-human-readable` is
+    // on somewhere in the graph — unreadable, and worse, decided by feature
+    // unification rather than by any crate with an opinion. `metering` 0.20
+    // settles it upstream (`wire::rfc3339`), so this crate writes the column with
+    // plain `serde` again, and this is the assertion that the result is genuinely
+    // portable: an engine that has never heard of `time` parses the timestamp as
+    // a timestamp. If it ever fails, the upstream wire format moved.
     let workload = MeteringWorkload::new(START)
         .seed(0xA0D17)
         .malo_ids(1)

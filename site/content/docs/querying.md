@@ -251,8 +251,25 @@ let confined = store.scoped("tenant", "a").await?;           // …or the sessio
 column, or `melo_id` on a table that
 [identifies a reading by its Messlokation](@/docs/storage-model.md#the-messlokation-may-be-part-of-the-identity).
 A column that is *not* in the merge key never splits a series: a Bilanzkreis
-reassigned between two deliveries is one series with a changed attribute, and
+reassigned partway through a range is one series with a changed attribute, and
 refusing that would make an ordinary correction unreadable.
+
+#### And one no narrowing can fix
+
+Two values at one instant that are *not* two readings: resolution partitions by
+the merge key **and `version_scope`**, so two network operators for one reading
+leave two winners agreeing on channel and discriminators alike. The fold refuses
+those with `InvariantViolated` — nothing is being rejected at a boundary, so
+something that should not be true already is, in stored rows.
+
+Both write paths refuse a second operator, so reaching it means
+[integrity constraints are off](@/docs/storage-model.md#the-constraints-that-stop-a-wrong-number)
+or something other than MeterStore wrote the rows. It matters most on the
+**register** path: a Zählerstandsgang is *differenced*, so an arbitrary one of the
+two values lands on both sides of a subtraction and the consumption between two
+reads means nothing.
+
+A `SUM` written in SQL is not covered — it will simply be twice the truth.
 
 ### …but a measuring point is a set of them
 

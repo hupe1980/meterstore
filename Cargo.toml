@@ -1,7 +1,8 @@
 [package]
 name = "meterstore"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
+authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/meterstore"
@@ -101,10 +102,13 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # conversion, Ersatzwertbildung. MeterStore persists and queries those types —
 # it does not redefine them. Part of the mako platform (hupe1980/mako).
 #
-# 0.19 is a floor rather than a preference: `calendar::DayBoundary` is what makes
-# the gas Bilanzierungsmonat expressible, and a version scope derived without it
-# is wrong for a whole commodity.
-metering = { version = "0.19", features = ["serde"] }
+# 0.20 is a floor rather than a preference: two of the things this crate stores
+# are its types rather than strings it checks itself. `ids::BdewCode` is the
+# operator half of a `VersionScope`, where a wrong-but-plausible value is not an
+# error but a *different scope*. `wire::rfc3339` fixes the shape
+# `ProvenanceEntry::occurred_at` is written in, which `time`'s own
+# feature-conditional serde impl would otherwise leave to feature unification.
+metering = { version = "0.20", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is

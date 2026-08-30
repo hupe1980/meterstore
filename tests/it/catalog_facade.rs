@@ -36,6 +36,15 @@ async fn facade(harness: &TestHarness) -> Router {
     CatalogFacade::new(harness.cold().catalog()).router()
 }
 
+/// The façade as [`ColdTier::catalog_facade`] builds it: confined to one namespace.
+fn confined(harness: &TestHarness) -> Router {
+    CatalogFacade::in_namespace(
+        harness.cold().catalog(),
+        iceberg::NamespaceIdent::new(NAMESPACE.to_string()),
+    )
+    .router()
+}
+
 async fn call(app: &Router, method: Method, path: &str) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
@@ -195,4 +204,66 @@ async fn a_route_outside_the_served_subset_says_so() {
             .is_some_and(|m| m.contains("read-only subset")),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn a_confined_facade_serves_one_namespace_and_admits_no_other() {
+    // A SQL catalogue is a table in a database, and a database is a thing
+    // organisations share. Serving every namespace the catalogue happens to hold
+    // would put an unauthenticated read of somebody else's table metadata on a
+    // socket — the same class of mistake as a query that steps outside its
+    // tenant, and this endpoint is the one that is reachable from a network.
+    let harness = TestHarness::start().await.expect("harness");
+
+    // A second namespace, as a co-tenant of the same catalogue would create.
+    let catalog = harness.cold().catalog();
+    let other = iceberg::NamespaceIdent::new("someone_else".to_string());
+    iceberg::Catalog::create_namespace(catalog.as_ref(), &other, Default::default())
+        .await
+        .expect("a co-tenant's namespace");
+
+    // Unconfined, it is listed — which is exactly why the confined form exists.
+    let (_, all) = call(&facade(&harness).await, Method::GET, "/v1/namespaces").await;
+    let names: Vec<String> = all["namespaces"]
+        .as_array()
+        .expect("namespaces")
+        .iter()
+        .map(|n| n[0].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(names.contains(&"someone_else".to_string()), "{all}");
+
+    let app = confined(&harness);
+
+    // The listing reports one namespace, and it is not the other one.
+    let (status, listed) = call(&app, Method::GET, "/v1/namespaces").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        listed["namespaces"],
+        serde_json::json!([[NAMESPACE]]),
+        "{listed}"
+    );
+
+    // And every route that names another namespace is refused before the catalog
+    // is touched — including the one that would return its table metadata.
+    for path in [
+        "/v1/namespaces/someone_else",
+        "/v1/namespaces/someone_else/tables",
+        "/v1/namespaces/someone_else/tables/anything",
+    ] {
+        let (status, body) = call(&app, Method::GET, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert_eq!(
+            body["error"]["type"], "NoSuchNamespaceException",
+            "a client parses the kind, and 403 would confirm the namespace exists: {body}"
+        );
+    }
+
+    // The served namespace still works exactly as before.
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        &format!("/v1/namespaces/{NAMESPACE}/tables"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

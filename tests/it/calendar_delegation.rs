@@ -10,7 +10,10 @@ use metering::calendar::{
     DayKind, day_kind, day_length, gas_day_end_utc, gas_day_start_utc, intervals_in_day, local_day,
     local_gas_day,
 };
-use meterstore::planner::{balancing_day, gas_day_length, intervals_in_gas_day};
+use metering::interval::Sparte;
+use meterstore::planner::{
+    balancing_day, balancing_day_length, expected_intervals_in_balancing_day,
+};
 use time::Duration;
 use time::macros::{date, datetime};
 
@@ -110,16 +113,34 @@ fn the_long_and_short_gas_days_are_named_after_the_saturday() {
     // boundary — so the 23- and 25-hour Gastage are the ones that began on the
     // Saturday, not the transition Sunday. This is the property that makes a
     // completeness check on calendar days wrong in both directions at once.
-    assert_eq!(gas_day_length(date!(2026 - 10 - 24)).whole_hours(), 25);
-    assert_eq!(gas_day_length(date!(2026 - 10 - 25)).whole_hours(), 24);
-    assert_eq!(gas_day_length(date!(2026 - 03 - 28)).whole_hours(), 23);
-    assert_eq!(gas_day_length(date!(2026 - 03 - 29)).whole_hours(), 24);
+    assert_eq!(
+        balancing_day_length(date!(2026 - 10 - 24), Sparte::Gas).whole_hours(),
+        25
+    );
+    assert_eq!(
+        balancing_day_length(date!(2026 - 10 - 25), Sparte::Gas).whole_hours(),
+        24
+    );
+    assert_eq!(
+        balancing_day_length(date!(2026 - 03 - 28), Sparte::Gas).whole_hours(),
+        23
+    );
+    assert_eq!(
+        balancing_day_length(date!(2026 - 03 - 29), Sparte::Gas).whole_hours(),
+        24
+    );
 
     // Mirror image of the calendar day, quarter-hour by quarter-hour.
     let q = IntervalResolution::QuarterHour;
-    assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 24), q), Some(100));
+    assert_eq!(
+        expected_intervals_in_balancing_day(date!(2026 - 10 - 24), q, Sparte::Gas),
+        Some(100)
+    );
     assert_eq!(intervals_in_day(date!(2026 - 10 - 24), q), Some(96));
-    assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 25), q), Some(96));
+    assert_eq!(
+        expected_intervals_in_balancing_day(date!(2026 - 10 - 25), q, Sparte::Gas),
+        Some(96)
+    );
     assert_eq!(intervals_in_day(date!(2026 - 10 - 25), q), Some(100));
 }
 
@@ -167,7 +188,8 @@ fn a_march_of_gas_days_is_also_four_short() {
     let total: u32 = (1..=31)
         .map(|d| {
             let day = time::Date::from_calendar_date(2026, time::Month::March, d).unwrap();
-            intervals_in_gas_day(day, IntervalResolution::QuarterHour).unwrap()
+            expected_intervals_in_balancing_day(day, IntervalResolution::QuarterHour, Sparte::Gas)
+                .unwrap()
         })
         .sum();
     assert_eq!(total, 2_976 - 4);

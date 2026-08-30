@@ -74,7 +74,7 @@ fn delivery(meter: usize) -> StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         START,
     );

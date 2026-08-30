@@ -207,8 +207,13 @@ impl Compatibility {
 /// `configured` is the source of truth for intent; `stored` for reality. Columns
 /// are matched by **name**, because that is what the encoder writes and what an
 /// external engine reads — Iceberg matches by field id underneath, which is what
-/// makes a rename free, but a rename is invisible from here and looks like a drop
-/// plus an add. Both are safe, so the conservative reading costs nothing.
+/// makes a rename free, but a rename is invisible from here and reads as a drop
+/// plus an add.
+///
+/// For a nullable column that costs nothing: both halves are safe. For a
+/// **non-nullable** one — every identity column is one — both halves are unsafe
+/// and the table halts, which is right rather than incidental: renaming an
+/// identity column changes the merge key.
 pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
     let mut changes = Vec::new();
 

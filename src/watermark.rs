@@ -210,7 +210,7 @@ pub fn next_window(
     // past rows that are still in PostgreSQL, and they are stranded below it
     // with nothing but `invariant_violations` to say so.
     //
-    // The only way to get there is to change `partition_step` on a table that
+    // The only way to get there is to change `archival_step` on a table that
     // has already archived. That is a migration, not a setting, and it fails
     // here rather than in the data.
     if align_to_step(from, step) != from {
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn a_watermark_off_the_step_grid_is_refused_rather_than_walked_past() {
-        // The only way here is changing `partition_step` on a table that has
+        // The only way here is changing `archival_step` on a table that has
         // already archived. Left to run, every window would name a partition
         // relation nothing creates, so each would look empty, the watermark
         // would advance over rows still in PostgreSQL, and they would be

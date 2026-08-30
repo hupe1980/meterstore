@@ -110,6 +110,12 @@ impl ScanSpec {
     /// …)` would still be unique but would make that declaration false, so the
     /// remaining key columns are appended *after* `(malo_id, from)` rather than
     /// interleaved with it.
+    ///
+    /// The two orderings agree only narrowly: PostgreSQL sorts `malo_id` under
+    /// the database collation, Parquet declares byte order, and eleven ASCII
+    /// digits are a set every collation orders identically. A text column that
+    /// could hold anything else must stay *out* of the declared prefix — which is
+    /// why an identity column joins the cursor after it, never inside it.
     pub fn cursor_columns(&self) -> Vec<String> {
         let mut columns: Vec<String> = crate::encode::schema::SORT_COLUMNS
             .iter()

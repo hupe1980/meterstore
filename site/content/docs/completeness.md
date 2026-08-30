@@ -44,6 +44,52 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 | `not_billable` | Intervals whose quality bars them from billing |
 | `complete` | `missing == 0 && surplus == 0` |
 
+`actual = 0` on a row is a channel that delivered nothing at all — `is_silent()`
+in Rust. Such a row exists only when the query was given a reference window, which
+is the next section.
+
+## The finding a range cannot make about itself
+
+The report is an aggregate over the rows the range holds, so a channel with **no**
+rows produces no groups and appears nowhere — a meter that stopped delivering
+entirely, a pipeline that dropped a Bilanzkreis, a market-location change nobody
+carried through. Nothing inside the range can supply the missing roster, because
+the missing roster is precisely what the range does not contain. It comes from an
+earlier window:
+
+```rust
+// Anything that reported in the month before this one is expected in it.
+let report = store
+    .completeness(from, to)
+    .seen_since(from - Duration::days(30))
+    .await?;
+
+for gone in report.iter().filter(|r| r.is_silent()) {
+    tracing::error!(malo = %gone.malo_id, obis = %gone.obis_code, "delivered nothing");
+}
+```
+
+Such a channel comes back with `actual = 0`, the whole range as `missing`, and
+`first_gap` on its first balancing day — which is what an operator needs: not that
+a value is absent, but from when.
+
+In SQL the arguments read left to right in time order, so the reference window is
+the **leading** one:
+
+```sql
+-- Reported: March. Expected: whatever reported in February.
+SELECT * FROM meter_completeness('2026-02-01', '2026-03-01', '2026-04-01')
+WHERE actual = 0;
+```
+
+**The window is yours, because there is no honest default.** Too short and a meter
+read monthly looks decommissioned; too long and every terminated measuring point
+is a standing finding. What a roster means — "still in service" — is master data
+this crate does not hold.
+
+A channel whose *grid* changed is still reporting and is not called silent: the
+match is on what names a reading, not on the resolution it is delivered at.
+
 ## One row per reading, not per measuring point
 
 The report groups by the **merge key**, so identity columns and a key-carrying

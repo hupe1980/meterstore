@@ -123,9 +123,13 @@ impl PostgresHot {
     ///
     /// Turning this off trades both guarantees for insert throughput — two GiST
     /// indexes per partition on the busiest table in the schema — and wants a
-    /// measurement in hand. Completeness (§9.6) then reports an overlap as
-    /// `surplus` after the fact; a duplicated scope has no after-the-fact
-    /// detection at all.
+    /// measurement in hand. What is left is *detection* rather than refusal:
+    ///
+    /// * An **overlap** shows up in completeness (§9.6) as `surplus`.
+    /// * A **duplicated scope** reaches the typed reads, which refuse to fold two
+    ///   values at one instant and raise [`Error::InvariantViolated`].
+    /// * Neither covers a `SUM` written in SQL, which will simply be twice the
+    ///   truth.
     ///
     /// Requires `btree_gist` (PostgreSQL contrib), created on demand.
     pub fn integrity_constraints(mut self, enabled: bool) -> Self {
@@ -269,15 +273,18 @@ impl PostgresHot {
                 source_detail TEXT,
                 provenance    TEXT,
                 version       NUMERIC({VERSION_PRECISION},{VERSION_SCALE}) NOT NULL,
-                -- Canonical `<operator>:<YYYY-MM>` only. `VersionScope` refuses
-                -- an operator containing the separator, and the one-operator
-                -- exclusion below reads the operator back with `split_part`,
-                -- which would take the wrong half if a second separator ever
-                -- appeared. Every other coded column carries a CHECK; this one
-                -- carries the load-bearing one and had none.
+                -- Canonical `<Marktpartner-ID>:<YYYY-MM>` only. The operator
+                -- half is a `metering::BdewCode` — thirteen digits, what MSCONS
+                -- carries in NAD+MS — so it cannot hold the separator that the
+                -- one-operator exclusion below reads it back with
+                -- (`split_part(version_scope, ':', 1)`).
+                --
+                -- The check digit is deliberately not checked: BDEW's
+                -- Anwendungshilfe §2.3 carves out GS1-issued GLNs, so a
+                -- well-formed Marktpartner-ID may legitimately fail it.
                 version_scope TEXT             NOT NULL
                     CONSTRAINT version_scope_canonical CHECK (
-                        version_scope ~ '^[^:]+:[0-9]{{4}}-(0[1-9]|1[0-2])$'
+                        version_scope ~ '^[0-9]{{13}}:[0-9]{{4}}-(0[1-9]|1[0-2])$'
                     ),
                 recorded_at   TIMESTAMPTZ      NOT NULL,
                 -- The day this reading is balanced on: the Berlin calendar day,
@@ -894,7 +901,11 @@ impl PostgresHot {
 
         let inserted = query.execute(&mut *conn).await.map_err(pg)?.rows_affected();
 
-        let skipped = n as u64 - inserted;
+        // `saturating_sub`: `rows_affected` cannot exceed the rows sent, but the
+        // difference is a subtraction on the write path and an underflow there
+        // panics in a debug build and wraps to ~2^64 in a release one — two
+        // different wrong answers to a question that only exists for a metric.
+        let skipped = (n as u64).saturating_sub(inserted);
         let metrics = crate::observe::metrics();
         let attrs = crate::observe::table(table);
         metrics.rows_written.add(inserted, &attrs);

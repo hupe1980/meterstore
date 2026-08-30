@@ -103,9 +103,8 @@ impl std::fmt::Display for TimeModel {
 pub mod defaults {
     use time::Duration;
 
-    /// Hot-table partition granularity.
-    pub const PARTITION_STEP: Duration = Duration::DAY;
-    /// Archival window size. Must equal [`PARTITION_STEP`].
+    /// Archival window size, which is also the hot table's partition
+    /// granularity — a purge drops exactly one partition per archived window.
     pub const ARCHIVAL_STEP: Duration = Duration::DAY;
     /// How far behind wall clock archival stays.
     pub const SETTLEMENT_LAG: Duration = Duration::weeks(1);
@@ -141,7 +140,6 @@ pub mod defaults {
 pub struct TableConfig {
     name: String,
     time_model: TimeModel,
-    partition_step: Duration,
     archival_step: Duration,
     settlement_lag: Duration,
     partition_headroom: Duration,
@@ -160,7 +158,6 @@ impl TableConfig {
         Self {
             name: name.into(),
             time_model: TimeModel::Interval,
-            partition_step: defaults::PARTITION_STEP,
             archival_step: defaults::ARCHIVAL_STEP,
             settlement_lag: defaults::SETTLEMENT_LAG,
             partition_headroom: defaults::PARTITION_HEADROOM,
@@ -206,13 +203,18 @@ impl TableConfig {
         self
     }
 
-    /// Set the hot-table partition granularity.
-    pub fn partition_step(mut self, step: Duration) -> Self {
-        self.partition_step = step;
-        self
-    }
-
-    /// Set the archival window size.
+    /// Set the archival window size — **and with it the hot table's partition
+    /// granularity**, which is the same number.
+    ///
+    /// The purge is a partition drop, so one archived window has to be exactly
+    /// one partition: a coarser partition would force archival back to a
+    /// row-wise `DELETE` — millions of dead tuples a day and the vacuum debt
+    /// behind them — and a finer one would multiply partition count for nothing.
+    ///
+    /// It cannot be changed once a table has archived: the watermark sits on the
+    /// old grid, and a window off that grid names a partition relation nothing
+    /// creates. [`next_window`](crate::watermark::next_window) refuses rather
+    /// than walking the boundary past rows PostgreSQL still holds.
     pub fn archival_step(mut self, step: Duration) -> Self {
         self.archival_step = step;
         self
@@ -360,24 +362,21 @@ impl TableConfig {
                 self.name.len(),
             )));
         }
-        if self.partition_step <= Duration::ZERO {
-            return Err(Error::config("partition_step must be positive"));
-        }
         if self.archival_step <= Duration::ZERO {
             return Err(Error::config("archival_step must be positive"));
         }
-
-        // The purge is a partition drop, so an archival window must correspond to
-        // exactly one partition. A coarser partition would force the archiver
-        // back to row-wise DELETE — millions of dead tuples per day and the
-        // vacuum debt that follows. A finer one multiplies partition count for
-        // no benefit. Neither degrades loudly, so it is rejected here.
-        if self.partition_step != self.archival_step {
+        // A partition relation is named `<table>_YYYY_MM_DD_HHMM` — minute
+        // granularity, because that is what a name a human reads during an
+        // incident should be. A sub-minute step makes two consecutive windows
+        // name the *same* relation: the second `ATTACH PARTITION` fails on a
+        // relation that already exists, or worse, `from_relation_name` reads an
+        // orphan back as the wrong window and drops a partition that is still
+        // above the watermark. Neither is discoverable from the setting.
+        if self.archival_step < Duration::MINUTE {
             return Err(Error::config(format!(
-                "partition_step ({}) must equal archival_step ({}): a purge drops \
-                 exactly one partition per archived window, and any mismatch \
-                 silently degrades the purge to row-wise DELETE",
-                fmt_duration(self.partition_step),
+                "archival_step is {}, and a partition relation is named to the minute \
+                 (<table>_YYYY_MM_DD_HHMM) — two consecutive windows would name one \
+                 relation. One minute is the floor",
                 fmt_duration(self.archival_step),
             )));
         }
@@ -395,9 +394,9 @@ impl TableConfig {
                 fmt_duration(self.archival_step),
             )));
         }
-        if self.partition_headroom < self.partition_step {
+        if self.partition_headroom < self.archival_step {
             return Err(Error::config(
-                "partition_headroom must cover at least one partition_step, \
+                "partition_headroom must cover at least one archival_step, \
                  or inserts will fail before a new partition exists",
             ));
         }
@@ -502,11 +501,8 @@ impl ValidatedTableConfig {
     pub fn time_model(&self) -> TimeModel {
         self.0.time_model
     }
-    /// Hot-table partition granularity.
-    pub fn partition_step(&self) -> Duration {
-        self.0.partition_step
-    }
-    /// Archival window size.
+    /// Archival window size, which is also the hot table's partition
+    /// granularity: one archived window is exactly one partition.
     pub fn archival_step(&self) -> Duration {
         self.0.archival_step
     }
@@ -650,7 +646,7 @@ impl ValidatedTableConfig {
     /// Enough to cover the settlement lag plus the pre-creation headroom.
     pub fn expected_hot_partitions(&self) -> i64 {
         let span = self.0.settlement_lag + self.0.partition_headroom;
-        (span.whole_seconds() / self.0.partition_step.whole_seconds()).max(1)
+        (span.whole_seconds() / self.0.archival_step.whole_seconds()).max(1)
     }
 }
 
@@ -763,31 +759,13 @@ mod tests {
     fn defaults_validate() {
         let c = base().build().unwrap();
         assert_eq!(c.name(), "readings");
-        assert_eq!(c.partition_step(), Duration::DAY);
         assert_eq!(c.archival_step(), Duration::DAY);
-    }
-
-    #[test]
-    fn partition_step_must_equal_archival_step() {
-        // The mismatch that silently degrades purge to row-wise DELETE.
-        let err = base()
-            .partition_step(Duration::weeks(1))
-            .archival_step(Duration::DAY)
-            .build()
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("partition_step"), "{msg}");
-        assert!(
-            msg.contains("DELETE"),
-            "message must name the consequence: {msg}"
-        );
     }
 
     #[test]
     fn settlement_lag_must_cover_at_least_one_window() {
         // Otherwise a window can be archived while still receiving corrections.
         let err = base()
-            .partition_step(Duration::days(7))
             .archival_step(Duration::days(7))
             .settlement_lag(Duration::DAY)
             .build()
@@ -811,8 +789,34 @@ mod tests {
 
     #[test]
     fn non_positive_steps_are_rejected() {
-        assert!(base().partition_step(Duration::ZERO).build().is_err());
+        assert!(base().archival_step(Duration::ZERO).build().is_err());
         assert!(base().archival_step(-Duration::DAY).build().is_err());
+    }
+
+    #[test]
+    fn a_sub_minute_step_is_refused_because_partitions_are_named_to_the_minute() {
+        // `<table>_YYYY_MM_DD_HHMM`: at 30 seconds, two consecutive windows name
+        // one relation. The second attach fails, and an orphan read back by name
+        // resolves to the wrong window — so a partition still above the
+        // watermark could be dropped.
+        let err = base()
+            .archival_step(Duration::seconds(30))
+            .settlement_lag(Duration::minutes(5))
+            .partition_headroom(Duration::minutes(5))
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minute"), "{err}");
+
+        // One minute is legal, and so is everything above it.
+        assert!(
+            base()
+                .archival_step(Duration::MINUTE)
+                .settlement_lag(Duration::minutes(5))
+                .partition_headroom(Duration::minutes(5))
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1069,7 +1073,6 @@ mod tests {
         assert_eq!(base().build().unwrap().expected_hot_partitions(), 21);
 
         let weekly = base()
-            .partition_step(Duration::weeks(1))
             .archival_step(Duration::weeks(1))
             .settlement_lag(Duration::weeks(2))
             .partition_headroom(Duration::weeks(2))

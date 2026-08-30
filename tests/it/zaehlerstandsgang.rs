@@ -159,10 +159,11 @@ fn zsg_register(
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", first, Sparte::Strom).expect("scope"),
+            meterstore::VersionScope::for_interval("9900000000001", first, Sparte::Strom)
+                .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -362,7 +363,7 @@ fn interval_series() -> meterstore::encode::StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-27 06:00 UTC),
     );
@@ -371,7 +372,8 @@ fn interval_series() -> meterstore::encode::StoredSeries {
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+                .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -471,7 +473,8 @@ async fn corrections_still_supersede_within_one_messlokation() {
 
     let mut corrected = zsg_at(MELO, START, 4, 200_000, 3);
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
     store
@@ -528,7 +531,8 @@ async fn a_late_correction_reconciles_per_messlokation() {
     // A correction for an archived instant, for one meter only.
     let mut corrected = zsg_at(MELO, START, 4, 200_000, 3);
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
     let outcome = store
@@ -563,7 +567,8 @@ async fn a_late_correction_reconciles_per_messlokation() {
     // precisely when the files hold one version.
     let mut replay = zsg_at(MELO, START, 4, 200_000, 3);
     replay.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
     let again = store.append_readings(&[replay]).await.expect("replay");
@@ -788,7 +793,8 @@ async fn a_register_read_resolves_corrections_and_spans_the_boundary() {
     let mut corrected = zsg(START, 1, 999_999, 0);
     corrected.readings[0].quality = QualityFlag::Corrected;
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            .expect("scope"),
         meterstore::Version::new(20_260_726_000_002).expect("version"),
     );
     store

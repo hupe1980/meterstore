@@ -605,6 +605,128 @@ impl SubjectRegistry {
     }
 }
 
+/// When personal metering values stop being personal.
+///
+/// Two shapes, because § 60 Abs. 6 MsbG has two triggers and only one of them is
+/// a clock. The Messstellenbetreiber must erase or anonymise personenbezogene
+/// Messwerte *as soon as* storing them is no longer necessary, *"spätestens
+/// jedoch nach drei Jahren ab dem Schluss des Kalenderjahres, in dem der
+/// jeweilige Messwert erhoben wurde"*. Three years is the **ceiling**; the
+/// operative trigger is earlier and is a business decision.
+///
+/// A policy turns an instant into the cutoff a sweep applies to the latest
+/// reading each subject explains — see
+/// [`MeterCatalog::anonymise_before`](crate::MeterCatalog::anonymise_before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    /// The statutory shape: `years` full calendar years after the end of the one
+    /// a value was collected in.
+    ///
+    /// **Not `now - years`**, which is the tempting spelling and is wrong by up
+    /// to a year in the direction that erases data still within its period. The
+    /// deadline for a value collected on 2 January 2025 is 31 December 2028, not
+    /// 2 January 2028, because the clock starts at the *Schluss des
+    /// Kalenderjahres*. The year is Berlin's, because the statute is.
+    CalendarYears(u32),
+    /// A rolling window — the earlier "no longer necessary" trigger, where a
+    /// deployment has decided what that means.
+    Rolling(time::Duration),
+}
+
+impl Retention {
+    /// The instant a sweep run at `now` treats as the ceiling: a subject is due
+    /// once every reading it explains starts strictly before this.
+    ///
+    /// ```rust
+    /// use meterstore::Retention;
+    /// use time::macros::datetime;
+    ///
+    /// // Values collected in 2024 come due at the end of 2027, so a sweep any
+    /// // time in 2028 covers them — and leaves 2025's alone until 2029.
+    /// let cutoff = Retention::CalendarYears(3).cutoff(datetime!(2028-06-01 00:00 UTC));
+    /// assert_eq!(cutoff, datetime!(2024-12-31 23:00 UTC)); // 2025-01-01 Berlin
+    /// ```
+    /// # Both arms saturate towards *nothing is due*
+    ///
+    /// A period wider than the calendar can express means "keep everything". The
+    /// other reading — subtract nothing, so the cutoff is *this* year — makes
+    /// every subject in the store due at once, and erasure has no undo.
+    ///
+    /// ```rust
+    /// use meterstore::Retention;
+    /// use time::macros::datetime;
+    ///
+    /// let now = datetime!(2028-06-01 00:00 UTC);
+    /// // A period nothing can be older than: nothing comes due.
+    /// assert!(Retention::CalendarYears(u32::MAX).cutoff(now) < datetime!(1970-01-01 00:00 UTC));
+    /// assert!(Retention::Rolling(time::Duration::MAX).cutoff(now) < now);
+    /// ```
+    #[must_use]
+    pub fn cutoff(self, now: OffsetDateTime) -> OffsetDateTime {
+        match self {
+            Self::CalendarYears(years) => {
+                // Saturating in the direction that keeps data, and clamped to a
+                // year the calendar can answer for. `Date::MIN` is `-9999-01-01`,
+                // whose Berlin midnight is an hour *before* it in UTC — out of
+                // range, and `metering::calendar::year_start_utc` panics rather
+                // than folding it away. One year in is the earliest that
+                // converts.
+                let year = metering::calendar::local_year(now)
+                    .saturating_sub(i32::try_from(years).unwrap_or(i32::MAX))
+                    .max(EARLIEST_CUTOFF_YEAR);
+                metering::calendar::year_start_utc(year)
+            }
+            // `checked_sub` for the same reason, onto the same floor, so both
+            // arms of an unrepresentable period give the same answer.
+            Self::Rolling(window) => now
+                .checked_sub(window)
+                .unwrap_or_else(|| metering::calendar::year_start_utc(EARLIEST_CUTOFF_YEAR)),
+        }
+    }
+}
+
+/// The earliest year [`Retention::cutoff`] will name.
+///
+/// `time::Date::MIN` is `-9999-01-01`, and Berlin's midnight on it is an hour
+/// earlier still in UTC — outside what `OffsetDateTime` can hold, which
+/// `metering::calendar::year_start_utc` surfaces as a panic rather than folding
+/// away. One year in converts, and is far enough before any metering value that
+/// a cutoff here means nothing is due.
+const EARLIEST_CUTOFF_YEAR: i32 = -9998;
+
+/// Destroy the linkage of every reference in `due`, skipping those already gone.
+///
+/// Shared by the single-table sweep and the catalog-wide one, so both are
+/// idempotent in the same way: a reference the registry no longer resolves is
+/// passed over rather than re-erased, and a re-run writes no second audit row
+/// claiming an erasure that did not happen on it.
+pub(crate) async fn anonymise(
+    registry: &SubjectRegistry,
+    due: &[String],
+    reason: &str,
+    actor: &str,
+    now: OffsetDateTime,
+) -> Result<Vec<ErasureRecord>> {
+    let mut erased = Vec::new();
+    for reference in due {
+        let subject = SubjectRef::new(reference.clone())?;
+        // Already anonymised — by an Article 17 request, or by an earlier sweep.
+        if registry.resolve(&subject).await?.is_none() {
+            continue;
+        }
+        erased.push(registry.erase(&subject, reason, actor, now).await?);
+    }
+    // Counted here rather than at each caller, so a sweep run from the catalog,
+    // from one store, or from the maintenance loop all reach the same instrument.
+    // No `table` attribute: the registry is deployment-wide and a subject's
+    // linkage is destroyed everywhere at once, so attributing the count to a
+    // table would invite a per-table sum that double-counts it.
+    crate::observe::metrics()
+        .subjects_anonymised
+        .add(erased.len() as u64, &[]);
+    Ok(erased)
+}
+
 /// A random reference with no derivation from the subject.
 ///
 /// Deriving it — hashing a meter serial, say — would leave a re-identification
@@ -712,6 +834,74 @@ mod tests {
             SubjectRegistry::new(lazy_pool())
                 .tombstone("41373559241")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_statutory_ceiling_starts_at_the_end_of_the_collection_year() {
+        use time::macros::datetime;
+
+        // § 60 Abs. 6 MsbG: three years *ab dem Schluss des Kalenderjahres*. A
+        // value collected on 2 January 2025 comes due on 31 December 2028, not
+        // on 2 January 2028 — `now - 3 years` would erase it a year early, which
+        // is the direction that destroys data still inside its retention period.
+        let policy = Retention::CalendarYears(3);
+        // Berlin's year boundary, so a UTC instant in the last hour of the year
+        // is already the next one locally.
+        assert_eq!(
+            policy.cutoff(datetime!(2028-01-02 00:00 UTC)),
+            datetime!(2024-12-31 23:00 UTC)
+        );
+        assert_eq!(
+            policy.cutoff(datetime!(2028-12-31 23:00 UTC)),
+            datetime!(2025-12-31 23:00 UTC)
+        );
+
+        // The cutoff does not move within a year, so a daily sweep is stable —
+        // and a value's own year is either wholly due or wholly not.
+        assert_eq!(
+            policy.cutoff(datetime!(2028-03-01 00:00 UTC)),
+            policy.cutoff(datetime!(2028-11-30 00:00 UTC)),
+        );
+    }
+
+    #[test]
+    fn a_rolling_window_is_measured_from_the_sweep() {
+        use time::macros::datetime;
+
+        let now = datetime!(2028-06-01 00:00 UTC);
+        assert_eq!(
+            Retention::Rolling(time::Duration::days(90)).cutoff(now),
+            now - time::Duration::days(90)
+        );
+    }
+
+    #[test]
+    fn a_period_the_calendar_cannot_express_keeps_everything() {
+        use time::macros::datetime;
+
+        // The one arithmetic mistake here that cannot be undone. A retention
+        // period too wide to represent has a safe reading — "keep everything" —
+        // and a catastrophic one: fall back to subtracting nothing and the cutoff
+        // becomes *this* year, so every subject in the store is due at once and
+        // every linkage is destroyed. Both arms saturate towards keeping.
+        let now = datetime!(2028-06-01 00:00 UTC);
+        let epoch = datetime!(1970-01-01 00:00 UTC);
+
+        for years in [u32::MAX, i32::MAX as u32, 100_000, 12_030, 10_000] {
+            let cutoff = Retention::CalendarYears(years).cutoff(now);
+            assert!(
+                cutoff < epoch,
+                "CalendarYears({years}) put the cutoff at {cutoff}, which makes \
+                 readings due that are nowhere near the ceiling"
+            );
+        }
+        assert!(Retention::Rolling(time::Duration::MAX).cutoff(now) < epoch);
+
+        // And an ordinary period still works, so the guard has not swallowed it.
+        assert_eq!(
+            Retention::CalendarYears(3).cutoff(now),
+            datetime!(2024-12-31 23:00 UTC)
         );
     }
 

@@ -583,6 +583,7 @@ fn merge(
     }
 
     intervals.sort_by_key(|i| i.from);
+    refuse_repeated_instants(malo_id, &intervals)?;
 
     let obis = match obis_code {
         Some(code) => Some(code.parse::<ObisCode>().map_err(|e| {
@@ -614,6 +615,45 @@ fn merge(
         extra,
         series,
     }))
+}
+
+/// Refuse a folded series that holds two values at one instant.
+///
+/// [`refuse_mixed_readings`] asks whether the rows describe two *readings* — a
+/// second channel, a second tenant, a second Messlokation. This is the case it
+/// cannot see: resolution partitions by the merge key **and `version_scope`**, so
+/// two scopes for one reading leave two winners agreeing on every part of that
+/// key, and `metering::aggregate` sums both.
+///
+/// Both write paths refuse a second network operator, so reaching here means
+/// `PostgresHot::integrity_constraints(false)` or a writer that is not this
+/// crate. [`Error::InvariantViolated`] rather than `IntegrityViolation`: nothing
+/// is being refused at a boundary, something that should not be true already is.
+fn refuse_repeated_instants(
+    malo_id: MaloId,
+    intervals: &[metering::interval::MeterInterval],
+) -> Result<()> {
+    // Sorted by `from` on the way in, so a repeat is adjacent.
+    for pair in intervals.windows(2) {
+        if pair[0].from != pair[1].from {
+            continue;
+        }
+        return Err(Error::InvariantViolated {
+            table: malo_id.to_string(),
+            detail: format!(
+                "two values survived resolution for one reading at {at}: {a} and {b}. \
+                 Resolution partitions by the merge key and version_scope, so the cause \
+                 is almost always two network operators for one reading — which both \
+                 write paths refuse, unless integrity constraints are off or something \
+                 other than meterstore wrote these rows. Folding them into one series \
+                 would sum to twice the truth",
+                at = pair[0].from,
+                a = pair[0].value,
+                b = pair[1].value,
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The channel and the merge-key discriminators one decoded group carries — what
@@ -780,12 +820,13 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSG-1".to_owned()),
-            sender_mp_id: "9900000000001".to_owned(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
     fn stored(intervals: Vec<MeterInterval>, recorded_at: OffsetDateTime) -> StoredSeries {
-        let scope = VersionScope::for_interval("99", intervals[0].from, Sparte::Strom).unwrap();
+        let scope =
+            VersionScope::for_interval("9900000000001", intervals[0].from, Sparte::Strom).unwrap();
         StoredSeries::new(
             MeasurementSeries::new(
                 malo(),
@@ -969,6 +1010,50 @@ mod tests {
     }
 
     #[test]
+    fn two_values_at_one_instant_are_refused_rather_than_summed() {
+        // The case `refuse_mixed_readings` cannot see. Resolution partitions by
+        // the merge key *and* `version_scope`, so two network operators for one
+        // reading leave two winners agreeing on channel and discriminators —
+        // same instant, two values, and the fold would hand `metering::aggregate`
+        // both. Both write paths refuse a second operator, so getting here means
+        // integrity constraints are off or something else wrote the rows; this is
+        // the after-the-fact detection §7.3 says a duplicated scope otherwise has
+        // none of.
+        let mut second = one_interval("1-0:1.8.0");
+        second.series.intervals[0].value = rust_decimal::Decimal::new(99, 1);
+        second.recorded_at += time::Duration::hours(1);
+
+        let err = merge(malo(), None, &[], vec![one_interval("1-0:1.8.0"), second]).unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvariantViolated { .. }),
+            "stored data that should not exist, not a delivery being refused: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("version_scope"), "{msg}");
+        assert!(
+            msg.contains("1.5") && msg.contains("9.9"),
+            "both values: {msg}"
+        );
+    }
+
+    #[test]
+    fn ordinary_deliveries_of_one_series_still_fold() {
+        // The guard must not fire on the thing the fold exists for: two
+        // deliveries covering *different* instants of one channel.
+        let first = one_interval("1-0:1.8.0");
+        let mut later = one_interval("1-0:1.8.0");
+        later.series.intervals[0].from += time::Duration::minutes(15);
+        later.series.intervals[0].to += time::Duration::minutes(15);
+        later.recorded_at += time::Duration::hours(1);
+
+        let folded = merge(malo(), None, &[], vec![first, later])
+            .unwrap()
+            .expect("one series");
+        assert_eq!(folded.series.intervals.len(), 2);
+    }
+
+    #[test]
     fn folding_two_tenants_into_one_series_is_refused() {
         // Worse than a wrong total: it is one party's readings inside another's
         // series, from a read that named neither.
@@ -1001,29 +1086,40 @@ mod tests {
     #[test]
     fn a_column_that_is_not_in_the_merge_key_does_not_split_a_series() {
         // The rule is the merge key, not "any column that differs". A Bilanzkreis
-        // reassigned between two deliveries is one series with a changed
-        // attribute, and refusing that would make an ordinary correction
-        // unreadable.
-        let of = |bk: &str, hours: i64| {
+        // reassigned partway through a range splits the decode into two groups —
+        // `from_record_batch` starts a new one wherever any non-interval column
+        // changes — and the fold has to put them back, or an ordinary attribute
+        // change would make a series unreadable.
+        //
+        // The two groups cover **different instants**, which is the only shape
+        // resolution can actually produce: it keeps one row per (merge key,
+        // version_scope), so one channel cannot hold two rows at one instant with
+        // a Bilanzkreis to tell them apart. A fixture that overlapped them would
+        // be asserting the fold accepts a state the store cannot be in, which is
+        // what `two_values_at_one_instant_are_refused_rather_than_summed` says it
+        // must not.
+        let of = |bk: &str, quarters: i64| {
             let mut s = one_interval("1-0:1.8.0");
+            let shift = time::Duration::minutes(15 * quarters);
+            s.series.intervals[0].from += shift;
+            s.series.intervals[0].to += shift;
             s.extra.insert(
                 "bilanzkreis".to_string(),
                 ScalarValue::Utf8(Some(bk.into())),
             );
-            s.recorded_at += time::Duration::hours(hours);
+            s.recorded_at += time::Duration::hours(quarters);
             s
         };
 
-        assert!(
-            merge(
-                malo(),
-                Some("1-0:1.8.0"),
-                &[],
-                vec![of("BK-1", 0), of("BK-2", 1)]
-            )
-            .unwrap()
-            .is_some()
-        );
+        let folded = merge(
+            malo(),
+            Some("1-0:1.8.0"),
+            &[],
+            vec![of("BK-1", 0), of("BK-2", 1)],
+        )
+        .unwrap()
+        .expect("one series");
+        assert_eq!(folded.series.intervals.len(), 2, "both groups are kept");
     }
 
     #[test]
@@ -1155,9 +1251,12 @@ mod tests {
         // reads has only what `merge` hands back. Losing it here would relabel
         // every gas and water series as electricity — silently, since the numbers
         // look the same.
-        let scope =
-            VersionScope::for_interval("99", datetime!(2026-07-20 00:00 UTC), Sparte::Strom)
-                .unwrap();
+        let scope = VersionScope::for_interval(
+            "9900000000001",
+            datetime!(2026-07-20 00:00 UTC),
+            Sparte::Strom,
+        )
+        .unwrap();
         let gas = StoredSeries::of(
             Sparte::Gas,
             MeasurementSeries::new(

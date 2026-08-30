@@ -9,7 +9,7 @@ weight = 8
 ```rust
 let handle = store.maintenance()
     .interval(Duration::minutes(15))
-    .expire_snapshots(false)      // retention is a compliance decision
+    .expire_snapshots(false)      // snapshot retention is a compliance decision
     .spawn();
 ```
 
@@ -18,8 +18,10 @@ construction would surprise a process that only wanted to read.
 
 One cycle archives every due window (bounded, so a store that has been down for a
 month catches up over several cycles rather than holding one process for hours),
-optionally expires snapshots, then checks the invariant — in that order, so the
-check sees the state the cycle produced.
+optionally expires snapshots, checks the invariant, and — where a retention policy
+is configured — runs the [§ 60 Abs. 6 sweep](#the-retention-sweep). In that order,
+so each step sees the state the cycle produced rather than the one it started
+from.
 
 The handle **owns** the loop: dropping it stops the loop after the cycle in
 flight, exactly as `shutdown()` does, so a handle that goes out of scope cannot
@@ -48,6 +50,34 @@ for table in outcome.unhealthy() {
     tracing::error!(table = %table.table, violations = table.invariant_violations);
 }
 ```
+
+### The retention sweep {#the-retention-sweep}
+
+The third job, and the only one that is a *duty on a clock* rather than an answer
+to a request. § 60 Abs. 6 MsbG obliges the Messstellenbetreiber to erase or
+anonymise personenbezogene Messwerte *"spätestens jedoch nach drei Jahren ab dem
+Schluss des Kalenderjahres"*. Nobody asks; it comes due anyway.
+
+```rust
+let handle = catalog.maintenance()
+    .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
+    .spawn();
+```
+
+Off by default, for the reason snapshot expiry is: destroying a linkage is
+irreversible, so turning it on is the compliance decision.
+
+`CalendarYears(3)` is **not** `now - 3 years`. The clock starts at the *Schluss
+des Kalenderjahres*, so a value collected on 2 January 2025 comes due on 31
+December 2028; the rolling spelling would erase it a year early.
+`Retention::Rolling(d)` covers the earlier "no longer necessary" trigger.
+
+**A catalogue operation even with one table.** The registry is deployment-wide, so
+one erasure unlinks a subject in every table at once and the cutoff is applied to
+the latest reading in the deployment — see
+[Privacy and retention](@/docs/privacy.md). A failed sweep appears in
+`outcome.failures()` under the name `<retention>`, so an alert needs no second
+place to look.
 
 **A failing table does not end the cycle.** It becomes a row with a `failure` and
 the rest are still maintained. What fails here persists until an operator acts — a
@@ -191,9 +221,10 @@ applied at write time and every engine just groups on the answer. Both are
 [explained in full](@/docs/interop.md#the-gas-day-trap).
 
 `system.config` exists because the settings that matter *interact*: a
-`partition_step` that disagrees with `archival_step`, or a `settlement_lag`
-shorter than a window, are each valid alone and wrong together. Seeing them side
-by side is how that gets noticed.
+`settlement_lag` shorter than an `archival_step` is valid alone and wrong beside
+it — a window closes while corrections for it are still arriving, and they land
+below the watermark where no query looks. Seeing the two side by side is how that
+gets noticed.
 
 All four are snapshots computed when asked. `store.refresh_system_tables(now)`
 recomputes them — deliberately explicit, so an ordinary query never silently pays
@@ -206,7 +237,10 @@ application installs a meter provider, recording is a no-op. That is the right
 contract for a library: MeterStore decides what is worth measuring, the
 application decides where measurements go.
 
-Every instrument carries a `table` attribute; scan metrics add `tier`.
+Every instrument carries a `table` attribute; scan metrics add `tier`. The
+retention counter carries neither — a subject's linkage is destroyed across the
+whole deployment at once, so attributing it to a table would invite a sum that
+double-counts it.
 
 | Instrument | Why it exists |
 |---|---|
@@ -218,6 +252,7 @@ Every instrument carries a `table` attribute; scan metrics add `tier`.
 | `meterstore.partitions.dropped` / `.orphans_reclaimed` | Purge keeping up; non-zero orphans mean runs are being interrupted. |
 | `meterstore.write.rows` / `.rows_deduplicated` / `.late_corrections` | Ingest volume, the redelivery rate (expected to be non-zero), and corrections arriving after their interval was archived. |
 | `meterstore.query.plan_duration` / `.scan_duration` | **Two instruments, not one.** A single `query.duration` recorded at plan time measured only the time to build a plan — making a slow catalogue look like a slow query and hiding a slow scan behind fast planning. |
+| `meterstore.retention.subjects_anonymised` | **Compliance rather than health.** § 60 Abs. 6 comes due on a clock, so an operator who enabled the sweep needs evidence it ran: a flat zero over a year is a job that is not working, and a spike is a cohort reaching the ceiling together. The only counter here whose *rise* is worth a look, because erasure is irreversible. |
 | `meterstore.query.merge_elided` / `.merge_elision_decisions` | The elided ratio — how often a historical scan skipped version resolution. It falls as corrections accumulate in the ranges being queried, which is the data changing rather than the layout degrading; see [compaction](#compaction). |
 
 ## Schema evolution
@@ -308,6 +343,20 @@ expiry bounds is the metadata JSON, whose snapshot array grows with every commit
 and is parsed on **every** table load. Unreferenced manifest lists and old
 metadata files stay on object storage — removing those needs the listing operation
 above.
+
+### The retention window is meterstore's, not the table's
+
+`snapshot_retention` and `min_snapshots_to_keep` decide what expiry removes, and
+nothing else does — including `history.expire.*` on the Iceberg table, which
+`iceberg`'s expire action would otherwise apply on top. Its age path runs whether
+or not snapshot ids are named, defaulting to `max-snapshot-age-ms` of **five
+days**, so a store could stop being able to reproduce a settlement older than a
+working week.
+
+MeterStore pins that cutoff to the epoch, which selects nothing: the ids computed
+against the configured retention are the whole of what is expired. Since
+`history.expire.*` is a *table* property, that also keeps out-of-band compaction
+from deciding a deployment's retention by setting one.
 
 ### Do not expire snapshots from a foreign tool
 

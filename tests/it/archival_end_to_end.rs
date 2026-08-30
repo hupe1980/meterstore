@@ -34,6 +34,8 @@ const TABLE: &str = "readings_versions";
 const D20: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 const D21: OffsetDateTime = datetime!(2026-07-21 00:00 UTC);
 const D22: OffsetDateTime = datetime!(2026-07-22 00:00 UTC);
+const D23: OffsetDateTime = datetime!(2026-07-23 00:00 UTC);
+const D24: OffsetDateTime = datetime!(2026-07-24 00:00 UTC);
 const NOW: OffsetDateTime = datetime!(2026-07-30 00:00 UTC);
 
 struct Harness {
@@ -93,7 +95,7 @@ impl Harness {
         let source = MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         };
         let detail = serde_json::to_string(&source).unwrap();
 
@@ -119,7 +121,7 @@ impl Harness {
             .bind(Some(detail.as_str()))
             .bind(Some("[]"))
             .bind(rust_decimal::Decimal::new(version, 0))
-            .bind("99:2026-07")
+            .bind("9900000000001:2026-07")
             .bind(datetime!(2026-07-27 06:00 UTC))
             .execute(self.hot.pool())
             .await
@@ -480,6 +482,76 @@ async fn snapshot_expiry_bounds_metadata_growth() {
     assert!(expired > 0, "old snapshots must be removable");
     // Whatever was expired, the table is still readable at its current state.
     assert_eq!(h.cold.watermark(TABLE).await.unwrap().get(), D22);
+}
+
+#[tokio::test]
+async fn expiry_removes_exactly_what_meterstore_selected() {
+    // `iceberg`'s expire action runs its **age** path whether or not ids are
+    // named: with no cutoff set it falls back to the table's
+    // `history.expire.max-snapshot-age-ms`, default five days. So a call that
+    // names ids also expires everything older than that — straight through
+    // `min_snapshots_to_keep`, through the ten-year `snapshot_retention` this
+    // crate is configured with, and through the watermark-chain protection
+    // computed here, none of which the library knows about.
+    //
+    // The property is set explicitly to make that deterministic without waiting
+    // five days, and it is a second hazard in its own right: `history.expire.*`
+    // is a *table* property, so the out-of-band compaction this design
+    // recommends could set one and silently decide the deployment's retention.
+    let h = Harness::start().await;
+
+    for (from, to) in [(D20, D21), (D21, D22), (D22, D23), (D23, D24)] {
+        h.cold
+            .append_and_commit(
+                TABLE,
+                stream_of(Vec::new()),
+                WriteHints::default(),
+                ArchivalWindow::new(from, to).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    // Leaves the current snapshot carrying no watermark, so expiry re-stamps
+    // first — the ordinary state after out-of-band maintenance.
+    h.foreign_commit().await;
+
+    {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        let table = h.cold.load(TABLE).await.expect("load");
+        let txn = Transaction::new(&table);
+        let action = txn
+            .update_table_properties()
+            .set(
+                "history.expire.max-snapshot-age-ms".to_string(),
+                "1".to_string(),
+            )
+            .set(
+                "history.expire.min-snapshots-to-keep".to_string(),
+                "1".to_string(),
+            );
+        action
+            .apply(txn)
+            .expect("apply")
+            .commit(h.catalog.as_ref())
+            .await
+            .expect("the property an out-of-band tool would set");
+    }
+
+    // Everything is past the retention window, so the floor is the only thing
+    // deciding what survives — and it is meterstore's floor, not the library's.
+    const KEEP: usize = 3;
+    h.cold
+        .expire_snapshots(TABLE, Duration::ZERO, KEEP, datetime!(2030-01-01 00:00 UTC))
+        .await
+        .unwrap();
+
+    let left = h.cold.snapshots(TABLE).await.unwrap().len();
+    assert_eq!(
+        left, KEEP,
+        "min_snapshots_to_keep is a compliance floor: the library's own age path \
+         must not expire past it"
+    );
+    assert_eq!(h.cold.watermark(TABLE).await.unwrap().get(), D24);
 }
 
 #[tokio::test]

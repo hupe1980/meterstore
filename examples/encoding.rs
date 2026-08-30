@@ -43,7 +43,7 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSCONS-2026-07-20-001".to_string()),
-            sender_mp_id: "9900000000001".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         // Ingestion time is injected, so this example is reproducible.
         datetime!(2026-07-27 06:00 UTC),

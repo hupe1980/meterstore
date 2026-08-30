@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use metering::ids::BdewCode;
 use metering::interval::Sparte;
 use time::OffsetDateTime;
 
@@ -158,7 +159,30 @@ impl fmt::Display for Version {
 /// The (network operator, month) pair a [`Version`] is comparable within.
 ///
 /// Stored as a canonical `"<operator>:<YYYY-MM>"` string so it dictionary-encodes
-/// well and remains greppable in the lake.
+/// well and remains greppable in the lake — twenty characters, the same twenty
+/// on every row, because the operator half is a [`BdewCode`] and those are
+/// always thirteen digits.
+///
+/// # The operator is parsed, not carried
+///
+/// It is the **Marktpartner-ID** of the network operator that issued the
+/// version — what MSCONS puts in `NAD+MS`, and the same identifier
+/// [`MeasurementSource::Mscons`] carries. `metering` 0.20 gave it a type, and
+/// this crate takes the type for the reason it takes [`MaloId`] rather than
+/// eleven digits: past the constructor a wrong-but-plausible operator is simply
+/// a *different scope*, so a correction fails to supersede the value it corrects
+/// and both rows survive into the resolved view. There is no error anywhere and
+/// the total is inflated.
+///
+/// The check digit is verified but **not enforced**, which is `BdewCode`'s
+/// rule rather than a choice made here: BDEW's own Anwendungshilfe carves out
+/// GS1-issued GLNs, which use a different procedure, so a well-formed
+/// Marktpartner-ID may legitimately fail the BDEW one.
+/// [`operator_has_bdew_check_digit`](Self::operator_has_bdew_check_digit)
+/// reports it so ingestion can warn.
+///
+/// [`MeasurementSource::Mscons`]: metering::measurement_series::MeasurementSource::Mscons
+/// [`MaloId`]: metering::ids::MaloId
 ///
 /// # The month is the interval's, never the delivery's
 ///
@@ -192,7 +216,8 @@ impl fmt::Display for Version {
 pub struct VersionScope(String);
 
 impl VersionScope {
-    /// Build a scope from a BDEW operator code and an explicit year/month.
+    /// Build a scope from a network operator's Marktpartner-ID and an explicit
+    /// year/month.
     ///
     /// **Prefer [`VersionScope::for_interval`].** This constructor cannot tell
     /// whether the month you pass is the interval's or the delivery's, and
@@ -202,16 +227,16 @@ impl VersionScope {
     ///
     /// It remains public for reconstructing a scope that is already known to be
     /// correct — parsing a stored value, or a test pinning a specific month.
-    pub fn new(operator: impl AsRef<str>, year: i32, month: u8) -> Result<Self> {
-        let operator = operator.as_ref();
-        if operator.is_empty() {
-            return Err(Error::config("version scope operator must not be empty"));
-        }
-        if operator.contains(':') {
-            return Err(Error::config(format!(
-                "version scope operator {operator:?} must not contain ':' (the canonical separator)"
-            )));
-        }
+    ///
+    /// `operator` is anything that parses as a [`BdewCode`], so a `&str` from a
+    /// configuration file or an MSCONS `NAD+MS` segment works directly and a
+    /// malformed one fails here rather than becoming a scope nothing matches.
+    pub fn new<O>(operator: O, year: i32, month: u8) -> Result<Self>
+    where
+        O: TryInto<BdewCode>,
+        O::Error: fmt::Display,
+    {
+        let operator = parse_operator(operator)?;
         if !(1..=12).contains(&month) {
             return Err(Error::config(format!("month {month} out of range 1..=12")));
         }
@@ -232,17 +257,28 @@ impl VersionScope {
     /// use metering::interval::Sparte;
     /// use time::macros::datetime;
     ///
+    /// // The network operator's Marktpartner-ID, as MSCONS carries it in NAD+MS.
+    /// let nb = "9900000000001";
+    ///
     /// // 02:00 local on 1 March: already March, still the February gas month.
     /// let at = datetime!(2026-03-01 1:00 UTC);
-    /// assert_eq!(VersionScope::for_interval("99", at, Sparte::Strom)?.period(), "2026-03");
-    /// assert_eq!(VersionScope::for_interval("99", at, Sparte::Gas)?.period(), "2026-02");
+    /// assert_eq!(VersionScope::for_interval(nb, at, Sparte::Strom)?.period(), "2026-03");
+    /// assert_eq!(VersionScope::for_interval(nb, at, Sparte::Gas)?.period(), "2026-02");
+    ///
+    /// // And it is parsed, so a wrong-but-plausible one fails here rather than
+    /// // becoming a scope of its own that nothing else shares.
+    /// assert!(VersionScope::for_interval("99", at, Sparte::Strom).is_err());
     /// # Ok::<(), meterstore::Error>(())
     /// ```
-    pub fn for_interval(
-        operator: impl AsRef<str>,
+    pub fn for_interval<O>(
+        operator: O,
         interval_start: OffsetDateTime,
         sparte: Sparte,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        O: TryInto<BdewCode>,
+        O::Error: fmt::Display,
+    {
         let month = crate::planner::balancing_month(interval_start, sparte);
         Self::new(operator, month.year(), u8::from(month.month()))
     }
@@ -255,13 +291,24 @@ impl VersionScope {
 
     /// The network operator that assigned versions in this scope.
     ///
-    /// Split on the **first** separator, which is the half PostgreSQL's
+    /// The half before the separator, which is the half PostgreSQL's
     /// `split_part(version_scope, ':', 1)` takes in the one-operator exclusion.
-    /// Both constructors refuse an operator containing one, so there is only ever
-    /// the one.
-    pub fn operator(&self) -> &str {
+    /// A [`BdewCode`] is thirteen digits and cannot contain one, so there is
+    /// only ever the one and the two agree by construction.
+    pub fn operator(&self) -> BdewCode {
         let at = self.0.find(':').expect("canonical form contains ':'");
-        &self.0[..at]
+        self.0[..at].parse().expect("constructed from a BdewCode")
+    }
+
+    /// Whether the operator's thirteenth digit matches the BDEW procedure.
+    ///
+    /// **Advisory**, and `false` does not mean the code is wrong: BDEW's
+    /// Anwendungshilfe §2.3 carves out GS1-issued GLNs, which use a different
+    /// check-digit procedure and are legitimate Marktpartner-IDs. Use it to warn
+    /// at an ingest boundary, never to reject — the same restraint
+    /// [`Version::is_well_formed`] applies to a short version label.
+    pub fn operator_has_bdew_check_digit(&self) -> bool {
+        self.operator().has_bdew_check_digit()
     }
 
     /// Whether an interval belongs to this scope.
@@ -306,20 +353,29 @@ impl VersionScope {
                 "version_scope",
                 format!(
                     "{s:?} is not a canonical version scope — it must be \
-                     <operator>:<YYYY-MM>, with an operator containing no ':' and a \
-                     month in 01..=12"
+                     <operator>:<YYYY-MM>, with a 13-digit Marktpartner-ID as the \
+                     operator and a month in 01..=12"
                 ),
             )
         };
-        // `split_once`, not `rsplit_once`: the operator may not contain the
-        // separator, so the first one is the only one.
+        // `split_once`, not `rsplit_once`: a Marktpartner-ID is thirteen digits
+        // and cannot contain the separator, so the first one is the only one.
         let Some((operator, period)) = s.split_once(':') else {
             return Err(malformed());
         };
         let Some((year, month)) = period.split_once('-') else {
             return Err(malformed());
         };
-        if operator.is_empty()
+        // Rendered back and compared, not merely parsed. `BdewCode`'s `FromStr`
+        // trims — right at an ingest boundary, wrong here: `" 99…1:2026-07"`
+        // would parse, be stored as it stands, and then be refused by the hot
+        // table's `CHECK`, which anchors on thirteen digits. The one thing this
+        // constructor exists to guarantee is that what it accepts is exactly what
+        // `new` would have produced.
+        let canonical = operator
+            .parse::<BdewCode>()
+            .is_ok_and(|code| code.as_str() == operator);
+        if !canonical
             || year.len() != 4
             || month.len() != 2
             || year.parse::<i32>().is_err()
@@ -340,6 +396,34 @@ impl fmt::Display for VersionScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Parse a caller-supplied network-operator code.
+///
+/// The counterpart of [`parse_malo`](crate::encode::parse_malo) for the other
+/// identifier this crate is handed as a bare string, and the reason
+/// [`VersionScope`]'s constructors take `impl TryInto<BdewCode>`: a code the
+/// caller has already parsed passes through at no cost, while thirteen digits
+/// off an MSCONS `NAD+MS` segment are checked here.
+///
+/// `metering`'s own message says what shape is expected; this adds what a wrong
+/// one costs, because the failure is otherwise invisible — the delivery is
+/// accepted into a scope nothing else shares, so the correction never supersedes
+/// and every sum over the reading is inflated.
+fn parse_operator<O>(operator: O) -> Result<BdewCode>
+where
+    O: TryInto<BdewCode>,
+    O::Error: fmt::Display,
+{
+    operator.try_into().map_err(|e| {
+        Error::config(format!(
+            "a version scope's operator is the network operator's Marktpartner-ID, \
+             as MSCONS carries it in NAD+MS: {e}. A version is only comparable within \
+             the (operator, month) that issued it, so a wrong one is a scope of its \
+             own — the correction never supersedes, and both rows survive into the \
+             resolved view"
+        ))
+    })
 }
 
 /// A version together with the scope it is comparable within.
@@ -414,6 +498,11 @@ impl ScopedVersion {
 mod tests {
     use super::*;
     use time::Duration;
+
+    /// A real BDEW Marktpartner-ID: thirteen digits, `99` = BDEW/Strom.
+    const OPERATOR: &str = "9900000000001";
+    /// A second one, for the comparisons that must not cross operators.
+    const OTHER_OPERATOR: &str = "9900000000002";
 
     fn scope(op: &str, y: i32, m: u8) -> VersionScope {
         VersionScope::new(op, y, m).unwrap()
@@ -530,7 +619,7 @@ mod tests {
     #[test]
     fn short_versions_are_stored_and_still_order() {
         // Regulated data we already received must not be rejected, only flagged.
-        let s = scope("9900000000001", 2026, 7);
+        let s = scope(OPERATOR, 2026, 7);
         let a = ScopedVersion::new(s.clone(), Version::new(1).unwrap());
         let b = ScopedVersion::new(s, Version::new(2).unwrap());
         assert!(b.supersedes(&a).unwrap());
@@ -538,7 +627,7 @@ mod tests {
 
     #[test]
     fn versions_order_within_a_scope() {
-        let s = scope("9900000000001", 2026, 7);
+        let s = scope(OPERATOR, 2026, 7);
         let older = ScopedVersion::new(s.clone(), Version::new(20_260_701_000_001).unwrap());
         let newer = ScopedVersion::new(s, Version::new(20_260_715_000_002).unwrap());
 
@@ -555,7 +644,7 @@ mod tests {
         // be incomparable with what it is meant to supersede, and the hot tier's
         // one-operator exclusion would refuse it anyway.
         let stored = ScopedVersion::new(
-            scope("9900000000001", 2026, 7),
+            scope(OPERATOR, 2026, 7),
             Version::new(20_260_715_000_002).unwrap(),
         );
         let next = stored.next().unwrap();
@@ -570,15 +659,15 @@ mod tests {
         // `Decimal128(20,0)` is the ceiling, and rolling over it would produce a
         // version that sorts *below* what it was meant to supersede.
         let at_ceiling =
-            ScopedVersion::new(scope("99", 2026, 7), Version::new(MAX_VERSION).unwrap());
+            ScopedVersion::new(scope(OPERATOR, 2026, 7), Version::new(MAX_VERSION).unwrap());
         assert!(at_ceiling.next().is_err());
     }
 
     #[test]
     fn versions_do_not_compare_across_operators() {
         // This is the comparison that silently picks wrong values.
-        let a = ScopedVersion::new(scope("9900000000001", 2026, 7), Version::new(5).unwrap());
-        let b = ScopedVersion::new(scope("9900000000002", 2026, 7), Version::new(9).unwrap());
+        let a = ScopedVersion::new(scope(OPERATOR, 2026, 7), Version::new(5).unwrap());
+        let b = ScopedVersion::new(scope(OTHER_OPERATOR, 2026, 7), Version::new(9).unwrap());
 
         assert!(matches!(
             a.try_cmp(&b),
@@ -588,8 +677,8 @@ mod tests {
 
     #[test]
     fn versions_do_not_compare_across_months() {
-        let a = ScopedVersion::new(scope("9900000000001", 2026, 7), Version::new(5).unwrap());
-        let b = ScopedVersion::new(scope("9900000000001", 2026, 8), Version::new(9).unwrap());
+        let a = ScopedVersion::new(scope(OPERATOR, 2026, 7), Version::new(5).unwrap());
+        let b = ScopedVersion::new(scope(OPERATOR, 2026, 8), Version::new(9).unwrap());
 
         assert!(a.try_cmp(&b).is_err());
     }
@@ -600,10 +689,11 @@ mod tests {
 
         // 23:00 UTC on 31 July is already 1 August in Berlin, and the market
         // works in local time.
-        let july = VersionScope::for_interval("99", datetime!(2026-07-31 20:00 UTC), Sparte::Strom)
-            .unwrap();
+        let july =
+            VersionScope::for_interval(OPERATOR, datetime!(2026-07-31 20:00 UTC), Sparte::Strom)
+                .unwrap();
         let august =
-            VersionScope::for_interval("99", datetime!(2026-07-31 23:00 UTC), Sparte::Strom)
+            VersionScope::for_interval(OPERATOR, datetime!(2026-07-31 23:00 UTC), Sparte::Strom)
                 .unwrap();
 
         assert_eq!(july.period(), "2026-07");
@@ -622,13 +712,13 @@ mod tests {
         // February Gastag.
         let early = datetime!(2026-03-01 1:00 UTC);
         assert_eq!(
-            VersionScope::for_interval("99", early, Sparte::Strom)
+            VersionScope::for_interval(OPERATOR, early, Sparte::Strom)
                 .unwrap()
                 .period(),
             "2026-03"
         );
         assert_eq!(
-            VersionScope::for_interval("99", early, Sparte::Gas)
+            VersionScope::for_interval(OPERATOR, early, Sparte::Gas)
                 .unwrap()
                 .period(),
             "2026-02"
@@ -638,7 +728,7 @@ mod tests {
         let later = datetime!(2026-03-01 6:00 UTC);
         for sparte in [Sparte::Strom, Sparte::Gas] {
             assert_eq!(
-                VersionScope::for_interval("99", later, sparte)
+                VersionScope::for_interval(OPERATOR, later, sparte)
                     .unwrap()
                     .period(),
                 "2026-03"
@@ -655,10 +745,10 @@ mod tests {
         // one deriving the calendar month is accepted: the wrong rule, enforced
         // firmly.
         let early = datetime!(2026-03-01 1:00 UTC);
-        let correct = VersionScope::for_interval("99", early, Sparte::Gas).unwrap();
+        let correct = VersionScope::for_interval(OPERATOR, early, Sparte::Gas).unwrap();
         assert!(correct.covers(early, Sparte::Gas));
 
-        let calendar_month = VersionScope::new("99", 2026, 3).unwrap();
+        let calendar_month = VersionScope::new(OPERATOR, 2026, 3).unwrap();
         assert!(
             !calendar_month.covers(early, Sparte::Gas),
             "the calendar month is not this interval's gas Bilanzierungsmonat"
@@ -675,8 +765,8 @@ mod tests {
         // is irrelevant, because the scope comes from the interval.
         let interval = datetime!(2026-07-20 06:00 UTC);
         for sparte in [Sparte::Strom, Sparte::Gas] {
-            let original = VersionScope::for_interval("99", interval, sparte).unwrap();
-            let correction = VersionScope::for_interval("99", interval, sparte).unwrap();
+            let original = VersionScope::for_interval(OPERATOR, interval, sparte).unwrap();
+            let correction = VersionScope::for_interval(OPERATOR, interval, sparte).unwrap();
             assert_eq!(original, correction);
         }
     }
@@ -691,7 +781,7 @@ mod tests {
         let end = datetime!(2027-01-01 00:00 UTC);
         while at < end {
             for sparte in [Sparte::Strom, Sparte::Gas, Sparte::Waerme, Sparte::Wasser] {
-                let scope = VersionScope::for_interval("99", at, sparte).unwrap();
+                let scope = VersionScope::for_interval(OPERATOR, at, sparte).unwrap();
                 assert!(scope.covers(at, sparte), "{at} {sparte} {scope}");
             }
             at += time::Duration::hours(5);
@@ -702,8 +792,9 @@ mod tests {
     fn covers_accepts_only_intervals_in_the_scope_month() {
         use time::macros::datetime;
 
-        let july = VersionScope::for_interval("99", datetime!(2026-07-20 00:00 UTC), Sparte::Strom)
-            .unwrap();
+        let july =
+            VersionScope::for_interval(OPERATOR, datetime!(2026-07-20 00:00 UTC), Sparte::Strom)
+                .unwrap();
         assert!(july.covers(datetime!(2026-07-01 00:00 UTC), Sparte::Strom));
         assert!(july.covers(datetime!(2026-07-31 20:00 UTC), Sparte::Strom));
         assert!(!july.covers(datetime!(2026-08-01 00:00 UTC), Sparte::Strom));
@@ -713,14 +804,14 @@ mod tests {
 
     #[test]
     fn operator_and_period_split_the_canonical_form() {
-        let s = scope("9900000000001", 2026, 3);
-        assert_eq!(s.operator(), "9900000000001");
+        let s = scope(OPERATOR, 2026, 3);
+        assert_eq!(s.operator().as_str(), OPERATOR);
         assert_eq!(s.period(), "2026-03");
     }
 
     #[test]
     fn scope_round_trips_through_canonical_form() {
-        let s = scope("9900000000001", 2026, 3);
+        let s = scope(OPERATOR, 2026, 3);
         assert_eq!(s.as_str(), "9900000000001:2026-03");
         assert_eq!(VersionScope::parse(s.as_str()).unwrap(), s);
     }
@@ -737,19 +828,27 @@ mod tests {
             "9900000000001:2026-13", // month out of range
             "9900000000001:2026-99",
             "9900000000001:2026-00",
-            "9900000000001:20x6-03", // year not a number
-            "a:b:2026-03",           // operator carrying the separator
-            ":2026-03",              // no operator
-            "9900000000001:2026-3",  // unpadded month
-            "9900000000001:202-003", // seven characters, wrong shape
-            "9900000000001",         // no separator at all
+            "9900000000001:20x6-03",  // year not a number
+            "a:b:2026-03",            // operator carrying the separator
+            ":2026-03",               // no operator
+            "9900000000001:2026-3",   // unpadded month
+            "9900000000001:202-003",  // seven characters, wrong shape
+            "9900000000001",          // no separator at all
+            "99:2026-03",             // the short spelling this crate used to take
+            "990000000000:2026-03",   // twelve digits
+            "99000000000012:2026-03", // fourteen
+            // `BdewCode`'s own `FromStr` trims, which is right at an ingest
+            // boundary and wrong for a stored value: this would parse, be kept
+            // as it stands, and then be refused by the hot table's CHECK.
+            " 9900000000001:2026-03",
+            "9900000000001 :2026-03",
         ] {
             assert!(VersionScope::parse(bad).is_err(), "{bad:?} must not parse");
         }
 
         // And everything a constructor can produce still round-trips.
         for month in 1..=12 {
-            let s = scope("9900000000001", 2026, month);
+            let s = scope(OPERATOR, 2026, month);
             assert_eq!(VersionScope::parse(s.as_str()).unwrap(), s);
         }
     }
@@ -759,19 +858,68 @@ mod tests {
         // The one-operator exclusion is `split_part(version_scope, ':', 1)`, so
         // `operator` has to split on the first separator, not the last. Both
         // constructors refuse an operator containing one, so the two agree.
-        let s = scope("9900000000001", 2026, 3);
-        assert_eq!(s.operator(), s.as_str().split(':').next().unwrap());
+        let s = scope(OPERATOR, 2026, 3);
+        assert_eq!(s.operator().as_str(), s.as_str().split(':').next().unwrap());
     }
 
     #[test]
-    fn scope_rejects_separator_in_operator() {
-        // Otherwise "a:b" + month would parse back to a different operator.
-        assert!(VersionScope::new("bad:operator", 2026, 7).is_err());
+    fn the_operator_must_be_a_marktpartner_id() {
+        // Past the constructor a wrong-but-plausible operator is simply a
+        // *different scope*: the correction fails to supersede, both rows
+        // survive resolution, and the total is inflated with no error anywhere.
+        // So it is parsed here, exactly as `MaloId` is.
+        for bad in [
+            "99",             // the short spelling a fixture reaches for
+            "bad:operator",   // the separator, which thirteen digits cannot hold
+            "990000000000",   // twelve digits
+            "99000000000012", // fourteen
+            "99000000000x1",  // not all digits
+            "",
+        ] {
+            assert!(
+                VersionScope::new(bad, 2026, 7).is_err(),
+                "{bad:?} is not a Marktpartner-ID"
+            );
+        }
+
+        let err = VersionScope::new("99", 2026, 7).unwrap_err().to_string();
+        assert!(
+            err.contains("13-digit"),
+            "metering's own shape message: {err}"
+        );
+        assert!(
+            err.contains("NAD+MS"),
+            "the message must name where the value comes from: {err}"
+        );
+        assert!(
+            err.contains("supersedes"),
+            "and what a wrong one costs, since the failure is otherwise invisible: {err}"
+        );
+    }
+
+    #[test]
+    fn a_gs1_gln_is_stored_and_flagged_rather_than_refused() {
+        // BDEW's Anwendungshilfe §2.3 carves out GS1-issued GLNs, which use a
+        // different check-digit procedure — so a well-formed Marktpartner-ID may
+        // legitimately fail the BDEW one, and refusing it would refuse data the
+        // market issued. Reported instead, like a short version label.
+        let digits = "990098765432";
+        let check = metering::ids::BdewCode::compute_check_digit(digits).expect("twelve digits");
+        let consistent = VersionScope::new(&*format!("{digits}{check}"), 2026, 7).unwrap();
+        assert!(consistent.operator_has_bdew_check_digit());
+
+        let wrong_check = (check + 1) % 10;
+        let inconsistent = VersionScope::new(&*format!("{digits}{wrong_check}"), 2026, 7).unwrap();
+        assert!(!inconsistent.operator_has_bdew_check_digit());
+        assert!(
+            VersionScope::parse(inconsistent.as_str()).is_ok(),
+            "stored and readable back: the flag is advisory, not a gate"
+        );
     }
 
     #[test]
     fn scope_rejects_out_of_range_month() {
-        assert!(VersionScope::new("9900000000001", 2026, 0).is_err());
-        assert!(VersionScope::new("9900000000001", 2026, 13).is_err());
+        assert!(VersionScope::new(OPERATOR, 2026, 0).is_err());
+        assert!(VersionScope::new(OPERATOR, 2026, 13).is_err());
     }
 }

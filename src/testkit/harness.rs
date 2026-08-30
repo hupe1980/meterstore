@@ -231,7 +231,7 @@ impl TestHarness {
     /// Make sure the hot tier can hold `[from, to)`.
     pub async fn ensure_partitions(&self, from: OffsetDateTime, to: OffsetDateTime) -> Result<()> {
         self.hot
-            .ensure_partitions(self.config.name(), from, to, self.config.partition_step())
+            .ensure_partitions(self.config.name(), from, to, self.config.archival_step())
             .await
             .map(|_| ())
     }

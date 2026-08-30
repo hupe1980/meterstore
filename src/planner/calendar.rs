@@ -138,53 +138,33 @@ pub fn balancing_day_length(day: Date, sparte: Sparte) -> Duration {
     day_boundary(sparte).day_length(day)
 }
 
-/// How long the Gastag `day` is — 23, 24 or 25 hours.
-///
-/// The long and short ones are named after the **Saturday**: the clocks move at
-/// 02:00/03:00 local, which falls inside the gas day that began 06:00 the
-/// previous morning.
-///
-/// ```rust
-/// use meterstore::planner::gas_day_length;
-/// use time::macros::date;
-///
-/// assert_eq!(gas_day_length(date!(2026 - 10 - 24)).whole_hours(), 25);
-/// assert_eq!(gas_day_length(date!(2026 - 10 - 25)).whole_hours(), 24);
-/// ```
-#[must_use]
-pub fn gas_day_length(day: Date) -> Duration {
-    DayBoundary::Gastag.day_length(day)
-}
-
-/// How many intervals of `resolution` a Gastag holds.
-///
-/// [`metering::calendar::intervals_in_day`] under the Gastag boundary. `None` for
-/// a resolution coarser than a day (`P1M`, `P1Y`), which has no fixed count
-/// within one — the honest answer, rather than an invented 96.
-///
-/// ```rust
-/// use meterstore::planner::intervals_in_gas_day;
-/// use metering::IntervalResolution;
-/// use time::macros::date;
-///
-/// let q = IntervalResolution::QuarterHour;
-/// assert_eq!(intervals_in_gas_day(date!(2026 - 07 - 15), q), Some(96));
-/// // The 25-hour Gastag is Saturday's, not the transition Sunday's.
-/// assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 24), q), Some(100));
-/// assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 25), q), Some(96));
-/// // A daily series expects one interval per day, gas or not.
-/// assert_eq!(intervals_in_gas_day(date!(2026 - 07 - 15), IntervalResolution::Day), Some(1));
-/// assert_eq!(intervals_in_gas_day(date!(2026 - 07 - 15), IntervalResolution::Month), None);
-/// ```
-#[must_use]
-pub fn intervals_in_gas_day(day: Date, resolution: IntervalResolution) -> Option<u32> {
-    DayBoundary::Gastag.intervals_in_day(day, resolution)
-}
-
 /// How many intervals of `resolution` a balancing day holds, for `sparte`.
 ///
 /// [`metering::calendar::intervals_in_day`] under the boundary the commodity is
-/// balanced on.
+/// balanced on. `None` for a resolution coarser than a day (`P1M`, `P1Y`), which
+/// has no fixed count within one — the honest answer, rather than an invented 96.
+///
+/// ```rust
+/// use meterstore::planner::expected_intervals_in_balancing_day as intervals;
+/// use metering::IntervalResolution;
+/// use metering::interval::Sparte;
+/// use time::macros::date;
+///
+/// let q = IntervalResolution::QuarterHour;
+/// assert_eq!(intervals(date!(2026 - 07 - 15), q, Sparte::Strom), Some(96));
+///
+/// // The 25-hour day is the Sunday for the calendar and the **Saturday** for
+/// // gas: the clocks move at 03:00, inside the Gastag that began the morning
+/// // before.
+/// assert_eq!(intervals(date!(2026 - 10 - 25), q, Sparte::Strom), Some(100));
+/// assert_eq!(intervals(date!(2026 - 10 - 24), q, Sparte::Gas), Some(100));
+/// assert_eq!(intervals(date!(2026 - 10 - 25), q, Sparte::Gas), Some(96));
+///
+/// // A daily series expects one interval per day, gas or not; a monthly one has
+/// // no count within a day at all.
+/// assert_eq!(intervals(date!(2026 - 07 - 15), IntervalResolution::Day, Sparte::Gas), Some(1));
+/// assert_eq!(intervals(date!(2026 - 07 - 15), IntervalResolution::Month, Sparte::Gas), None);
+/// ```
 #[must_use]
 pub fn expected_intervals_in_balancing_day(
     day: Date,
@@ -283,15 +263,27 @@ mod tests {
         // report one day four short and its neighbour four in surplus.
         let q = IntervalResolution::QuarterHour;
 
-        assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 24), q), Some(100));
-        assert_eq!(intervals_in_gas_day(date!(2026 - 10 - 25), q), Some(96));
+        assert_eq!(
+            expected_intervals_in_balancing_day(date!(2026 - 10 - 24), q, Sparte::Gas),
+            Some(100)
+        );
+        assert_eq!(
+            expected_intervals_in_balancing_day(date!(2026 - 10 - 25), q, Sparte::Gas),
+            Some(96)
+        );
         assert_eq!(
             expected_intervals_in_balancing_day(date!(2026 - 10 - 25), q, Sparte::Strom),
             Some(100)
         );
 
-        assert_eq!(intervals_in_gas_day(date!(2026 - 03 - 28), q), Some(92));
-        assert_eq!(intervals_in_gas_day(date!(2026 - 03 - 29), q), Some(96));
+        assert_eq!(
+            expected_intervals_in_balancing_day(date!(2026 - 03 - 28), q, Sparte::Gas),
+            Some(92)
+        );
+        assert_eq!(
+            expected_intervals_in_balancing_day(date!(2026 - 03 - 29), q, Sparte::Gas),
+            Some(96)
+        );
         assert_eq!(
             expected_intervals_in_balancing_day(date!(2026 - 03 - 29), q, Sparte::Strom),
             Some(92)
@@ -330,11 +322,11 @@ mod tests {
         // intervals on the long Gastag, and 1 440 on an ordinary one.
         let minute = IntervalResolution::from_seconds(60).expect("a minute is a resolution");
         assert_eq!(
-            intervals_in_gas_day(date!(2026 - 07 - 15), minute),
+            expected_intervals_in_balancing_day(date!(2026 - 07 - 15), minute, Sparte::Gas),
             Some(1_440)
         );
         assert_eq!(
-            intervals_in_gas_day(date!(2026 - 10 - 24), minute),
+            expected_intervals_in_balancing_day(date!(2026 - 10 - 24), minute, Sparte::Gas),
             Some(1_500)
         );
     }

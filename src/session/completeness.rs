@@ -138,6 +138,20 @@ impl Completeness {
     pub fn is_measurable(&self) -> bool {
         self.resolution.is_some() && self.expected > 0
     }
+
+    /// Whether the channel delivered **nothing at all** over the range.
+    ///
+    /// The strongest form of incompleteness, and the one an aggregate over the
+    /// range alone cannot see: a channel with no rows produces no groups, so it
+    /// is absent from the report rather than reported as empty. A row like this
+    /// exists only because the query was given a reference window to draw a
+    /// roster of channels from — see
+    /// [`CompletenessQuery::seen_since`](crate::session::CompletenessQuery::seen_since).
+    ///
+    /// In SQL it is `actual = 0`.
+    pub fn is_silent(&self) -> bool {
+        self.actual == 0
+    }
 }
 
 /// The daily grain the aggregate produces, before roll-up.
@@ -353,7 +367,55 @@ fn daily_plan(
     .build()
 }
 
+/// The channels a range is expected to hold, drawn from an earlier window.
+///
+/// One row per `(malo_id, obis_code, discriminators, sparte, resolution)` — the
+/// same key [`roll_up`] reports on, so a roster entry and a report row are
+/// comparable without re-deriving either.
+fn roster_plan(
+    resolved: Arc<dyn TableProvider>,
+    table: &str,
+    discriminators: &[String],
+    since: OffsetDateTime,
+    until: OffsetDateTime,
+) -> DfResult<datafusion::logical_expr::LogicalPlan> {
+    let ts = |t: OffsetDateTime| lit(crate::encode::schema::timestamp_scalar(t));
+
+    LogicalPlanBuilder::scan(
+        table.to_string(),
+        datafusion::datasource::provider_as_source(resolved),
+        None,
+    )?
+    .filter(
+        col(column::FROM)
+            .gt_eq(ts(since))
+            .and(col(column::FROM).lt(ts(until))),
+    )?
+    // Group keys only, no measure: what is wanted is the *set* of channels, and
+    // counting them would make the reference window as expensive as the reported
+    // one for an answer nothing reads.
+    .aggregate(
+        {
+            let mut keys = vec![
+                col(column::MALO_ID),
+                col(column::OBIS_CODE),
+                col(column::SPARTE),
+                col(column::RESOLUTION),
+            ];
+            keys.extend(discriminators.iter().map(col));
+            keys
+        },
+        Vec::<Expr>::new(),
+    )?
+    .build()
+}
+
 /// Run the aggregate and roll it up to one row per channel.
+///
+/// `seen_since`, when set, is the start of a **reference window** ending at
+/// `from`: every channel that reported in it is expected to report in the
+/// range, so one that does not comes back as a row with `actual = 0` rather
+/// than as no row at all. See [`CompletenessQuery`].
 pub(crate) async fn compute(
     state: &dyn Session,
     resolved: Arc<dyn TableProvider>,
@@ -361,14 +423,24 @@ pub(crate) async fn compute(
     discriminators: &[String],
     from: OffsetDateTime,
     to: OffsetDateTime,
+    seen_since: Option<OffsetDateTime>,
 ) -> Result<Vec<Completeness>> {
     if to <= from {
         return Err(Error::config(format!(
             "completeness range end {to} must be after start {from}"
         )));
     }
+    if let Some(since) = seen_since
+        && since >= from
+    {
+        return Err(Error::config(format!(
+            "the reference window {since} must start before the reported range {from}: \
+             a roster drawn from the range itself can only contain channels the range \
+             already reports, so it would find nothing silent"
+        )));
+    }
 
-    let plan = daily_plan(resolved, table, discriminators, from, to)?;
+    let plan = daily_plan(Arc::clone(&resolved), table, discriminators, from, to)?;
     let physical = state.create_physical_plan(&plan).await?;
     let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
@@ -377,7 +449,166 @@ pub(crate) async fn compute(
         daily.extend(decode_daily(batch, discriminators)?);
     }
 
-    Ok(roll_up(daily, from, to))
+    let mut rows = roll_up(daily, from, to);
+
+    if let Some(since) = seen_since {
+        let plan = roster_plan(resolved, table, discriminators, since, from)?;
+        let physical = state.create_physical_plan(&plan).await?;
+        let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
+
+        let mut roster = Vec::new();
+        for batch in &batches {
+            roster.extend(decode_roster(batch, discriminators)?);
+        }
+        rows.extend(silent_rows(&rows, roster, from, to));
+        // The report is otherwise ordered by the roll-up's `BTreeMap`, and a
+        // silent channel appended at the end would read as a different kind of
+        // row rather than as one more channel. Sorted on the reported key.
+        rows.sort_by(|a, b| {
+            (&a.malo_id, &a.obis_code, &a.identity, &a.resolution).cmp(&(
+                &b.malo_id,
+                &b.obis_code,
+                &b.identity,
+                &b.resolution,
+            ))
+        });
+    }
+
+    Ok(rows)
+}
+
+/// One roster entry: a channel that reported in the reference window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Channel {
+    malo_id: String,
+    obis_code: String,
+    identity: Vec<(String, String)>,
+    sparte: Sparte,
+    resolution: Option<String>,
+}
+
+/// Read the roster aggregate's output back into channels.
+fn decode_roster(batch: &RecordBatch, discriminators: &[String]) -> Result<Vec<Channel>> {
+    let text = |name: &str| -> Result<&StringArray> {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_string_opt::<i32>())
+            .ok_or_else(|| Error::decode(name, "expected a string column"))
+    };
+
+    let malo = text(column::MALO_ID)?;
+    let obis = text(column::OBIS_CODE)?;
+    let sparte = text(column::SPARTE)?;
+    let resolution = text(column::RESOLUTION)?;
+    let identity_columns = discriminators
+        .iter()
+        .map(|name| text(name))
+        .collect::<Result<Vec<_>>>()?;
+
+    (0..batch.num_rows())
+        .map(|i| {
+            Ok(Channel {
+                malo_id: malo.value(i).to_string(),
+                obis_code: obis.value(i).to_string(),
+                identity: discriminators
+                    .iter()
+                    .zip(&identity_columns)
+                    .map(|(name, column)| (name.clone(), column.value(i).to_string()))
+                    .collect(),
+                sparte: sparte.value(i).parse().map_err(|e| {
+                    Error::decode(column::SPARTE, format!("{:?}: {e}", sparte.value(i)))
+                })?,
+                resolution: (!resolution.is_null(i)).then(|| resolution.value(i).to_string()),
+            })
+        })
+        .collect()
+}
+
+/// A report row for every rostered channel the range does not mention.
+///
+/// The whole expectation is missing, and `first_gap` is the range's first
+/// balancing day — which is what an operator needs to know: not that a value is
+/// absent, but from when.
+///
+/// Matched on `(malo_id, obis_code, identity)` rather than on the full reported
+/// key. A channel whose grid changed between the reference window and the range
+/// is still reporting, and calling it silent because it now delivers at a
+/// different resolution would be a finding about the roster rather than about
+/// the data.
+fn silent_rows(
+    reported: &[Completeness],
+    roster: Vec<Channel>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> Vec<Completeness> {
+    use std::collections::BTreeSet;
+
+    /// What names a reading, minus the grid it was delivered on.
+    type Key = (String, String, Vec<(String, String)>);
+    let key = |malo: &str, obis: &str, identity: &[(String, String)]| -> Key {
+        (malo.to_string(), obis.to_string(), identity.to_vec())
+    };
+
+    let present: BTreeSet<Key> = reported
+        .iter()
+        .map(|r| key(&r.malo_id, &r.obis_code, &r.identity))
+        .collect();
+
+    let mut seen: BTreeSet<Key> = BTreeSet::new();
+    roster
+        .into_iter()
+        .filter(|c| !present.contains(&key(&c.malo_id, &c.obis_code, &c.identity)))
+        // A channel that changed grid inside the reference window appears twice
+        // there and is one silent channel here.
+        .filter(|c| seen.insert(key(&c.malo_id, &c.obis_code, &c.identity)))
+        .map(|c| {
+            let (expected, first_gap) =
+                expected_over_range(from, to, c.resolution.as_deref(), c.sparte);
+            Completeness {
+                malo_id: c.malo_id,
+                obis_code: c.obis_code,
+                identity: c.identity,
+                sparte: c.sparte,
+                resolution: c.resolution,
+                expected,
+                actual: 0,
+                missing: expected,
+                surplus: 0,
+                first_gap,
+                substituted: 0,
+                not_billable: 0,
+            }
+        })
+        .collect()
+}
+
+/// How many intervals a range should hold for a channel that delivered none, and
+/// the first balancing day it is short.
+///
+/// Summed per balancing day exactly as [`roll_up`] does, so a silent channel's
+/// `expected` is the number a channel delivering everything would have reported
+/// — including the 92- and 100-interval DST days, and the Gastag for gas.
+fn expected_over_range(
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    resolution: Option<&str>,
+    sparte: Sparte,
+) -> (u64, Option<Date>) {
+    let mut day = balancing::balancing_day(from, sparte);
+    let last = balancing::balancing_day(to - time::Duration::nanoseconds(1), sparte);
+
+    let mut expected = 0u64;
+    let mut first_gap = None;
+    while day <= last {
+        let n = expected_in_day(day, resolution, sparte, from, to);
+        expected += n;
+        if n > 0 && first_gap.is_none() {
+            first_gap = Some(day);
+        }
+        let Some(next) = day.next_day() else { break };
+        day = next;
+    }
+    (expected, first_gap)
 }
 
 /// Read the aggregate's output back into typed rows.
@@ -632,6 +863,113 @@ fn expected_in_day(
     (covered.whole_seconds() / step.whole_seconds()).max(0) as u64
 }
 
+/// A completeness report waiting to be run.
+///
+/// Returned by [`MeterStore::completeness`](crate::MeterStore::completeness) and
+/// awaited directly, so the plain report is one call.
+///
+/// # The finding a range cannot make about itself
+///
+/// The report is an aggregate over the rows the range holds, so a channel with no
+/// rows produces no groups and appears nowhere — the most severe incompleteness
+/// there is, and the one nothing in the range can supply, because the missing
+/// roster is precisely what the range does not contain.
+///
+/// [`seen_since`](Self::seen_since) supplies it from an earlier window: a channel
+/// that reported between `since` and the start of the range and does not report
+/// inside it comes back with `actual = 0`, the whole range as `missing`, and
+/// `first_gap` on its first balancing day.
+///
+/// ```no_run
+/// # async fn example(store: &meterstore::MeterStore) -> meterstore::Result<()> {
+/// # let (from, to) = (time::OffsetDateTime::UNIX_EPOCH, time::OffsetDateTime::UNIX_EPOCH);
+/// let report = store
+///     .completeness(from, to)
+///     .seen_since(from - time::Duration::days(30))
+///     .await?;
+///
+/// for gone in report.iter().filter(|r| r.is_silent()) {
+///     tracing::error!(malo = %gone.malo_id, obis = %gone.obis_code, "delivered nothing");
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// The window is the caller's because there is no honest default: too short and a
+/// meter read monthly looks decommissioned, too long and every terminated
+/// measuring point is a standing finding. What a roster means — "still in
+/// service" — is master data this crate does not hold.
+pub struct CompletenessQuery<'a> {
+    store: &'a crate::session::MeterStore,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    seen_since: Option<OffsetDateTime>,
+}
+
+impl std::fmt::Debug for CompletenessQuery<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletenessQuery")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("seen_since", &self.seen_since)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> CompletenessQuery<'a> {
+    pub(crate) fn new(
+        store: &'a crate::session::MeterStore,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Self {
+        Self {
+            store,
+            from,
+            to,
+            seen_since: None,
+        }
+    }
+
+    /// Also report channels that reported since `since` and are **silent** in the
+    /// range.
+    ///
+    /// `since` must be before the range starts: a roster drawn from the range
+    /// itself can only hold channels the range already reports, so it would find
+    /// nothing. See the type documentation for why the window is the caller's.
+    #[must_use]
+    pub fn seen_since(mut self, since: OffsetDateTime) -> Self {
+        self.seen_since = Some(since);
+        self
+    }
+
+    /// Run the report.
+    ///
+    /// The same thing `.await` does; spelled out for a caller that wants the
+    /// call to look like a call.
+    pub async fn run(self) -> Result<Vec<Completeness>> {
+        let (resolved, table, discriminators) = self.store.completeness_inputs().await?;
+        compute(
+            &self.store.context().state(),
+            resolved,
+            &table,
+            &discriminators,
+            self.from,
+            self.to,
+            self.seen_since,
+        )
+        .await
+    }
+}
+
+impl<'a> std::future::IntoFuture for CompletenessQuery<'a> {
+    type Output = Result<Vec<Completeness>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.run())
+    }
+}
+
 /// `meter_completeness(from, to)` — completeness as a queryable table.
 ///
 /// Registered by [`MeterStore`], so the table it reports on is the store's own.
@@ -671,14 +1009,25 @@ impl CompletenessFunction {
 
 impl datafusion::catalog::TableFunctionImpl for CompletenessFunction {
     fn call(&self, args: &[Expr]) -> DfResult<Arc<dyn TableProvider>> {
-        let (name, from, to) = match args {
-            [from, to] => (None, from, to),
-            [name, from, to] => (Some(as_string(name)?), from, to),
+        // Arguments read left to right in **time order**, so the three-argument
+        // form is `(seen_since, from, to)` and not `(from, to, seen_since)` —
+        // the reference window ends where the reported range begins, and writing
+        // it out of order is how an operator gets the two the wrong way round.
+        //
+        // A leading table name and a leading `seen_since` are told apart by
+        // whether the argument reads as an instant. A table name never does:
+        // `TableConfig` refuses anything that is not a plain identifier, and no
+        // plain identifier parses as a date.
+        let (name, seen_since, from, to) = match args {
+            [from, to] => (None, None, from, to),
+            [first, from, to] if as_instant(first).is_ok() => (None, Some(first), from, to),
+            [name, from, to] => (Some(as_string(name)?), None, from, to),
+            [name, since, from, to] => (Some(as_string(name)?), Some(since), from, to),
             _ => {
                 return Err(DataFusionError::Plan(format!(
-                    "{}(from, to) or {}(table, from, to)",
-                    Self::NAME,
-                    Self::NAME
+                    "{name}(from, to), {name}(seen_since, from, to), \
+                     {name}(table, from, to) or {name}(table, seen_since, from, to)",
+                    name = Self::NAME,
                 )));
             }
         };
@@ -699,6 +1048,7 @@ impl datafusion::catalog::TableFunctionImpl for CompletenessFunction {
             discriminators: self.discriminators.clone(),
             from: as_instant(from)?,
             to: as_instant(to)?,
+            seen_since: seen_since.map(as_instant).transpose()?,
         }))
     }
 }
@@ -761,6 +1111,7 @@ struct CompletenessProvider {
     discriminators: Vec<String>,
     from: OffsetDateTime,
     to: OffsetDateTime,
+    seen_since: Option<OffsetDateTime>,
 }
 
 impl std::fmt::Debug for CompletenessProvider {
@@ -769,6 +1120,7 @@ impl std::fmt::Debug for CompletenessProvider {
             .field("table", &self.table)
             .field("from", &self.from)
             .field("to", &self.to)
+            .field("seen_since", &self.seen_since)
             .finish()
     }
 }
@@ -801,6 +1153,7 @@ impl TableProvider for CompletenessProvider {
             &self.discriminators,
             self.from,
             self.to,
+            self.seen_since,
         )
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1228,5 +1581,121 @@ mod tests {
         );
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Completeness::is_complete));
+    }
+
+    fn channel(sparte: Sparte, resolution: Option<&str>) -> Channel {
+        Channel {
+            malo_id: "12345678905".into(),
+            obis_code: "1-0:1.8.0".into(),
+            identity: Vec::new(),
+            sparte,
+            resolution: resolution.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_channel_that_delivered_nothing_is_the_finding_the_range_cannot_make() {
+        // The whole point. An aggregate over the range produces no group for a
+        // channel with no rows, so the most severe incompleteness there is — a
+        // meter that stopped entirely — is *absent* from the report rather than
+        // reported as empty. The roster is the only thing that can supply it.
+        let silent = silent_rows(&[], vec![channel(Sparte::Strom, Some("PT15M"))], FROM, TO);
+
+        assert_eq!(silent.len(), 1);
+        let row = &silent[0];
+        assert!(row.is_silent());
+        assert!(!row.is_complete());
+        assert_eq!(row.actual, 0);
+        // 2 976 quarter-hours, which is 31 × 96 — and arriving at it is the
+        // whole of what the clipping does. The range is a *UTC* month, so it is
+        // not aligned to a Berlin day at either end: the first balancing day is
+        // 23 hours of it and the last is two, and the spring-forward Sunday in
+        // between contributes 92 rather than 96. A report that expected 96 a day
+        // over Berlin days would claim four intervals missing on 29 March and
+        // another day's worth at the ends.
+        assert_eq!(row.expected, 31 * 96);
+        assert_eq!(row.missing, row.expected, "the whole range is missing");
+        assert_eq!(row.surplus, 0);
+        assert_eq!(row.first_gap, Some(date!(2026 - 03 - 01)));
+    }
+
+    #[test]
+    fn a_channel_still_reporting_is_not_called_silent() {
+        // Including when its grid changed. A meter converted from an hourly
+        // profile to a quarter-hourly one reports under a different resolution
+        // than the roster saw, and calling that a silent channel would be a
+        // finding about the roster rather than about the data.
+        let reported = roll_up(vec![row(date!(2026 - 03 - 02), 96, "MEASURED")], FROM, TO);
+        let silent = silent_rows(
+            &reported,
+            vec![channel(Sparte::Strom, Some("PT1H"))],
+            FROM,
+            TO,
+        );
+        assert!(silent.is_empty(), "{silent:?}");
+    }
+
+    #[test]
+    fn a_silent_gas_channel_is_measured_on_the_gastag() {
+        // The Gastag runs 06:00 to 06:00, so a month-long range clips six hours
+        // off each end day rather than expecting two whole extra days.
+        let silent = silent_rows(&[], vec![channel(Sparte::Gas, Some("PT15M"))], FROM, TO);
+        assert_eq!(silent.len(), 1);
+        // The Gastage tile the timeline exactly as the calendar days do, so the
+        // range holds the same number of quarter-hours however it is cut into
+        // days — five hours of the first Gastag, twenty of the last.
+        assert_eq!(silent[0].expected, 31 * 96);
+        // And the first short day is a Gastag, which begins on 28 February.
+        assert_eq!(silent[0].first_gap, Some(date!(2026 - 02 - 28)));
+    }
+
+    #[test]
+    fn a_silent_channel_with_no_grid_reports_nothing_to_judge() {
+        // No declared resolution means no expectation, in both directions: the
+        // row must not claim a month-long gap it cannot measure.
+        let silent = silent_rows(&[], vec![channel(Sparte::Strom, None)], FROM, TO);
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].expected, 0);
+        assert_eq!(silent[0].missing, 0);
+        assert!(!silent[0].is_measurable());
+        assert_eq!(silent[0].first_gap, None);
+    }
+
+    #[test]
+    fn a_channel_that_changed_grid_and_went_silent_is_one_row() {
+        // It appears twice in the roster — once per grid — and is one silent
+        // channel, not two.
+        let silent = silent_rows(
+            &[],
+            vec![
+                channel(Sparte::Strom, Some("PT1H")),
+                channel(Sparte::Strom, Some("PT15M")),
+            ],
+            FROM,
+            TO,
+        );
+        assert_eq!(silent.len(), 1);
+    }
+
+    #[test]
+    fn identity_keeps_two_tenants_silent_channels_apart() {
+        // A tenant discriminator is what makes two rows two readings, so one
+        // tenant reporting must not make the other's silence invisible.
+        let tenant = |who: &str| Channel {
+            identity: vec![("tenant".into(), who.into())],
+            ..channel(Sparte::Strom, Some("PT15M"))
+        };
+        let reported = roll_up(
+            vec![DailyRow {
+                identity: vec![("tenant".into(), "a".into())],
+                ..row(date!(2026 - 03 - 02), 96, "MEASURED")
+            }],
+            FROM,
+            TO,
+        );
+
+        let silent = silent_rows(&reported, vec![tenant("a"), tenant("b")], FROM, TO);
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].identity, vec![("tenant".into(), "b".into())]);
     }
 }

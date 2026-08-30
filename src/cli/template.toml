@@ -65,12 +65,6 @@ name = "readings_versions"
 time_model = "interval"
 
 [tables.hot]
-# The purge of an archived window is DROP TABLE, not DELETE, and that only holds
-# when a window is exactly one partition. `partition_step` must therefore equal
-# `archival_step` below — each is valid alone and wrong when they disagree, so
-# they are written next to each other and checked against each other.
-partition_step = "1d"
-
 # How far ahead partitions are pre-created. Running out makes inserts fail
 # outright, so `partitions_ahead` in `meterstore status` is the number that
 # predicts a failure rather than describing one.
@@ -78,10 +72,17 @@ partition_headroom = "7d"
 
 [tables.archival]
 # How far behind wall clock archival stays, so a late correction still finds its
-# interval in the hot tier where it can be superseded cheaply.
+# interval in the hot tier where it can be superseded cheaply. It must cover at
+# least one `archival_step`, or a window can close while corrections for it are
+# still arriving — and they would land below the watermark, where no query looks.
 settlement_lag = "7d"
 
-# One window per commit. Must equal `partition_step`.
+# One window per commit — and the hot table's partition granularity, which is
+# the same number. The purge of an archived window is DROP TABLE, not DELETE,
+# and that only holds when a window is exactly one partition.
+#
+# It cannot be changed once a table has archived: the watermark sits on the old
+# grid, and a window off that grid names a partition relation nothing creates.
 archival_step = "1d"
 
 [tables.maintenance]

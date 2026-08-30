@@ -7,6 +7,232 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.7.0] — 2026-08-30
+
+An audit of the seams where this crate meets its dependencies, one setting fewer,
+the two findings a completeness report and a retention sweep could not make — and
+`metering` 0.20, which takes two of this crate's own workarounds off it.
+
+### A duplicated version scope doubled a total, silently
+
+Resolution partitions by the merge key **and `version_scope`**, so two network
+operators for one reading leave two winners that agree on channel *and* on every
+discriminator. `refuse_mixed_readings` — the check that stops a typed read folding
+two readings into one series — asks whether the rows describe two readings, and
+these do not. It let them through, `merge` folded them, and
+`metering::aggregate` summed both.
+
+Both write paths refuse a second operator, so the state is not reachable through
+them. It is reachable through `PostgresHot::integrity_constraints(false)`, which
+is a supported setting, and through anything else that writes to a PostgreSQL
+table — and §7.3 said in as many words that a duplicated scope then has *no*
+after-the-fact detection. It has one now: the fold refuses two values at one
+instant with `InvariantViolated`, on both the interval and the register path.
+
+It matters more on the register path than the interval one. A Zählerstandsgang is
+*differenced* to get consumption, so two values at one instant do not double a
+sum — an arbitrary one of the two lands on both sides of a subtraction and the
+figure between two reads bears no relation to anything.
+
+The guarantee has an edge, and it is written down rather than implied: a `SUM` in
+SQL is not covered and will simply be twice the truth. The constraint is what
+prevents a duplicated scope; the typed reads are what notice one.
+
+Finding it also turned up a unit-test fixture asserting the fold *accepted* two
+deliveries at one instant — a state resolution cannot produce, since it keeps one
+row per (merge key, version_scope). Its real subject was that a non-key column
+does not split a series, which it now tests over two instants instead.
+
+### A retention period too wide to represent erased everything
+
+`Retention::CalendarYears` subtracts from the current year, and the conversion
+fell back to subtracting **zero** when the period did not fit an `i32`. So a
+nonsense period — a `u32` from a bad config, a units mix-up — did not mean "keep
+everything", it put the cutoff at the start of *this* year and made every subject
+in the store due at once. Erasure is irreversible.
+
+Both arms now saturate towards keeping, and are clamped to a year the calendar can
+answer for: `metering::calendar::year_start_utc` panics on `Date::MIN`, because
+Berlin's midnight on `-9999-01-01` is an hour before it in UTC.
+
+### Smaller, from the same pass
+
+- `meterstore.retention.subjects_anonymised` counts what a sweep destroyed.
+  Compliance rather than health — a flat zero over a year is a job that is not
+  running — and the only counter here whose *rise* is worth a look. Recorded in
+  one place, so the catalog sweep, the single-table sweep and the maintenance loop
+  all reach it, and with no `table` attribute, because a linkage is destroyed
+  across the whole deployment at once.
+- The deduplicated-row count is a `saturating_sub`. It cannot underflow today, but
+  it is a subtraction on the write path, and an underflow there panics in a debug
+  build and wraps to ~2^64 in a release one — two different wrong answers to a
+  question that only exists for a metric.
+- `ScanSpec::cursor_columns` now records why the Parquet footer's declared sort
+  order is safe: PostgreSQL sorts under the database collation and Parquet
+  declares byte order, and they agree because a MaLo-ID is eleven ASCII digits. A
+  text column that could hold anything else must stay out of the declared prefix.
+
+### `metering` 0.20 — the version scope's operator is now a type
+
+Requires `metering` **0.20**, and takes two things from it.
+
+**`ids::BdewCode` is the operator half of a `VersionScope`.** It was an unparsed
+string with two ad-hoc rules: not empty, and no `':'`. But this is the network
+operator's Marktpartner-ID — thirteen digits, what MSCONS carries in `NAD+MS` —
+and the crate's own doctrine for `MaloId` applies to it exactly: past the
+constructor a wrong-but-plausible operator is not an error, it is a **different
+scope**. The correction never supersedes the value it corrects, both rows survive
+resolution, and every sum over the reading is inflated with nothing reporting it.
+
+So the constructors take `impl TryInto<BdewCode>`, the way the read paths take
+`impl TryInto<MaloId>`. Three things fall out. The stored column is a fixed twenty
+characters, so the hot table's `CHECK` is exact — `^[0-9]{13}:[0-9]{4}-(0[1-9]|1[0-2])$`
+rather than "anything without a colon". The one-operator exclusion's
+`split_part(version_scope, ':', 1)` can only ever take the half the type reports,
+because thirteen digits contain no separator — a rule that used to be written
+twice and kept in step by hand. And `VersionScope::operator()` returns the code
+rather than a `&str`.
+
+The check digit is verified but **not enforced**, which is `BdewCode`'s rule
+rather than a choice made here: BDEW's Anwendungshilfe §2.3 carves out GS1-issued
+GLNs, which use a different procedure, so a well-formed Marktpartner-ID may
+legitimately fail the BDEW one and refusing it would refuse data the market
+issued. `VersionScope::operator_has_bdew_check_digit()` reports it, the same
+restraint `Version::is_well_formed` applies to a short version label.
+
+**The hand-written `provenance` encoder is gone.** It existed for one field:
+`ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose serde impl is
+feature-conditional, so the on-disk shape of an audit trail under a decades-long
+retention was decided by Cargo feature unification rather than by any crate with
+an opinion about it. `metering` 0.20 settles it upstream in a `wire` module — RFC
+3339 for a human-readable format, `time`'s compact tuple for a binary one — which
+makes the stored shape a deliberate, documented, tested choice by the crate that
+owns the type, exactly the standing `source_detail`'s tags already had. Two rules
+became one, and about seventy lines of encoder, decoder and argument went with it.
+The column's byte shape changes (declaration order rather than alphabetical) and
+is still asserted byte for byte, now pinning the upstream decision.
+
+`MeasurementSource::Correction` also loses its `uuid::Uuid` upstream, so
+`source_detail` carries `correction_ref` as a string. Nothing here constructed
+one.
+
+### Snapshot expiry ignored the retention window it was given
+
+`iceberg`'s expire action runs its **age** path whether or not snapshot ids are
+named: with no cutoff set it falls back to the table's
+`history.expire.max-snapshot-age-ms`, default **five days**. This crate named ids
+and set nothing else, so a single `--expire-snapshots` cycle expired everything
+older than a working week — through the ten-year `snapshot_retention` it is
+configured with, through `min_snapshots_to_keep`, and through the watermark-chain
+protection it computes. The one guarantee the cold tier exists to hold, and it
+survived because every test asked for expiry from a date in 2030, where
+everything is past retention either way.
+
+The cutoff is now pinned to the epoch, which selects nothing, so the ids computed
+against the configured retention are the whole of what is expired. That closes a
+second door at the same time: `history.expire.*` is a *table* property, so the
+out-of-band compaction this design recommends could otherwise have set one and
+silently decided the deployment's retention.
+
+### A bound between two stored instants could skip the next row
+
+DataFusion unifies a timestamp comparison on the finer of the two units, so a
+literal written with sub-microsecond precision reaches the planner as nanoseconds
+carrying a value *between* two stored instants. Converting it to an exclusive
+bound added a whole microsecond, which landed past the next stored instant:
+`"from" > TIMESTAMP '2026-07-10 00:00:00.0000005'` produced a lower bound of
+`…0000015`, and the row at `…000001` — which satisfies the predicate — was outside
+the range the tier split scanned. No error; the row simply was not read.
+
+That is the one thing §17.1 says the analysis may never do. The bound is now
+snapped to the microsecond grid the schema stores on, and the property that
+guards it works in nanoseconds rather than whole seconds — which is why it never
+generated the case. A 30 000-combination exhaustive check over the sub-microsecond
+neighbourhood runs beside it, because a property drawing bounds and probes
+independently meets this one only by luck.
+
+### A retention sweep could orphan readings in a table it was not looking at
+
+The subject registry is **deployment-wide**: one map keyed by natural identifier,
+so two tables registering the same identifier share one `SubjectRef` and a single
+erasure unlinks both. `MeterStore::anonymise_before` read one table. In the shape
+every EDM deployment has — an authoritative Lastgang beside a second stream — the
+first table to reach the ceiling therefore destroyed a linkage the other still
+depended on: a measuring point whose Lastgang stopped three years ago but whose
+register readings are current had the live ones orphaned, irreversibly, with
+nothing reporting it.
+
+`MeterCatalog::anonymise_before` applies the cutoff to the latest reading **in the
+deployment**. The single-table method stays and says what it is scoped to.
+
+### § 60 Abs. 6 had no schedule
+
+Archival and snapshot expiry were jobs; the retention duty was a call. But nobody
+files § 60 Abs. 6 — it comes due on its own, which is exactly what a scheduler is
+for. `Maintenance::anonymise_after(Retention::CalendarYears(3), reason, actor)`
+runs it on the maintenance cycle, off by default because destroying a linkage is
+irreversible, and `meterstore maintain --anonymise-after-years 3` is the same
+thing from a shell.
+
+`Retention::CalendarYears(3)` is **not** `now - 3 years`. The statutory clock
+starts at the *Schluss des Kalenderjahres*, so a value collected on 2 January 2025
+comes due on 31 December 2028; the rolling spelling would erase it a year early,
+which is the direction that destroys data still inside its period.
+`Retention::Rolling(d)` is there for the earlier "no longer necessary" trigger.
+
+### Completeness could not see the channel that delivered nothing
+
+The report is an aggregate over the rows a range holds, so a channel with **no**
+rows produced no groups and appeared nowhere — the most severe incompleteness
+there is, and the one the report was silent about. Nothing inside the range can
+supply the missing roster, because the missing roster is precisely what the range
+does not contain.
+
+`store.completeness(from, to).seen_since(since)` draws it from an earlier window:
+a channel that reported between `since` and the start of the range and does not
+report inside it comes back with `actual = 0`, the whole range as `missing`, and
+`first_gap` on its first balancing day. In SQL the arguments read in time order —
+`meter_completeness(seen_since, from, to)`. The window is the caller's because
+"still in service" is master data this crate does not hold.
+
+`completeness` now returns a builder rather than a future; `.await` on it is
+unchanged.
+
+### The catalogue façade served the whole catalogue
+
+A SQL catalogue is a table in a database and a database is a thing organisations
+share, so an unauthenticated endpoint that listed every namespace it happened to
+hold was handing out somebody else's table metadata. `ColdTier::catalog_facade()`
+is confined to the tier's own namespace: the listing reports one, every other
+route answers `404 NoSuchNamespaceException` before the catalog is touched, and
+`CatalogFacade::new` still serves everything for a caller that means it.
+
+### One step instead of two
+
+`partition_step` had to equal `archival_step`, was checked against it at
+construction, and was shown beside it in `system.config` so a mismatch could be
+noticed. The only thing two settings could express was the mistake. There is one,
+`archival_step`, and it is the hot table's partition granularity as well; the old
+key now fails the file as an unknown field.
+
+A step below one minute is refused with it. A partition relation is named
+`<table>_YYYY_MM_DD_HHMM`, so two consecutive sub-minute windows name one
+relation — the second attach fails, and an orphan read back by name resolves to
+the wrong window, where it could drop a partition still above the watermark.
+
+### Smaller
+
+- `planner::gas_day_length` and `intervals_in_gas_day` are gone. They were sugar
+  over `balancing_day_length(day, Sparte::Gas)`, and the crate root exported the
+  gas-only pair while the general ones were reachable only through `planner`. The
+  general functions are exported instead.
+- `evolution::compare`'s note that a rename "reads as a drop plus an add, both
+  safe" was true only for a nullable column. For a non-nullable one — every
+  identity column — both halves are unsafe and the table halts, which is the
+  right answer rather than an accident of matching by name.
+- `MaintenanceOutcome::failures` reports a failed retention sweep under
+  `<retention>`, so an alert built on it needs no second place to look.
+
 ## [0.6.0] — 2026-08-25
 
 A lock audit, the front end the crate did not have, and consumer feedback from an
@@ -42,8 +268,6 @@ on-disk representation of data under a decades-long retention depended on what
 else happened to be in the binary that wrote it, and `time`'s deserialiser takes
 the tuple path when the feature is off, so rows written while some other crate
 had turned it on would silently stop decoding.
-
-### The lock audit
 
 ### The lock audit
 

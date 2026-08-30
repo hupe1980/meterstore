@@ -135,7 +135,7 @@ impl<'a> SystemTables<'a> {
         let (hot_partitions, partitions_ahead) = match &partitions {
             Some(starts) => (
                 starts.len() as i64,
-                crate::tiering::store::partitions_ahead(starts, now, self.config.partition_step())
+                crate::tiering::store::partitions_ahead(starts, now, self.config.archival_step())
                     as i64,
             ),
             None => (-1, -1),
@@ -163,10 +163,6 @@ impl<'a> SystemTables<'a> {
         vec![
             entry("table", c.name().to_string()),
             entry("merge_key", c.merge_key().join(", ")),
-            entry(
-                "partition_step",
-                format!("{}s", c.partition_step().whole_seconds()),
-            ),
             entry(
                 "archival_step",
                 format!("{}s", c.archival_step().whole_seconds()),
@@ -591,9 +587,9 @@ mod tests {
 
     #[test]
     fn config_exposes_the_settings_that_interact() {
-        // partition_step vs archival_step, and settlement_lag vs a window, are
-        // each valid alone and wrong together. Showing them together is the
-        // point of the table.
+        // `settlement_lag` and `archival_step` are each valid alone and wrong
+        // together — a lag shorter than a window strands corrections below the
+        // watermark. Showing them side by side is the point of the table.
         let config = TableConfig::new("readings").build().unwrap();
         let hot: Arc<dyn HotStore> = Arc::new(NoStore);
         let cold: Arc<dyn ColdStore> = Arc::new(NoStore);
@@ -601,8 +597,8 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|e| e.setting.as_str()).collect();
         for expected in [
-            "partition_step",
             "archival_step",
+            "partition_headroom",
             "settlement_lag",
             "merge_key",
             "expected_hot_partitions",

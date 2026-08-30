@@ -177,12 +177,12 @@ out of the process.
 ## The duty on a clock
 
 `erase_subject` answers an Article 17 request. Nobody files § 60 Abs. 6 — it comes
-due on its own:
+due on its own, so it is a job rather than a call:
 
 ```rust
-let erased = store
-    .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", now)
-    .await?;
+let handle = catalog.maintenance()
+    .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
+    .spawn();
 ```
 
 Every subject whose readings have all passed the cutoff loses its mapping.
@@ -192,10 +192,35 @@ Every subject whose readings have all passed the cutoff loses its mapping.
   created would erase a live customer.
 - **It reads the raw versioned relation**, because a superseded version is still a
   stored personal value.
-- **Idempotent**, so it runs on a cron.
-- **The cutoff is yours.** The statutory ceiling is a calendar computation over the
-  year a value was *erhoben*, and the earlier "no longer necessary" trigger is a
-  business decision this crate has no view on.
+- **Idempotent**, so it runs on a schedule and a re-run writes no second audit row.
+- **`CalendarYears(3)` is not `now - 3 years`.** The statutory clock starts at the
+  *Schluss des Kalenderjahres*, so a value collected on 2 January 2025 comes due on
+  31 December 2028. The rolling spelling would erase it a year early — the
+  direction that destroys data still inside its retention period.
+  `Retention::Rolling(d)` exists for the earlier "no longer necessary" trigger,
+  which is a business decision this crate has no view on.
+
+`catalog.anonymise_before(cutoff, …)` is the same sweep run once, for a deployment
+that schedules it elsewhere.
+
+### A catalogue operation, even with one table
+
+The registry is deployment-wide: one `meterstore_subject_map` keyed by natural
+identifier, so two tables registering the same identifier share one `SubjectRef`
+and a single erasure unlinks **both**. That is what an Article 17 request needs —
+it must reach the authoritative readings *and* the non-authoritative second
+stream, since "non-authoritative for settlement" says nothing about whether the
+data is personal.
+
+Swept per table, the first to reach the ceiling destroys a linkage the others
+still depend on: a measuring point whose Lastgang stopped three years ago but
+whose Zählerstandsgang is current has its live register readings orphaned,
+irreversibly, with nothing reporting it. So the cutoff is applied to the latest
+reading **in the deployment**, and a table declaring no subject column contributes
+nothing — its rows carry no reference to the subject at all.
+
+`MeterStore::anonymise_before` remains, for the single-table deployment where the
+two are the same thing.
 
 This is also the answer to "there is no partial data expiry". The statute does not
 require deleting rows; it requires that the values stop being personal, and that

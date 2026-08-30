@@ -104,7 +104,7 @@ fn range_of(filter: &Expr) -> TimeRange {
             match (as_timestamp(low), as_timestamp(high)) {
                 // BETWEEN is inclusive on both sides; our upper bound is
                 // exclusive, so the high value must still be matched.
-                (Some(lo), Some(hi)) => TimeRange::new(Some(lo), Some(exclusive_after(hi))),
+                (Some(lo), Some(hi)) => TimeRange::new(Some(lo), Some(next_stored_instant(hi))),
                 _ => TimeRange::unbounded(),
             }
         }
@@ -131,11 +131,11 @@ fn as_from_bound(left: &Expr, op: Operator, right: &Expr) -> Option<TimeRange> {
 fn bound_from(op: Operator, value: OffsetDateTime) -> Option<TimeRange> {
     Some(match op {
         Operator::Lt => TimeRange::new(None, Some(value)),
-        Operator::LtEq => TimeRange::new(None, Some(exclusive_after(value))),
-        Operator::Gt => TimeRange::new(Some(exclusive_after(value)), None),
+        Operator::LtEq => TimeRange::new(None, Some(next_stored_instant(value))),
+        Operator::Gt => TimeRange::new(Some(next_stored_instant(value)), None),
         Operator::GtEq => TimeRange::new(Some(value), None),
         // A point lookup is a range of one instant.
-        Operator::Eq => TimeRange::new(Some(value), Some(exclusive_after(value))),
+        Operator::Eq => TimeRange::new(Some(value), Some(next_stored_instant(value))),
         _ => return None,
     })
 }
@@ -151,12 +151,21 @@ fn flip(op: Operator) -> Operator {
     }
 }
 
-/// The smallest instant strictly after `t`, at storage resolution.
+/// The smallest **stored** instant strictly after `t` — the successor on the
+/// microsecond grid, not `t + 1 microsecond`.
 ///
-/// Storage is microsecond-precision, so converting an inclusive bound to an
-/// exclusive one is exact rather than an approximation.
-fn exclusive_after(t: OffsetDateTime) -> OffsetDateTime {
-    t + time::Duration::microseconds(1)
+/// DataFusion unifies a timestamp comparison on the finer of the two units, so a
+/// literal written with sub-microsecond precision arrives as
+/// `Timestamp(Nanosecond)` carrying a value *between* two stored instants. Adding
+/// a whole microsecond to that lands past the next stored one: `"from" >
+/// TIMESTAMP '2026-07-10 00:00:00.0000005'` would bound at `…0000015` and skip
+/// the row at `…000001`, which satisfies the predicate. Silently, because the row
+/// is simply not read — and §17.1 permits error in the widening direction only.
+fn next_stored_instant(t: OffsetDateTime) -> OffsetDateTime {
+    let micros = t.unix_timestamp_nanos().div_euclid(1_000);
+    // `div_euclid` floors towards negative infinity, so a pre-epoch instant
+    // truncates downwards like every other one rather than towards zero.
+    OffsetDateTime::from_unix_timestamp_nanos((micros + 1) * 1_000).unwrap_or(t)
 }
 
 /// Whether an expression is the `from` column, or a **lossless** cast of it.
@@ -265,6 +274,105 @@ mod tests {
         df_col(col::FROM)
     }
 
+    /// A bound between two stored instants must not skip the next one.
+    ///
+    /// A literal carrying sub-microsecond precision arrives as nanoseconds and
+    /// lands between two rows; a lower bound past the first row that satisfies
+    /// the predicate is never scanned, with no error and no row.
+    #[test]
+    fn a_bound_between_two_stored_instants_still_admits_the_next_one() {
+        let base = datetime!(2026-07-10 00:00 UTC);
+        let off_grid = base + time::Duration::nanoseconds(500);
+        let next_row = base + time::Duration::microseconds(1);
+        let nanos = |t: OffsetDateTime| {
+            lit(ScalarValue::TimestampNanosecond(
+                Some(t.unix_timestamp_nanos() as i64),
+                Some("UTC".into()),
+            ))
+        };
+
+        // `from > 00:00:00.0000005` is satisfied by the row at 00:00:00.000001.
+        let r = time_range(&[from().gt(nanos(off_grid))]);
+        assert_eq!(r.start(), Some(next_row));
+        assert!(r.start().is_some_and(|s| s <= next_row));
+
+        // `from <= 00:00:00.0000005` is satisfied by the row at 00:00:00, and the
+        // exclusive end must therefore sit above it.
+        let r = time_range(&[from().lt_eq(nanos(off_grid))]);
+        assert_eq!(r.end(), Some(next_row));
+        assert!(r.end().is_some_and(|e| e > base));
+    }
+
+    /// The widening contract, checked exhaustively over the sub-microsecond
+    /// neighbourhood rather than sampled.
+    ///
+    /// The property below draws bounds and probes independently, so it only
+    /// meets this case when a probe happens to land on the one stored instant a
+    /// too-far lower bound skips — likely over many runs, not guaranteed on any
+    /// one. Every bound in a two-microsecond neighbourhood against every stored
+    /// instant in a three-microsecond one is 30 000 combinations and runs in
+    /// milliseconds, so it is checked rather than sampled.
+    #[test]
+    fn no_bound_near_the_grid_can_exclude_a_row_it_admits() {
+        let base = datetime!(2026-07-10 00:00 UTC);
+        let ops = [
+            (Operator::Lt, "<"),
+            (Operator::LtEq, "<="),
+            (Operator::Gt, ">"),
+            (Operator::GtEq, ">="),
+            (Operator::Eq, "="),
+        ];
+
+        for bound_nanos in 0..2_000i64 {
+            let bound = base + time::Duration::nanoseconds(bound_nanos);
+            let literal = lit(ScalarValue::TimestampNanosecond(
+                Some(bound.unix_timestamp_nanos() as i64),
+                Some("UTC".into()),
+            ));
+            for (op, name) in ops {
+                let range = time_range(&[Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(from()),
+                    op,
+                    Box::new(literal.clone()),
+                ))]);
+
+                for micros in 0..3i64 {
+                    let row = base + time::Duration::microseconds(micros);
+                    let admitted = match op {
+                        Operator::Lt => row < bound,
+                        Operator::LtEq => row <= bound,
+                        Operator::Gt => row > bound,
+                        Operator::GtEq => row >= bound,
+                        _ => row == bound,
+                    };
+                    let scanned = range.start().is_none_or(|s| row >= s)
+                        && range.end().is_none_or(|e| row < e);
+                    assert!(
+                        !admitted || scanned,
+                        "from {name} {bound} admits {row}, but the extracted \
+                         range {range:?} excludes it",
+                    );
+                }
+            }
+        }
+    }
+
+    /// And a bound already on the grid keeps the bound it always had.
+    #[test]
+    fn a_bound_on_the_grid_is_unchanged() {
+        assert_eq!(
+            next_stored_instant(T10),
+            T10 + time::Duration::microseconds(1)
+        );
+        // Pre-epoch instants truncate downwards too, so the successor of a grid
+        // instant is still one microsecond on.
+        let before = datetime!(1969-12-31 23:59:59 UTC);
+        assert_eq!(
+            next_stored_instant(before),
+            before + time::Duration::microseconds(1)
+        );
+    }
+
     #[test]
     fn range_filters_round_trip_through_extraction() {
         // What the split narrows must be re-extractable, or the cold scan is
@@ -297,7 +405,7 @@ mod tests {
     #[test]
     fn strictly_greater_than_excludes_the_bound_itself() {
         let r = time_range(&[from().gt(ts(T10))]);
-        assert_eq!(r.start(), Some(exclusive_after(T10)));
+        assert_eq!(r.start(), Some(next_stored_instant(T10)));
         assert!(r.start().unwrap() > T10);
     }
 
@@ -601,13 +709,21 @@ mod properties {
         Or(Box<Pred>, Box<Pred>),
     }
 
-    fn at(seconds: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(seconds).expect("in range")
+    /// The model works in **nanoseconds**, because that is the unit a bound
+    /// arrives in.
+    ///
+    /// DataFusion unifies a timestamp comparison on the finer of the two sides,
+    /// so a literal written with sub-microsecond precision reaches this module as
+    /// `Timestamp(Nanosecond)` carrying a value *between* two stored instants. A
+    /// model in whole seconds can never generate one, which is exactly how a
+    /// lower bound that skipped the next stored row survived this property.
+    fn at(nanos: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).expect("in range")
     }
 
-    fn ts(seconds: i64) -> Expr {
-        lit(ScalarValue::TimestampMicrosecond(
-            Some(seconds * 1_000_000),
+    fn ts(nanos: i64) -> Expr {
+        lit(ScalarValue::TimestampNanosecond(
+            Some(nanos),
             Some("UTC".into()),
         ))
     }
@@ -660,10 +776,22 @@ mod properties {
         range.start().is_none_or(|s| at >= s) && range.end().is_none_or(|e| at < e)
     }
 
-    /// Instants are drawn from a small window so a generated bound and a
-    /// generated probe actually meet — over the whole `i64` range they never
-    /// would, and every case would pass vacuously.
-    const WINDOW: std::ops::Range<i64> = 0..40;
+    /// Bounds are drawn from a small window so a generated bound and a generated
+    /// probe actually meet — over the whole `i64` range they never would, and
+    /// every case would pass vacuously.
+    ///
+    /// Nanoseconds, spanning forty microseconds, so most draws land **between**
+    /// two stored instants rather than on one.
+    const WINDOW: std::ops::Range<i64> = 0..40_000;
+
+    /// Stored instants, which live on the microsecond grid the schema declares.
+    ///
+    /// A probe is a row the scan could actually return, so it is drawn from the
+    /// grid rather than from [`WINDOW`] — a bound may sit between two rows, a row
+    /// may not sit between two rows.
+    fn probe() -> impl Strategy<Value = i64> {
+        (0..40i64).prop_map(|micros| micros * 1_000)
+    }
 
     fn leaf() -> impl Strategy<Value = Pred> {
         let op = prop_oneof![
@@ -703,7 +831,7 @@ mod properties {
         #[test]
         fn an_admitted_row_is_never_outside_the_extracted_range(
             pred in predicate(),
-            probe in WINDOW,
+            probe in probe(),
         ) {
             let range = time_range(&[pred.to_expr()]);
             prop_assert!(
@@ -718,7 +846,7 @@ mod properties {
         #[test]
         fn intersecting_several_filters_stays_conservative(
             preds in prop::collection::vec(predicate(), 1..4),
-            probe in WINDOW,
+            probe in probe(),
         ) {
             let exprs: Vec<Expr> = preds.iter().map(Pred::to_expr).collect();
             let range = time_range(&exprs);
@@ -733,8 +861,12 @@ mod properties {
         /// filters, and must survive the round trip — otherwise Iceberg prunes
         /// against bounds wider than the ones the planner chose, or narrower.
         #[test]
-        fn range_filters_re_extract_to_the_same_bounds(a in WINDOW, b in WINDOW) {
-            let range = TimeRange::between(at(a.min(b)), at(a.max(b) + 1));
+        fn range_filters_re_extract_to_the_same_bounds(a in probe(), b in probe()) {
+            // Grid instants on both sides: `range_filters` writes the bounds in
+            // the column's own microseconds, so an off-grid bound could not
+            // round-trip through them and asking it to would test the wrong
+            // thing.
+            let range = TimeRange::between(at(a.min(b)), at(a.max(b) + 1_000));
             prop_assert_eq!(time_range(&range_filters(range)), range);
         }
     }

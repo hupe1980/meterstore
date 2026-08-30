@@ -87,12 +87,13 @@ async fn a_configuration_file_builds_a_working_store() {
             MeasurementSource::Mscons {
                 pid: 13_005,
                 message_ref: None,
-                sender_mp_id: "99".to_string(),
+                sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
             },
             START,
         ),
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", START, Sparte::Strom).expect("scope"),
+            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+                .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
         START,

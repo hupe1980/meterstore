@@ -384,6 +384,99 @@ impl MeterCatalog {
         }
         Ok(out)
     }
+
+    /// Anonymise every subject whose readings **in every table** predate `cutoff`.
+    ///
+    /// # Why not [`MeterStore::anonymise_before`] run per table
+    ///
+    /// The subject registry is deployment-wide: one `meterstore_subject_map`
+    /// keyed by natural identifier, so two tables registering the same identifier
+    /// share one [`SubjectRef`] and one erasure unlinks both. Swept per table, the
+    /// first to reach the ceiling destroys a linkage the others still depend on —
+    /// a measuring point whose Lastgang stopped three years ago but whose register
+    /// readings are current has the live ones orphaned, irreversibly, and nothing
+    /// reports it, because from that table's view the subject really had passed
+    /// the ceiling.
+    ///
+    /// So the cutoff is applied to the **latest reading in the deployment**. A
+    /// table declaring no subject column contributes nothing: its rows carry no
+    /// reference to the subject at all.
+    ///
+    /// Idempotent and safe on a schedule; see
+    /// [`Maintenance::anonymise_after`](super::Maintenance::anonymise_after).
+    ///
+    /// [`SubjectRef`]: crate::erasure::SubjectRef
+    pub async fn anonymise_before(
+        &self,
+        cutoff: OffsetDateTime,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        anonymise_across(self.stores.values(), cutoff, reason, actor, now).await
+    }
+}
+
+/// The catalog-wide retention sweep, over any set of stores.
+///
+/// Shared with [`Maintenance`](super::Maintenance), whose store list is the same
+/// one a catalog holds — so the scheduled sweep and the manual one cannot come to
+/// different conclusions about which subjects are due.
+pub(crate) async fn anonymise_across<'a>(
+    stores: impl Iterator<Item = &'a MeterStore>,
+    cutoff: OffsetDateTime,
+    reason: &str,
+    actor: &str,
+    now: OffsetDateTime,
+) -> Result<Vec<crate::erasure::ErasureRecord>> {
+    let mut latest: BTreeMap<String, OffsetDateTime> = BTreeMap::new();
+    let mut registry = None;
+    let mut subject_tables = 0usize;
+
+    for store in stores {
+        let Some(seen) = store.subject_last_seen().await? else {
+            continue;
+        };
+        subject_tables += 1;
+        registry = registry.or_else(|| store.subject_registry());
+        for (reference, at) in seen {
+            latest
+                .entry(reference)
+                .and_modify(|held| *held = (*held).max(at))
+                .or_insert(at);
+        }
+    }
+
+    if subject_tables == 0 {
+        return Err(Error::config(
+            "no table in this catalog declares a subject column, so there is no \
+             linkage to destroy: without one the stored readings carry no reference \
+             to a person and § 60 Abs. 6 has nothing to act on here",
+        ));
+    }
+    let registry = registry.ok_or_else(|| {
+        Error::config(
+            "a table declares a subject column but no SubjectRegistry is configured, \
+             so the references it stores resolve to nothing this process can erase",
+        )
+    })?;
+
+    let due: Vec<String> = latest
+        .into_iter()
+        .filter(|(_, last)| *last < cutoff)
+        .map(|(reference, _)| reference)
+        .collect();
+
+    let erased = crate::erasure::anonymise(registry, &due, reason, actor, now).await?;
+    if !erased.is_empty() {
+        tracing::warn!(
+            tables = subject_tables,
+            subjects = erased.len(),
+            %cutoff,
+            "anonymised subjects whose readings have passed the retention ceiling"
+        );
+    }
+    Ok(erased)
 }
 
 /// Every relation a logical plan scans, by name.

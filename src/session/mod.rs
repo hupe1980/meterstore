@@ -13,9 +13,9 @@ pub mod system;
 pub mod udf;
 
 pub use catalog::{MeterCatalog, MeterCatalogBuilder};
-pub use completeness::{Completeness, CompletenessFunction};
+pub use completeness::{Completeness, CompletenessFunction, CompletenessQuery};
 pub use displacement::{Displacement, Effect, StoredValue};
-pub use maintenance::{Maintenance, MaintenanceOutcome, TableMaintenance};
+pub use maintenance::{Maintenance, MaintenanceOutcome, RETENTION_LABEL, TableMaintenance};
 pub use query::{QueryDescription, QueryResult};
 pub use readings::ReadingsQuery;
 pub use series::{ResolvedSeries, SeriesQuery};

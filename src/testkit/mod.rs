@@ -97,7 +97,7 @@ pub struct MeteringWorkload {
     resolution: Duration,
     correction_rate: f64,
     gap_rate: f64,
-    operator: String,
+    operator: metering::ids::BdewCode,
     malo_offset: usize,
     sparte: Sparte,
     unit: MeasurementUnit,
@@ -115,7 +115,7 @@ impl MeteringWorkload {
             resolution: Duration::minutes(15),
             correction_rate: 0.0,
             gap_rate: 0.0,
-            operator: "9900000000001".to_string(),
+            operator: "9900000000001".parse().expect("a valid Marktpartner-ID"),
             malo_offset: 0,
             sparte: Sparte::Strom,
             unit: Sparte::Strom.billing_unit(),
@@ -447,7 +447,7 @@ impl MeteringWorkload {
             MeasurementSource::Mscons {
                 pid: 13_005,
                 message_ref: None,
-                sender_mp_id: self.operator.clone(),
+                sender_mp_id: self.operator,
             },
             recorded_at,
         );
@@ -462,7 +462,7 @@ impl MeteringWorkload {
             self.sparte,
             series,
             ScopedVersion::new(
-                VersionScope::for_interval(&self.operator, scope_anchor, self.sparte)?,
+                VersionScope::for_interval(self.operator, scope_anchor, self.sparte)?,
                 Version::new(version)?,
             ),
             recorded_at,
@@ -493,10 +493,10 @@ impl MeteringWorkload {
             MeasurementSource::Mscons {
                 pid: 13_005,
                 message_ref: None,
-                sender_mp_id: self.operator.clone(),
+                sender_mp_id: self.operator,
             },
             ScopedVersion::new(
-                VersionScope::for_interval(&self.operator, scope_anchor, self.sparte)?,
+                VersionScope::for_interval(self.operator, scope_anchor, self.sparte)?,
                 Version::new(version)?,
             ),
             recorded_at,

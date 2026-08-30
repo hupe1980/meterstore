@@ -146,8 +146,13 @@ A read-only Iceberg REST Catalog endpoint implementing the spec's config,
 namespace and table-metadata routes. Every Iceberg engine speaks this; nothing
 MeterStore-specific is needed client-side.
 
-Three decisions it makes explicit:
+Four decisions it makes explicit:
 
+- **It serves one namespace, not the whole catalogue.** A SQL catalogue is a table
+  in a database, and a database is a thing organisations share.
+  `cold_tier.catalog_facade()` is confined to the tier's own namespace and answers
+  **404 `NoSuchNamespaceException`** for anything else, the listing included.
+  `CatalogFacade::new(catalog)` serves everything, for a caller that means it.
 - **There is no write path, rather than a write path that is off.** Concurrent
   external writers would break the tiering invariant, and nothing downstream could
   detect it: the files would be valid Iceberg, the invariant check only looks at

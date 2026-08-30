@@ -525,6 +525,7 @@ fn merge(
     }
 
     readings.sort_by_key(|r| r.at);
+    refuse_repeated_instants(malo_id, &readings)?;
 
     let (Some(source), Some(recorded_at), Some(sparte), Some(unit), Some(obis), Some(version)) =
         (source, recorded_at, sparte, unit, obis, version)
@@ -563,6 +564,43 @@ fn merge(
 }
 
 /// Refuse to fold deliveries that are not one register.
+/// Refuse a folded register history that holds two values at one instant.
+///
+/// The Zählerstandsgang counterpart of the interval path's check, and it matters
+/// more: a register history is *differenced* to get consumption, so an arbitrary
+/// one of the two values lands on both sides of a subtraction and the figure
+/// between two reads means nothing. `metering::consumption_between` cannot
+/// notice.
+///
+/// [`refuse_mixed_registers`] cannot see this case — see the interval path's
+/// `refuse_repeated_instants` for why.
+fn refuse_repeated_instants(
+    malo_id: MaloId,
+    readings: &[metering::reading::MeterReading],
+) -> Result<()> {
+    // Sorted by `at` on the way in, so a repeat is adjacent.
+    for pair in readings.windows(2) {
+        if pair[0].at != pair[1].at {
+            continue;
+        }
+        return Err(Error::InvariantViolated {
+            table: malo_id.to_string(),
+            detail: format!(
+                "two register readings survived resolution for one meter at {at}: \
+                 {a} and {b}. Resolution partitions by the merge key and version_scope, \
+                 so the cause is almost always two network operators for one reading — \
+                 which both write paths refuse, unless integrity constraints are off or \
+                 something other than meterstore wrote these rows. Differencing them \
+                 would produce a consumption figure that means nothing",
+                at = pair[0].at,
+                a = pair[0].value,
+                b = pair[1].value,
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn refuse_mixed_registers(stored: &[StoredReadings], discriminators: &[String]) -> Result<()> {
     let key_of = |s: &StoredReadings| -> Result<(String, Vec<(String, String)>)> {
         Ok((
@@ -625,7 +663,7 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
@@ -649,11 +687,52 @@ mod tests {
             }],
             source(),
             ScopedVersion::new(
-                VersionScope::for_interval("99", at, Sparte::Strom).unwrap(),
+                VersionScope::for_interval("9900000000001", at, Sparte::Strom).unwrap(),
                 Version::new(20_260_720_000_001).unwrap(),
             ),
             at,
         )
+    }
+
+    #[test]
+    fn two_register_values_at_one_instant_are_refused_rather_than_differenced() {
+        // Worse here than on the interval path. A register history is
+        // *differenced* to get consumption, so two values at one instant do not
+        // merely double a sum — an arbitrary one of the two lands on both sides
+        // of a subtraction and the consumption between two reads becomes a number
+        // with no relationship to anything. `refuse_mixed_registers` cannot see
+        // it: resolution partitions by the merge key *and* `version_scope`, so
+        // two operators for one reading leave two winners that agree on
+        // everything it looks at.
+        let mut second = one_reading("1-0:1.8.0");
+        second.readings[0].value = Decimal::new(9_999, 0);
+        second.recorded_at += time::Duration::hours(1);
+
+        let err = merge(malo(), None, &[], vec![one_reading("1-0:1.8.0"), second]).unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvariantViolated { .. }),
+            "stored data that should not exist, not a delivery being refused: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("version_scope"), "{msg}");
+        assert!(msg.contains("1234") && msg.contains("9999"), "both: {msg}");
+    }
+
+    #[test]
+    fn a_register_read_at_successive_instants_still_folds() {
+        // The guard must not fire on what the fold exists for: a register read
+        // twice, which is the whole of a Zählerstandsgang.
+        let first = one_reading("1-0:1.8.0");
+        let mut later = one_reading("1-0:1.8.0");
+        later.readings[0].at += time::Duration::minutes(15);
+        later.readings[0].value = Decimal::new(1_240, 0);
+        later.recorded_at += time::Duration::hours(1);
+
+        let folded = merge(malo(), None, &[], vec![first, later])
+            .unwrap()
+            .expect("one history");
+        assert_eq!(folded.readings.len(), 2);
     }
 
     #[test]

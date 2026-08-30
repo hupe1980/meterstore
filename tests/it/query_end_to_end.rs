@@ -112,7 +112,7 @@ impl Harness {
         kwh: i64,
         version: i64,
     ) {
-        self.insert_scoped(malo, start, count, kwh, version, "99:2026-07")
+        self.insert_scoped(malo, start, count, kwh, version, "9900000000001:2026-07")
             .await
     }
 
@@ -144,7 +144,7 @@ impl Harness {
         let detail = serde_json::to_string(&MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         })
         .unwrap();
 
@@ -494,7 +494,7 @@ fn correction(
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "99".to_string(),
+            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-26 06:00 UTC),
     );
@@ -503,8 +503,12 @@ fn correction(
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("99", start, metering::interval::Sparte::Strom)
-                .unwrap(),
+            meterstore::VersionScope::for_interval(
+                "9900000000001",
+                start,
+                metering::interval::Sparte::Strom,
+            )
+            .unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-26 06:00 UTC),
@@ -923,10 +927,24 @@ async fn a_correction_delivered_in_a_later_month_still_supersedes() {
     // Both rows carry the scope of the *interval's* month, which is what makes
     // their versions comparable — even though the correction was delivered in
     // August.
-    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
-        .await;
-    h.insert_scoped("11111111115", D20, 2, 40, 20_260_820_000_002, "99:2026-07")
-        .await;
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        10,
+        20_260_720_000_001,
+        "9900000000001:2026-07",
+    )
+    .await;
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        40,
+        20_260_820_000_002,
+        "9900000000001:2026-07",
+    )
+    .await;
 
     let total = h
         .scalar(
@@ -954,10 +972,24 @@ async fn versions_in_different_scopes_do_not_resolve_against_each_other() {
         .await
         .unwrap();
 
-    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
-        .await;
-    h.insert_scoped("11111111115", D20, 2, 40, 20_260_820_000_002, "99:2026-08")
-        .await;
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        10,
+        20_260_720_000_001,
+        "9900000000001:2026-07",
+    )
+    .await;
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        40,
+        20_260_820_000_002,
+        "9900000000001:2026-08",
+    )
+    .await;
 
     let total = h
         .scalar(
@@ -1042,8 +1074,9 @@ async fn system_config_shows_the_settings_that_interact() {
 
     let batches = store
         .sql(
-            r#"SELECT value FROM system.config
-               WHERE setting IN ('partition_step', 'archival_step')"#,
+            r#"SELECT setting, value FROM system.config
+               WHERE setting IN ('archival_step', 'settlement_lag', 'partition_step')
+               ORDER BY setting"#,
         )
         .await
         .unwrap()
@@ -1052,13 +1085,16 @@ async fn system_config_shows_the_settings_that_interact() {
         .unwrap();
 
     use datafusion::arrow::array::AsArray;
-    let values = batches[0].column(0).as_string::<i32>();
-    assert_eq!(batches[0].num_rows(), 2);
-    assert_eq!(
-        values.value(0),
-        values.value(1),
-        "a mismatch here degrades purge to row-wise DELETE, so it must be visible"
-    );
+    let settings = batches[0].column(0).as_string::<i32>();
+    let names: Vec<&str> = (0..batches[0].num_rows())
+        .map(|i| settings.value(i))
+        .collect();
+    // `settlement_lag` shorter than `archival_step` strands corrections below
+    // the watermark, so the pair that can disagree is shown side by side.
+    assert_eq!(names, ["archival_step", "settlement_lag"]);
+    // And `partition_step` is gone: the partition granularity *is* the archival
+    // step, so there is no second number that could disagree with it.
+    assert!(!names.contains(&"partition_step"));
 }
 
 /// Sum `value` as an integer, for a store already built.
@@ -1427,12 +1463,26 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
         .await
         .unwrap();
 
-    h.insert_scoped("11111111115", D20, 2, 10, 20_260_720_000_001, "99:2026-07")
-        .await;
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        10,
+        20_260_720_000_001,
+        "9900000000001:2026-07",
+    )
+    .await;
 
     // Same interval, same month, *different* operator.
     let second = h
-        .try_insert_scoped("11111111115", D20, 2, 40, 20_260_720_000_002, "88:2026-07")
+        .try_insert_scoped(
+            "11111111115",
+            D20,
+            2,
+            40,
+            20_260_720_000_002,
+            "9900000000002:2026-07",
+        )
         .await;
 
     assert!(
@@ -1440,6 +1490,82 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
         "a second network operator for the same interval must be refused: \
          both rows would survive resolution and double every sum over them"
     );
+}
+
+#[tokio::test]
+async fn a_duplicated_scope_that_got_past_the_constraint_is_refused_at_the_read() {
+    // The exclusion is what *prevents* two network operators for one reading.
+    // `PostgresHot::integrity_constraints(false)` is a supported setting, and out
+    // of band anything can write to a PostgreSQL table — so the state exists, and
+    // in it resolution returns two winners that agree on channel and on every
+    // discriminator. Nothing narrows them apart, and a fold sums both.
+    //
+    // Dropping the partition's constraint reaches exactly that state on a live
+    // store, which is what makes this an end-to-end assertion rather than a
+    // restatement of the unit test.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        10,
+        20_260_720_000_001,
+        "9900000000001:2026-07",
+    )
+    .await;
+
+    sqlx::query(&format!(
+        r#"ALTER TABLE "{TABLE}_2026_07_20_0000" DROP CONSTRAINT "{TABLE}_2026_07_20_0000_one_operator""#
+    ))
+    .execute(h.hot.pool())
+    .await
+    .expect("the constraint is what a deployment turns off");
+
+    h.insert_scoped(
+        "11111111115",
+        D20,
+        2,
+        40,
+        20_260_720_000_002,
+        "9900000000002:2026-07",
+    )
+    .await;
+
+    // A bare SQL `SUM` is the failure this cannot catch, and it is asserted so
+    // the boundary of the guarantee is written down rather than assumed.
+    let doubled = h
+        .scalar(
+            ReadMode::Unified,
+            "SELECT CAST(SUM(value) AS BIGINT) FROM readings",
+        )
+        .await;
+    assert_eq!(
+        doubled, 100,
+        "both scopes survive resolution, so SQL sums them: 2×10 + 2×40"
+    );
+
+    // The typed read does not hand back the number. It says what is wrong.
+    let store = h.store(ReadMode::Unified).await;
+    let err = store
+        .series("11111111115")
+        .unwrap()
+        .range(D20, D21)
+        .collect()
+        .await
+        .expect_err("a fold of two values at one instant must not return a series");
+
+    assert!(
+        matches!(err, meterstore::Error::InvariantViolated { .. }),
+        "stored data that should not exist, not a delivery being refused: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("version_scope"), "{msg}");
+    drop(store);
 }
 
 #[tokio::test]
@@ -1454,8 +1580,15 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
         .await
         .unwrap();
-    h.insert_scoped("11111111115", D18, 2, 10, 20_260_718_000_001, "99:2026-07")
-        .await;
+    h.insert_scoped(
+        "11111111115",
+        D18,
+        2,
+        10,
+        20_260_718_000_001,
+        "9900000000001:2026-07",
+    )
+    .await;
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let before = h
@@ -1470,8 +1603,12 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
     let store = h.store(ReadMode::Unified).await;
     let mut other = correction("11111111115", D18, 2, 40, 20_260_718_000_002);
     other.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("88", D18, metering::interval::Sparte::Strom)
-            .unwrap(),
+        meterstore::VersionScope::for_interval(
+            "9900000000002",
+            D18,
+            metering::interval::Sparte::Strom,
+        )
+        .unwrap(),
         meterstore::Version::new(20_260_718_000_002).unwrap(),
     );
     let late = store.append(&[other]).await;
@@ -1487,8 +1624,9 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
     let msg = err.to_string();
     assert!(msg.contains("network operator"), "{msg}");
     assert!(
-        msg.contains("\"99\"") && msg.contains("\"88\""),
-        "the message must name both scopes so the caller can tell which is wrong: {msg}"
+        msg.contains("9900000000001") && msg.contains("9900000000002"),
+        "the message must name both operators so the caller can tell which is wrong, \
+         and as Marktpartner-IDs rather than as a Debug struct: {msg}"
     );
     assert_eq!(
         after, before,

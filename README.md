@@ -184,6 +184,30 @@ naming is load-bearing — see
 [the version-resolution trap](https://hupe1980.github.io/meterstore/docs/interop/#the-version-resolution-trap)
 before pointing an external engine at the warehouse.
 
+A `SUM` over an incomplete month returns a smaller number and no reason, so
+**completeness is a query**. The expected count is the DST-aware calendar's — 92
+on the spring day, 100 on the autumn one, and for gas both on the Gastag rather
+than the Sunday. The strongest finding is the one a range cannot make about
+itself: a channel that delivered *nothing* produces no rows to aggregate, so it
+needs a roster from an earlier window.
+
+```rust
+store.completeness(from, to).await?;                              // gaps within
+store.completeness(from, to).seen_since(from - month).await?;     // and what went silent
+```
+
+Personal data comes with a clock rather than a request. § 60 Abs. 6 MsbG says
+erase or anonymise *at the latest* three years after the end of the year a value
+was collected in, so the sweep is a scheduled job — and a **catalogue** one,
+because one subject map spans every table and a per-table sweep would orphan
+readings the other tables still hold:
+
+```rust
+catalog.maintenance()
+    .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
+    .spawn();
+```
+
 `meter_local_day` is not a convenience, and for **gas it is the wrong function**.
 `Europe/Berlin` observes daylight saving, so the UTC day boundary sits at 01:00
 or 02:00 local and grouping on UTC days is wrong every day of the year — but the
@@ -205,7 +229,13 @@ calendar day is the Sunday.
 And the boundary carries up to the **month**. The gas Bilanzierungsmonat runs
 01.06 06:00 to 01.07 06:00 (EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3.1),
 so an MSCONS version scope for a gas row is cut at 06:00 as well — which is why
-every `VersionScope` constructor takes a `Sparte`.
+every `VersionScope` constructor takes a `Sparte`:
+
+```rust
+// The network operator's Marktpartner-ID, parsed — because a wrong-but-plausible
+// one is not an error, it is a different scope that nothing else shares.
+VersionScope::for_interval("9900000000001", interval.from, Sparte::Gas)?
+```
 
 **An external engine does not get that function — so it gets the answer instead.**
 SQL dialects differ on timestamp arithmetic, so no single published expression is
@@ -225,7 +255,7 @@ SELECT balancing_day, SUM(value) FROM readings GROUP BY 1;
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
-| `metering` | 0.19 or later | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.20 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
@@ -254,9 +284,10 @@ meterstore  → where it lives, how it is tiered, how it is queried  (all I/O)
 ```
 
 [`metering`](https://crates.io/crates/metering) owns intervals, units, quality
-flags, DST-correct calendars, validation, Ersatzwertbildung, gas conversion and
-aggregation. MeterStore adds exactly three things: **correction versioning**, the
-**transaction-time axis**, and the **tiering boundary**.
+flags, DST-correct calendars, the identifiers (`MaloId`, `MeloId`, `BdewCode`),
+validation, Ersatzwertbildung, gas conversion and aggregation. MeterStore adds
+exactly three things: **correction versioning**, the **transaction-time axis**,
+and the **tiering boundary**.
 
 That boundary is deliberate. Duplicating a domain rule here — a unit conversion, a
 DST calendar — would create a second implementation to keep correct, and it would
@@ -272,11 +303,11 @@ drift.
 | [Writing readings](https://hupe1980.github.io/meterstore/docs/writing/) | Routed writes, bulk ingest, idempotent redelivery |
 | [Querying](https://hupe1980.github.io/meterstore/docs/querying/) | SQL across tiers, provenance, the typed series API |
 | [Reproducibility](https://hupe1980.github.io/meterstore/docs/reproducibility/) | Settlement reruns on two independent time axes |
-| [Completeness](https://hupe1980.github.io/meterstore/docs/completeness/) | DST-aware gap detection as a first-class query |
+| [Completeness](https://hupe1980.github.io/meterstore/docs/completeness/) | DST-aware gap detection, including the channel that delivered nothing |
 | [Operations](https://hupe1980.github.io/meterstore/docs/operations/) | Scheduling, locks, system tables, metrics, failure matrix |
-| [The CLI](https://hupe1980.github.io/meterstore/docs/cli/) | `meterstore` — check, create, status, archive, query, serve |
+| [The CLI](https://hupe1980.github.io/meterstore/docs/cli/) | `meterstore` — check, create, status, archive, maintain, query, serve |
 | [External engines](https://hupe1980.github.io/meterstore/docs/interop/) | Spark, Trino, DuckDB — and the trap to avoid |
-| [Privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/) | Pseudonymisation and the three-year duty |
+| [Privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/) | Pseudonymisation, and the three-year duty as a scheduled job |
 | [Configuration](https://hupe1980.github.io/meterstore/docs/configuration/) | TOML over the same validated types |
 
 ## Status
@@ -285,8 +316,8 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**778 tests**: unit, property, and integration against real PostgreSQL 16 and a
-real Iceberg warehouse, plus an independently implemented correctness oracle over
+**807 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+a real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
 read the output and agree with it, down to the audit trail's timestamps. The lock
 behaviour is asserted against a real server holding a real conflicting lock, not

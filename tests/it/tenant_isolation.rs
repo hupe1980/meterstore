@@ -145,7 +145,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("99", D20, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000001", D20, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),

@@ -74,8 +74,8 @@ pub enum Command {
     /// Write a starter configuration file.
     ///
     /// Commented, and with the settings that interact placed next to each other —
-    /// `partition_step` and `archival_step` are each valid alone and wrong when
-    /// they disagree.
+    /// `settlement_lag` and `archival_step` are each valid alone and wrong when
+    /// the lag is the shorter of the two.
     Init {
         /// Overwrite an existing file.
         #[arg(long)]
@@ -84,9 +84,9 @@ pub enum Command {
 
     /// Validate the configuration without connecting to anything.
     ///
-    /// Runs the full cross-field validation, so a file whose `archival_step`
-    /// disagrees with its `partition_step` fails here rather than degrading a
-    /// purge to a row-wise `DELETE` in production.
+    /// Runs the full cross-field validation, so a file whose `settlement_lag`
+    /// is shorter than its `archival_step` fails here rather than stranding
+    /// corrections below the watermark in production.
     Check,
 
     /// Create every table the configuration declares, in both tiers.
@@ -134,6 +134,22 @@ pub enum Command {
         /// is what makes a past settlement reproducible.
         #[arg(long)]
         expire_snapshots: bool,
+        /// Also anonymise subjects whose readings have all passed a retention
+        /// ceiling, given as full calendar years after the year of collection.
+        ///
+        /// `--anonymise-after-years 3` is § 60 Abs. 6 MsbG's ceiling: erase or
+        /// anonymise *"spätestens nach drei Jahren ab dem Schluss des
+        /// Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*. Not
+        /// `now - 3 years`, which would erase a January value a year early.
+        ///
+        /// Off by default, and irreversible when on: destroying a linkage is a
+        /// compliance decision, and turning this on is that decision. Requires a
+        /// table declaring `subject_column`.
+        #[arg(long, value_name = "YEARS")]
+        anonymise_after_years: Option<u32>,
+        /// Who the audit trail records as having run the sweep.
+        #[arg(long, default_value = "meterstore maintain", value_name = "WHO")]
+        anonymise_actor: String,
     },
 
     /// Run a query across both tiers.
@@ -288,7 +304,18 @@ async fn run(cli: &Cli) -> Result<()> {
         Command::Maintain {
             interval,
             expire_snapshots,
-        } => maintain(cli, interval, *expire_snapshots).await,
+            anonymise_after_years,
+            anonymise_actor,
+        } => {
+            maintain(
+                cli,
+                interval,
+                *expire_snapshots,
+                *anonymise_after_years,
+                anonymise_actor,
+            )
+            .await
+        }
         Command::Query {
             sql,
             historical,
@@ -405,19 +432,33 @@ async fn archive(cli: &Cli, only: Option<&str>, max_windows: usize) -> Result<()
     render::archive(&lines, cli.format)
 }
 
-async fn maintain(cli: &Cli, interval: &str, expire_snapshots: bool) -> Result<()> {
+async fn maintain(
+    cli: &Cli,
+    interval: &str,
+    expire_snapshots: bool,
+    anonymise_after_years: Option<u32>,
+    actor: &str,
+) -> Result<()> {
     let every = crate::settings::parse_human_duration(interval)?;
     let catalog = load(cli).await?;
 
-    let handle = catalog
+    let mut maintenance = catalog
         .maintenance()
         .interval(every)
-        .expire_snapshots(expire_snapshots)
-        .spawn();
+        .expire_snapshots(expire_snapshots);
+    if let Some(years) = anonymise_after_years {
+        maintenance = maintenance.anonymise_after(
+            crate::erasure::Retention::CalendarYears(years),
+            "§ 60 Abs. 6 MsbG",
+            actor,
+        );
+    }
+    let handle = maintenance.spawn();
 
     tracing::info!(
         interval = %interval,
         tables = catalog.len(),
+        anonymise_after_years,
         "maintenance loop running; press ctrl-c to stop"
     );
 

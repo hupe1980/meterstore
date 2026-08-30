@@ -36,6 +36,10 @@ const TABLE: &str = "readings_versions";
 const D20: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 const D21: OffsetDateTime = datetime!(2026-07-21 00:00 UTC);
 const SECRET: &[u8] = b"test-suppression-key-32-bytes!!!";
+/// A second subject-bearing stream, the shape every EDM deployment has.
+const SECOND_TABLE: &str = "esa_typ2_versions";
+/// An interval well past any retention ceiling the sweep tests use.
+const OLD: OffsetDateTime = datetime!(2022-07-20 00:00 UTC);
 
 /// A store whose readings carry a pseudonymous subject reference.
 async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
@@ -124,6 +128,89 @@ async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
     (store, warehouse)
 }
 
+/// A catalog of two subject-bearing tables sharing one registry.
+///
+/// The shape every EDM deployment has — an authoritative Lastgang beside a second
+/// stream — and the one the retention sweep has to be correct for, because the
+/// registry is *deployment-wide*: one map keyed by natural identifier, so a
+/// single erasure unlinks a subject in both tables at once.
+async fn catalog_with_subjects() -> (meterstore::MeterCatalog, tempfile::TempDir) {
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let pool = PgPool::connect(&url).await.expect("connect");
+    let hot = Arc::new(PostgresHot::new(pool.clone()));
+
+    let warehouse = tempfile::tempdir().expect("warehouse");
+    let catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+        .load(
+            "meterstore",
+            std::collections::HashMap::from([
+                (SQL_CATALOG_PROP_URI.to_string(), url.clone()),
+                (
+                    SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                    format!("file://{}", warehouse.path().display()),
+                ),
+                (
+                    SQL_CATALOG_PROP_BIND_STYLE.to_string(),
+                    SqlBindStyle::DollarNumeric.to_string(),
+                ),
+            ]),
+        )
+        .await
+        .expect("catalog");
+    let cold = Arc::new(IcebergCold::new(
+        Arc::new(catalog) as Arc<dyn Catalog>,
+        NamespaceIdent::new("metering".to_string()),
+        8 * 1024 * 1024,
+    ));
+    let registry = SubjectRegistry::with_erasure_secret(pool, SECRET).expect("secret");
+    registry.create_tables().await.expect("registry tables");
+
+    let mut builder = meterstore::MeterCatalog::builder();
+    for name in [TABLE, SECOND_TABLE] {
+        let config = TableConfig::new(name)
+            .settlement_lag(Duration::days(1))
+            .subject_column("subject_ref")
+            .build()
+            .expect("config");
+
+        let hot_dyn: Arc<dyn HotStore> = hot.clone();
+        let cold_dyn: Arc<dyn ColdStore> = cold.clone();
+        hot_dyn
+            .create_tables(
+                name,
+                &config.merge_key(),
+                &config.extra_columns(),
+                config.time_model(),
+            )
+            .await
+            .expect("hot table");
+        cold_dyn
+            .create_tables(
+                name,
+                &config.identity_column_names(),
+                &config.extra_columns(),
+            )
+            .await
+            .expect("cold table");
+        hot.ensure_partitions(name, D20, OLD + Duration::days(400), Duration::DAY)
+            .await
+            .expect("partitions");
+
+        builder = builder.table(
+            MeterStore::builder()
+                .hot(hot_dyn)
+                .cold(cold_dyn, cold.table_provider(name).await.expect("provider"))
+                .table(config)
+                .subject_registry(registry.clone()),
+        );
+    }
+
+    (builder.build().await.expect("catalog"), warehouse)
+}
+
 /// A reading attributed to `subject`, or to nobody when `None`.
 fn reading(subject: Option<&str>) -> StoredSeries {
     reading_at(D20, subject)
@@ -155,7 +242,7 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
         ScopedVersion::new(
             // Derived from the interval, not from a fixture constant: a scope
             // that does not cover its intervals is refused at encode time.
-            VersionScope::for_interval("99", from, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000001", from, Sparte::Strom).unwrap(),
             Version::new(1).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -338,6 +425,153 @@ async fn the_retention_sweep_anonymises_only_subjects_past_the_ceiling() {
         .await
         .expect("second sweep");
     assert!(again.is_empty());
+}
+
+#[tokio::test]
+async fn a_retention_sweep_over_a_catalog_waits_for_every_table() {
+    // The bug this exists for. The registry is deployment-wide, so one erasure
+    // unlinks a subject in *both* tables — which means a per-table sweep run on
+    // the table that reached the ceiling first destroys a linkage the other
+    // table's live readings still depend on. Irreversibly, and with nothing
+    // reporting it, because from that table's point of view the subject really
+    // had passed the ceiling.
+    let (catalog, _w) = catalog_with_subjects().await;
+    let authoritative = catalog.table(TABLE).expect("first table");
+    let second = catalog.table(SECOND_TABLE).expect("second table");
+
+    // One subject: old on the authoritative stream, current on the other. The
+    // shape of a measuring point whose Lastgang stopped but whose second stream
+    // is still being delivered.
+    let straddling = authoritative
+        .register_subject("customer-straddling")
+        .await
+        .expect("register");
+    // And one that is old everywhere, which really has come due.
+    let due = authoritative
+        .register_subject("customer-due")
+        .await
+        .expect("register");
+
+    // Distinct interval starts, because `subject_ref` is an attribute rather than
+    // part of the merge key: two readings sharing `(malo_id, obis_code, from)`
+    // are one reading, and the second would be deduplicated away.
+    authoritative
+        .append(&[reading_at(OLD, Some(straddling.as_str()))])
+        .await
+        .expect("old reading");
+    authoritative
+        .append(&[reading_at(OLD + Duration::minutes(15), Some(due.as_str()))])
+        .await
+        .expect("old reading");
+    second
+        .append(&[reading_at(D20, Some(straddling.as_str()))])
+        .await
+        .expect("current reading");
+
+    let cutoff = datetime!(2023-01-01 00:00 UTC);
+    let registry = authoritative.subject_registry().expect("configured");
+
+    let erased = catalog
+        .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+        .await
+        .expect("sweep");
+
+    assert_eq!(
+        erased.len(),
+        1,
+        "only the subject due everywhere: {erased:?}"
+    );
+    assert_eq!(erased[0].subject, due);
+    assert!(
+        registry.resolve(&due).await.unwrap().is_none(),
+        "the subject past the ceiling in every table is unlinked"
+    );
+    assert!(
+        registry.resolve(&straddling).await.unwrap().is_some(),
+        "a subject still delivering on the second stream must survive: erasing it \
+         would orphan readings that have not come due, in a table the sweep was \
+         not even looking at"
+    );
+
+    // Idempotent across the catalog too.
+    let again = catalog
+        .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+        .await
+        .expect("second sweep");
+    assert!(again.is_empty());
+
+    // And the difference is real rather than a coincidence: the *per-table*
+    // sweep, run on the table that reached the ceiling, does erase the
+    // straddling subject — which is why it is documented as single-table only.
+    let per_table = authoritative
+        .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+        .await
+        .expect("per-table sweep");
+    assert_eq!(
+        per_table.len(),
+        1,
+        "the single-table sweep sees only its own table, so it treats the \
+         straddling subject as due: {per_table:?}"
+    );
+    assert_eq!(per_table[0].subject, straddling);
+}
+
+#[tokio::test]
+async fn the_scheduled_sweep_is_the_catalog_sweep() {
+    // A maintenance loop must reach the same conclusion the manual sweep does,
+    // or the scheduled duty is a second implementation of the rule.
+    let (catalog, _w) = catalog_with_subjects().await;
+    let store = catalog.table(TABLE).expect("first table");
+
+    let subject = store
+        .register_subject("customer-old")
+        .await
+        .expect("register");
+    store
+        .append(&[reading_at(OLD, Some(subject.as_str()))])
+        .await
+        .expect("old reading");
+
+    // Off by default: destroying a linkage uninvited would be taking a
+    // compliance decision on the operator's behalf.
+    let quiet = catalog.maintenance().run_once(D21).await.expect("cycle");
+    assert!(quiet.anonymised.is_empty());
+    assert!(quiet.retention_failure.is_none());
+    assert!(
+        store
+            .subject_registry()
+            .unwrap()
+            .resolve(&subject)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Turned on, the same cycle applies the ceiling. `D21` is in 2026 and the
+    // reading is from 2022, so three full calendar years have passed.
+    let sweeping = catalog
+        .maintenance()
+        .anonymise_after(
+            meterstore::Retention::CalendarYears(3),
+            "§ 60 Abs. 6 MsbG",
+            "maintenance",
+        )
+        .run_once(D21)
+        .await
+        .expect("cycle");
+
+    assert_eq!(sweeping.subjects_anonymised(), 1, "{sweeping:?}");
+    assert!(sweeping.healthy());
+    assert!(
+        store
+            .subject_registry()
+            .unwrap()
+            .resolve(&subject)
+            .await
+            .unwrap()
+            .is_none(),
+        "the linkage is destroyed"
+    );
 }
 
 #[tokio::test]

@@ -34,6 +34,17 @@
 //! The distinction matters: `501` invites a client to retry against a future
 //! version.
 //!
+//! # It serves one namespace
+//!
+//! A SQL catalogue is a table in a database, and a database is a thing
+//! organisations share, so serving every namespace it happens to hold would put
+//! an unauthenticated read of somebody else's table metadata on a socket.
+//! [`ColdTier::catalog_facade`] confines the façade to the namespace the tier
+//! writes into; anything outside answers `404 NoSuchNamespaceException`.
+//! [`CatalogFacade::new`] serves the whole catalogue, for a caller that means it.
+//!
+//! [`ColdTier::catalog_facade`]: crate::cold::ColdTier::catalog_facade
+//!
 //! # It carries no credentials of its own
 //!
 //! The response tells a client where the data is; it does not tell it how to
@@ -57,18 +68,69 @@ use tracing::{debug, info};
 #[derive(Clone)]
 pub struct CatalogFacade {
     catalog: Arc<dyn Catalog>,
+    /// The one namespace this endpoint serves, if it is confined to one.
+    ///
+    /// `None` serves the whole catalogue, which is only right where the
+    /// catalogue is this deployment's alone.
+    namespace: Option<NamespaceIdent>,
 }
 
 impl std::fmt::Debug for CatalogFacade {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CatalogFacade").finish_non_exhaustive()
+        f.debug_struct("CatalogFacade")
+            .field("namespace", &self.namespace)
+            .finish_non_exhaustive()
     }
 }
 
 impl CatalogFacade {
-    /// Serve the given catalog.
+    /// Serve **every** namespace the catalog holds.
+    ///
+    /// Right only where the catalogue is this deployment's alone. Prefer
+    /// [`in_namespace`](Self::in_namespace), which is what
+    /// [`ColdTier::catalog_facade`](crate::cold::ColdTier::catalog_facade)
+    /// builds.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            namespace: None,
+        }
+    }
+
+    /// Serve only `namespace`, and answer `404` for anything else.
+    ///
+    /// Applied to the request rather than the response: `list_namespaces` reports
+    /// this one, and every other route compares before it touches the catalog.
+    pub fn in_namespace(catalog: Arc<dyn Catalog>, namespace: NamespaceIdent) -> Self {
+        Self {
+            catalog,
+            namespace: Some(namespace),
+        }
+    }
+
+    /// The namespace this façade is confined to, if any.
+    #[must_use]
+    pub fn namespace(&self) -> Option<&NamespaceIdent> {
+        self.namespace.as_ref()
+    }
+
+    /// Refuse a namespace this façade does not serve.
+    ///
+    /// `404` rather than `403`: `NoSuchNamespaceException` is an error kind every
+    /// Iceberg client handles, and a `403` would confirm the namespace exists —
+    /// the one bit this is meant not to hand out.
+    fn admit(&self, requested: &NamespaceIdent) -> Result<(), ApiError> {
+        match &self.namespace {
+            Some(served) if served != requested => Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                kind: "NoSuchNamespaceException",
+                message: format!(
+                    "namespace {:?} is not served here",
+                    requested.as_ref().join(".")
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// The router, ready to be served or nested under a larger application.
@@ -139,7 +201,17 @@ struct ConfigResponse {
 }
 
 /// `GET /v1/namespaces`
+///
+/// A confined façade reports the one namespace it serves without asking the
+/// catalog, so a listing cannot leak what else is in there.
 async fn list_namespaces(State(facade): State<CatalogFacade>) -> Result<Response, ApiError> {
+    if let Some(served) = facade.namespace() {
+        return Ok(Json(NamespacesResponse {
+            namespaces: vec![served.as_ref().to_vec()],
+        })
+        .into_response());
+    }
+
     let namespaces = facade
         .catalog
         .list_namespaces(None)
@@ -163,6 +235,7 @@ async fn load_namespace(
     Path(namespace): Path<String>,
 ) -> Result<Response, ApiError> {
     let ident = namespace_of(&namespace);
+    facade.admit(&ident)?;
     let found = facade
         .catalog
         .get_namespace(&ident)
@@ -188,6 +261,7 @@ async fn list_tables(
     Path(namespace): Path<String>,
 ) -> Result<Response, ApiError> {
     let ident = namespace_of(&namespace);
+    facade.admit(&ident)?;
     let tables = facade
         .catalog
         .list_tables(&ident)
@@ -227,7 +301,9 @@ async fn load_table(
     State(facade): State<CatalogFacade>,
     Path((namespace, table)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let ident = TableIdent::new(namespace_of(&namespace), table.clone());
+    let ns = namespace_of(&namespace);
+    facade.admit(&ns)?;
+    let ident = TableIdent::new(ns, table.clone());
     let loaded = facade
         .catalog
         .load_table(&ident)

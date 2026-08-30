@@ -25,13 +25,14 @@
 //!
 //! [`planner`] re-exports `metering::calendar` for convenience, so callers get
 //! DST-correct local days without depending on both crates directly. The
-//! implementation is upstream and there is only one of it. Since `metering` 0.19
-//! the *choice* between the two calendars is upstream too, as
+//! implementation is upstream and there is only one of it. The *choice* between
+//! the two calendars is upstream too, as
 //! [`DayBoundary`](metering::calendar::DayBoundary) — so the one thing
 //! [`planner::calendar`] adds is neither arithmetic nor the choice, but a
 //! storage fact: a stored row carries its `sparte`, so the store knows which
 //! boundary applies to it. That mapping is [`planner::day_boundary`], written
 //! once.
+
 //!
 //! ## The five things a caller usually wants
 //!
@@ -48,7 +49,9 @@
 //!   and an optional version ceiling, for a settlement rerun.
 //! - [`MeterStore::completeness`] — whether a range holds what the DST-aware
 //!   calendar says it should, because a missing interval is information rather
-//!   than an empty set.
+//!   than an empty set. [`seen_since`] adds the finding a range cannot make about
+//!   itself: a channel that delivered *nothing* has no rows to aggregate, so it
+//!   needs a roster drawn from an earlier window.
 //! - [`MeterCatalog`] — several tables in one session, when a deployment holds
 //!   more than one stream and needs a statement that mentions both.
 //!
@@ -183,6 +186,7 @@
 //! [`SqlSurface`]: crate::session::SqlSurface
 //! [`TimeModel`]: crate::config::TimeModel
 //! [`collect_by_channel`]: crate::session::SeriesQuery::collect_by_channel
+//! [`seen_since`]: crate::session::CompletenessQuery::seen_since
 
 // Doc comments throughout cite `§N`. Those are cross-references between the
 // design notes this crate's maintainers keep, not links a reader needs to
@@ -229,18 +233,20 @@ pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
 pub use config::{CHECK_VALUES_KEY, TableConfig, TimeModel, ValidatedTableConfig, coded_column};
 pub use encode::{StoredReadings, canonical_obis, parse_malo};
-pub use erasure::{ErasureRecord, SubjectRef, SubjectRegistry};
+pub use erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
 pub use hot::PostgresHot;
 pub use planner::{
     ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
-    balancing_day, balancing_month, day_boundary, intervals_in_gas_day,
+    balancing_day, balancing_day_bounds, balancing_day_length, balancing_month, day_boundary,
+    expected_intervals_in_balancing_day,
 };
 pub use session::{
-    AUTHORITATIVE_ATTEMPTS, Completeness, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog,
-    MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryDescription, QueryResult,
-    ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
+    AUTHORITATIVE_ATTEMPTS, Completeness, CompletenessQuery, HotWriter, Maintenance,
+    MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
+    QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
+    SqlSurface, TableMaintenance,
 };
 pub use settings::{Deployment, Settings};
 pub use tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
@@ -258,18 +264,20 @@ pub mod prelude {
         CHECK_VALUES_KEY, TableConfig, TimeModel, ValidatedTableConfig, coded_column,
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
-    pub use crate::erasure::{ErasureRecord, SubjectRef, SubjectRegistry};
+    pub use crate::erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
     pub use crate::error::{Error, Result};
     pub use crate::evolution::{Compatibility, SchemaChange};
     pub use crate::hot::PostgresHot;
     pub use crate::planner::{
         ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
-        balancing_day, balancing_month, day_boundary, intervals_in_gas_day,
+        balancing_day, balancing_day_bounds, balancing_day_length, balancing_month, day_boundary,
+        expected_intervals_in_balancing_day,
     };
     pub use crate::session::{
-        AUTHORITATIVE_ATTEMPTS, Completeness, HotWriter, Maintenance, MaintenanceOutcome,
-        MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryDescription,
-        QueryResult, ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
+        AUTHORITATIVE_ATTEMPTS, Completeness, CompletenessQuery, HotWriter, Maintenance,
+        MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
+        QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
+        SqlSurface, TableMaintenance,
     };
     pub use crate::settings::{Deployment, Settings};
     pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};

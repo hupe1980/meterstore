@@ -203,7 +203,7 @@ mod tests {
             unit: MeasurementUnit::KiloWattHour,
             quality,
             version: ScopedVersion::new(
-                VersionScope::new("99", 2026, 7).unwrap(),
+                VersionScope::new("9900000000001", 2026, 7).unwrap(),
                 Version::new(version).unwrap(),
             ),
             recorded_at: datetime!(2026-07-27 06:00 UTC),

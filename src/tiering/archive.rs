@@ -244,7 +244,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                 table,
                 now,
                 now + self.config.partition_headroom(),
-                self.config.partition_step(),
+                self.config.archival_step(),
             )
             .await?
             .len();
@@ -257,7 +257,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // Reaching zero stops writes, so it has to be counted from reality.
         if let Some(starts) = self.hot.partition_starts(table).await? {
             crate::observe::metrics().hot_partitions_ahead.record(
-                crate::tiering::store::partitions_ahead(&starts, now, self.config.partition_step())
+                crate::tiering::store::partitions_ahead(&starts, now, self.config.archival_step())
                     as u64,
                 &crate::observe::table(table),
             );

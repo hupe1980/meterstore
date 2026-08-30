@@ -59,6 +59,12 @@ pub struct Metrics {
     pub rows_deduplicated: Counter<u64>,
     /// Corrections routed to the cold tier because their interval was archived.
     pub late_corrections: Counter<u64>,
+    /// Subjects whose linkage a retention sweep destroyed.
+    ///
+    /// **Compliance rather than health.** § 60 Abs. 6 comes due on a clock, so a
+    /// flat zero over a year is a sweep that is not running — and erasure is
+    /// irreversible, so this is the one counter here whose *rise* is worth a look.
+    pub subjects_anonymised: Counter<u64>,
 
     /// Rows read, by tier.
     pub rows_scanned: Counter<u64>,
@@ -110,6 +116,14 @@ impl Metrics {
                 .with_description(
                     "Archival runs that stopped because a lock was not available. \
                      Not a failure: nothing was changed and the next cycle retries",
+                )
+                .build(),
+            subjects_anonymised: meter
+                .u64_counter("meterstore.retention.subjects_anonymised")
+                .with_description(
+                    "Subjects whose linkage a § 60 Abs. 6 retention sweep destroyed. \
+                     Irreversible: a rise is worth a look, and a flat zero over a \
+                     year is a sweep that is not running",
                 )
                 .build(),
             partitions_dropped: meter
@@ -217,6 +231,9 @@ mod tests {
         m.plan_duration.record(0.01, &table("readings"));
         m.scan_duration
             .record(0.01, &table_tier("readings", "cold"));
+        // Deployment-wide, so it carries no table attribute — the empty slice is
+        // as much a case as any other.
+        m.subjects_anonymised.add(1, &[]);
     }
 
     #[test]

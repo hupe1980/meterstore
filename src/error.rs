@@ -257,7 +257,7 @@ mod tests {
             .is_retryable()
         );
 
-        assert!(!Error::config("archival_step must equal partition_step").is_retryable());
+        assert!(!Error::config("settlement_lag must be at least one archival_step").is_retryable());
         assert!(!Error::encode("version", "too many digits").is_retryable());
         assert!(
             !Error::IntegrityViolation {

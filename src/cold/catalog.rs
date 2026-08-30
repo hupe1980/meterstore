@@ -530,10 +530,20 @@ impl ColdTier {
     /// engine pointed at the bare warehouse directory has to guess. A deployment
     /// already on a REST catalogue or on S3 Tables has an endpoint engines
     /// understand, and needs nothing here.
+    ///
+    /// **Confined to this tier's namespace.** A SQL catalogue is a table in a
+    /// database and a database is a thing organisations share, so serving every
+    /// namespace it happens to hold would put an unauthenticated read of somebody
+    /// else's table metadata on a socket. Anything outside answers `404`;
+    /// [`CatalogFacade::new`](crate::serve::CatalogFacade::new) serves the whole
+    /// catalogue for a caller that means it.
     #[cfg(feature = "catalog-facade")]
     #[must_use]
     pub fn catalog_facade(&self) -> crate::serve::CatalogFacade {
-        crate::serve::CatalogFacade::new(Arc::clone(&self.catalog))
+        crate::serve::CatalogFacade::in_namespace(
+            Arc::clone(&self.catalog),
+            self.cold.namespace().clone(),
+        )
     }
 }
 

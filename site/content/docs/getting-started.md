@@ -10,7 +10,7 @@ weight = 1
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
 | PostgreSQL | **12 or later** | See below. The test suite pins 16 |
-| `metering` | 0.19 or later | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | **0.20 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs only `SELECT` plus ownership of its own tables. No server
@@ -124,7 +124,7 @@ let store = MeterStore::builder()
     .table(
         TableConfig::new("readings_versions")
             .settlement_lag(Duration::days(7))   // stay behind the correction window
-            .archival_step(Duration::DAY)        // one partition per commit
+            .archival_step(Duration::DAY)        // one window per commit, one partition per window
             .build()?,
     )
     .build()

@@ -40,12 +40,11 @@ extra_columns = [
 ]
 
 [tables.hot]
-partition_step = "1d"            # must equal archival_step
 partition_headroom = "14d"       # pre-created ahead of the write frontier
 
 [tables.archival]
 settlement_lag = "7d"
-archival_step = "1d"
+archival_step = "1d"             # and the partition granularity — the same number
 scan_chunk_rows = 50_000
 
 [tables.maintenance]
@@ -107,22 +106,32 @@ may be measured by several Messlokationen. `identify_by_melo` pins that either
 way — see
 [the storage model](@/docs/storage-model.md#the-messlokation-may-be-part-of-the-identity).
 
+## `archival_step` is also the partition granularity
+
+One setting, not two. The purge of an archived window is `DROP TABLE`, not
+`DELETE`, and that only holds when a window is exactly one partition: a coarser
+partition forces archival back to row-wise `DELETE` — millions of dead tuples a
+day and the vacuum debt behind them — and a finer one multiplies partition count
+for nothing.
+
+It cannot be changed once a table has archived. The watermark sits on the old
+grid, and a window off that grid names a partition relation nothing creates, so
+`next_window` refuses rather than walking the boundary past rows PostgreSQL still
+holds. Create a new table at the new step.
+
+Below one minute it is refused at construction: a partition relation is named
+`<table>_YYYY_MM_DD_HHMM`, so two consecutive sub-minute windows would name one.
+
 ## Settings that must agree
 
-Two pairs are validated against each other at construction, because getting them
-wrong degrades **silently** rather than failing:
+`settlement_lag` must cover at least one `archival_step`. It is validated at
+construction because getting it wrong degrades **silently**: a window can be
+archived while it is still receiving corrections, and they land below the
+watermark where no query looks.
 
-- `partition_step` **must equal** `archival_step`. A purge drops exactly one
-  partition per archived window; a coarser partition forces archival back to
-  row-wise `DELETE` and the vacuum debt that follows, and a finer one multiplies
-  partition count for no benefit.
-- `settlement_lag` must cover at least one `archival_step`, or a window can be
-  archived while it is still receiving corrections — stranding them below the
-  watermark.
+`system.config` shows the two side by side, which is how a mismatch gets noticed.
 
-`system.config` shows them side by side, which is how a mismatch gets noticed.
-
-## Five decisions the file format makes
+## Six decisions the file format makes
 
 **It can open the tiers, and does not have to.** `connect()` builds both and hands
 the pool back, because it is usually shared with the rest of the service and with
@@ -190,7 +199,7 @@ implementable against the published `iceberg` crate. Both run out of band — se
 
 | Setting | Default | Rationale |
 |---|---|---|
-| `partition_step` / `archival_step` | 1 day | One partition per commit |
+| `archival_step` | 1 day | One window per commit, and one partition per window |
 | `settlement_lag` | 7 days | Must exceed the market's correction window |
 | `partition_headroom` | 14 days | Pre-created ahead of the write frontier |
 | `scan_chunk_rows` | 50 000 | The bound on a scan's peak memory. **Rows, not measuring points** — meters differ by orders of magnitude in how much they report, so a fixed number of *them* is a variable amount of memory |

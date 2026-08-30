@@ -403,6 +403,110 @@ async fn completeness_agrees_with_the_gaps_the_workload_actually_left() {
     );
 }
 
+#[tokio::test]
+async fn a_channel_that_stops_delivering_entirely_is_only_visible_against_a_roster() {
+    // The finding a range cannot make about itself. Completeness is an aggregate
+    // over the rows a range holds, so a measuring point that delivered *nothing*
+    // produces no group and appears nowhere — the most severe incompleteness
+    // there is, and the one the report was silent about. Nothing inside the
+    // range can supply the missing channel, because the missing channel is
+    // exactly what the range does not contain.
+    //
+    // Two meters report the first day; only one reports the second.
+    let both = MeteringWorkload::new(START)
+        .seed(0x5115)
+        .malo_ids(2)
+        .days(1);
+    let (from, boundary) = both.range();
+
+    let survivor = MeteringWorkload::new(boundary)
+        .seed(0x5116)
+        .malo_ids(1)
+        .days(1);
+    let (_, to) = survivor.range();
+
+    let harness = TestHarness::start().await.expect("harness");
+    harness
+        .ensure_partitions(from, to + Duration::days(1))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(from).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+
+    harness
+        .ingest(&store, &both.generate().expect("first day"))
+        .await
+        .expect("ingest");
+    harness
+        .ingest(&store, &survivor.generate().expect("second day"))
+        .await
+        .expect("ingest");
+
+    // Without a roster the second day looks perfect: the one meter that reported
+    // is complete, and the one that vanished is not mentioned at all.
+    let blind = store
+        .completeness(boundary, to)
+        .await
+        .expect("completeness");
+    assert_eq!(blind.len(), 1, "one channel reported: {blind:?}");
+    assert!(blind.iter().all(|r| r.is_complete()));
+
+    // With the first day as the reference window, the silence is a finding.
+    let seeing = store
+        .completeness(boundary, to)
+        .seen_since(from)
+        .await
+        .expect("completeness");
+    assert_eq!(
+        seeing.len(),
+        2,
+        "both channels are accounted for: {seeing:?}"
+    );
+
+    let silent: Vec<_> = seeing.iter().filter(|r| r.is_silent()).collect();
+    assert_eq!(silent.len(), 1, "exactly one went quiet: {seeing:?}");
+    let gone = silent[0];
+    assert_eq!(gone.actual, 0);
+    assert_eq!(gone.missing, gone.expected);
+    assert!(gone.expected > 0, "a full day is expected of it");
+    assert!(!gone.is_complete());
+    assert!(
+        gone.first_gap.is_some(),
+        "and an operator is told from when"
+    );
+
+    // The meter that kept reporting is untouched by the roster.
+    let still_reporting: Vec<_> = seeing.iter().filter(|r| !r.is_silent()).collect();
+    assert_eq!(still_reporting.len(), 1);
+    assert!(still_reporting[0].is_complete());
+    assert_ne!(still_reporting[0].malo_id, gone.malo_id);
+
+    // And the same through SQL, where the reference window is the leading
+    // argument because the arguments read in time order.
+    let rows = store
+        .query(&format!(
+            "SELECT malo_id FROM meter_completeness('{from}', '{boundary}', '{to}') \
+             WHERE actual = 0",
+            from = from
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            boundary = boundary
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            to = to
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ))
+        .await
+        .expect("meter_completeness");
+    assert_eq!(
+        rows.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
+        1,
+        "the table function reports the silent channel too"
+    );
+    drop(store);
+}
+
 /// Run a **Zählerstandsgang** workload through a point store, archiving
 /// `archive_days` of it.
 ///

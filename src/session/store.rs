@@ -471,26 +471,45 @@ impl MeterStore {
     /// comes from each series' declared resolution and `metering`'s DST-aware
     /// calendar, so a 92-interval spring day is complete and a 96-interval autumn
     /// day is four short.
-    pub async fn completeness(
+    ///
+    /// Awaited directly for the plain report:
+    ///
+    /// ```no_run
+    /// # async fn example(store: &meterstore::MeterStore) -> meterstore::Result<()> {
+    /// # let (from, to) = (time::OffsetDateTime::UNIX_EPOCH, time::OffsetDateTime::UNIX_EPOCH);
+    /// for row in store.completeness(from, to).await? {
+    ///     if !row.is_complete() { /* … */ }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// [`seen_since`](super::CompletenessQuery::seen_since) adds the one finding
+    /// a range can never make about itself: a channel that delivered **nothing**
+    /// produces no rows, so it is absent from the report rather than reported as
+    /// empty — the strongest form of incompleteness, and the invisible one.
+    pub fn completeness(
         &self,
         from: time::OffsetDateTime,
         to: time::OffsetDateTime,
-    ) -> Result<Vec<super::Completeness>> {
+    ) -> super::CompletenessQuery<'_> {
+        super::CompletenessQuery::new(self, from, to)
+    }
+
+    /// The resolved provider and merge-key discriminators a completeness run needs.
+    pub(crate) async fn completeness_inputs(
+        &self,
+    ) -> Result<(
+        std::sync::Arc<dyn datafusion::catalog::TableProvider>,
+        String,
+        Vec<String>,
+    )> {
+        let name = self.resolved_table();
         let resolved = self
             .ctx
-            .table_provider(self.resolved_table().as_str())
+            .table_provider(name.as_str())
             .await
             .map_err(Error::from)?;
-
-        super::completeness::compute(
-            &self.ctx.state(),
-            resolved,
-            &self.resolved_table(),
-            &self.config.discriminator_columns(),
-            from,
-            to,
-        )
-        .await
+        Ok((resolved, name, self.config.discriminator_columns()))
     }
 
     /// Every committed state of the cold table, newest first.
@@ -1061,8 +1080,8 @@ impl MeterStore {
                     table,
                     first,
                     // Exclusive, so the partition holding `last` must be created.
-                    last + self.config.partition_step(),
-                    self.config.partition_step(),
+                    last + self.config.archival_step(),
+                    self.config.archival_step(),
                 )
                 .await?;
 
@@ -1190,8 +1209,8 @@ impl MeterStore {
                 .ensure_partitions(
                     table,
                     first,
-                    last + self.config.partition_step(),
-                    self.config.partition_step(),
+                    last + self.config.archival_step(),
+                    self.config.archival_step(),
                 )
                 .await?;
 
@@ -1651,6 +1670,17 @@ impl MeterStore {
     ///
     /// References the registry no longer resolves are skipped, so the sweep is
     /// idempotent and a re-run writes no second audit row.
+    ///
+    /// # This table only
+    ///
+    /// The subject map is deployment-wide — one table keyed by natural identifier
+    /// — so two meterstore tables registering the same identifier share one
+    /// reference and one erasure unlinks **both**. A deployment holding more than
+    /// one stream must therefore sweep with [`MeterCatalog::anonymise_before`],
+    /// which takes the latest reading across every table; this one would destroy
+    /// a linkage the other tables still depend on.
+    ///
+    /// [`MeterCatalog::anonymise_before`]: crate::MeterCatalog::anonymise_before
     pub async fn anonymise_before(
         &self,
         cutoff: time::OffsetDateTime,
@@ -1659,51 +1689,22 @@ impl MeterStore {
         now: time::OffsetDateTime,
     ) -> Result<Vec<crate::erasure::ErasureRecord>> {
         let registry = self.require_registry()?;
-        let column = self.config.subject_column().ok_or_else(|| {
-            Error::config(
+        if self.config.subject_column().is_none() {
+            return Err(Error::config(
                 "no subject column is declared, so there is no linkage to destroy: \
                  without one the stored readings carry no reference to a person and \
                  § 60 Abs. 6 has nothing to act on here",
-            )
-        })?;
-
-        // The **raw** relation, not the resolved one. A superseded version is
-        // still a stored personal value, so a subject whose only recent row is a
-        // correction that lost resolution has not passed the ceiling.
-        let sql = format!(
-            r#"SELECT "{column}" FROM {raw}
-               WHERE "{column}" IS NOT NULL
-               GROUP BY "{column}"
-               HAVING max("{from}") < $1"#,
-            raw = raw_name(self.config.name()),
-            from = crate::encode::schema::col::FROM,
-        );
-        let due = self
-            .query_with_params(&sql, vec![crate::encode::schema::timestamp_scalar(cutoff)])
-            .await?;
-
-        let mut references = std::collections::BTreeSet::new();
-        for batch in due.batches() {
-            let values = column_str(batch, column)?;
-            for i in 0..batch.num_rows() {
-                if !crate::arrow::array::Array::is_null(values, i) {
-                    references.insert(values.value(i).to_string());
-                }
-            }
+            ));
         }
 
-        let mut erased = Vec::new();
-        for reference in references {
-            let subject = crate::erasure::SubjectRef::new(reference)?;
-            // Already anonymised — by an Article 17 request, or by an earlier
-            // sweep. Nothing left to destroy, and an audit row would claim an
-            // erasure that did not happen on this run.
-            if registry.resolve(&subject).await?.is_none() {
-                continue;
-            }
-            erased.push(registry.erase(&subject, reason, actor, now).await?);
-        }
+        let seen = self.subject_last_seen().await?.unwrap_or_default();
+        let due: Vec<String> = seen
+            .into_iter()
+            .filter(|(_, last)| *last < cutoff)
+            .map(|(reference, _)| reference)
+            .collect();
 
+        let erased = crate::erasure::anonymise(registry, &due, reason, actor, now).await?;
         if !erased.is_empty() {
             warn!(
                 table = self.config.name(),
@@ -1713,6 +1714,58 @@ impl MeterStore {
             );
         }
         Ok(erased)
+    }
+
+    /// The latest interval each pseudonymous reference in this table explains.
+    ///
+    /// `None` where the table declares no subject column, which is not the same
+    /// as an empty map: one says the question does not apply here, the other
+    /// that it does and nothing is attributed. A retention sweep across several
+    /// tables has to tell them apart, because a subject is only due once **every**
+    /// table that names it has passed the ceiling.
+    ///
+    /// The **raw** relation, not the resolved one: a superseded version is still
+    /// a stored personal value, so a subject whose only recent row is a
+    /// correction that lost resolution has not passed the ceiling.
+    pub(crate) async fn subject_last_seen(
+        &self,
+    ) -> Result<Option<std::collections::BTreeMap<String, time::OffsetDateTime>>> {
+        let Some(column) = self.config.subject_column() else {
+            return Ok(None);
+        };
+
+        let sql = format!(
+            r#"SELECT "{column}" AS reference, max("{from}") AS last_seen FROM {raw}
+               WHERE "{column}" IS NOT NULL
+               GROUP BY 1"#,
+            raw = raw_name(self.config.name()),
+            from = crate::encode::schema::col::FROM,
+        );
+        let rows = self.query(&sql).await?;
+
+        let mut seen = std::collections::BTreeMap::new();
+        for batch in rows.batches() {
+            let references = column_str(batch, "reference")?;
+            let last = batch
+                .column_by_name("last_seen")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::arrow::array::TimestampMicrosecondArray>()
+                })
+                .ok_or_else(|| Error::decode("last_seen", "expected a microsecond timestamp"))?;
+            for i in 0..batch.num_rows() {
+                if crate::arrow::array::Array::is_null(references, i)
+                    || crate::arrow::array::Array::is_null(last, i)
+                {
+                    continue;
+                }
+                let at = crate::encode::schema::instant(last.value(i))?;
+                seen.entry(references.value(i).to_string())
+                    .and_modify(|held: &mut time::OffsetDateTime| *held = (*held).max(at))
+                    .or_insert(at);
+            }
+        }
+        Ok(Some(seen))
     }
 
     /// Refuse a write on a session that is not reading current best knowledge.
@@ -2028,8 +2081,8 @@ impl MeterStore {
                 && held.version.scope().operator() != row.written.version.scope().operator()
             {
                 return Err(Error::config(format!(
-                    "reading {} {} at {} is already stored under network operator {:?} \
-                     but this delivery asserts {:?}. A version is comparable only \
+                    "reading {} {} at {} is already stored under network operator {} \
+                     but this delivery asserts {}. A version is comparable only \
                      within its (operator, month) scope, so both would survive resolution \
                      and double every sum over them. Check that the scope carries the \
                      *network operator* rather than a forwarding party or a tenant",
@@ -2928,7 +2981,7 @@ impl HotWriter<'_> {
         }
 
         let table = store.config.name();
-        let step = store.config.partition_step();
+        let step = store.config.archival_step();
         let (first, last) = hot_bounds(series);
 
         // Only the bounds this writer has not already confirmed. A run of

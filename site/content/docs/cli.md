@@ -36,8 +36,8 @@ meterstore status
 ```
 
 `check` connects to nothing, which is what makes it a CI step: a file whose
-`archival_step` disagrees with its `partition_step` fails there rather than
-degrading a purge to a row-wise `DELETE` in production.
+`settlement_lag` is shorter than its `archival_step` fails there rather than
+stranding corrections below the watermark in production.
 
 ## Keeping archival running
 
@@ -58,7 +58,22 @@ mid-archival that is the difference between a clean stop and an orphaned
 partition the next run has to reclaim.
 
 Snapshot expiry is opt-in (`--expire-snapshots`), because a snapshot is what makes
-a past settlement reproducible: retention is a compliance decision.
+a past settlement reproducible: how far back a settlement can be reproduced is a
+compliance decision.
+
+So is the other opt-in job. `--anonymise-after-years 3` runs the § 60 Abs. 6 MsbG
+sweep on the same schedule, destroying the linkage of every subject whose readings
+have passed the ceiling **in every table**:
+
+```bash
+meterstore maintain --anonymise-after-years 3 --anonymise-actor retention-job
+```
+
+Off by default and irreversible when on. The years are full calendar years after
+the year of collection, not `now - 3 years`: the statutory clock starts at the
+*Schluss des Kalenderjahres*, and the rolling spelling would erase a January value
+a year early. Needs a table declaring `subject_column` — see
+[Privacy and retention](@/docs/privacy.md).
 
 ## Asking what the store holds
 

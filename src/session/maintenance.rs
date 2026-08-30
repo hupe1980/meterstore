@@ -1,7 +1,8 @@
-//! Scheduled upkeep: archival, snapshot expiry, and the invariant check.
+//! Scheduled upkeep: archival, snapshot expiry, the retention sweep, and the
+//! invariant check.
 //!
-//! Three jobs with different cadences and very different consequences, which is
-//! why they are one type with one entry point rather than three independent
+//! Four jobs with different cadences and very different consequences, which is
+//! why they are one type with one entry point rather than four independent
 //! timers:
 //!
 //! - **Archival** must run often enough that the hot tier stays bounded, and its
@@ -10,6 +11,10 @@
 //!   what makes a past settlement reproducible, so a run that expires too
 //!   eagerly destroys the audit position the cold tier exists to hold. It is
 //!   therefore opt-in and runs rarely.
+//! - **The retention sweep** ([`Maintenance::anonymise_after`]) is the other
+//!   compliance decision, and the only job here that is irreversible. Also
+//!   opt-in, and it runs across every table at once because the subject registry
+//!   is deployment-wide.
 //! - **The invariant check** is the alert. It is cheap and it is the only one
 //!   whose failure means query results may already be wrong.
 //!
@@ -102,6 +107,19 @@ impl TableMaintenance {
 pub struct MaintenanceOutcome {
     /// One entry per table the cycle ran over, in name order.
     pub tables: Vec<TableMaintenance>,
+    /// Subjects whose linkage this cycle destroyed, when a retention policy is
+    /// configured.
+    ///
+    /// **Not per table.** The subject registry is deployment-wide, so a subject
+    /// is due only once every table that names it has passed the ceiling — see
+    /// [`Maintenance::anonymise_after`].
+    pub anonymised: Vec<crate::erasure::ErasureRecord>,
+    /// Why the retention sweep did not run, if it was configured and failed.
+    ///
+    /// Rendered rather than typed, for the reason
+    /// [`TableMaintenance::failure`] is: the cycle has already moved on, and
+    /// what is left to do with it is log it and alert on it.
+    pub retention_failure: Option<String>,
 }
 
 impl MaintenanceOutcome {
@@ -144,9 +162,10 @@ impl MaintenanceOutcome {
         self.tables.iter().any(TableMaintenance::deferred)
     }
 
-    /// Whether every table's tiers still partition their data as they should.
+    /// Whether every table's tiers still partition their data as they should,
+    /// and the retention sweep — if configured — ran.
     pub fn healthy(&self) -> bool {
-        self.tables.iter().all(TableMaintenance::healthy)
+        self.tables.iter().all(TableMaintenance::healthy) && self.retention_failure.is_none()
     }
 
     /// The tables that are not healthy — what an alert should name.
@@ -155,12 +174,33 @@ impl MaintenanceOutcome {
     }
 
     /// The tables whose cycle failed, with the reason.
+    ///
+    /// A failed **retention sweep** appears here too, under the name
+    /// `<retention>`: it is not a table's failure, but it is a failure an
+    /// operator has to see, and a caller iterating this to build an alert must
+    /// not have to know about a second place to look.
     pub fn failures(&self) -> impl Iterator<Item = (&str, &str)> {
         self.tables
             .iter()
             .filter_map(|t| Some((t.table.as_str(), t.failure.as_deref()?)))
+            .chain(
+                self.retention_failure
+                    .as_deref()
+                    .map(|why| (RETENTION_LABEL, why)),
+            )
+    }
+
+    /// Subjects anonymised this cycle.
+    pub fn subjects_anonymised(&self) -> usize {
+        self.anonymised.len()
     }
 }
+
+/// What a failed retention sweep is named in [`MaintenanceOutcome::failures`].
+///
+/// Angle-bracketed so it cannot collide with a table name: `TableConfig` refuses
+/// anything that is not a plain identifier.
+pub const RETENTION_LABEL: &str = "<retention>";
 
 /// Upkeep for one store or a whole catalog, run on demand or on a schedule.
 ///
@@ -174,6 +214,15 @@ pub struct Maintenance {
     interval: Duration,
     max_windows: usize,
     expire_snapshots: bool,
+    retention: Option<RetentionSweep>,
+}
+
+/// A configured § 60 Abs. 6 sweep: the policy, and who to record as having run it.
+#[derive(Debug, Clone)]
+struct RetentionSweep {
+    policy: crate::erasure::Retention,
+    reason: String,
+    actor: String,
 }
 
 impl Maintenance {
@@ -210,6 +259,7 @@ impl Maintenance {
             interval: Self::DEFAULT_INTERVAL,
             max_windows: Self::DEFAULT_MAX_WINDOWS,
             expire_snapshots: false,
+            retention: None,
         }
     }
 
@@ -239,6 +289,53 @@ impl Maintenance {
     pub fn expire_snapshots(mut self, enabled: bool) -> Self {
         self.expire_snapshots = enabled;
         self
+    }
+
+    /// Also anonymise subjects whose readings have passed a retention ceiling.
+    ///
+    /// **Off by default.** § 60 Abs. 6 MsbG obliges the Messstellenbetreiber to
+    /// erase or anonymise personenbezogene Messwerte as soon as storing them is
+    /// no longer necessary, *"spätestens jedoch nach drei Jahren ab dem Schluss
+    /// des Kalenderjahres"* — a duty on a clock rather than an answer to a
+    /// request, which is why it belongs on a schedule. It is opt-in for the
+    /// reason snapshot expiry is: destroying a linkage is irreversible, so a
+    /// store that did it uninvited would take a compliance decision on the
+    /// operator's behalf.
+    ///
+    /// # A catalog operation even with one table
+    ///
+    /// The sweep runs across **every** store this loop holds, and a subject is
+    /// due only once all of them have passed the ceiling. The registry is
+    /// deployment-wide — one map keyed by natural identifier — so a single
+    /// erasure unlinks a subject everywhere, and sweeping per table would orphan
+    /// readings the other tables still hold.
+    ///
+    /// `reason` and `actor` go into the audit trail, which is what makes an
+    /// erasure provable to a regulator; neither may be empty.
+    ///
+    /// ```no_run
+    /// # use meterstore::{Maintenance, Retention};
+    /// # fn example(m: Maintenance) -> Maintenance {
+    /// m.anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
+    /// # }
+    /// ```
+    pub fn anonymise_after(
+        mut self,
+        policy: crate::erasure::Retention,
+        reason: impl Into<String>,
+        actor: impl Into<String>,
+    ) -> Self {
+        self.retention = Some(RetentionSweep {
+            policy,
+            reason: reason.into(),
+            actor: actor.into(),
+        });
+        self
+    }
+
+    /// The retention policy this loop applies, if any.
+    pub fn retention(&self) -> Option<crate::erasure::Retention> {
+        self.retention.as_ref().map(|r| r.policy)
     }
 
     /// Run one cycle over every table.
@@ -287,12 +384,49 @@ impl Maintenance {
             });
         }
 
-        let outcome = MaintenanceOutcome { tables };
+        // **After** archival, and over every store at once. A subject's readings
+        // move between tiers during a cycle, and the sweep reads the raw relation
+        // across both — so running it first would ask the question of a state the
+        // cycle was about to change. Across every store, because the registry is
+        // deployment-wide and a per-table sweep destroys linkage the other tables
+        // still depend on.
+        let (anonymised, retention_failure) = match &self.retention {
+            None => (Vec::new(), None),
+            Some(sweep) => {
+                let cutoff = sweep.policy.cutoff(now);
+                match super::catalog::anonymise_across(
+                    self.stores.iter(),
+                    cutoff,
+                    &sweep.reason,
+                    &sweep.actor,
+                    now,
+                )
+                .await
+                {
+                    Ok(records) => (records, None),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            %cutoff,
+                            "retention sweep failed; the cycle continues and the next tick retries"
+                        );
+                        (Vec::new(), Some(e.to_string()))
+                    }
+                }
+            }
+        };
+
+        let outcome = MaintenanceOutcome {
+            tables,
+            anonymised,
+            retention_failure,
+        };
         info!(
             tables = outcome.tables.len(),
             windows = outcome.windows_archived(),
             rows = outcome.rows_archived(),
             snapshots_expired = outcome.snapshots_expired(),
+            anonymised = outcome.subjects_anonymised(),
             failed = outcome.failures().count(),
             healthy = outcome.healthy(),
             "maintenance cycle"
@@ -468,6 +602,7 @@ mod tests {
                 "readings_versions",
                 vec![archived(96), archived(4), idle()],
             )],
+            ..Default::default()
         };
         assert_eq!(outcome.rows_archived(), 100);
         assert_eq!(outcome.windows_archived(), 2);
@@ -487,6 +622,7 @@ mod tests {
                     ..table("esa_typ2_versions", vec![archived(4)])
                 },
             ],
+            ..Default::default()
         };
 
         assert_eq!(outcome.rows_archived(), 100);
@@ -513,6 +649,7 @@ mod tests {
                     ..table("esa_typ2_versions", Vec::new())
                 },
             ],
+            ..Default::default()
         };
 
         assert!(!outcome.healthy());
@@ -532,6 +669,7 @@ mod tests {
                 invariant_violations: 1,
                 ..table("readings_versions", Vec::new())
             }],
+            ..Default::default()
         };
         assert!(!bad.healthy());
         // A cycle over no tables is vacuously healthy, which is right: it is what
@@ -545,10 +683,50 @@ mod tests {
         // like failures, or the alert fires on a healthy deployment.
         let outcome = MaintenanceOutcome {
             tables: vec![table("readings_versions", vec![contended()])],
+            ..Default::default()
         };
         assert!(outcome.lease_contended());
         assert!(outcome.healthy());
         assert_eq!(outcome.rows_archived(), 0);
+    }
+
+    #[test]
+    fn a_failed_retention_sweep_is_a_failure_the_table_alert_already_sees() {
+        // The sweep is not any one table's work, but an operator watching
+        // `failures()` for a name must not have to know about a second place to
+        // look — a retention duty silently not running is the failure mode.
+        let outcome = MaintenanceOutcome {
+            tables: vec![table("readings_versions", vec![archived(96)])],
+            retention_failure: Some("no subject column is declared".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!outcome.healthy());
+        assert_eq!(
+            outcome.failures().map(|(t, _)| t).collect::<Vec<_>>(),
+            vec![RETENTION_LABEL],
+        );
+        // And the table's own work still reports as done.
+        assert_eq!(outcome.rows_archived(), 96);
+        assert!(outcome.tables[0].healthy());
+    }
+
+    #[test]
+    fn a_retention_policy_is_opt_in_and_readable_back() {
+        // Destroying a linkage is irreversible, so a loop must never do it
+        // uninvited — and a deployment that did opt in has to be able to see it.
+        let plain = Maintenance::over(Vec::new());
+        assert_eq!(plain.retention(), None);
+
+        let sweeping = Maintenance::over(Vec::new()).anonymise_after(
+            crate::erasure::Retention::CalendarYears(3),
+            "§ 60 Abs. 6 MsbG",
+            "retention-job",
+        );
+        assert_eq!(
+            sweeping.retention(),
+            Some(crate::erasure::Retention::CalendarYears(3))
+        );
     }
 
     #[test]

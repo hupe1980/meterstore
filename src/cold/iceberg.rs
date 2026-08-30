@@ -82,6 +82,12 @@ impl IcebergCold {
         TableIdent::new(self.namespace.clone(), table.to_string())
     }
 
+    /// The namespace this tier writes into.
+    #[must_use]
+    pub fn namespace(&self) -> &NamespaceIdent {
+        &self.namespace
+    }
+
     /// Create the namespace and table if they do not exist.
     ///
     /// The table is named `<table>_versions` because it holds **every** version
@@ -296,7 +302,25 @@ impl IcebergCold {
         }
 
         let txn = Transaction::new(&loaded);
-        let action = txn.expire_snapshots().expire_snapshot_ids(doomed);
+        // **`expire_older_than_ms` pinned to the epoch is what keeps the retention
+        // window a compliance setting.**
+        //
+        // `iceberg`'s action runs its age path whether or not ids are named,
+        // falling back to the table's `history.expire.max-snapshot-age-ms` —
+        // default **five days**. That cuts through `snapshot_retention`,
+        // `min_snapshots_to_keep` and the watermark-chain protection computed
+        // above, none of which the library knows about, so one cycle could leave
+        // no settlement older than a working week reproducible.
+        //
+        // The epoch selects nothing by age, so the ids computed here are the
+        // whole of what is expired — the library's own documented way to expire
+        // by id alone. Since `history.expire.*` is a *table* property, it also
+        // keeps an out-of-band tool from deciding this deployment's retention.
+        let action = txn
+            .expire_snapshots()
+            .expire_older_than_ms(0)
+            .retain_last(retain_last.max(1))
+            .expire_snapshot_ids(doomed);
 
         let committed = action
             .apply(txn)

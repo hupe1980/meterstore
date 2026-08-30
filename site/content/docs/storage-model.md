@@ -24,9 +24,9 @@ mapping needs no lookup table.
 | `resolution` | `Utf8`, nullable | `string` | ISO 8601, e.g. `PT15M` |
 | `source_kind` | `Utf8` | `string` | Filterable discriminant — the payload's own tag (`MSCONS`, …) |
 | `source_detail` | `Utf8`, nullable | `string` | JSON variant payload |
-| `provenance` | `Utf8`, nullable | `string` | JSON audit trail, RFC 3339 timestamps — [not `serde`'s](#json-columns) |
+| `provenance` | `Utf8`, nullable | `string` | JSON audit trail, [RFC 3339 timestamps](#json-columns) |
 | `version` | `Decimal128(20,0)` | `decimal(20,0)` | MSCONS correction version |
-| `version_scope` | `Utf8` | `string` | `<operator>:<YYYY-MM>` — the **Bilanzierungsmonat**, cut at 06:00 for gas |
+| `version_scope` | `Utf8` | `string` | `<Marktpartner-ID>:<YYYY-MM>` — twenty characters, the **Bilanzierungsmonat**, cut at 06:00 for gas |
 | `recorded_at` | `Timestamp(µs, UTC)` | `timestamptz` | Transaction time |
 | `balancing_day` | `Date32` | `date` | The local day this reading is booked on |
 
@@ -74,33 +74,30 @@ would find the two columns disagreeing.
 Taking the tag from the serialised form means a variant renamed upstream moves
 both columns together, and a variant added upstream needs no edit here.
 
-### Two JSON columns, and the one that is *not* `serde`'s {#json-columns}
+### Two JSON columns {#json-columns}
 
 `source_detail` and `provenance` are the only columns holding serialised structure
-rather than a scalar.
+rather than a scalar. Both are `metering`'s own `serde` output: hand-writing
+either would be a second copy of a vocabulary the domain owns.
 
-**`source_detail` is `serde`'s**, for the reason above: `MeasurementSource` is a
-seven-variant enum with per-variant payloads, and hand-writing it would be a
-second copy of a vocabulary `metering` owns. It carries a **nested** vocabulary
-though — `VirtualMeter` holds a `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is an
-upstream tag inside an upstream payload. Retagged, `source_kind` still reads
-`VIRTUAL_METER` and still agrees with the payload's outer key, so the
-discriminant check passes and only the payload stops decoding.
+`source_detail` carries a **nested** vocabulary — `VirtualMeter` holds a
+`VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is an upstream tag inside an upstream
+payload. Retagged, `source_kind` still reads `VIRTUAL_METER` and still agrees with
+the payload's outer key, so the discriminant check passes and only the payload
+stops decoding.
 
-**`provenance` is written out explicitly**, because of one field.
-`ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose `serde` impl is
-*feature-conditional* — a nine-element ordinal-date array
-(`[2026,208,6,0,0,0,0,0,0]`) without `serde-human-readable`, a `time`-formatted
-string with it. So the on-disk shape of an audit trail under a decades-long
-retention would be chosen by Cargo feature unification rather than by this crate,
-and `time` takes the tuple path on read when the feature is off. Enabling it here
-would move that decision, not remove it, and impose a global feature on the whole
-graph. Encoded like every other column instead — `metering`'s stable event code,
-RFC 3339 for the instant — which is also what lets DuckDB cast it:
+`provenance` carries RFC 3339 timestamps, which is what lets an external engine
+cast one straight out of the JSON:
 
 ```json
-[{"actor":"MSCONS","event_type":"INGESTED","note":null,"occurred_at":"2026-03-01T00:00:00Z"}]
+[{"occurred_at":"2026-03-01T00:00:00Z","event_type":"INGESTED","actor":"MSCONS","note":null}]
 ```
+
+That spelling is `metering`'s (`wire::rfc3339`), not `time`'s. `time`'s own serde
+impl is *feature-conditional* — a nine-element ordinal-date array without
+`serde-human-readable`, a non-RFC-3339 string with it — so left to it, the on-disk
+shape of an audit trail under a decades-long retention would be chosen by Cargo
+feature unification.
 
 > Anything persisted through `serde` has its stored shape decided by a
 > *dependency*, and a change there is a **stored-data** break, not a wire-format
@@ -233,12 +230,35 @@ belongs to *February's* gas scope.
 So every `VersionScope` constructor takes a `Sparte`:
 
 ```rust
-let scope = VersionScope::for_interval(operator, interval.from, Sparte::Gas)?;
+let scope = VersionScope::for_interval("9900000000001", interval.from, Sparte::Gas)?;
 ```
 
 It is not decoration: a producer deriving the correct gas Bilanzierungsmonat and
 one deriving the calendar month disagree by six hours at every month boundary,
 and `covers` refuses whichever the store was not told to expect.
+
+### The operator is parsed, not carried
+
+It is the network operator's **Marktpartner-ID** — thirteen digits, what MSCONS
+puts in `NAD+MS`, and the same identifier `MeasurementSource::Mscons` carries. The
+constructors take `metering`'s `BdewCode`, for the reason the read paths take a
+`MaloId` rather than eleven digits: past the constructor a wrong-but-plausible
+operator is not an error, it is a **different scope**. The correction never
+supersedes the value it corrects, both rows survive resolution, and every sum over
+the reading is inflated with nothing anywhere reporting it.
+
+That makes the stored column a fixed twenty characters, so the hot table's `CHECK`
+is exact (`^[0-9]{13}:[0-9]{4}-(0[1-9]|1[0-2])$`) rather than "anything without a
+colon", and the one-operator exclusion's `split_part(version_scope, ':', 1)` can
+only ever take the half the type reports.
+
+The **check digit is verified but not enforced**, which is `BdewCode`'s rule
+rather than a choice made here: BDEW's *Identifikatoren in der
+Marktkommunikation* §2.3 carves out GS1-issued GLNs, which use a different
+procedure, so a well-formed Marktpartner-ID may legitimately fail the BDEW one.
+`VersionScope::operator_has_bdew_check_digit()` reports it so an ingest boundary
+can warn — the same restraint `Version::is_well_formed` applies to a short version
+label.
 
 ## Identity versus attribute columns
 
@@ -344,7 +364,7 @@ Two words that are easy to conflate, with a financial consequence:
 | | Answers | Where it lives |
 |---|---|---|
 | **Tenant** | *Whose installation this is.* An account, a customer of a service bureau, an isolation boundary. Opaque to MeterStore. | A deployment-declared identity column |
-| **Network operator** | *Who assigned this version.* A BDEW Codenummer, and half of the scope a version is comparable within. | `version_scope` |
+| **Network operator** | *Who assigned this version.* A 13-digit BDEW/DVGW Marktpartner-ID (`metering::BdewCode`), and half of the scope a version is comparable within. | `version_scope` |
 
 Neither determines the other. One tenant routinely holds data from many network
 operators — a supplier takes deliveries from every grid operator it has customers
@@ -391,8 +411,12 @@ correction rather than to the history.
 
 Both need `btree_gist`, which ships in contrib and is created on demand.
 `PostgresHot::integrity_constraints(false)` turns them off; do that with a
-measurement in hand, since it trades an overlap being *refused* for an overlap
-being reported after the fact by [completeness](@/docs/completeness.md).
+measurement in hand, because what is left is *detection* rather than refusal:
+
+- An **overlap** shows up as `surplus` in [completeness](@/docs/completeness.md).
+- A **duplicated scope** reaches the typed reads, which refuse to fold two values
+  at one instant and raise `InvariantViolated`.
+- Neither covers a `SUM` written in SQL. That will simply be twice the truth.
 
 ## Cold-tier layout
 
