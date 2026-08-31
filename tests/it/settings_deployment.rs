@@ -248,3 +248,114 @@ archival_step = "1d"
     // that would have failed on a bare creation.
     deployment.store().await.expect("idempotent");
 }
+
+#[tokio::test]
+async fn a_subject_column_in_a_file_reaches_a_registry_that_can_erase() {
+    // `subject_column` was parseable, validated and *unreachable*: nothing on the
+    // deployment path built a `SubjectRegistry`, and `MeterStoreBuilder::build`
+    // refuses a subject column without one. So every subcommand of a deployment
+    // declaring one — `create`, `status`, and the § 60 Abs. 6 sweep the CLI
+    // documents as needing exactly this — failed at startup with a message about
+    // a registry no configuration file could supply.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let text = format!(
+        r#"
+[hot]
+url = "{url}"
+max_connections = 4
+
+[cold]
+catalog = "sql"
+uri = "{url}"
+warehouse = "file://{}"
+namespace = "metering"
+file_target_bytes = 8388608
+metadata_pool_max_connections = 2
+
+[privacy]
+erasure_secret = "0123456789abcdef0123456789abcdef"
+
+[[tables]]
+name = "readings_versions"
+subject_column = "subject_ref"
+
+[tables.archival]
+settlement_lag = "1d"
+archival_step = "1d"
+"#,
+        warehouse.path().display(),
+    );
+
+    let deployment = Settings::from_toml(&text)
+        .expect("parse")
+        .connect()
+        .await
+        .expect("connect");
+    assert!(
+        deployment.registry.is_some(),
+        "a declared subject column builds the registry it resolves against"
+    );
+
+    let store = deployment.store().await.expect("store");
+    let registry = store
+        .subject_registry()
+        .expect("the store carries the deployment's registry");
+    assert!(
+        registry.suppresses_reregistration(),
+        "the file supplied a key, so the suppression list is on"
+    );
+
+    // End to end: register, erase, and the trail is what `meterstore erasures`
+    // reads. `create_tables` had to have created the registry's own two tables,
+    // or none of this reaches a relation.
+    let subject = store
+        .register_subject("tenant-a:12345678905")
+        .await
+        .expect("register");
+    store
+        .erase_subject(&subject, "DSAR-2026-0042", "dpo", START)
+        .await
+        .expect("erase");
+    let trail = registry.erasures(10).await.expect("trail");
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].reason, "DSAR-2026-0042");
+    assert_eq!(trail[0].actor, "dpo");
+    // The trail proves an erasure happened without recording whom it concerned.
+    assert_eq!(trail[0].subject, subject);
+
+    // And the suppression list holds: a replaying pipeline does not re-link the
+    // subject it just erased.
+    let err = store
+        .register_subject("tenant-a:12345678905")
+        .await
+        .expect_err("suppressed");
+    assert!(err.to_string().contains("erased"), "{err}");
+}
+
+#[tokio::test]
+async fn a_deployment_with_no_subject_column_builds_no_registry() {
+    // The commonest configuration. A registry built anyway would create two
+    // tables in a database that has no use for them.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+
+    let deployment = Settings::from_toml(&file(&url, warehouse.path()))
+        .expect("parse")
+        .connect()
+        .await
+        .expect("connect");
+    assert!(deployment.registry.is_none());
+    assert!(
+        deployment
+            .store()
+            .await
+            .expect("store")
+            .subject_registry()
+            .is_none()
+    );
+}

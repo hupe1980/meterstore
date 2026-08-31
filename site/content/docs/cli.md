@@ -20,6 +20,7 @@ or two library calls, and nothing here is unreachable from Rust.
 | `query` `explain` | SQL across both tiers, with the boundary it ran against |
 | `completeness` | Which channels are short, and which delivered nothing |
 | `snapshots` | What a settlement rerun can pin to |
+| `erasures` | The erasure audit trail, deployment-wide |
 | `serve` | Flight SQL and the Iceberg REST façade |
 | `purge` | Destroy a table. No recovery path |
 
@@ -73,7 +74,8 @@ meterstore maintain --anonymise-after-years 3 --anonymise-actor retention-job
 Off by default and irreversible when on. The years are full calendar years after
 the year of collection, not `now - 3 years`: the statutory clock starts at the
 *Schluss des Kalenderjahres*, and the rolling spelling would erase a January value
-a year early. Needs a table declaring `subject_column` — see
+a year early. Needs a table declaring `subject_column` and a `[privacy]` section
+for the registry it resolves against — see
 [Privacy and retention](@/docs/privacy.md).
 
 ## Asking what the store holds
@@ -151,28 +153,34 @@ against their *own* `sparte`; the flag decides where the **range** is cut, which
 one value cannot do for two — so a table holding both is reported once per
 commodity.
 
-`--from`/`--to` take RFC 3339 instants for any other period, and `--malo` /
-`--obis` narrow the report to one measuring point or one channel — in the scan,
-so asking about one meter does not cost a scan of the portfolio.
+`--from`/`--to` take RFC 3339 instants for any other period, and `--malo`,
+`--melo` and `--obis` narrow the report to one measuring point, one meter or one
+channel — in the scan, so asking about one meter does not cost a scan of the
+portfolio. Each is **parsed**: a mistyped identifier fails at the call rather
+than narrowing to nothing, which on this report reads as *"everything is fine"*.
 
 **`--seen-since` is the finding a range cannot make about itself.** A channel that
 delivered nothing produces no rows to aggregate, so it is absent from the report
 rather than reported as empty — unless a roster is drawn from an earlier window.
 There is no default, because what a roster means is master data this crate does
 not hold: too short and a meter read monthly looks decommissioned, too long and
-every terminated measuring point is a standing finding. `--malo` and `--obis`
-narrow the roster too, or every channel outside them would come back as silent.
+every terminated measuring point is a standing finding. The narrowing flags apply
+to the roster too, or every channel outside them would come back as silent.
 
 This exits **zero** whatever it finds. A gap is a fact to triage; `status` is the
 check that fails, because a stranded row means query results are *wrong* rather
 than incomplete. For a monitoring check, read the JSON — it carries
-`channels_reported`, `channels_incomplete`, `channels_silent` and
-`intervals_missing` beside the rows:
+`channels_reported`, `channels_incomplete`, `channels_silent`,
+`channels_unmeasurable` and `intervals_missing` beside the rows:
 
 ```bash
 meterstore completeness --month 2026-06 --format json \
-  | jq -e '.channels_incomplete == 0'
+  | jq -e '.channels_incomplete == 0 and .channels_unmeasurable == 0'
 ```
+
+Both halves matter. A channel with no declared resolution has no expectation to
+compare against, so it reports `complete` without anything having been checked —
+a check on `channels_incomplete` alone passes a month nobody could judge.
 
 More on what the numbers mean, and why `missing` is not `expected - actual`, in
 [Completeness](@/docs/completeness.md).
@@ -264,6 +272,37 @@ meterstore purge --table readings_versions --confirm readings_versions
 The only operation in the crate that deletes stored readings — every partition,
 the catalogue entry and the data files in object storage. There is no recovery
 path, which is why the name has to be given twice.
+
+## The erasure trail
+
+```bash
+meterstore erasures --limit 50
+```
+
+"We deleted it" is not evidence. Every erasure writes a row saying **when, why
+and by whom** — and deliberately not *whose*, since the natural identifier is the
+thing being destroyed. This is the report a regulator asks for.
+
+The registry is deployment-wide, so the trail is one list rather than one per
+table. A configuration whose tables declare no `subject_column` holds no mapping
+at all, and says so rather than printing an empty list that reads as "nothing has
+been erased".
+
+## No `meterstore erase`
+
+Reading the trail is the only thing the command line does with the subject
+registry, and the omission is the same shape as the one below.
+
+An Article 17 request usually reaches an application's own tables too — billing
+periods, quality assessments, substitute-value logs — and those must succeed or
+fail **together** with the mapping. A CLI invocation commits its own transaction
+and cannot enclose them, so the failure mode is the worst kind: a subject
+reported as erased whose derived rows survived. `SubjectRegistry::erase_in` takes
+a transaction the caller owns, which is where that erasure belongs.
+[Privacy and retention →](@/docs/privacy.md)
+
+The duty that comes due on its own is a different matter, and the CLI does run
+it: `meterstore maintain --anonymise-after-years 3`.
 
 ## No `meterstore append`
 

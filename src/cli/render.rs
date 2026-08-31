@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 
+use crate::erasure::ErasureRecord;
 use crate::error::{Error, Result};
 use crate::session::system::TableStatus;
 use crate::session::{Completeness, QueryDescription, QueryResult};
@@ -228,6 +229,12 @@ pub fn completeness(
         "channels_reported": rows.len(),
         "channels_incomplete": rows.iter().filter(|(_, r)| !r.is_complete()).count(),
         "channels_silent": rows.iter().filter(|(_, r)| r.is_silent()).count(),
+        // Counted separately because such a channel reports `complete = true`
+        // without anything having been checked: it declares no resolution, or a
+        // calendar one with no fixed count within a day. A monitoring check on
+        // `channels_incomplete` alone therefore passes a month nobody could
+        // judge, which is the answer this report exists not to give.
+        "channels_unmeasurable": rows.iter().filter(|(_, r)| !r.is_measurable()).count(),
         // Not `missing`: every channel object carries one of those, and a
         // top-level key of the same name reads as a duplicate rather than as a
         // total.
@@ -267,12 +274,14 @@ pub fn completeness(
         }
         println!();
         println!(
-            "{} channel(s) over [{}, {}) — {} incomplete, {} silent, {} interval(s) missing",
+            "{} channel(s) over [{}, {}) — {} incomplete, {} silent, {} unmeasurable, \
+             {} interval(s) missing",
             rows.len(),
             instant(from),
             instant(to),
             rows.iter().filter(|(_, r)| !r.is_complete()).count(),
             rows.iter().filter(|(_, r)| r.is_silent()).count(),
+            rows.iter().filter(|(_, r)| !r.is_measurable()).count(),
             rows.iter().map(|(_, r)| r.missing).sum::<u64>(),
         );
         // The discriminators are printed under the row rather than as columns:
@@ -405,6 +414,46 @@ pub fn snapshots(rows: &[(String, SnapshotInfo)], format: Format) -> Result<()> 
                 s.watermark
                     .map_or_else(|| "— (foreign commit)".to_string(), |w| instant(w.get())),
                 s.rows.map_or_else(|| "—".to_string(), |n| n.to_string()),
+            );
+        }
+    })
+}
+
+/// The erasure audit trail.
+///
+/// Deliberately holds no natural identifier — that is the thing being erased,
+/// and a trail that retained it would defeat the exercise. What it proves is that
+/// an erasure happened, when, why and by whom, which is what a regulator asks
+/// for.
+pub fn erasures(rows: &[ErasureRecord], format: Format) -> Result<()> {
+    let document = json!({
+        "erasures": rows
+            .iter()
+            .map(|r| json!({
+                "subject_ref": r.subject.as_str(),
+                "erased_at": instant(r.erased_at),
+                "reason": r.reason,
+                "actor": r.actor,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    emit(format, &document, || {
+        if rows.is_empty() {
+            // An empty trail is a fact rather than an error: a deployment that
+            // has had no Article 17 request and is inside its retention ceiling
+            // has erased nothing, and a blank screen reads as a broken command.
+            println!("no erasures recorded");
+            return;
+        }
+        println!("{:<26} {:<40} {:<24} REASON", "ERASED", "SUBJECT", "ACTOR");
+        for r in rows {
+            println!(
+                "{:<26} {:<40} {:<24} {}",
+                instant(r.erased_at),
+                r.subject.as_str(),
+                r.actor,
+                r.reason,
             );
         }
     })

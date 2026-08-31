@@ -10,7 +10,7 @@ weight = 1
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
 | PostgreSQL | **12 or later** | See below. The test suite pins 16 |
-| `metering` | **0.21 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | **0.22 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs only `SELECT` plus ownership of its own tables. No server

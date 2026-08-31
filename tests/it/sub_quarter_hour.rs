@@ -57,9 +57,9 @@ async fn split_store(workload: &MeteringWorkload) -> (TestHarness, meterstore::M
 fn the_domain_counts_sub_quarter_hour_intervals_per_calendar_day() {
     // The arithmetic everything below depends on. Asserted directly first, so a
     // failure downstream is attributable to storage rather than to the calendar.
-    // `from_seconds` is the one way in since metering 0.19: `Custom` carries an
-    // opaque `CustomSeconds` that refuses the durations a named variant already
-    // spells, so `Custom(900)` can no longer exist beside `QuarterHour`.
+    // `from_seconds` is the one way in: `Custom` carries an opaque
+    // `CustomSeconds` that refuses the durations a named variant already spells,
+    // so there is no `Custom(900)` beside `QuarterHour`.
     let minute = IntervalResolution::from_seconds(60).expect("a minute is a resolution");
     assert_eq!(minute.to_iso8601(), "PT60S");
     assert_eq!(

@@ -92,7 +92,7 @@ impl<'a> SeriesQuery<'a> {
     /// identifier — so it is checked against the store's declared columns rather
     /// than interpolated on trust. An unknown name is refused here, naming what is
     /// available, instead of reaching the engine as a fragment of SQL.
-    pub fn column_eq(mut self, name: &str, value: ScalarValue) -> Result<Self> {
+    pub fn column_eq(self, name: &str, value: ScalarValue) -> Result<Self> {
         // Declared columns, plus every merge-key column beyond the core three —
         // which is the same list except on a table that identifies a reading by
         // its Messlokation, where `melo_id` is a *core* column doing an identity
@@ -120,8 +120,51 @@ impl<'a> SeriesQuery<'a> {
                 accepted.join(", "),
             )));
         }
-        self.filters.push((name.to_string(), value));
-        Ok(self)
+        Ok(self.with_filter(name.to_string(), value))
+    }
+
+    /// Add one equality predicate. The single push site, so `melo` and
+    /// `column_eq` cannot come to differ about how a filter is carried.
+    fn with_filter(mut self, name: String, value: ScalarValue) -> Self {
+        self.filters.push((name, value));
+        self
+    }
+
+    /// Restrict to one **Messlokation** — one meter.
+    ///
+    /// The narrowing a table that declares
+    /// [`identify_by_melo`](crate::config::TableConfig::identify_by_melo) cannot
+    /// do without: `melo_id` joins the merge key there, so one Marktlokation
+    /// measured by two meters stores two series per channel and an unnarrowed
+    /// read folds both into one — which sums a load profile to twice the truth.
+    ///
+    /// On a table where `melo_id` only *labels* a row it is still a filter,
+    /// selecting the rows that name this meter.
+    ///
+    /// # Why this exists beside `column_eq`
+    ///
+    /// [`column_eq`](Self::column_eq) accepts `melo_id` on such a table and
+    /// takes a bare `ScalarValue`, which is **not parsed**: a Zählpunktbezeichnung
+    /// is 33 characters with no check digit, stored uppercase, and a truncated or
+    /// lower-cased literal matches nothing at all. Silently — an empty series
+    /// looks exactly like a meter that reported nothing, and that is the report
+    /// a settlement run would act on. This one parses
+    /// ([`parse_melo`](crate::encode::parse_melo)) and takes whatever the caller
+    /// is holding: a [`MeloId`], a `&str` or a `String`.
+    pub fn melo<M>(self, melo_id: M) -> Result<Self>
+    where
+        M: TryInto<MeloId>,
+        M::Error: std::fmt::Display,
+    {
+        let melo = crate::encode::parse_melo(melo_id)?;
+        // Pushed directly rather than through `column_eq`, whose accepted set is
+        // the *declared* columns plus the discriminators: `melo_id` is a core
+        // column on every table, and refusing it where it merely labels a row
+        // would make the typed narrowing narrower than the untyped one.
+        Ok(self.with_filter(
+            col::MELO_ID.to_string(),
+            ScalarValue::Utf8(Some(melo.to_string())),
+        ))
     }
 
     /// Restrict to intervals whose resolved quality is one of `flags`.
@@ -698,21 +741,39 @@ fn refuse_mixed_readings(
         let (channel, identity) = (&first.0, &first.1);
         // The channel first: it is the difference a caller is likelier to have
         // meant, and `.obis(..)` is the narrower fix.
-        let differs = if channel != &key.0 {
-            format!(
-                "two channels ({} and {})",
-                channel.as_deref().unwrap_or("<none>"),
-                key.0.as_deref().unwrap_or("<none>"),
+        let (differs, fix) = if channel != &key.0 {
+            (
+                format!(
+                    "two channels ({} and {})",
+                    channel.as_deref().unwrap_or("<none>"),
+                    key.0.as_deref().unwrap_or("<none>"),
+                ),
+                ".obis(..)",
             )
         } else {
-            format!("two readings ({} and {})", render(identity), render(&key.1))
+            // Which identity column actually differs decides which narrowing to
+            // name. A caller told to reach for `.column_eq("melo_id", …)` would
+            // be sent to the untyped door for a value that has to be parsed —
+            // and an unparsed Zählpunktbezeichnung matches nothing at all.
+            let melo_differs = identity
+                .iter()
+                .zip(&key.1)
+                .any(|((name, a), (_, b))| name == col::MELO_ID && a != b);
+            (
+                format!("two readings ({} and {})", render(identity), render(&key.1)),
+                if melo_differs {
+                    ".melo(..)"
+                } else {
+                    ".column_eq(..)"
+                },
+            )
         };
 
         return Err(Error::config(format!(
             "{malo} spans {differs} over this range, and a MeasurementSeries can only \
              describe one — folding them puts two values at the same instant into one \
              series, which sums to twice the truth with nothing to notice it. Narrow the \
-             read with .obis(..) or .column_eq(..), or scope the session",
+             read with {fix}, or scope the session",
             malo = stored[0].series.malo_id,
         )));
     }

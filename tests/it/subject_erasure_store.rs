@@ -601,3 +601,73 @@ async fn declaring_a_subject_column_without_a_registry_fails_at_build() {
     // with an unbacked subject column.
     assert!(!err.to_string().is_empty());
 }
+
+#[tokio::test]
+async fn a_sweep_from_a_restricted_view_is_refused_rather_than_erasing_a_live_subject() {
+    // The one place a restricted read mode destroys data instead of misreporting
+    // it. A subject's due-date is `max(from)` over the session running the sweep
+    // — so under `Historical`, which sees the cold tier only, a subject metered
+    // daily looks last-seen at the final archived interval. Old enough to erase,
+    // and still live. Erasure has no recovery path.
+    let (store, _w) = store_with_subjects().await;
+
+    let live = store.register_subject("customer-still-here").await.unwrap();
+    store
+        .append(&[reading_at(D20, Some(live.as_str()))])
+        .await
+        .expect("a current reading, in the hot window");
+
+    let cutoff = datetime!(2030-01-01 00:00 UTC);
+
+    // Every restricted posture is refused, not just the pinned ones: `Historical`
+    // is the dangerous one precisely because it is the mode a reporting service
+    // would already be holding.
+    for mode in [
+        meterstore::ReadMode::Historical,
+        meterstore::ReadMode::Operational,
+    ] {
+        let restricted = store.in_read_mode(mode).await.expect("derived session");
+        let err = restricted
+            .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+            .await
+            .expect_err("a sweep must not decide from a partial view")
+            .to_string();
+        assert!(err.contains("anonymise_before"), "{mode:?}: {err}");
+        assert!(
+            err.contains("Use the store this one was derived from"),
+            "{err}"
+        );
+    }
+
+    let pinned = store
+        .as_known_at(datetime!(2020-01-01 00:00 UTC))
+        .await
+        .expect("pinned session");
+    assert!(
+        pinned
+            .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+            .await
+            .is_err(),
+        "a transaction-time ceiling hides every reading recorded after it"
+    );
+
+    // The linkage survived all four refusals.
+    assert!(
+        store
+            .subject_registry()
+            .unwrap()
+            .resolve(&live)
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing was erased"
+    );
+
+    // And the unrestricted store still sweeps, so the guard did not just turn the
+    // feature off.
+    let erased = store
+        .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+        .await
+        .expect("the store it was derived from is unrestricted");
+    assert_eq!(erased.len(), 1);
+}

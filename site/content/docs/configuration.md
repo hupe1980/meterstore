@@ -24,6 +24,11 @@ metadata_pool_max_connections = 4  # the sql catalogue's own pool
 region = "eu-central-1"          # non-secret half of the S3 credentials
 # endpoint = "https://minio.internal"   # S3-compatible stores
 
+# Only where a table declares a `subject_column`. Without this section such a
+# deployment is refused at startup: the references would resolve to nothing.
+[privacy]
+erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes, turns on suppression
+
 [[tables]]
 name = "readings_versions"
 time_model = "interval"          # or "point" — a Zählerstandsgang
@@ -35,7 +40,8 @@ subject_column = "subject_ref"
 # so two rows differing in it are different readings.
 extra_columns = [
   { name = "tenant",        identity = true },
-  { name = "bilanzkreis",   check = "EIC" },                 # check-character validated
+  { name = "bilanzkreis",   check = "EIC:X" },               # an EIC, and a party code
+  { name = "lieferant",     check = "BDEW" },                # a Marktpartner-ID, not 13 digits
   { name = "ingest_source", values = ["MSCONS", "SMGW"] },   # renders a CHECK
 ]
 
@@ -56,6 +62,35 @@ min_snapshots_to_keep = 20
 let settings = Settings::from_path("meterstore.toml")?;
 let config = settings.single_table()?;   // fully validated
 ```
+
+`check` takes `"EIC"`, `"MALO"`, `"MELO"` or `"BDEW"` — the identifier schemes
+`ValueCheck` knows. Each stops somewhere different, and
+[checked columns](@/docs/storage-model.md#checked-columns) says where.
+
+An EIC may name its **object type**: `"EIC:X"` a party (a Bilanzkreis), `"EIC:Y"`
+an area (a Bilanzierungsgebiet), and the rest of ENTSO-E's list. That is position
+3 of the code and the only thing distinguishing the two, so declaring it is what
+stops a Bilanzierungsgebiet from being stored as a Bilanzkreis — and unlike the
+check character it is a regular expression, so the database enforces it too. A
+letter this build does not list is refused at `meterstore check` rather than
+degrading to a bare `"EIC"`.
+
+## `[privacy]`
+
+Needed exactly when a table declares a `subject_column`, and inert otherwise. A
+subject column names the column holding pseudonymous references, and a
+deployment declaring one without a registry is **refused at startup** rather than
+at the first erasure request: the references would resolve to nothing and an
+Article 17 request would have no mapping to destroy.
+
+`Settings::connect()` builds one registry for the whole deployment, because the
+mapping is deployment-wide — two tables that register the same natural
+identifier share a `SubjectRef`, and a single erasure unlinks both.
+
+`erasure_secret` is optional and at least 32 bytes. It turns on the
+**suppression list**, without which a replaying pipeline silently re-links a
+subject whose mapping was deleted.
+[Why it is optional →](@/docs/privacy.md#configuring-it)
 
 `meterstore check` validates the same file from a shell, connecting to nothing —
 which is what makes it a CI step rather than a deployment-time surprise. See

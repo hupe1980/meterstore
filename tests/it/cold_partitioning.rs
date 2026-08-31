@@ -1,9 +1,9 @@
 //! The cold layout's partition spec, and what it actually prunes.
 //!
 //! §10.1 partitions by the declared identity columns and then `month(from)`.
-//! Both halves are here because both were, until recently, documented and
-//! absent: the table was created unpartitioned and the `buckets` setting left
-//! over from the original design validated a number nothing read.
+//! Both halves are asserted because a partition spec is the kind of thing that
+//! can be documented and absent — the table created unpartitioned, or a
+//! `buckets` setting validated by configuration and read by nothing.
 //!
 //! The assertions are deliberately about *observable layout* rather than about
 //! `iceberg-rust`'s planner agreeing with itself. A partition spec that exists

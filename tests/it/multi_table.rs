@@ -707,3 +707,295 @@ async fn one_maintenance_loop_covers_every_table_and_names_them_apart() {
         );
     }
 }
+
+/// A table keyed by a `tenant` identity column, so a catalog of two of them can
+/// be confined to one tenant as a whole.
+fn tenanted(name: &str) -> ValidatedTableConfig {
+    use datafusion::arrow::datatypes::{DataType, Field};
+    TableConfig::new(name)
+        .settlement_lag(Duration::days(1))
+        .identity_column(Field::new("tenant", DataType::Utf8, false))
+        .build()
+        .expect("config")
+}
+
+/// One quarter-hour reading for a tenant, on a named table's shape.
+fn tenant_reading(tenant: &str, kwh: i64, version: u128) -> meterstore::encode::StoredSeries {
+    use datafusion::common::ScalarValue;
+    use metering::interval::{MeterInterval, Sparte};
+    use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+
+    let interval = MeterInterval {
+        from: START,
+        to: START + Duration::minutes(15),
+        value: rust_decimal::Decimal::new(kwh, 0),
+        quality: metering::QualityFlag::Measured,
+        obis_code: "1-0:1.8.0".parse().ok(),
+    };
+    let series = MeasurementSeries::new(
+        "11111111115".parse().unwrap(),
+        "1-0:1.8.0".parse().ok(),
+        vec![interval],
+        MeasurementSource::ManualEntry {
+            operator_id: "test".to_string(),
+            reason: "fixture".to_string(),
+        },
+        datetime!(2026-07-27 06:00 UTC),
+    );
+    meterstore::encode::StoredSeries::new(
+        series,
+        meterstore::ScopedVersion::new(
+            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom).unwrap(),
+            meterstore::Version::new(version).unwrap(),
+        ),
+        datetime!(2026-07-27 06:00 UTC),
+    )
+    .with_extra("tenant", ScalarValue::Utf8(Some(tenant.to_string())))
+}
+
+/// Two tenanted tables in one catalog, each holding both tenants' rows.
+async fn two_tenanted_tables() -> (TestHarness, MeterCatalog) {
+    let harness = TestHarness::with_config(tenanted(TestHarness::TABLE))
+        .await
+        .expect("harness");
+
+    let catalog = MeterCatalog::builder()
+        .table(
+            harness
+                .builder_for(tenanted(TestHarness::TABLE))
+                .await
+                .expect("primary builder"),
+        )
+        .table(
+            harness
+                .builder_for(tenanted(SECOND))
+                .await
+                .expect("secondary builder"),
+        )
+        .build()
+        .await
+        .expect("catalog");
+    catalog.create_tables().await.expect("create both");
+
+    for store in catalog.tables() {
+        store
+            .hot_store()
+            .ensure_partitions(
+                store.config().name(),
+                START,
+                START + Duration::days(2),
+                Duration::DAY,
+            )
+            .await
+            .expect("partitions");
+        harness
+            .seed_watermark_for(store.config().name(), START, Duration::DAY)
+            .await
+            .expect("watermark");
+        // Different values per tenant, so a scope that leaked would change the
+        // number rather than happen to agree.
+        store
+            .append(&[
+                tenant_reading("a", 10, 20_260_720_000_001),
+                tenant_reading("b", 7, 20_260_720_000_002),
+            ])
+            .await
+            .expect("append");
+    }
+
+    (harness, catalog)
+}
+
+#[tokio::test]
+async fn a_catalog_confines_every_table_to_one_tenant() {
+    // `isolated` confines the relations a session can name and
+    // `MeterStore::scoped` confines one table's rows. A multi-tenant deployment
+    // serving a whole catalog needs the cross-table join *and* the tenant
+    // boundary, which is what this gives.
+    let (_h, catalog) = two_tenanted_tables().await;
+
+    async fn total(c: &MeterCatalog) -> i64 {
+        count(
+            &c.query("SELECT SUM(value)::BIGINT FROM readings")
+                .await
+                .expect("query"),
+        )
+    }
+
+    // Unscoped, the catalog sees both tenants.
+    assert_eq!(total(&catalog).await, 17);
+
+    let confined = catalog.scoped("tenant", "a").await.expect("scoped");
+    assert_eq!(total(&confined).await, 10, "one tenant's rows only");
+
+    // Both tables, and the join that is the catalog's reason to exist still
+    // plans — which is the half `isolated` could not give.
+    let joined = confined
+        .query(
+            "SELECT SUM(r.value)::BIGINT FROM readings r \
+             JOIN esa_typ2 e ON r.malo_id = e.malo_id",
+        )
+        .await
+        .expect("a scoped catalog still joins");
+    assert_eq!(count(&joined), 10, "the second table is scoped too");
+
+    // Caller-supplied SQL cannot step past it: the predicate is injected below
+    // the projection, so naming the other tenant returns nothing rather than
+    // the other tenant's rows.
+    let escape = confined
+        .query("SELECT SUM(value)::BIGINT FROM readings WHERE tenant = 'b'")
+        .await
+        .expect("plans");
+    assert_eq!(count(&escape), 0, "the scope is enforced, not advisory");
+
+    // And the raw versions relation is scoped as well, or the audit trail would
+    // be the way out.
+    let raw = confined
+        .query("SELECT COUNT(DISTINCT tenant)::BIGINT FROM readings_versions")
+        .await
+        .expect("plans");
+    assert_eq!(count(&raw), 1);
+}
+
+#[tokio::test]
+async fn a_catalog_scope_is_all_of_its_tables_or_none_of_them() {
+    // A scope that covered three tables and silently skipped the fourth is not a
+    // boundary. The refusal names the table that cannot carry it, and happens
+    // before any table is confined.
+    let harness = TestHarness::with_config(tenanted(TestHarness::TABLE))
+        .await
+        .expect("harness");
+    let catalog = MeterCatalog::builder()
+        .table(
+            harness
+                .builder_for(tenanted(TestHarness::TABLE))
+                .await
+                .expect("primary"),
+        )
+        // No `tenant` column at all.
+        .table(
+            harness
+                .builder_for(config(SECOND))
+                .await
+                .expect("secondary"),
+        )
+        .build()
+        .await
+        .expect("catalog");
+
+    let err = catalog
+        .scoped("tenant", "a")
+        .await
+        .expect_err("one table cannot carry the scope")
+        .to_string();
+    assert!(err.contains(SECOND), "the message names the table: {err}");
+    assert!(err.contains("tenant"), "{err}");
+    assert!(
+        err.contains("isolate"),
+        "the message names the honest alternative: {err}"
+    );
+
+    // An attribute column is refused for the same reason it is on one store:
+    // only a merge-key column partitions readings.
+    assert!(catalog.scoped("bilanzkreis", "BK-1").await.is_err());
+}
+
+#[tokio::test]
+async fn a_catalog_scope_only_ever_narrows() {
+    let (_h, catalog) = two_tenanted_tables().await;
+    let a = catalog.scoped("tenant", "a").await.expect("scoped");
+
+    // Idempotent.
+    a.scoped("tenant", "a").await.expect("same value");
+
+    // And it cannot be re-pointed: a handle confined to one tenant that could
+    // reach another is not a boundary.
+    let err = a
+        .scoped("tenant", "b")
+        .await
+        .expect_err("re-scoping widens")
+        .to_string();
+    assert!(err.contains("narrows"), "{err}");
+}
+
+#[tokio::test]
+async fn a_derived_catalog_keeps_the_scope_it_was_given() {
+    // A boundary a derived session drops is not a boundary — the property
+    // `MeterStore` already holds, now across a catalog's rebuild.
+    let (_h, catalog) = two_tenanted_tables().await;
+    let confined = catalog.scoped("tenant", "a").await.expect("scoped");
+
+    let historical = confined
+        .in_read_mode(meterstore::ReadMode::Historical)
+        .await
+        .expect("historical");
+    for store in historical.tables() {
+        assert_eq!(
+            store.row_scope().len(),
+            1,
+            "{} lost its scope",
+            store.config().name()
+        );
+    }
+
+    let known = confined
+        .as_known_at(datetime!(2026-07-28 00:00 UTC))
+        .await
+        .expect("as_known_at");
+    for store in known.tables() {
+        assert_eq!(store.row_scope().len(), 1);
+    }
+
+    // `as_of` has no catalog form, and says why rather than inventing a
+    // correspondence between two tables' snapshots.
+    let err = catalog
+        .in_read_mode(meterstore::ReadMode::AsOf {
+            snapshot: meterstore::SnapshotSelector::Id(1),
+            max_version: None,
+        })
+        .await
+        .expect_err("a snapshot belongs to one table")
+        .to_string();
+    assert!(err.contains("one table"), "{err}");
+    assert!(err.contains("as_known_at"), "{err}");
+}
+
+#[tokio::test]
+async fn a_failing_table_reaches_the_caller_as_the_error_it_raised() {
+    // `archive_all` must not wrap. Folding a per-table failure into a
+    // `Storage` error flattens the taxonomy a caller matches on and, worse,
+    // makes it **retryable** — `InvariantViolated` is the one condition this
+    // crate is most emphatic must not be retried past, and archival is where it
+    // surfaces. The table's name belongs in a log line, not in the message.
+    let (_h, catalog) = two_tables().await;
+    let store = catalog.table(SECOND).expect("secondary");
+
+    // Break one table's hot half, so archival fails the same way through both
+    // doors. Which variant it raises does not matter: what is asserted is that
+    // the catalog hands back what the store raised.
+    store
+        .hot_store()
+        .drop_table(SECOND)
+        .await
+        .expect("drop the hot half");
+
+    let direct = store
+        .archive(START + Duration::days(30), 4)
+        .await
+        .expect_err("the hot table is gone");
+    let through_catalog = catalog
+        .archive_all(START + Duration::days(30), 4)
+        .await
+        .expect_err("so the catalog cannot archive it either");
+
+    assert_eq!(
+        through_catalog.to_string(),
+        direct.to_string(),
+        "the catalog wrapped the error instead of passing it on"
+    );
+    assert_eq!(
+        through_catalog.is_retryable(),
+        direct.is_retryable(),
+        "wrapping changed whether a supervisor will retry"
+    );
+}

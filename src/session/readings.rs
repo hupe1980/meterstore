@@ -75,14 +75,22 @@ impl<'a> ReadingsQuery<'a> {
     ///
     /// The narrowing a point table usually needs: a Marktlokation may be measured
     /// by several, each carrying the same register at the same instants, so an
-    /// unnarrowed read spans them. Parsed on the way in, so a truncated or padded
-    /// Zählpunktbezeichnung fails here rather than silently matching nothing.
-    pub fn melo(mut self, melo_id: &str) -> Result<Self> {
-        self.melo_id = Some(
-            melo_id
-                .parse::<MeloId>()
-                .map_err(|e| Error::encode(col::MELO_ID, format!("{melo_id:?}: {e}")))?,
-        );
+    /// unnarrowed read spans them. Parsed on the way in
+    /// ([`parse_melo`](crate::encode::parse_melo)), so a truncated, padded or
+    /// lower-cased Zählpunktbezeichnung fails here rather than silently matching
+    /// nothing.
+    ///
+    /// Takes whatever the caller is holding — a [`MeloId`], a `&str` or a
+    /// `String`. The first is the common one and costs nothing: a
+    /// [`channels`](Self::channels) or [`collect_by_channel`](Self::collect_by_channel)
+    /// read hands back `MeloId`s, and narrowing to one of them should not go
+    /// back through a string.
+    pub fn melo<M>(mut self, melo_id: M) -> Result<Self>
+    where
+        M: TryInto<MeloId>,
+        M::Error: std::fmt::Display,
+    {
+        self.melo_id = Some(crate::encode::parse_melo(melo_id)?);
         Ok(self)
     }
 

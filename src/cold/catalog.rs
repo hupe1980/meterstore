@@ -103,6 +103,12 @@ fn is_s3_scheme(scheme: &str) -> bool {
 /// A scheme whose backend feature was not compiled in is an error rather than a
 /// silent fallback to the local filesystem, which would write a "cloud" warehouse
 /// to disk and fail only later, obscurely.
+///
+/// Both refusals are [`Error::Config`](crate::Error::Config) rather than
+/// `Storage`, and the difference is not cosmetic: `Storage` is
+/// [retryable](crate::Error::is_retryable), so a supervisor reading the CLI's
+/// exit code would restart-loop forever on a scheme this build can never
+/// support. Neither of these changes on a retry.
 pub(crate) fn warehouse_factory(
     warehouse_uri: &str,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>> {
@@ -119,7 +125,7 @@ pub(crate) fn warehouse_factory(
                 })
             }
             #[cfg(not(feature = "object-store-s3"))]
-            return Err(Error::Storage(format!(
+            return Err(Error::config(format!(
                 "warehouse scheme {scheme:?} needs the meterstore `object-store-s3` feature, which was not compiled in"
             )));
         }
@@ -129,7 +135,7 @@ pub(crate) fn warehouse_factory(
                 Arc::new(OpenDalStorageFactory::Gcs)
             }
             #[cfg(not(feature = "object-store-gcs"))]
-            return Err(Error::Storage(format!(
+            return Err(Error::config(format!(
                 "warehouse scheme {scheme:?} needs the meterstore `object-store-gcs` feature, which was not compiled in"
             )));
         }
@@ -139,13 +145,14 @@ pub(crate) fn warehouse_factory(
                 Arc::new(OpenDalStorageFactory::Azdls)
             }
             #[cfg(not(feature = "object-store-azure"))]
-            return Err(Error::Storage(format!(
+            return Err(Error::config(format!(
                 "warehouse scheme {scheme:?} needs the meterstore `object-store-azure` feature, which was not compiled in"
             )));
         }
         other => {
-            return Err(Error::Storage(format!(
-                "unsupported warehouse scheme {other:?}"
+            return Err(Error::config(format!(
+                "unsupported warehouse scheme {other:?}: the warehouse is file://, \
+                 memory://, s3://, gs:// or abfss://"
             )));
         }
     })
@@ -655,10 +662,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_scheme_is_an_error_not_a_local_fallback() {
-        // The old behaviour silently wrote a "cloud" warehouse to local disk.
-        let err = warehouse_factory("ftp://host/wh").unwrap_err().to_string();
-        assert!(err.contains("ftp"), "{err}");
+    fn a_scheme_this_build_cannot_serve_is_a_configuration_error() {
+        // Not a local fallback, which would write a "cloud" warehouse to disk and
+        // fail only later, obscurely — and not a `Storage` error either.
+        //
+        // `Storage` is retryable, and the CLI maps a retryable error to exit 75
+        // (EX_TEMPFAIL), so a supervisor would restart-loop forever on a scheme
+        // this binary can never support. Neither refusal changes on a retry.
+        let unknown = warehouse_factory("ftp://host/wh").unwrap_err();
+        assert!(unknown.to_string().contains("ftp"), "{unknown}");
+        assert!(
+            !unknown.is_retryable(),
+            "an unsupported scheme never becomes supported: {unknown}"
+        );
+
+        // The same for a scheme whose backend feature was not compiled in. In an
+        // `--all-features` build every one of them is, so this asserts the
+        // reachable half: whatever the feature set, the refusal is not
+        // retryable.
+        for uri in ["s3://bucket/wh", "gs://bucket/wh", "abfss://c@a/wh"] {
+            if let Err(e) = warehouse_factory(uri) {
+                assert!(!e.is_retryable(), "{uri}: {e}");
+                assert!(e.to_string().contains("feature"), "{uri}: {e}");
+            }
+        }
     }
 
     #[test]

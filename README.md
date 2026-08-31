@@ -86,8 +86,9 @@ meterstore status    # boundary, lag, write runway, health
 
 `meterstore query` runs SQL across both tiers and prints the boundary the answer
 was computed against; `meterstore completeness --month 2026-06` reports which
-channels are short before a settlement run trusts a `SUM`; `meterstore maintain`
-is the archival loop as a foreground process.
+channels are short before a settlement run trusts a `SUM`; `meterstore erasures`
+prints the audit trail a regulator asks for; `meterstore maintain` is the archival
+loop as a foreground process.
 [The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
 
 As a library:
@@ -175,16 +176,23 @@ store as one reading.
 A deployment's own columns are declared the same way, and an identifier among
 them is **parsed rather than trusted** — the argument that makes `malo_id` a
 `MaloId` rather than eleven digits. A Bilanzkreis is an ENTSO-E EIC with a check
-character:
+character; a Lieferant is a thirteen-digit Marktpartner-ID:
 
 ```rust
 TableConfig::new("readings_versions")
-    .identity_column(Field::new("tenant", DataType::Utf8, false))   // joins the merge key
-    .attribute_column(eic_column("bilanzkreis", true))              // check character enforced
+    .identity_column(Field::new("tenant", DataType::Utf8, false))            // joins the merge key
+    .attribute_column(checked_column("bilanzkreis", ValueCheck::Eic(Some(EicType::Party)), true))
+    .attribute_column(checked_column("lieferant", ValueCheck::Bdew, true))   // thirteen digits, no more
 ```
 
 Values are parsed and stored canonicalised, so one Bilanzkreis in two spellings
 cannot become two readings that never supersede each other.
+
+Each scheme stops somewhere different and the documentation says where: the EIC
+check character and the MaLo check digit are enforced, a MeLo has no check digit
+and gains the casing instead, and a Marktpartner-ID's thirteenth digit is
+deliberately **not** checked — BDEW's Bildungsvorschrift exempts GS1-issued GLNs,
+which is why `version_scope` does not check its operator's digit either.
 
 A `MeasurementSeries` holds one `obis_code`, so a typed read describes **one
 channel** — folding import and export together sums to twice the truth. A
@@ -194,6 +202,20 @@ measuring point is a set of them, so there is a read for that too, in one scan:
 store.series(malo)?.obis("1-0:1.8.0")?.range(from, to).collect().await?;   // one channel
 store.series(malo)?.range(from, to).collect_by_channel().await?;          // all of them
 ```
+
+A service exposing caller-supplied SQL confines it by **injection into the plan**,
+so no statement can omit, alias or `UNION` past the boundary — including across a
+join, where both sides carry their own:
+
+```rust
+store.scoped("tenant", t).await?;      // rows, one table
+catalog.isolated("readings").await?;   // relations
+catalog.scoped("tenant", t).await?;    // rows, every table — and the join still plans
+```
+
+The last is all-or-nothing: a column missing from some table's merge key is
+refused, naming that table, before any table is confined. A scope that covered
+three tables and skipped the fourth is not a boundary.
 
 `readings` is version-resolved; `readings_versions` is the raw audit trail. The
 naming is load-bearing — see
@@ -232,6 +254,21 @@ catalog.maintenance()
     .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
     .spawn();
 ```
+
+A table declaring a `subject_column` needs the registry it resolves against, and
+a configuration file supplies it — one for the whole deployment, because the
+mapping is:
+
+```toml
+[privacy]
+erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes; turns on suppression
+```
+
+`meterstore erasures` reads the audit trail from a shell, because *"we deleted
+it"* is not evidence. There is deliberately no `meterstore erase`: an Article 17
+request usually reaches an application's own tables too, and those must succeed
+or fail in **one transaction** with the mapping — which `erase_in` gives and a
+CLI invocation cannot.
 
 `meter_local_day` is not a convenience, and for **gas it is the wrong function**.
 `Europe/Berlin` observes daylight saving, so the UTC day boundary sits at 01:00
@@ -287,6 +324,22 @@ Blindarbeit, a gas volume, a Zustandszahl — so `NOT obis_is_import(...)` sweep
 those in with the feed-in. `obis_direction(obis_code)` returns `'IMPORT'`,
 `'EXPORT'` or null.
 
+A Bilanzkreis and a Bilanzierungsgebiet share the alphabet, the length and the
+check character; only **position 3** — the ENTSO-E object type — tells them apart.
+`ValueCheck::Eic(Some(EicType::Party))` (`check = "EIC:X"` in TOML) pins it, and
+unlike the check character that half is a regular expression, so PostgreSQL
+enforces it on rows this crate did not write.
+
+For a column that does not declare one, it is a query — and `eic_normalise` is
+what tells *"not an EIC"* apart from *"an EIC whose type letter this build does
+not list"*, which is the row a stricter parser downstream will reject:
+
+```sql
+SELECT DISTINCT bilanzkreis FROM readings
+WHERE eic_normalise(bilanzkreis) IS NOT NULL
+  AND eic_object_type(bilanzkreis) IS NULL;
+```
+
 [Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
 ## Requirements
@@ -295,7 +348,7 @@ those in with the feed-in. `obis_direction(obis_code)` returns `'IMPORT'`,
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
-| `metering` | **0.21 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.22 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
@@ -324,7 +377,7 @@ meterstore  → where it lives, how it is tiered, how it is queried  (all I/O)
 ```
 
 [`metering`](https://crates.io/crates/metering) owns intervals, units, quality
-flags, DST-correct calendars, the identifiers (`MaloId`, `MeloId`, `BdewCode`),
+flags, DST-correct calendars, the identifiers (`MaloId`, `MeloId`, `BdewCode`, `Eic`),
 validation, Ersatzwertbildung, gas conversion and aggregation. MeterStore adds
 exactly three things: **correction versioning**, the **transaction-time axis**,
 and the **tiering boundary**.
@@ -356,7 +409,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**857 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+**892 tests**: unit, property, doc and integration against real PostgreSQL 16 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
 read the output and agree with it, down to the audit trail's timestamps. The lock

@@ -301,6 +301,28 @@ fold, and takes `&self` so the builder survives. Both are narrowed by everything
 the builder was, including `.column_eq(..)`: an unscoped list would name channels
 belonging to a tenant the read cannot see.
 
+**A second Messlokation is a reading too**, on a Lastgang table declaring
+`identify_by_melo(true)` — two meters under one Marktlokation, both carrying
+`1-0:1.8.0` at the same instants. `.melo(..)` is the narrowing for that one:
+
+```rust
+let one_meter = store.series(malo)?
+    .melo(melo)?                       // a MeloId, a &str or a String
+    .obis("1-0:1.8.0")?
+    .range(from, to)
+    .collect().await?;
+```
+
+It **parses** where `.column_eq("melo_id", …)` does not, and that is the whole
+reason it exists beside it. A Zählpunktbezeichnung is 33 characters with no check
+digit, held uppercase — so a truncated or lower-cased literal matches nothing at
+all, and an empty series is indistinguishable from a meter that reported nothing.
+That is the report a settlement run would act on.
+
+The refusal names it: an unnarrowed read over two meters reports *"spans two
+readings … narrow the read with `.melo(..)`"*, and `.column_eq(..)` where the
+difference is a tenant.
+
 ### Reading registers
 
 ```rust
@@ -445,12 +467,13 @@ a commodity to its boundary is `planner::day_boundary`; everything below it is
 endpoint has no way to add a tenant predicate — and a deny-list of relation names
 is a boundary that holds until someone adds a table.
 
-Two things confine a session instead. Both inject into the plan, so no statement
+Three things confine a session instead. All inject into the plan, so no statement
 can omit, alias or `UNION` past them:
 
 ```rust
-let tenant   = store.scoped("tenant", "a").await?;       // rows
+let tenant   = store.scoped("tenant", "a").await?;       // rows, one table
 let billing  = catalog.isolated("readings").await?;      // relations
+let confined = catalog.scoped("tenant", "a").await?;     // rows, every table
 ```
 
 **`scoped` confines the rows.** The equality is enforced below the projection,
@@ -473,6 +496,26 @@ Mehrfamilienhaus is handed to code that must not see the others.
 any registered relation is reachable by naming it. An isolated session registers
 one table's two relations and nothing else, so a statement naming another fails to
 plan.
+
+**`MeterCatalog::scoped` confines the rows of every table at once**, which is
+what a multi-tenant deployment serving a whole catalog needs — Flight SQL serves
+one as readily as a single table. The join still plans, with **both** sides
+carrying their own predicate:
+
+```rust
+let confined = catalog.scoped("tenant", tenant).await?;
+confined.query("SELECT … FROM readings r JOIN esa_typ2 e USING (malo_id)").await?;
+```
+
+**Every table, or none.** A column that is not in some table's merge key is
+refused, naming that table, before any table is confined — a scope that covered
+three tables and silently skipped the fourth is not a boundary, it is a
+boundary-shaped object that leaks one relation. A catalog whose tables do not
+share an identity column cannot be scoped as a whole, and `isolated` plus
+`MeterStore::scoped` is the honest answer for it.
+
+Derived catalogs keep it: `as_known_at` and `in_read_mode` on a scoped catalog
+stay scoped, and re-pointing a fixed column is refused on every table.
 
 ### And only queries run
 
@@ -563,6 +606,12 @@ one row.
 
 ## The other stored identifier
 
+| Function | Returns |
+|---|---|
+| `eic_regelzone(code)` | `'TENNET'`, `'AMPRION'`, `'FIFTY_HERTZ'`, `'TRANSNET_BW'`, or null |
+| `eic_object_type(code)` | The object-type letter — `'X'` party, `'Y'` area, … — or null |
+| `eic_normalise(code)` | The canonical spelling, or null when the value is not an EIC at all |
+
 A deployment declaring a `bilanzierungsgebiet` column ([checked
 columns](@/docs/storage-model.md#checked-columns)) can group by its **Regelzone**
 without a mapping table:
@@ -581,6 +630,68 @@ the Regelzone letter.
 Null for a Bilanzkreis, for another issuing office's code, and for a string that
 is not an EIC — the argument comes from a deployment column that may not be
 declared `check = "EIC"`, so one row of free text must not take a report down.
+
+### What an EIC names is a query, not a constraint
+
+The same sixteen-character alphabet addresses a Bilanzkreis and a
+Bilanzierungsgebiet, and only **position 3** — the ENTSO-E object type — tells
+them apart. A column can declare which it holds
+([`EIC:X`](@/docs/storage-model.md#which-kind-of-eic-eic-x-and-the-rest)), and
+where it does not, this is the report:
+
+```sql
+SELECT DISTINCT bilanzkreis
+FROM readings
+WHERE eic_object_type(bilanzkreis) IS DISTINCT FROM 'X';
+```
+
+`'X'` a party, `'Y'` an area, `'Z'` a measurement point, `'W'` a resource object,
+`'T'` a tie line, `'V'` a location, `'A'` a substation — the closed list of the
+ENTSO-E *EIC Reference Manual* §4.2. German Bilanzkreise carry an `X`, which the
+manual calls out as a national usage that remains valid.
+
+`IS DISTINCT FROM` rather than `<>`, because the answer is three-valued.
+
+### Two parsers, and the strict one runs first
+
+`eic_object_type` returns null for **two entirely different findings**, and only
+one of them is actionable:
+
+1. the value is not an EIC at all — free text in an identifier column;
+2. the value *is* an EIC, carrying an object-type letter this build's `metering`
+   does not list.
+
+`metering` parses the second tolerantly on purpose: the type list is ENTSO-E's to
+extend, and a store that hard-failed on an entry added after its release would
+refuse data the market has already issued. That is the right call for a decade of
+retention — and it stops being invisible the moment an EIC passes through two
+parsers in one process and **the other one is strict**. A
+market library holding a Bilanzkreis as its own type may enumerate the seven
+letters and refuse anything else; it then rejects a row this store accepted, on a
+read, at a moment nobody chose.
+
+`eic_normalise(code)` is what separates the two:
+
+```sql
+-- Not an EIC. Somebody wrote free text into an identifier column.
+SELECT DISTINCT bilanzkreis FROM readings
+WHERE bilanzkreis IS NOT NULL AND eic_normalise(bilanzkreis) IS NULL;
+
+-- A well-formed EIC whose object type this build does not list — the rows a
+-- strict downstream parser will reject.
+SELECT DISTINCT bilanzkreis FROM readings
+WHERE eic_normalise(bilanzkreis) IS NOT NULL
+  AND eic_object_type(bilanzkreis) IS NULL;
+```
+
+Find them on your own schedule; declare `check = "EIC:X"` to stop accepting new
+ones.
+
+`eic_normalise` is also the EIC counterpart of `obis_normalise`, and does that
+job for the same reason: a column written by something other than this crate may
+hold a code in lower case or with surrounding space, and a checked column holds
+only the trimmed uppercase form — so a literal join across the two returns
+nothing.
 
 ## Several tables in one session
 

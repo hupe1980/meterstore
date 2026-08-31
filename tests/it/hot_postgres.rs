@@ -462,17 +462,45 @@ async fn creating_a_partition_does_not_block_on_a_reader() {
 
     let reader = HoldingAccessShare::on(&url, TABLE).await;
 
-    let started = std::time::Instant::now();
+    // The property, and the whole of it: with a conflicting ACCESS SHARE held for
+    // the entire call, creation succeeds. Had it queued it would have sat out the
+    // two-second DDL lock timeout and come back `LockTimeout` — the reader is not
+    // released until afterwards, so there is no third outcome to be lucky about.
     let made = hot
         .ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
         .expect("a reader must not be able to block partition creation");
-    let elapsed = started.elapsed();
-
     assert_eq!(made.len(), 1);
+
+    // And the negative, which is what makes the positive mean something: the
+    // spelling this crate does *not* use really does block on the same reader.
+    //
+    // Asserted rather than timed. A wall-clock bound on the call above would be
+    // a weaker restatement of what `expect` already proves, and would fail on a
+    // loaded machine for a reason that has nothing to do with locks — the suite
+    // runs twenty-odd databases against one server.
+    let mut blocking = PgPool::connect(&url)
+        .await
+        .expect("connect")
+        .acquire()
+        .await
+        .expect("connection");
+    sqlx::query("SET lock_timeout = '1s'")
+        .execute(&mut *blocking)
+        .await
+        .expect("set");
+    let naive = sqlx::query(&format!(
+        r#"CREATE TABLE "{TABLE}_naive" PARTITION OF "{TABLE}"
+               FOR VALUES FROM ('2026-07-21 00:00:00+00') TO ('2026-07-22 00:00:00+00')"#
+    ))
+    .execute(&mut *blocking)
+    .await;
+    let err = naive
+        .expect_err("CREATE TABLE … PARTITION OF takes ACCESS EXCLUSIVE on the parent")
+        .to_string();
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "creation waited {elapsed:?}, so it queued for a lock it should not need"
+        err.contains("lock timeout") || err.contains("canceling statement"),
+        "it should have queued behind the reader's ACCESS SHARE and timed out: {err}"
     );
 
     reader.release().await;
@@ -1286,7 +1314,7 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
         "9900000000001:2026-13",  // month out of range
         "990000000000:2026-07",   // twelve digits — a Marktpartner-ID is thirteen
         "99000000000012:2026-07", // fourteen
-        "99:2026-07",             // the short spelling this schema used to accept
+        "99:2026-07",             // an operator too short to be a Marktpartner-ID
         "a:b:2026-07",            // a second separator, which split_part would mis-read
         "2026-07",
     ] {

@@ -135,6 +135,156 @@ impl MeterCatalog {
         store.in_own_session().await
     }
 
+    /// A catalog whose every table is confined to one value of a **merge-key
+    /// column**.
+    ///
+    /// ```no_run
+    /// # async fn f(catalog: &meterstore::MeterCatalog, sql: &str, tenant: &str)
+    /// #     -> meterstore::Result<()> {
+    /// let confined = catalog.scoped("tenant", tenant).await?;
+    /// let rows = confined.query(sql).await?;   // caller-supplied SQL, one tenant, both tables
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// [`isolated`](Self::isolated) confines the *relations* a session can name
+    /// and [`MeterStore::scoped`] confines the *rows* of one table. This confines
+    /// the rows of all of them, which is what a multi-tenant deployment serving a
+    /// whole catalog needs: the cross-table join that is the catalog's reason to
+    /// exist, and the tenant boundary, together.
+    ///
+    /// The predicate is injected into each table's plan and enforced below the
+    /// projection, exactly as it is for one store: the engine never sees it, so
+    /// no caller-supplied statement can omit it, alias around it or `UNION` past
+    /// it — including across a join, since **both** sides carry their own.
+    ///
+    /// # Every table, or none
+    ///
+    /// A column that is not in some table's merge key is refused, naming that
+    /// table, **before any table is confined**: a scope that covered three tables
+    /// and silently skipped the fourth is not a boundary but a boundary-shaped
+    /// object that leaks one relation. A catalog whose tables do not share an
+    /// identity column cannot be scoped as a whole, and
+    /// [`isolated`](Self::isolated) plus [`MeterStore::scoped`] is the honest
+    /// answer for it.
+    ///
+    /// Only a merge-key column may scope a session, here as there: such a column
+    /// partitions readings, so filtering before ranking and after give the same
+    /// winner. An attribute column does not.
+    ///
+    /// # It composes, and it does not come off
+    ///
+    /// Scoping a second column narrows further; re-scoping one already fixed is
+    /// refused unless the value is identical, on every table. Derived catalogs —
+    /// [`as_known_at`](Self::as_known_at), [`in_read_mode`](Self::in_read_mode) —
+    /// stay scoped.
+    ///
+    /// [`MeterStore::scoped`]: crate::MeterStore::scoped
+    pub async fn scoped(&self, column: &str, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+
+        // Checked over every table first. `narrowed_scope` is the same rule
+        // `MeterStore::scoped` applies, run here without confining anything, so
+        // a refusal leaves the caller holding the catalog they started with
+        // rather than a half-confined one.
+        let mut narrowed = BTreeMap::new();
+        for (name, store) in &self.stores {
+            let scope = store.narrowed_scope(column, &value).map_err(|e| {
+                Error::config(format!(
+                    "this catalog cannot be scoped to {column} = {value:?}: {e}. A scope \
+                     that covered the other tables and skipped this one would not be a \
+                     boundary — isolate to one table and scope that, if this table is \
+                     meant to be outside it"
+                ))
+            })?;
+            narrowed.insert(name.clone(), scope);
+        }
+
+        self.rebuild(|name, store| {
+            let builder = store.to_builder();
+            match narrowed.get(name).and_then(Option::as_ref) {
+                Some(scope) => builder.row_scope(scope.clone()),
+                // `None` means this table already held exactly this scope.
+                None => builder,
+            }
+        })
+        .await
+    }
+
+    /// A catalog reading the data **as it was known at** `at`, in every table.
+    ///
+    /// [`MeterStore::as_known_at`] over the whole catalog, and the one
+    /// reproducible read that *can* be catalog-wide: it pins the row-level
+    /// `recorded_at` axis, which every table carries and which archival only ever
+    /// moves rather than rewrites. So one instant is one meaningful ceiling
+    /// across all of them.
+    ///
+    /// [`MeterStore::as_of`] deliberately has **no** catalog counterpart. It pins
+    /// an Iceberg *snapshot*, and a snapshot belongs to one table — there is no
+    /// single id that means the same moment in two of them, and no commit that
+    /// makes two snapshots atomic (§15.3: nothing is transactional across
+    /// tables). A catalog-wide `as_of` would have to invent a correspondence
+    /// between per-table snapshots and call the result reproducible. Pin each
+    /// table with [`table`](Self::table) and `as_of`, or use this, whose axis is
+    /// genuinely shared.
+    ///
+    /// [`MeterStore::as_known_at`]: crate::MeterStore::as_known_at
+    /// [`MeterStore::as_of`]: crate::MeterStore::as_of
+    pub async fn as_known_at(&self, at: OffsetDateTime) -> Result<Self> {
+        self.in_read_mode(crate::planner::ReadMode::AsKnownAt(at))
+            .await
+    }
+
+    /// The same catalog, reading a different set of tiers.
+    ///
+    /// The general form of [`as_known_at`](Self::as_known_at).
+    /// [`Historical`](crate::ReadMode::Historical) answers a reporting query
+    /// across every table off the lake alone, with no load on the operational
+    /// database; [`Operational`](crate::ReadMode::Operational) answers a
+    /// monitoring query off the recent window with no Iceberg round trip.
+    ///
+    /// Applied to **every** table, which is what makes the result meaningful: a
+    /// catalog already refuses to build with its tables in different modes,
+    /// because a join between a historical table and a unified one silently
+    /// mixes a reproducible half with a mutable one, and a result reports one
+    /// mode because a statement runs under one.
+    ///
+    /// [`AsOf`](crate::ReadMode::AsOf) is refused for the reason
+    /// [`as_known_at`](Self::as_known_at) gives: a snapshot belongs to one table.
+    pub async fn in_read_mode(&self, mode: crate::planner::ReadMode) -> Result<Self> {
+        if let crate::planner::ReadMode::AsOf { .. } = mode {
+            return Err(Error::config(
+                "a pinned snapshot belongs to one table: there is no snapshot id that \
+                 means the same moment in two of them, and nothing commits two atomically. \
+                 Pin each table with MeterCatalog::table(..).as_of(..), or use \
+                 MeterCatalog::as_known_at, whose recorded_at axis every table shares",
+            ));
+        }
+        self.rebuild(|_, store| store.to_builder().read_mode(mode))
+            .await
+    }
+
+    /// Rebuild every table into a **fresh shared session**, through `f`.
+    ///
+    /// The one place a derived catalog is assembled. Each store's own
+    /// `to_builder` carries what a derived session must not drop; this adds the
+    /// shared `SessionContext`, which is the thing a catalog owns and a store
+    /// does not — rebuilding through `MeterStore`'s own derivations would give N
+    /// private sessions and no cross-table join.
+    async fn rebuild<F>(&self, f: F) -> Result<Self>
+    where
+        F: Fn(&str, &MeterStore) -> MeterStoreBuilder,
+    {
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_information_schema(true),
+        );
+        let mut stores = BTreeMap::new();
+        for (name, store) in &self.stores {
+            let derived = f(name, store).session(ctx.clone()).build().await?;
+            stores.insert(name.clone(), derived);
+        }
+        Ok(Self { ctx, stores })
+    }
+
     /// Every table, in name order.
     pub fn tables(&self) -> impl Iterator<Item = &MeterStore> {
         self.stores.values()
@@ -359,10 +509,15 @@ impl MeterCatalog {
     ) -> Result<Vec<(String, Vec<crate::tiering::archive::ArchivalOutcome>)>> {
         let mut out = Vec::with_capacity(self.stores.len());
         for (name, store) in &self.stores {
-            let outcome = store
-                .archive(now, max_windows)
-                .await
-                .map_err(|e| Error::Storage(format!("archiving {name}: {e}")))?;
+            // The error is returned as it came, with the table named in a log
+            // line rather than folded into its message. Wrapping it in a
+            // `Storage` would flatten the taxonomy a caller matches on and, worse,
+            // make it retryable: `InvariantViolated` is the one condition this
+            // crate is most emphatic must *not* be retried past, and archival is
+            // where it surfaces.
+            let outcome = store.archive(now, max_windows).await.inspect_err(|e| {
+                tracing::error!(table = %name, error = %e, "archiving a catalog table failed");
+            })?;
             out.push((name.clone(), outcome));
         }
         Ok(out)
@@ -434,6 +589,12 @@ pub(crate) async fn anonymise_across<'a>(
     let mut subject_tables = 0usize;
 
     for store in stores {
+        // Checked per table and before anything is erased. A subject's due-date
+        // is `max(from)` across the deployment, so one table reading a pinned or
+        // half-visible view understates it — and the sweep would erase a subject
+        // whose live readings that table simply could not see. Erasure has no
+        // recovery path.
+        store.require_current_knowledge("the retention sweep")?;
         let Some(seen) = store.subject_last_seen().await? else {
             continue;
         };

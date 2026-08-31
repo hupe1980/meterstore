@@ -32,7 +32,6 @@
 //! storage fact: a stored row carries its `sparte`, so the store knows which
 //! boundary applies to it. That mapping is [`planner::day_boundary`], written
 //! once.
-
 //!
 //! ## The five things a caller usually wants
 //!
@@ -55,10 +54,13 @@
 //! - [`MeterCatalog`] — several tables in one session, when a deployment holds
 //!   more than one stream and needs a statement that mentions both.
 //!
-//! Two more that a service exposing SQL will want: [`MeterStore::scoped`]
-//! confines a session to one identity value, and
-//! [`MeterCatalog::isolated`] confines it to one table — both by
-//! injection into the plan, so caller-supplied SQL cannot step past them.
+//! Three more that a service exposing SQL will want: [`MeterStore::scoped`]
+//! confines a session to one identity value, [`MeterCatalog::isolated`] confines
+//! it to one table, and [`MeterCatalog::scoped`] confines **every** table of a
+//! catalog to one identity value — which is what a multi-tenant deployment
+//! putting a whole catalog on a socket needs, since the first two together force
+//! a choice between the cross-table join and the tenant boundary. All three
+//! inject into the plan, so caller-supplied SQL cannot step past them.
 //! [`MeterStore::append_authoritative`] is the write path for a value the
 //! operator authors rather than receives.
 //!
@@ -117,16 +119,32 @@
 //! point it still mattered.
 //!
 //! A deployment's own columns get the same treatment when they hold an
-//! identifier. [`eic_column`] declares one whose values must parse as an
-//! [`Eic`] — the ENTSO-E code a Bilanzkreis is addressed by, whose **check
-//! character** has none of the BDEW Codenummer's GS1 carve-out. Values are
-//! stored canonicalised, so such a column may sit in the merge key without two
-//! spellings becoming two readings.
+//! identifier. [`checked_column`] declares one whose values must parse as a
+//! [`ValueCheck`] — an [`Eic`], the ENTSO-E code a Bilanzkreis is addressed by;
+//! a [`MaloId`] or [`MeloId`], for a reading that references a measuring point
+//! it is not keyed to; or a [`BdewCode`], the Marktpartner-ID of a Lieferant or
+//! Messstellenbetreiber. Values are stored canonicalised, so such a column may
+//! sit in the merge key without two spellings becoming two readings.
+//!
+//! Each scheme stops somewhere different, and [`ValueCheck`] says where: the EIC
+//! check character and the MaLo check digit are enforced, a MeLo has no check
+//! digit to enforce, and a Marktpartner-ID's thirteenth digit is deliberately
+//! *not* checked — BDEW's Bildungsvorschrift carves out GS1-issued GLNs, which
+//! is the same reason [`VersionScope`] does not check it either.
+//!
+//! An EIC column may name the **object type** it holds —
+//! `ValueCheck::Eic(Some(EicType::Party))` for a Bilanzkreis, `Area` for a
+//! Bilanzierungsgebiet. The two share the alphabet, the length and the check
+//! character, so position 3 is the only thing that tells them apart — and unlike
+//! the check character it is expressible as a regular expression, so declaring it
+//! strengthens the hot table's `CHECK` as well as the write path.
 //!
 //! [`MaloId`]: metering::ids::MaloId
 //! [`MeloId`]: metering::ids::MeloId
 //! [`Eic`]: metering::ids::Eic
-//! [`eic_column`]: crate::config::eic_column
+//! [`BdewCode`]: metering::ids::BdewCode
+//! [`checked_column`]: crate::config::checked_column
+//! [`ValueCheck`]: crate::config::ValueCheck
 //!
 //! ## Tiers and surfaces
 //!
@@ -143,10 +161,11 @@
 //! serves any [`SqlSurface`], so a whole [`MeterCatalog`] goes on a socket as
 //! readily as one table.
 //!
-//! And a command line, behind `cli`: [`cli`] is `meterstore init`, `check`,
-//! `create`, `status`, `archive`, `maintain`, `query`, `completeness` and
-//! `serve` over the same public API, for the questions an operator asks during
-//! an incident and the archival loop a deployment has to run somewhere.
+//! And a command line, behind `cli`: [`cli`] is the `meterstore` binary over the
+//! same public API — `check`, `create`, `status`, `archive`, `maintain`,
+//! `query`, `completeness` and `serve` among its verbs — for the questions an
+//! operator asks during an incident and the archival loop a deployment has to
+//! run somewhere.
 //!
 //! [`Settings::connect`]: crate::settings::Settings::connect
 //!
@@ -176,10 +195,10 @@
 //!
 //! Pre-alpha, and **unpublished on purpose**: the API is still settling, and
 //! integrating against a real workload is what settles it. What is implemented,
-//! what is measured and what is not yet done are on the
-//! [status page](https://hupe1980.github.io/meterstore); [`testkit`] is the
-//! reference the store is checked against, and is public so a deployment can run
-//! it over its own configuration.
+//! what is measured and what is not yet done are in the
+//! [repository README](https://github.com/hupe1980/meterstore#status);
+//! [`testkit`] is the reference the store is checked against, and is public so a
+//! deployment can run it over its own configuration.
 //!
 //! Full documentation: <https://hupe1980.github.io/meterstore>
 //!
@@ -191,6 +210,7 @@
 //! [`MeterStore::completeness`]: crate::session::MeterStore::completeness
 //! [`MeterCatalog`]: crate::session::MeterCatalog
 //! [`MeterCatalog::isolated`]: crate::session::MeterCatalog::isolated
+//! [`MeterCatalog::scoped`]: crate::session::MeterCatalog::scoped
 //! [`MeterStore::scoped`]: crate::session::MeterStore::scoped
 //! [`MeterStore::append_authoritative`]: crate::session::MeterStore::append_authoritative
 //! [`SqlSurface`]: crate::session::SqlSurface
@@ -242,11 +262,13 @@ pub use cold::IcebergRestCatalog;
 pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
 pub use config::{
-    CHECK_VALUES_KEY, TableConfig, TimeModel, VALUE_CHECK_EIC, VALUE_CHECK_KEY,
-    ValidatedTableConfig, coded_column, declared_value_check, eic_column,
+    CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
+    ValueCheck, checked_column, coded_column, declared_value_check,
 };
-pub use encode::{StoredReadings, canonical_obis, parse_malo};
-pub use erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
+pub use encode::{StoredReadings, canonical_obis, parse_malo, parse_melo};
+pub use erasure::{
+    ErasureRecord, MIN_ERASURE_SECRET_BYTES, Retention, SubjectRef, SubjectRegistry,
+};
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
 pub use hot::PostgresHot;
@@ -261,7 +283,7 @@ pub use session::{
     QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
     SqlSurface, TableMaintenance,
 };
-pub use settings::{Deployment, Settings};
+pub use settings::{Deployment, PrivacySettings, Settings};
 pub use tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
 pub use version::{ScopedVersion, Version, VersionScope};
 pub use watermark::{Tier, TieringWatermark};
@@ -274,11 +296,13 @@ pub mod prelude {
     pub use crate::cold::S3TablesCatalog;
     pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
     pub use crate::config::{
-        CHECK_VALUES_KEY, TableConfig, TimeModel, VALUE_CHECK_EIC, VALUE_CHECK_KEY,
-        ValidatedTableConfig, coded_column, declared_value_check, eic_column,
+        CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
+        ValueCheck, checked_column, coded_column, declared_value_check,
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
-    pub use crate::erasure::{ErasureRecord, Retention, SubjectRef, SubjectRegistry};
+    pub use crate::erasure::{
+        ErasureRecord, MIN_ERASURE_SECRET_BYTES, Retention, SubjectRef, SubjectRegistry,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::evolution::{Compatibility, SchemaChange};
     pub use crate::hot::PostgresHot;
@@ -294,7 +318,7 @@ pub mod prelude {
         QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
         SqlSurface, TableMaintenance,
     };
-    pub use crate::settings::{Deployment, Settings};
+    pub use crate::settings::{Deployment, PrivacySettings, Settings};
     pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
     pub use crate::version::{ScopedVersion, Version, VersionScope};
     pub use crate::watermark::{Tier, TieringWatermark};

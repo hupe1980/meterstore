@@ -205,6 +205,14 @@ it holds an exclusive **cold-append lease** across the read and the write
 instead — two processes appending the same late correction serialise rather than
 both finding no stored row.
 
+The loser waits, with a backoff budget of about **14 seconds**, and then gives up
+with a retryable `Error::LockTimeout` having changed nothing. The budget is sized
+for the operation rather than for the common case: the Iceberg commit is a
+compare-and-swap that retries under contention, and the Parquet write before it is
+sized by the delivery. A bulk correction run over an archived month is both the
+largest write and the one time several writers queue, so it is the case the budget
+has to cover.
+
 ## Zählerstandsgänge
 
 A **Lastgang** is energy over `[from, to)`. A **Zählerstandsgang** is a

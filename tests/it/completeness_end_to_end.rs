@@ -280,4 +280,33 @@ async fn a_column_that_is_not_declared_is_refused_rather_than_interpolated() {
     // report, which would read as "this meter is fine".
     assert!(store.completeness(D01, D02).malo("nonsense").is_err());
     assert!(store.completeness(D01, D02).obis("nonsense").is_err());
+    assert!(store.completeness(D01, D02).melo("nonsense").is_err());
+
+    // `melo` is the one where the parse does the most work. A
+    // Zaehlpunktbezeichnung has no check digit and is stored uppercase, so the
+    // untyped door narrows to nothing on a value that differs only in case --
+    // and on this report an empty narrowing reads as a meter that has stopped
+    // delivering, which is the strongest finding it can make.
+    const MELO: &str = "DE0001234567890123456789012345678";
+    let canonical = store
+        .completeness(D01, D02)
+        .melo(MELO.to_lowercase())
+        .expect("parsed, and canonicalised on the way in");
+    let literal = store
+        .completeness(D01, D02)
+        .column_eq(
+            "melo_id",
+            datafusion::common::ScalarValue::Utf8(Some(MELO.to_lowercase())),
+        )
+        .expect("the untyped door accepts anything");
+    // This fixture stores no Messlokation, so both are empty here; what the pair
+    // pins is that one of them parsed and the other did not.
+    assert_eq!(canonical.await.expect("report").len(), 0);
+    assert_eq!(literal.await.expect("report").len(), 0);
+
+    // And whatever the caller is holding.
+    let parsed: metering::ids::MeloId = MELO.parse().unwrap();
+    assert!(store.completeness(D01, D02).melo(parsed).is_ok());
+    assert!(store.completeness(D01, D02).melo(MELO).is_ok());
+    assert!(store.completeness(D01, D02).melo(MELO.to_string()).is_ok());
 }

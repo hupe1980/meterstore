@@ -716,13 +716,13 @@ fn resolve_extra(
 ///
 /// The write is the only place a check character is worth anything: a wrong one
 /// found in a settlement run a month later names a row and nothing that could
-/// correct it. See [`eic_column`](crate::config::eic_column).
+/// correct it. See [`checked_column`](crate::config::checked_column).
 ///
 /// Canonicalising rather than merely accepting, because a checked column may be
 /// an identity column — one identifier in two spellings would be two merge keys,
 /// the failure [`canonical_obis`](crate::canonical_obis) prevents for OBIS.
 fn check_declared_value(field: &Field, value: ScalarValue) -> Result<ScalarValue> {
-    let Some(check) = crate::config::declared_value_check(field) else {
+    let Some(code) = crate::config::declared_value_check(field) else {
         return Ok(value);
     };
     // The declaration is validated before the value, and unconditionally. A
@@ -731,30 +731,25 @@ fn check_declared_value(field: &Field, value: ScalarValue) -> Result<ScalarValue
     // outcome the declaration exists to rule out — and doing it here rather
     // than in the parse arm means a delivery that happens to leave the column
     // null does not slip past the same mistake.
-    if check != crate::config::VALUE_CHECK_EIC {
+    let Some(check) = crate::config::ValueCheck::from_code(code) else {
         return Err(Error::encode(
             field.name(),
             format!(
-                "declares an unknown value check {check:?}; this build knows {:?}",
-                crate::config::VALUE_CHECK_EIC
+                "declares an unknown value check {code:?}; this build knows {:?}",
+                crate::config::ValueCheck::known_codes()
             ),
         ));
-    }
+    };
     // A null passed the nullability check above, so there is nothing to parse.
     let ScalarValue::Utf8(Some(text)) = &value else {
         return Ok(value);
     };
-    let eic: metering::ids::Eic = text.parse().map_err(|e| {
-        Error::encode(
-            field.name(),
-            format!(
-                "{text:?} is not an EIC: {e}. The check character is part of the \
-                 code, so a transposition is detectable here — and only here, \
-                 while the delivery that carried it is still in hand"
-            ),
-        )
-    })?;
-    Ok(ScalarValue::Utf8(Some(eic.as_str().to_string())))
+    // The whole refusal is composed by the scheme, which is what keeps the four
+    // parts of it — the column, the value, what the scheme wanted and why the
+    // check is at the write — from drifting apart across two layers.
+    Ok(ScalarValue::Utf8(Some(
+        check.canonicalise(field.name(), text)?,
+    )))
 }
 
 /// The version scope check every write path makes, once per row.
@@ -1354,6 +1349,29 @@ where
         .map_err(|e| Error::encode(col::MALO_ID, e.to_string()))
 }
 
+/// Parse a caller-supplied MeLo-ID.
+///
+/// [`parse_malo`] for the other identifier a read narrows by. A
+/// Zählpunktbezeichnung has **no check digit**, so what this catches is a
+/// truncation, a padding and a casing — and the last is the one that matters
+/// most, because storage holds the uppercase canonical form and a lower-case
+/// literal in a `WHERE` clause matches nothing at all. Silently. A read that
+/// returns an empty series looks exactly like a meter that reported nothing.
+///
+/// Generic for the same reason [`parse_malo`] is: a `MeloId` the caller already
+/// holds — which is what a read of this store hands back — passes through
+/// without a re-parse, while a `&str` or a `String` off a market message is
+/// checked here.
+pub fn parse_melo<M>(melo_id: M) -> Result<MeloId>
+where
+    M: TryInto<MeloId>,
+    M::Error: std::fmt::Display,
+{
+    melo_id
+        .try_into()
+        .map_err(|e| Error::encode(col::MELO_ID, e.to_string()))
+}
+
 /// Build the Arrow [`Field`]s for extra deployment columns.
 pub fn extra_field(name: &str, ty: crate::arrow::datatypes::DataType) -> Field {
     Field::new(name, ty, true)
@@ -1363,6 +1381,7 @@ pub fn extra_field(name: &str, ty: crate::arrow::datatypes::DataType) -> Field {
 mod tests {
     use super::*;
     use crate::arrow::datatypes::DataType;
+    use crate::config::ValueCheck;
     use metering::QualityFlag;
     use metering::resolution::IntervalResolution;
     use time::macros::datetime;
@@ -1590,7 +1609,7 @@ mod tests {
             "bilanzkreis",
             ScalarValue::Utf8(Some("  11xbk0000000001a  ".to_string())),
         );
-        let field = crate::config::eic_column("bilanzkreis", true);
+        let field = crate::config::checked_column("bilanzkreis", ValueCheck::Eic(None), true);
 
         let batch = to_record_batch_with(&[s], std::slice::from_ref(&field)).unwrap();
         let stored = batch
@@ -1617,13 +1636,47 @@ mod tests {
             "bilanzkreis",
             ScalarValue::Utf8(Some("11XBK0000000001B".to_string())),
         );
-        let field = crate::config::eic_column("bilanzkreis", true);
+        let field = crate::config::checked_column("bilanzkreis", ValueCheck::Eic(None), true);
 
         let err = to_record_batch_with(&[s], std::slice::from_ref(&field))
             .unwrap_err()
             .to_string();
         assert!(err.contains("bilanzkreis"), "{err}");
-        assert!(err.contains("EIC"), "{err}");
+        assert!(err.contains("an EIC"), "{err}");
+        // The refusal is three parts and each does a different job: the column,
+        // the domain's own message about the shape it wanted, and why a producer
+        // will not get another chance to fix it.
+        assert!(err.contains("check character"), "{err}");
+    }
+
+    #[test]
+    fn every_scheme_refuses_a_value_in_the_same_three_parts() {
+        // A checked column is a promise made to whoever supplies the value, and
+        // a refusal that only says "invalid" sends them to the code. Each names
+        // the column, carries the domain's own message, and closes with why the
+        // check is at the write rather than at the read.
+        for (scheme, bad) in [
+            (ValueCheck::Eic(None), "11XBK0000000001B"),
+            (ValueCheck::Malo, "41373559214"),
+            (ValueCheck::Melo, "DE000123456789"),
+            (ValueCheck::Bdew, "99009876543"),
+        ] {
+            let s = series(vec![quarter(
+                datetime!(2026-07-20 00:00 UTC),
+                "1.5",
+                QualityFlag::Measured,
+            )])
+            .with_extra("declared", ScalarValue::Utf8(Some(bad.to_string())));
+            let field = crate::config::checked_column("declared", scheme, true);
+
+            let err = to_record_batch_with(&[s], std::slice::from_ref(&field))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("declared"), "{scheme}: {err}");
+            assert!(err.contains(bad), "{scheme}: {err}");
+            assert!(err.contains(scheme.noun()), "{scheme}: {err}");
+            assert!(err.ends_with(scheme.why()), "{scheme}: {err}");
+        }
     }
 
     #[test]
@@ -1635,7 +1688,7 @@ mod tests {
             "1.5",
             QualityFlag::Measured,
         )]);
-        let field = crate::config::eic_column("bilanzkreis", true);
+        let field = crate::config::checked_column("bilanzkreis", ValueCheck::Eic(None), true);
         let batch = to_record_batch_with(&[s], std::slice::from_ref(&field)).unwrap();
         assert!(batch.column_by_name("bilanzkreis").unwrap().is_null(0));
     }
@@ -2131,13 +2184,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_source_variant_stores_the_tag_its_payload_carries() {
-        // Derived rather than listed, so a variant added upstream is covered
-        // here without an edit — which is the whole reason the `match` went.
+    /// One value of **every** [`MeasurementSource`] variant.
+    ///
+    /// `encode_source` needs no edit for a variant added upstream — it reads the
+    /// tag off the payload — and that is exactly why the *tests* need one: a
+    /// variant nothing here constructs is a shape of `source_detail` this crate
+    /// has never written down, in a column under a decades-long retention
+    /// obligation.
+    ///
+    /// The `match` below is what keeps the list honest. `MeasurementSource` is
+    /// not `#[non_exhaustive]`, so a variant added upstream makes it
+    /// non-exhaustive and **fails to compile** — which is the difference between
+    /// a list that is complete and one that was complete when it was written.
+    fn every_source_variant() -> Vec<MeasurementSource> {
+        use metering::aggregation_rule::VirtualMeterKind;
         use metering::substitute::{SubstituteMethod, SubstitutionReason};
 
-        let sources = [
+        let all = vec![
             source(),
             MeasurementSource::SmgwDirectPush {
                 device_id: "d".into(),
@@ -2151,9 +2214,19 @@ mod tests {
                 method: SubstituteMethod::ZeroFill,
                 reason: SubstitutionReason::GatewayCommFailure,
             },
-            // The session-derived provenance `metering` 0.21 added. Nothing in
-            // `encode_source` needed an edit for them — which is the property
-            // this test exists to keep true — but the `Option` field is worth
+            MeasurementSource::RetroactiveCorrection {
+                correction_ref: "COR-42".into(),
+                corrected_by: "clearing".into(),
+            },
+            MeasurementSource::VirtualMeter {
+                rule: VirtualMeterKind::PvSelfConsumption,
+                source_ids: vec!["12345678905".into()],
+            },
+            MeasurementSource::RedispatchImport {
+                pid: 13_020,
+                activation_ref: Some("ACT-7".into()),
+            },
+            // The session-derived variants. Their `Option` fields are worth
             // exercising both ways, since a `None` that serialised to an absent
             // key rather than a null would be a stored-shape change.
             MeasurementSource::ChargeDetailRecord {
@@ -2170,7 +2243,30 @@ mod tests {
             },
         ];
 
-        for source in sources {
+        // Never called. It exists so the compiler checks the list above against
+        // the enum, and it is a `match` rather than a count because a count
+        // would pass while two entries described the same variant.
+        fn _every_variant_is_above(s: &MeasurementSource) {
+            match s {
+                MeasurementSource::Mscons { .. }
+                | MeasurementSource::SmgwDirectPush { .. }
+                | MeasurementSource::ManualEntry { .. }
+                | MeasurementSource::AutoSubstitute { .. }
+                | MeasurementSource::RetroactiveCorrection { .. }
+                | MeasurementSource::VirtualMeter { .. }
+                | MeasurementSource::RedispatchImport { .. }
+                | MeasurementSource::ChargeDetailRecord { .. }
+                | MeasurementSource::ClockAlignedMeterValue { .. }
+                | MeasurementSource::DeviceLog { .. } => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_source_variant_stores_the_tag_its_payload_carries() {
+        let mut tags = Vec::new();
+        for source in every_source_variant() {
             let (kind, detail) = encode_source(&source).unwrap();
             let payload: serde_json::Value = serde_json::from_str(&detail).unwrap();
             assert_eq!(
@@ -2179,7 +2275,96 @@ mod tests {
                 "{source:?}"
             );
             assert_eq!(decode_source(&kind, Some(&detail)).unwrap(), source);
+            tags.push(kind);
         }
+
+        // The tags themselves, because `source_kind` is a `GROUP BY` key and a
+        // `WHERE` literal in every external engine reading the warehouse — the
+        // one column of the pair a reader outside this process can see. A retag
+        // upstream keeps both columns agreeing with each other and stops old
+        // rows decoding, and every round-trip test above would still pass: they
+        // all read and write through the *same* impl.
+        assert_eq!(
+            tags,
+            [
+                "MSCONS",
+                "SMGW_DIRECT_PUSH",
+                "MANUAL_ENTRY",
+                "AUTO_SUBSTITUTE",
+                "RETROACTIVE_CORRECTION",
+                "VIRTUAL_METER",
+                "REDISPATCH_IMPORT",
+                "CHARGE_DETAIL_RECORD",
+                "CLOCK_ALIGNED_METER_VALUE",
+                "DEVICE_LOG",
+            ],
+            "a source tag changed. It is the discriminant already written into \
+             source_kind on every stored row, and the string every external \
+             engine filters on — this is a stored-data break"
+        );
+    }
+
+    #[test]
+    fn no_stored_json_column_holds_a_floating_point_number() {
+        // `source_detail` and `provenance` are the two columns this crate writes
+        // as JSON rather than as a typed Arrow column, so they are the two where
+        // a *representation* decided elsewhere in the build graph reaches disk.
+        //
+        // A float is the one that would not be noticed. An exact decimal written
+        // as `30.0` reads back as `30.000000000000004` on some other engine's
+        // parser, and settlement is money — the reason this crate uses
+        // `Decimal128` for `value` in the first place. `metering` states the
+        // representation on each of its own `Decimal` fields; this is the
+        // storage-side half of that, and holds for whatever a future upstream
+        // field turns out to be — including one inside an enum variant, which is
+        // the shape easiest to miss.
+        fn floats(v: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Number(n) if n.is_f64() => found.push(format!("{path} = {n}")),
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        floats(item, &format!("{path}[{i}]"), found);
+                    }
+                }
+                serde_json::Value::Object(fields) => {
+                    for (k, item) in fields {
+                        floats(item, &format!("{path}.{k}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for source in every_source_variant() {
+            let (_, detail) = encode_source(&source).unwrap();
+            floats(
+                &serde_json::from_str(&detail).unwrap(),
+                col::SOURCE_DETAIL,
+                &mut found,
+            );
+        }
+        let trail: Vec<ProvenanceEntry> = metering::measurement_series::ProvenanceEventType::ALL
+            .iter()
+            .map(|event_type| ProvenanceEntry {
+                occurred_at: datetime!(2026-03-01 00:00 UTC),
+                event_type: *event_type,
+                actor: "a".to_string(),
+                note: Some("n".to_string()),
+            })
+            .collect();
+        floats(
+            &serde_json::from_str(&encode_provenance(&trail).unwrap()).unwrap(),
+            col::PROVENANCE,
+            &mut found,
+        );
+
+        assert!(
+            found.is_empty(),
+            "a stored JSON column carries a floating-point number: {found:?}. \
+             Whatever it is, it is on disk under a retention measured in decades \
+             and it does not round-trip exactly through every reader"
+        );
     }
 
     #[test]

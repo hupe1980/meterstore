@@ -235,6 +235,12 @@ pub enum Command {
         /// Report one measuring point, by MaLo-ID.
         #[arg(long, value_name = "MALO")]
         malo: Option<String>,
+        /// Report one meter, by MeLo-ID (Zählpunktbezeichnung).
+        ///
+        /// A Marktlokation may be measured by several, and on a table that
+        /// identifies a reading by its Messlokation each is its own row.
+        #[arg(long, value_name = "MELO")]
+        melo: Option<String>,
         /// Report one channel, by OBIS code.
         #[arg(long, value_name = "OBIS")]
         obis: Option<String>,
@@ -288,6 +294,23 @@ pub enum Command {
         /// Also serve the read-only Iceberg REST façade here.
         #[arg(long, value_name = "ADDR")]
         catalog_addr: Option<String>,
+    },
+
+    /// Show the erasure audit trail.
+    ///
+    /// "We deleted it" is not evidence, so every erasure writes a row saying
+    /// when, why and by whom — and deliberately **not** whose, since the natural
+    /// identifier is the thing being destroyed. This is the report an auditor
+    /// asks for, and reading it is the only thing this crate's command line does
+    /// with the subject registry: see the CLI documentation for why there is no
+    /// `meterstore erase`.
+    ///
+    /// The registry is deployment-wide, so the trail is one list rather than one
+    /// per table.
+    Erasures {
+        /// Most rows to show, newest first.
+        #[arg(long, default_value_t = 50, value_name = "N")]
+        limit: i64,
     },
 
     /// Destroy a table: every partition, the catalogue entry and the data files.
@@ -403,6 +426,7 @@ async fn run(cli: &Cli) -> Result<()> {
             sparte,
             seen_since,
             malo,
+            melo,
             obis,
             gaps_only,
         } => {
@@ -418,6 +442,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 seen_since.as_deref(),
                 Narrowing {
                     malo: malo.as_deref(),
+                    melo: melo.as_deref(),
                     obis: obis.as_deref(),
                 },
                 *gaps_only,
@@ -427,6 +452,7 @@ async fn run(cli: &Cli) -> Result<()> {
         Command::Explain { sql } => explain(cli, sql).await,
         Command::Snapshots { table } => snapshots(cli, table.as_deref()).await,
         Command::Serve { addr, catalog_addr } => serve(cli, addr, catalog_addr.as_deref()).await,
+        Command::Erasures { limit } => erasures(cli, *limit).await,
         Command::Purge { table, confirm } => purge(cli, table, confirm).await,
     }
 }
@@ -681,6 +707,7 @@ struct Period<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 struct Narrowing<'a> {
     malo: Option<&'a str>,
+    melo: Option<&'a str>,
     obis: Option<&'a str>,
 }
 
@@ -727,6 +754,9 @@ async fn completeness(
         // question about one meter.
         if let Some(malo) = narrowing.malo {
             query = query.malo(malo)?;
+        }
+        if let Some(melo) = narrowing.melo {
+            query = query.melo(melo)?;
         }
         if let Some(obis) = narrowing.obis {
             query = query.obis(obis)?;
@@ -861,6 +891,34 @@ fn bind_address(addr: &str) -> Result<std::net::SocketAddr> {
              example 127.0.0.1:50051"
         ))
     })
+}
+
+/// The erasure audit trail, deployment-wide.
+///
+/// The registry lives in one `meterstore_subject_map` keyed by natural
+/// identifier, so every table that has one shares it — which is what makes a
+/// single erasure reach the authoritative readings and the non-authoritative
+/// second stream together. The trail is therefore read from the first table that
+/// carries a registry, not concatenated per table, which would report every row
+/// as many times as the deployment has tables.
+async fn erasures(cli: &Cli, limit: i64) -> Result<()> {
+    if limit <= 0 {
+        return Err(Error::config(format!(
+            "--limit is a row count and must be positive; got {limit}"
+        )));
+    }
+    let catalog = load(cli).await?;
+    let registry = catalog
+        .tables()
+        .find_map(crate::MeterStore::subject_registry)
+        .ok_or_else(|| {
+            Error::config(
+                "no table in this configuration declares a subject_column, so this \
+                 deployment holds no subject mapping and there is nothing to erase or \
+                 to report. See the privacy documentation",
+            )
+        })?;
+    render::erasures(&registry.erasures(limit).await?, cli.format)
 }
 
 async fn purge(cli: &Cli, table: &str, confirm: &str) -> Result<()> {

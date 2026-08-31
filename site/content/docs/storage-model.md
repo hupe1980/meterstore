@@ -269,7 +269,7 @@ behave differently:
 ```rust
 TableConfig::new("readings_versions")
     .identity_column(Field::new("tenant", DataType::Utf8, false))   // joins the merge key
-    .attribute_column(eic_column("bilanzkreis", true))              // carries data
+    .attribute_column(checked_column("bilanzkreis", ValueCheck::Eic(None), true))  // carries data
 ```
 
 **Identity columns join the merge key.** Two rows differing in one are different
@@ -322,38 +322,64 @@ Arrow metadata so it disturbs neither the type nor schema evolution.
 
 ### Checked columns
 
-A Bilanzkreis or a Bilanzierungsgebiet is not an arbitrary string. It is an
-**EIC** — the sixteen-character ENTSO-E Energy Identification Code — and it
-carries a **check character**:
+A Bilanzkreis is not sixteen arbitrary characters and a Lieferant is not thirteen
+arbitrary ones. Each is an identifier the market already validates, and a column
+holding one can say so:
 
 ```rust
-.attribute_column(eic_column("bilanzkreis", true))
-.attribute_column(eic_column("bilanzierungsgebiet", true))
+.attribute_column(checked_column("bilanzkreis", ValueCheck::Eic(Some(EicType::Party)), true))
+.attribute_column(checked_column("bilanzierungsgebiet", ValueCheck::Eic(Some(EicType::Area)), true))
+.attribute_column(checked_column("lieferant", ValueCheck::Bdew, true))
+.attribute_column(checked_column("unterliegende_malo", ValueCheck::Malo, true))
 ```
 
 ```toml
 extra_columns = [
-  { name = "bilanzkreis",         check = "EIC" },
-  { name = "bilanzierungsgebiet", check = "EIC" },
+  { name = "bilanzkreis",         check = "EIC:X" },
+  { name = "bilanzierungsgebiet", check = "EIC:Y" },
+  { name = "lieferant",           check = "BDEW" },
+  { name = "unterliegende_malo",  check = "MALO" },
 ]
 ```
 
 The same argument that makes `malo_id` a `MaloId` rather than eleven digits.
-Unlike the BDEW-Codenummer — whose Bildungsvorschrift exempts GS1-issued GLNs,
-which is why `version_scope` deliberately does **not** check its digit — the EIC
-scheme has no carve-out, so a mistyped code is detectable.
+An identifier stored as an arbitrary string is a string that will one day differ
+from the identifier it was meant to be, in a column nothing looks at until a
+settlement run joins on it.
 
-The write path parses every value with `metering::ids::Eic` and stores its
-**canonical spelling**, trimmed and uppercase. That matters most on an identity
-column, where a Bilanzkreis arriving in two spellings would be two readings that
-never supersede each other.
+The write path parses every value with `metering`'s own type and stores that
+type's **canonical spelling**. That matters most on an identity column, where one
+identifier arriving in two spellings would be two readings that never supersede
+each other.
+
+**Each scheme stops somewhere, and it is not the same place.**
+
+| `check` | Length | Shape | Arithmetic | Canonicalises |
+|---|---|---|---|---|
+| `EIC` | 16 | `0-9 A-Z -`, letter at 3, check character not `-` | **check character** | trim, uppercase |
+| `EIC:X` … `EIC:A` | 16 | the same, with position 3 pinned to that object type | **check character** | trim, uppercase |
+| `MALO` | 11 | digits, first not `0` | **check digit** | trim |
+| `MELO` | 33 | 2 letters, 6 digits, 25 alphanumerics | none exists | trim, uppercase |
+| `BDEW` | 13 | digits | **deliberately not checked** | trim |
+
+The two with arithmetic are the two where a transposition is *detectable* while
+the delivery that carried it is still in hand. `MELO` is still worth declaring
+because it fixes the **casing** — a Messlokation in two casings on an identity
+column is two readings — and `BDEW` because thirteen digits is the whole of the
+rule that *can* be enforced: BDEW's Bildungsvorschrift §2.3 exempts GS1-issued
+GLNs, which use a different check-digit procedure and are legitimate
+Marktpartner-IDs. That is the same carve-out for which `version_scope`
+deliberately does **not** check its operator's digit.
 
 **Two checks, and each stops somewhere.** The hot table gets a `CHECK` for the
-*shape* — sixteen characters of `0-9`, `A-Z` or `-`, an uppercase letter in
-position 3, and a check character that is never `-`. The check *character* is
-arithmetic over the other fifteen and no regular expression expresses it, so the
-write path enforces that half. A row written to PostgreSQL by something else gets
-the shape check and not the check character.
+*shape* in the table above; the write path enforces whatever arithmetic the
+scheme has, because a check digit is a function of the other digits and no
+regular expression expresses one. A row written to PostgreSQL by something else
+gets the first and not the second.
+
+The shape patterns are anchored on the **stored** form: `EIC` and `MELO`
+canonicalise to uppercase, so a row written in lower case by another writer is
+refused rather than becoming a second spelling.
 
 `check` and `values` are mutually exclusive: a closed vocabulary and an open
 identifier scheme are two different claims about one column.
@@ -365,8 +391,41 @@ identifier scheme are two different claims about one column.
 > Schema evolution does not flag it: the declaration rides in Arrow field
 > metadata, which comparison ignores so that a vocabulary is not a schema change.
 
-`eic_regelzone(code)` then reads a Bilanzierungsgebiet's **Regelzone** off
-position 4 — the grouping key of a MaBiS Summenzeitreihe.
+#### Which *kind* of EIC — `EIC:X` and the rest
+
+A Bilanzkreis and a Bilanzierungsgebiet share the alphabet, the length, the
+issuing office and the check character. The only thing that tells them apart is
+**position 3**, the ENTSO-E object type: `X` a party, `Y` an area. So a bare
+`check = "EIC"` column accepts either, and a `Y` code in the `bilanzkreis` column
+passes the write path, passes the `CHECK`, and makes every MaBiS grouping over it
+wrong — with no error anywhere.
+
+`check = "EIC:X"` pins it. Unlike the check character, this half **is**
+expressible as a regular expression, so it strengthens the database constraint as
+well as the write path:
+
+```
+EIC     ^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$
+EIC:X   ^[0-9A-Z-]{2}X[0-9A-Z-]{12}[0-9A-Z]$
+```
+
+It is the one part of *"is this the right kind of EIC"* PostgreSQL can enforce on
+a row this crate did not write. The letters are ENTSO-E's list — `X` party, `Y`
+area, `Z` measurement point, `W` resource object, `T` tie line, `V` location,
+`A` substation — and `EIC:Q` is refused at declaration rather than degrading to a
+bare `EIC`, because a column declared as holding party codes and silently taking
+any EIC is the outcome the declaration exists to rule out.
+
+**Bare `EIC` stays deliberately tolerant.** `metering` parses an object type it
+does not list as `None` rather than failing, because the list is ENTSO-E's to
+extend and a store that refused an entry added after its release would reject
+data the market has already issued. That matters when an EIC passes through
+**two** parsers in one process and the other one is strict —
+[`eic_normalise` and `eic_object_type`](@/docs/querying.md#what-an-eic-names-is-a-query-not-a-constraint)
+are how those rows are found before the strict parser finds them for you.
+
+`eic_regelzone(code)` reads a Bilanzierungsgebiet's **Regelzone** off position 4 —
+the grouping key of a MaBiS Summenzeitreihe.
 [Querying →](@/docs/querying.md#the-other-stored-identifier)
 
 ## The Messlokation may be part of the identity

@@ -48,6 +48,24 @@ namespace = "metering"
 file_target_bytes = 536870912
 metadata_pool_max_connections = 4
 
+# --- The subject registry, if any table declares a `subject_column`. ---
+#
+# Only needed then. A `subject_column` names the column holding pseudonymous
+# references to data subjects, and a deployment declaring one without a registry
+# is refused at startup: the references would resolve to nothing and an Article
+# 17 erasure would have no mapping to destroy.
+#
+# `erasure_secret` (at least 32 bytes) turns on the suppression list. Without it
+# erasure works and does not *stay* worked — once the mapping is gone, nothing
+# distinguishes an erased identifier from one never seen, so a pipeline replaying
+# old messages registers a fresh reference and silently re-links the subject.
+# That is every deployment fed by a message broker.
+#
+# The key must outlive every erasure and is not recoverable from the database.
+#
+# [privacy]
+# erasure_secret = "${METERSTORE_ERASURE_SECRET}"
+
 # --- One entry per managed table. ---
 [[tables]]
 # The physical table holds *every version* of every reading — the audit trail.
@@ -104,12 +122,32 @@ snapshot_retention = "10y"
 #
 # `values` declares a closed vocabulary and renders a `CHECK ... IN (...)`;
 # `check` declares an identifier scheme, and the write path parses every value
-# with it. A Bilanzkreis is an ENTSO-E EIC with a check character, not sixteen
-# arbitrary characters — so a transposition is caught while the delivery that
-# carried it is still in hand. The two are mutually exclusive.
+# with it and stores that scheme's canonical spelling. The two are mutually
+# exclusive.
+#
+#   "EIC"   16 characters, ENTSO-E — a Bilanzkreis, a Bilanzierungsgebiet.
+#           The check character is enforced, so a transposition is caught while
+#           the delivery that carried it is still in hand.
+#   "EIC:X" the same, and a party code — which is what a Bilanzkreis is.
+#           "EIC:Y" is an area (a Bilanzierungsgebiet); the rest of ENTSO-E's
+#           list is Z W T V A. The two share everything but position 3, so
+#           without this a Bilanzierungsgebiet stores as a Bilanzkreis and every
+#           MaBiS grouping over it is wrong. Unlike the check character, this
+#           half is a regular expression, so the database enforces it as well.
+#   "MALO"  11 digits — a Marktlokations-ID, check digit enforced.
+#   "MELO"  33 characters — a Zählpunktbezeichnung. No check digit exists;
+#           what this adds is the casing, so one Messlokation is one key.
+#   "BDEW"  13 digits — a Marktpartner-ID. The 13th digit is deliberately NOT
+#           checked: BDEW's Bildungsvorschrift exempts GS1-issued GLNs.
 #
 # [[tables.extra_columns]]
 # name = "bilanzkreis"
 # type = "string"
 # identity = false
-# check = "EIC"
+# check = "EIC:X"
+#
+# [[tables.extra_columns]]
+# name = "lieferant"
+# type = "string"
+# identity = false
+# check = "BDEW"

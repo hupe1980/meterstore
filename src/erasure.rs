@@ -147,6 +147,15 @@ impl std::fmt::Debug for SubjectRegistry {
     }
 }
 
+/// The shortest key [`SubjectRegistry::with_erasure_secret`] accepts.
+///
+/// A HMAC-SHA256 key, so this is the hash's own output width: shorter keys are
+/// permitted by the construction and are exactly what makes the suppression
+/// tombstone brute-forceable, since meter and market-location identifiers come
+/// from small structured spaces. Public so the configuration front end can refuse
+/// one at `meterstore check` rather than at the first process start.
+pub const MIN_ERASURE_SECRET_BYTES: usize = 32;
+
 impl SubjectRegistry {
     /// Wrap a connection pool, without a suppression list.
     ///
@@ -199,12 +208,12 @@ impl SubjectRegistry {
     pub fn with_erasure_secret(pool: PgPool, secret: &[u8]) -> Result<Self> {
         // A short key makes the oracle brute-forceable, which is the one thing
         // the construction is supposed to prevent.
-        if secret.len() < 32 {
-            return Err(Error::config(
-                "erasure secret must be at least 32 bytes: a shorter key can be \
-                 brute-forced, and the suppression list would then leak the \
-                 identifiers it exists to forget",
-            ));
+        if secret.len() < MIN_ERASURE_SECRET_BYTES {
+            return Err(Error::config(format!(
+                "erasure secret must be at least {MIN_ERASURE_SECRET_BYTES} bytes: a \
+                 shorter key can be brute-forced, and the suppression list would then \
+                 leak the identifiers it exists to forget"
+            )));
         }
         Ok(Self {
             pool,
@@ -383,9 +392,40 @@ impl SubjectRegistry {
         actor: &str,
         now: OffsetDateTime,
     ) -> Result<ErasureRecord> {
+        self.erase_triggered_by(subject, reason, actor, now, crate::observe::TRIGGER_REQUEST)
+            .await
+    }
+
+    /// [`erase`](Self::erase), saying what triggered it.
+    ///
+    /// The trigger is a metric attribute and nothing else — the audit row is the
+    /// same either way, because `reason` is what a regulator reads. It exists
+    /// because the two triggers have **opposite** readings: a flat `retention`
+    /// series is a sweep that is not running, and a flat `request` series is an
+    /// ordinary quarter. Summed into one counter, a deployment whose sweep had
+    /// silently stopped but which handled the occasional Article 17 request would
+    /// look like one whose sweep was working.
+    pub(crate) async fn erase_triggered_by(
+        &self,
+        subject: &SubjectRef,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+        trigger: &'static str,
+    ) -> Result<ErasureRecord> {
         let mut tx = self.pool.begin().await.map_err(pg)?;
-        let record = self.erase_in(&mut tx, subject, reason, actor, now).await?;
+        let (record, destroyed) = self
+            .erase_in_inner(&mut tx, subject, reason, actor, now)
+            .await?;
         tx.commit().await.map_err(pg)?;
+        // Counted after the commit, and only when a linkage actually died: a
+        // repeat request is auditable and is not a second erasure, so counting
+        // it would report a compliance event that did not happen.
+        if destroyed {
+            crate::observe::metrics()
+                .subjects_erased
+                .add(1, &crate::observe::erasure_trigger(trigger));
+        }
         Ok(record)
     }
 
@@ -439,6 +479,37 @@ impl SubjectRegistry {
         actor: &str,
         now: OffsetDateTime,
     ) -> Result<ErasureRecord> {
+        let (record, destroyed) = self
+            .erase_in_inner(conn, subject, reason, actor, now)
+            .await?;
+        // Counted as a *request*, which is what a caller-owned transaction is:
+        // the cascade it encloses — billing periods, quality assessments — is an
+        // Article 17 one. The retention sweep opens its own transaction and says
+        // so. Counted before the caller's commit, which is the honest cost of
+        // handing the transaction to them: a counter that only rose on commit
+        // would need this crate to know when that happened.
+        if destroyed {
+            crate::observe::metrics().subjects_erased.add(
+                1,
+                &crate::observe::erasure_trigger(crate::observe::TRIGGER_REQUEST),
+            );
+        }
+        Ok(record)
+    }
+
+    /// The erasure itself, and whether a linkage was actually destroyed.
+    ///
+    /// The single mechanism under [`erase`](Self::erase) and
+    /// [`erase_in`](Self::erase_in), so the counting decision — which differs
+    /// between them — is the only thing those two do not share.
+    async fn erase_in_inner(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        subject: &SubjectRef,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<(ErasureRecord, bool)> {
         if reason.trim().is_empty() {
             return Err(Error::config("erasure needs a reason for the audit trail"));
         }
@@ -497,12 +568,15 @@ impl SubjectRegistry {
             info!(%subject, actor, "subject linkage destroyed");
         }
 
-        Ok(ErasureRecord {
-            subject: subject.clone(),
-            erased_at: now,
-            reason: reason.to_string(),
-            actor: actor.to_string(),
-        })
+        Ok((
+            ErasureRecord {
+                subject: subject.clone(),
+                erased_at: now,
+                reason: reason.to_string(),
+                actor: actor.to_string(),
+            },
+            deleted > 0,
+        ))
     }
 
     /// Whether an identifier is on the suppression list.
@@ -714,16 +788,22 @@ pub(crate) async fn anonymise(
         if registry.resolve(&subject).await?.is_none() {
             continue;
         }
-        erased.push(registry.erase(&subject, reason, actor, now).await?);
+        // Counted as `retention` by `erase_triggered_by`, so a sweep run from the
+        // catalog, from one store, or from the maintenance loop all reach the
+        // same instrument under the same attribute — and none of them is
+        // mistaken for the Article 17 path, whose flat zero means the opposite.
+        erased.push(
+            registry
+                .erase_triggered_by(
+                    &subject,
+                    reason,
+                    actor,
+                    now,
+                    crate::observe::TRIGGER_RETENTION,
+                )
+                .await?,
+        );
     }
-    // Counted here rather than at each caller, so a sweep run from the catalog,
-    // from one store, or from the maintenance loop all reach the same instrument.
-    // No `table` attribute: the registry is deployment-wide and a subject's
-    // linkage is destroyed everywhere at once, so attributing the count to a
-    // table would invite a per-table sum that double-counts it.
-    crate::observe::metrics()
-        .subjects_anonymised
-        .add(erased.len() as u64, &[]);
     Ok(erased)
 }
 

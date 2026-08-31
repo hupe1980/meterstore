@@ -192,6 +192,14 @@ Every subject whose readings have all passed the cutoff loses its mapping.
   created would erase a live customer.
 - **It reads the raw versioned relation**, because a superseded version is still a
   stored personal value.
+- **It refuses to run on a restricted session.** The latest reading is
+  `max("from")` over the session sweeping, so a store in `Historical`,
+  `Operational`, `as_of` or `as_known_at` mode would compute it from a view that
+  is deliberately not current — under `Historical` the hot window is invisible, so
+  a subject metered daily looks last-seen at the final archived interval, old
+  enough to erase and still live. That is the same failure as keying on the
+  registration, reached another way, and it is irreversible. Sweep through the
+  store the restricted one was derived from.
 - **Idempotent**, so it runs on a schedule and a re-run writes no second audit row.
 - **`CalendarYears(3)` is not `now - 3 years`.** The statutory clock starts at the
   *Schluss des Kalenderjahres*, so a value collected on 2 January 2025 comes due on
@@ -225,6 +233,39 @@ two are the same thing.
 This is also the answer to "there is no partial data expiry". The statute does not
 require deleting rows; it requires that the values stop being personal, and that
 is `O(1)` without rewriting a byte.
+
+## Configuring it
+
+A table declaring a `subject_column` needs a registry to resolve against, and a
+deployment declaring one without a registry is **refused at startup** rather than
+at the first erasure request:
+
+```toml
+[privacy]
+erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes; optional
+
+[[tables]]
+name = "readings_versions"
+subject_column = "subject_ref"
+```
+
+`Settings::connect()` builds **one** registry for the whole deployment, over the
+same pool as the hot tier — because the mapping is deployment-wide, and because
+erasure needs storage where deletion is real and in the same database as the
+application's own tables. A configuration whose tables declare no subject column
+gets no registry and creates none of its tables.
+
+`erasure_secret` is what turns the suppression list on. It is optional because
+the key must outlive every erasure and is not recoverable from the database:
+losing it exposes nothing and silently disables suppression, which is the one
+failure this crate cannot report — so a deployment that cannot yet hold a key
+securely is better off knowing suppression is off than inventing one it will
+lose.
+
+`meterstore erasures` reads the audit trail from a shell. There is deliberately
+no `meterstore erase`: an Article 17 request usually reaches an application's own
+tables too, and those must succeed or fail in **one transaction** with the
+mapping — which `SubjectRegistry::erase_in` gives and a CLI invocation cannot.
 
 ## What it requires of the deployment
 

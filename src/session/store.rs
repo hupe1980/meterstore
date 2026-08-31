@@ -585,22 +585,17 @@ impl MeterStore {
             .and_then(|i| snapshots[i..].iter().find_map(|s| s.watermark))
             .unwrap_or_else(TieringWatermark::empty);
 
-        let mut builder = MeterStoreBuilder::default()
-            .hot(Arc::clone(&self.hot))
-            .cold(Arc::clone(&self.cold), Arc::clone(&self.cold_provider))
-            .table(self.config.clone())
+        // A reproducible read of a scoped store stays scoped, and keeps its
+        // registry: a boundary that a derived session drops is not a boundary.
+        // `to_builder` is where that list lives.
+        let mut store = self
+            .to_builder()
             .read_mode(ReadMode::AsOf {
                 snapshot,
                 max_version,
             })
-            // A reproducible read of a scoped store stays scoped: a boundary
-            // that a derived session drops is not a boundary.
-            .row_scope(self.row_scope.clone());
-        if let Some(registry) = self.registry.clone() {
-            builder = builder.subject_registry(registry);
-        }
-
-        let mut store = builder.build().await?;
+            .build()
+            .await?;
         store.pinned_watermark = Some(pinned_watermark);
         Ok(store)
     }
@@ -660,16 +655,99 @@ impl MeterStore {
     /// derived session dropped the scope answers caller-supplied SQL over every
     /// tenant.
     async fn derive(&self, mode: ReadMode) -> Result<Self> {
+        self.to_builder().read_mode(mode).build().await
+    }
+
+    /// Everything a derived session has to carry forward, as a builder.
+    ///
+    /// **The single place that list is written**, and the reason it is single:
+    /// five sessions derive from a store — [`as_of`](Self::as_of),
+    /// [`in_read_mode`](Self::in_read_mode), [`scoped`](Self::scoped),
+    /// [`in_own_session`](Self::in_own_session) and
+    /// [`MeterCatalog`](super::MeterCatalog)'s rebuild — and a field one of them
+    /// forgets is silent. A scoped store whose derived session dropped the scope
+    /// answers caller-supplied SQL over every tenant.
+    ///
+    /// The session is deliberately **not** carried: a derived store gets its own
+    /// unless a caller puts it back with [`session`](MeterStoreBuilder::session),
+    /// which is what a catalog does to keep its tables in one. Nor is
+    /// `pinned_watermark`, which belongs to a resolved snapshot rather than to
+    /// the configuration.
+    pub(crate) fn to_builder(&self) -> MeterStoreBuilder {
         let mut builder = MeterStoreBuilder::default()
             .hot(Arc::clone(&self.hot))
             .cold(Arc::clone(&self.cold), Arc::clone(&self.cold_provider))
             .table(self.config.clone())
-            .read_mode(mode)
+            .read_mode(self.mode)
             .row_scope(self.row_scope.clone());
         if let Some(registry) = self.registry.clone() {
             builder = builder.subject_registry(registry);
         }
-        builder.build().await
+        builder
+    }
+
+    /// The row scope this store would have if confined to `column = value`.
+    ///
+    /// The check half of [`scoped`](Self::scoped), separated so a catalog can
+    /// run it over **every** table before confining any of them: a scope applied
+    /// to three tables and refused by the fourth would otherwise leave a caller
+    /// holding a boundary that covers some of their data.
+    pub(crate) fn narrowed_scope(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Result<Option<Vec<(String, datafusion::scalar::ScalarValue)>>> {
+        let identity = self.config.discriminator_columns();
+        if !identity.iter().any(|c| c == column) {
+            let declared = match identity.is_empty() {
+                true => "none are declared".to_string(),
+                false => format!("this table is keyed by [{}]", identity.join(", ")),
+            };
+            return Err(Error::config(format!(
+                "{column:?} is not part of the merge key of {}, so a session cannot be \
+                 scoped to it — {declared}. Only a merge-key column partitions readings, \
+                 and only then does filtering leave one reading's version history intact: \
+                 scoping on an attribute would return a different resolved value, not \
+                 fewer rows",
+                self.config.name(),
+            )));
+        }
+
+        // A scoped session can never come to see more than it already could.
+        // Re-scoping the same column to a *different* value would do exactly
+        // that — hand a tenant-scoped store to less-trusted code and it could
+        // widen to any other tenant — so it is refused rather than replaced.
+        // Refused rather than narrowed to nothing, too: `tenant = 'a' AND tenant
+        // = 'b'` is a caller bug, and answering it with zero rows is the kind of
+        // quiet answer this crate declines to give.
+        let mut scope = self.row_scope.clone();
+        if let Some((_, held)) = scope.iter().find(|(c, _)| c == column) {
+            let held = match held {
+                datafusion::scalar::ScalarValue::Utf8(Some(v)) => v.as_str(),
+                other => {
+                    return Err(Error::config(format!(
+                        "this session is already scoped on {column:?} to a non-string value \
+                     ({other:?}), which cannot be re-scoped"
+                    )));
+                }
+            };
+            if held != value {
+                return Err(Error::config(format!(
+                    "this session is already scoped to {column} = {held:?} and cannot be \
+                     re-scoped to {value:?}. A scope only ever narrows: re-pointing one \
+                     would let a handle that had been confined to a tenant reach another, \
+                     which is the boundary it exists to be. Scope the store it was derived \
+                     from instead"
+                )));
+            }
+            // Same value: idempotent, so there is nothing to add.
+            return Ok(None);
+        }
+        scope.push((
+            column.to_string(),
+            datafusion::scalar::ScalarValue::Utf8(Some(value.to_string())),
+        ));
+        Ok(Some(scope))
     }
 
     /// A session confined to one value of a **merge-key column**.
@@ -715,74 +793,14 @@ impl MeterStore {
     /// Writes are unaffected: [`append`](Self::append) routes by `from` and
     /// carries the identity in the row.
     pub async fn scoped(&self, column: &str, value: impl Into<String>) -> Result<Self> {
-        // Every merge-key column beyond the core three, so a table keyed by
-        // Messlokation can be scoped to one of those too. The rule is about the
-        // merge key rather than about the word "identity": a column in it
-        // partitions *readings*, so filtering before ranking and after give the
-        // same winner.
-        let identity = self.config.discriminator_columns();
-        if !identity.iter().any(|c| c == column) {
-            let declared = match identity.is_empty() {
-                true => "none are declared".to_string(),
-                false => format!("this table is keyed by [{}]", identity.join(", ")),
-            };
-            return Err(Error::config(format!(
-                "{column:?} is not part of the merge key of {}, so a session cannot be \
-                 scoped to it — {declared}. Only a merge-key column partitions readings, \
-                 and only then does filtering leave one reading's version history intact: \
-                 scoping on an attribute would return a different resolved value, not \
-                 fewer rows",
-                self.config.name(),
-            )));
-        }
-
-        // A scoped session can never come to see more than it already could.
-        // Re-scoping the same column to a *different* value would do exactly
-        // that — hand a tenant-scoped store to less-trusted code and it could
-        // widen to any other tenant — so it is refused rather than replaced.
-        // Refused rather than narrowed to nothing, too: `tenant = 'a' AND tenant
-        // = 'b'` is a caller bug, and answering it with zero rows is the kind of
-        // quiet answer this crate declines to give.
-        let value = value.into();
-        let mut scope = self.row_scope.clone();
-        if let Some((_, held)) = scope.iter().find(|(c, _)| c == column) {
-            let held = match held {
-                datafusion::scalar::ScalarValue::Utf8(Some(v)) => v.as_str(),
-                other => {
-                    return Err(Error::config(format!(
-                        "this session is already scoped on {column:?} to a non-string value \
-                     ({other:?}), which cannot be re-scoped"
-                    )));
-                }
-            };
-            if held != value {
-                return Err(Error::config(format!(
-                    "this session is already scoped to {column} = {held:?} and cannot be \
-                     re-scoped to {value:?}. A scope only ever narrows: re-pointing one \
-                     would let a handle that had been confined to a tenant reach another, \
-                     which is the boundary it exists to be. Scope the store it was derived \
-                     from instead"
-                )));
-            }
-            // Same value: idempotent, so nothing to add.
+        // The check and the widened scope come from `narrowed_scope`, which a
+        // catalog runs over every table before confining any of them — so the
+        // rule about which columns may be scoped is stated once for both.
+        let Some(scope) = self.narrowed_scope(column, &value.into())? else {
+            // Already scoped to this exact value: idempotent.
             return self.in_own_session().await;
-        }
-        scope.push((
-            column.to_string(),
-            datafusion::scalar::ScalarValue::Utf8(Some(value)),
-        ));
-
-        let mut builder = MeterStoreBuilder::default()
-            .hot(Arc::clone(&self.hot))
-            .cold(Arc::clone(&self.cold), Arc::clone(&self.cold_provider))
-            .table(self.config.clone())
-            .read_mode(self.mode)
-            .row_scope(scope);
-        if let Some(registry) = self.registry.clone() {
-            builder = builder.subject_registry(registry);
-        }
-
-        let mut store = builder.build().await?;
+        };
+        let mut store = self.to_builder().row_scope(scope).build().await?;
         store.pinned_watermark = self.pinned_watermark;
         Ok(store)
     }
@@ -795,16 +813,7 @@ impl MeterStore {
     /// property — read mode, row scope, pinned watermark, registry — is carried
     /// over; only the shared catalog is not.
     pub async fn in_own_session(&self) -> Result<Self> {
-        let mut builder = MeterStoreBuilder::default()
-            .hot(Arc::clone(&self.hot))
-            .cold(Arc::clone(&self.cold), Arc::clone(&self.cold_provider))
-            .table(self.config.clone())
-            .read_mode(self.mode)
-            .row_scope(self.row_scope.clone());
-        if let Some(registry) = self.registry.clone() {
-            builder = builder.subject_registry(registry);
-        }
-        let mut store = builder.build().await?;
+        let mut store = self.to_builder().build().await?;
         store.pinned_watermark = self.pinned_watermark;
         Ok(store)
     }
@@ -1024,7 +1033,7 @@ impl MeterStore {
     /// anything near it rather than routing — see there for when that trade is
     /// the right one and when it is not.
     pub async fn append(&self, series: &[crate::encode::StoredSeries]) -> Result<AppendOutcome> {
-        self.require_writable("append")?;
+        self.require_current_knowledge("append")?;
         self.require_time_model(crate::config::TimeModel::Interval, "append")?;
         self.check_subject_refs(series).await?;
 
@@ -1159,7 +1168,7 @@ impl MeterStore {
         &self,
         readings: &[crate::encode::StoredReadings],
     ) -> Result<AppendOutcome> {
-        self.require_writable("append_readings")?;
+        self.require_current_knowledge("append_readings")?;
         self.require_time_model(crate::config::TimeModel::Point, "append_readings")?;
         self.check_reading_subject_refs(readings).await?;
 
@@ -1451,7 +1460,7 @@ impl MeterStore {
     ) -> Result<AppendOutcome> {
         use crate::session::Effect;
 
-        self.require_writable("append_authoritative")?;
+        self.require_current_knowledge("append_authoritative")?;
 
         let discriminators = self.config.discriminator_columns();
         let mut pending: Vec<crate::encode::StoredSeries> = series.to_vec();
@@ -1544,7 +1553,7 @@ impl MeterStore {
     ///
     /// [`StoredSeries`]: crate::encode::StoredSeries
     pub async fn hot_writer(&self) -> Result<HotWriter<'_>> {
-        self.require_writable("hot_writer")?;
+        self.require_current_knowledge("hot_writer")?;
         self.require_time_model(crate::config::TimeModel::Interval, "hot_writer")?;
         Ok(HotWriter {
             store: self,
@@ -1705,6 +1714,9 @@ impl MeterStore {
         actor: &str,
         now: time::OffsetDateTime,
     ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        // Erasure is irreversible and its due-date is `max(from)` over *this*
+        // session, so a restricted view does not misreport here — it destroys.
+        self.require_current_knowledge("anonymise_before")?;
         let registry = self.require_registry()?;
         if self.config.subject_column().is_none() {
             return Err(Error::config(
@@ -1785,33 +1797,43 @@ impl MeterStore {
         Ok(Some(seen))
     }
 
-    /// Refuse a write on a session that is not reading current best knowledge.
+    /// Refuse an operation whose *decision* is a query against this session,
+    /// when the session is not reading current best knowledge.
     ///
     /// [`as_of`](Self::as_of) and [`as_known_at`](Self::as_known_at) return a
     /// store pinned to a past state, and [`Historical`]/[`Operational`] restrict
-    /// which tiers are read. Those are **reading** postures, and a write through
-    /// one is a mistake with quiet consequences: every check the write path makes
-    /// — that a replay is a replay, that a reading carries one network operator,
-    /// what the write displaced — is a query against this session, so it would be
-    /// answered from the pinned or half-visible view rather than from what is
-    /// actually stored. The rows would land in the real table; only the reasoning
-    /// about them would be wrong.
+    /// which tiers are read. Those are **reading** postures, and two kinds of
+    /// operation must not run through one.
     ///
-    /// The store the pinned one was derived from is still writable, so the fix is
+    /// **The write path.** Every check it makes — that a replay is a replay, that
+    /// a reading carries one network operator, what the write displaced — is a
+    /// query against this session, so it would be answered from the pinned or
+    /// half-visible view rather than from what is actually stored. The rows would
+    /// land in the real table; only the reasoning about them would be wrong.
+    ///
+    /// **The retention sweep**, where the consequence is worse. It erases a
+    /// subject whose latest reading predates a cutoff, and that latest reading is
+    /// `max(from)` over *this session*. Under [`Historical`] the hot window is
+    /// invisible, so a subject metered daily looks last-seen at the final
+    /// archived interval — old enough to erase, while it is still live. Erasure
+    /// has no recovery path, which makes this the one place a restricted view
+    /// destroys data rather than merely misreporting it.
+    ///
+    /// The store the pinned one was derived from is unrestricted, so the fix is
     /// always to hold on to it rather than to reach through the derived handle.
     ///
     /// [`Historical`]: crate::planner::ReadMode::Historical
     /// [`Operational`]: crate::planner::ReadMode::Operational
-    fn require_writable(&self, operation: &str) -> Result<()> {
+    pub(crate) fn require_current_knowledge(&self, operation: &str) -> Result<()> {
         if self.mode == ReadMode::Unified {
             return Ok(());
         }
         Err(Error::config(format!(
             "{operation} is not available on a session in {:?} mode: this store reads a \
-             pinned or restricted view, and the write path checks a delivery against what \
-             the session can see — a replay, a second network operator and a displacement \
-             report would all be decided from the wrong state. Write through the store this \
-             one was derived from",
+             pinned or restricted view, and the decision it makes is a query against what \
+             the session can see — a replay, a second network operator, a displacement \
+             report and a subject's latest reading would all be settled from the wrong \
+             state. Use the store this one was derived from",
             self.mode,
         )))
     }

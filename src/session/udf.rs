@@ -29,9 +29,12 @@
 //! because a register may have no direction at all — and [`ObisTariffRegister`]
 //! and [`ObisNormalise`] the two accessors a query needs.
 //!
-//! [`EicRegelzone`] does the same for the other identifier a deployment stores:
-//! a Bilanzierungsgebiet's Regelzone is in position 4 of its EIC, which is a
-//! paragraph of BDEW citation upstream and one line here.
+//! [`EicRegelzone`], [`EicObjectType`] and [`EicNormalise`] do the same for the
+//! other identifier a deployment stores: a Bilanzierungsgebiet's Regelzone is in
+//! position 4 of its EIC and *what an EIC names at all* is in position 3, each a
+//! paragraph of citation upstream and one line here — and the third says whether
+//! the value was an EIC in the first place, which is what tells the two kinds of
+//! null in the second apart.
 //!
 //! The arithmetic is `metering::calendar`'s. These are wrappers: they convert
 //! between Arrow arrays and the domain functions and nothing else. Their tests
@@ -49,7 +52,7 @@ use datafusion::logical_expr::{
 };
 use metering::IntervalResolution;
 use metering::calendar;
-use metering::ids::{Eic, Regelzone};
+use metering::ids::{Eic, EicType, Regelzone};
 use metering::interval::{Direction, Sparte};
 use metering::obis::ObisCode;
 use time::{Date, OffsetDateTime};
@@ -471,6 +474,146 @@ impl ScalarUDFImpl for EicRegelzone {
         let out: StringArray = as_eic(&args)?
             .iter()
             .map(|e| e.and_then(|e| e.regelzone()).map(Regelzone::as_str))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// `eic_normalise(code)` — the canonical spelling of an EIC, or null.
+///
+/// Two jobs, as [`ObisNormalise`] has.
+///
+/// **A join key.** A foreign table may hold a code padded or in lower case, and
+/// a checked column holds only the trimmed uppercase form, so a literal
+/// comparison across the two returns nothing.
+///
+/// **A validity predicate**, which [`EicObjectType`] cannot be on its own: that
+/// one is null both for a value that is not an EIC and for an EIC whose
+/// object-type letter this build does not list. Only the second is actionable,
+/// and the pair separates them.
+///
+/// ```sql
+/// -- Free text in an identifier column.
+/// SELECT DISTINCT bilanzkreis FROM readings
+/// WHERE bilanzkreis IS NOT NULL AND eic_normalise(bilanzkreis) IS NULL;
+///
+/// -- A well-formed EIC whose object type this build does not list — the rows a
+/// -- stricter parser downstream will reject.
+/// SELECT DISTINCT bilanzkreis FROM readings
+/// WHERE eic_normalise(bilanzkreis) IS NOT NULL
+///   AND eic_object_type(bilanzkreis) IS NULL;
+/// ```
+///
+/// The second query matters because `metering` parses an object type it does not
+/// list as `None` rather than failing — the list is ENTSO-E's to extend, and a
+/// store that refused an entry added after its release would reject data the
+/// market has issued. Where an EIC passes through a stricter parser in the same
+/// process, this finds those rows on the deployment's own schedule; declaring
+/// [`ValueCheck::Eic`](crate::config::ValueCheck::Eic) with an object type stops
+/// new ones arriving.
+///
+/// Null rather than an error for a non-EIC, where [`ObisNormalise`] errors: this
+/// reads a *deployment* column that may carry no `check` at all, and one row of
+/// free text must not take a report down.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct EicNormalise {
+    signature: Signature,
+}
+
+impl Default for EicNormalise {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for EicNormalise {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "eic_normalise"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let out: StringArray = as_eic(&args)?
+            .iter()
+            .map(|e| e.map(|e| e.as_str().to_string()))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// `eic_object_type(code)` — the letter saying what an EIC names.
+///
+/// `'X'` a party, `'Y'` an area, `'Z'` a measurement point, `'W'` a resource
+/// object, `'T'` a tie line, `'V'` a location, `'A'` a substation — the closed
+/// list of the ENTSO-E *EIC Reference Manual* §4.2, in position 3 of every code.
+/// Null for anything that is not an EIC, and null for a type letter this build's
+/// `metering` does not list.
+///
+/// # The check a `check = "EIC"` column deliberately does not make
+///
+/// [`checked_column`](crate::config::checked_column) parses the code and stops
+/// there, because *which object type belongs in which column* is the
+/// deployment's schema rather than the scheme's rule — the same EIC alphabet
+/// addresses a Bilanzkreis and a Bilanzierungsgebiet, and only the column name
+/// says which was meant. So the check that a Bilanzkreis column holds party
+/// codes is a **query**, and this is the function it is written with:
+///
+/// ```sql
+/// -- A Bilanzierungsgebiet stored in the Bilanzkreis column. Both are EICs,
+/// -- both pass the write path, and every MaBiS grouping over them is wrong.
+/// SELECT DISTINCT bilanzkreis
+/// FROM readings
+/// WHERE eic_object_type(bilanzkreis) IS DISTINCT FROM 'X'
+/// ```
+///
+/// `IS DISTINCT FROM` rather than `<>`, because the answer is three-valued: a
+/// null is a code this build could not read as an EIC at all, which is a
+/// finding rather than a row to skip.
+///
+/// The letters are [`EicType::as_str`](metering::ids::EicType::as_str), which is
+/// also the `serde` tag — so a value from this function and one out of a JSON
+/// payload compare literally.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct EicObjectType {
+    signature: Signature,
+}
+
+impl Default for EicObjectType {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for EicObjectType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "eic_object_type"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let out: StringArray = as_eic(&args)?
+            .iter()
+            .map(|e| e.and_then(|e| e.object_type()).map(EicType::as_str))
             .collect();
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
@@ -907,6 +1050,8 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::from(ObisNormalise::default()),
         ScalarUDF::from(ObisDirection::default()),
         ScalarUDF::from(EicRegelzone::default()),
+        ScalarUDF::from(EicObjectType::default()),
+        ScalarUDF::from(EicNormalise::default()),
     ];
     // One-to-one with `metering::obis`'s own predicates. Listed rather than
     // generated so that adding one upstream is a deliberate act here, and so the
@@ -1667,6 +1812,103 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, vec![None, None, Some("TENNET".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn eic_object_type_reads_position_three_and_agrees_with_metering() {
+        // The wrapper's job is to preserve the upstream answer, so the
+        // expectation is `metering`'s own rather than a second table of letters
+        // here — a letter added upstream then shows up as a passing case rather
+        // than as a diff nobody made.
+        for code in [
+            "11XBK0000000001A",
+            "11YN000000000016",
+            "10X168Y4E6H0041Z",
+            "10X---ENTSOE---L",
+        ] {
+            let want = code
+                .parse::<Eic>()
+                .expect("a valid EIC")
+                .object_type()
+                .map(EicType::as_str);
+            assert_eq!(
+                one_string(&format!("SELECT eic_object_type('{code}')"))
+                    .await
+                    .as_deref(),
+                want,
+                "{code}"
+            );
+        }
+
+        // The finding the function exists for: an area code sitting in a column
+        // that is meant to hold party codes. Both are EICs, so the write path
+        // cannot tell them apart — only the column name says which was meant.
+        assert_eq!(
+            one_string("SELECT eic_object_type('11YN000000000016')")
+                .await
+                .as_deref(),
+            Some("Y")
+        );
+
+        // And null for the two things that are not a type letter: a value that
+        // is not an EIC at all, and a null column.
+        assert_eq!(
+            one_string("SELECT eic_object_type('not an eic')").await,
+            None
+        );
+        assert_eq!(
+            one_string("SELECT eic_object_type(CAST(NULL AS VARCHAR))").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn eic_normalise_tells_the_two_kinds_of_missing_object_type_apart() {
+        // `eic_object_type` is null for two entirely different findings, and
+        // only one of them is actionable: free text in an identifier column, and
+        // a well-formed EIC whose type letter this build's `metering` does not
+        // list. The second is the one a strict downstream parser will reject.
+        //
+        // `11QBK0000000001Y` is a real EIC — sixteen characters, an uppercase
+        // letter at position 3, and the check character the ENTSO-E algorithm
+        // computes for the other fifteen — carrying a `Q` at position 3, which
+        // the manual's type list does not hold.
+        const UNLISTED: &str = "11QBK0000000001Y";
+        assert!(
+            UNLISTED.parse::<Eic>().is_ok(),
+            "the fixture must be a valid EIC, or it tests the other branch"
+        );
+        assert_eq!(UNLISTED.parse::<Eic>().unwrap().object_type(), None);
+
+        // Both are null under `eic_object_type` …
+        for code in [UNLISTED, "not an eic"] {
+            assert_eq!(
+                one_string(&format!("SELECT eic_object_type('{code}')")).await,
+                None,
+                "{code}"
+            );
+        }
+        // … and `eic_normalise` separates them.
+        assert_eq!(
+            one_string(&format!("SELECT eic_normalise('{UNLISTED}')"))
+                .await
+                .as_deref(),
+            Some(UNLISTED)
+        );
+        assert_eq!(one_string("SELECT eic_normalise('not an eic')").await, None);
+
+        // And the join-key half, which is the other reason it exists: a column
+        // written by something that is not this crate holds what was typed.
+        assert_eq!(
+            one_string("SELECT eic_normalise('  11xbk0000000001a  ')")
+                .await
+                .as_deref(),
+            Some("11XBK0000000001A")
+        );
+        assert_eq!(
+            one_string("SELECT eic_normalise(CAST(NULL AS VARCHAR))").await,
+            None
+        );
     }
 
     #[tokio::test]

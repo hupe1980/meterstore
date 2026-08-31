@@ -380,3 +380,162 @@ async fn the_channel_list_is_narrowed_by_everything_the_read_was() {
     let series = query.collect().await.expect("collect").expect("rows");
     assert_eq!(series.intervals.len(), 1);
 }
+
+/// A Lastgang table that identifies a reading by its **Messlokation**.
+///
+/// The shape a Marktlokation with two meters needs: `melo_id` joins the merge
+/// key, so each meter's channel is its own series rather than a second delivery
+/// of the first one.
+fn identified_by_melo() -> meterstore::ValidatedTableConfig {
+    meterstore::TableConfig::new(meterstore::testkit::TestHarness::TABLE)
+        .settlement_lag(Duration::DAY)
+        .identify_by_melo(true)
+        .build()
+        .expect("config")
+}
+
+/// [`on_channel`], labelled with a Messlokation.
+fn from_meter(melo: &str, kwh: i64, version: u128) -> meterstore::encode::StoredSeries {
+    let mut stored = on_channel("1-0:1.8.0", &[(kwh, QualityFlag::Measured)], version);
+    stored.series = stored
+        .series
+        .with_melo_id(melo.parse().expect("a valid MeLo-ID"));
+    stored
+}
+
+const METER_A: &str = "DE0001234567890123456789012345678";
+const METER_B: &str = "DE0009876543210987654321098765432";
+
+#[tokio::test]
+async fn a_series_read_narrows_to_one_messlokation() {
+    // Two meters under one Marktlokation, both carrying `1-0:1.8.0` at the same
+    // instant. Unnarrowed, `collect` folds them into one series and the total is
+    // twice the truth — which is why `melo` exists on this builder and not only
+    // on the register one.
+    let harness = meterstore::testkit::TestHarness::with_config(identified_by_melo())
+        .await
+        .expect("harness");
+    harness
+        .ensure_partitions(START, START + Duration::days(2))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(START).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+
+    store
+        .append(&[
+            from_meter(METER_A, 10, 20_260_720_000_001),
+            from_meter(METER_B, 7, 20_260_720_000_002),
+        ])
+        .await
+        .expect("append");
+
+    // Unnarrowed, the fold is refused rather than doubling the month — and the
+    // message names the narrowing that fixes it, which is the typed one.
+    let err = store
+        .series("12345678905")
+        .unwrap()
+        .obis("1-0:1.8.0")
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("two meters are two readings, not one series")
+        .to_string();
+    assert!(err.contains("two readings"), "{err}");
+    assert!(
+        err.contains(".melo(..)"),
+        "the fix has to be the typed one: {err}"
+    );
+
+    // Narrowed, and the value is the one meter's.
+    for (melo, want) in [(METER_A, 10), (METER_B, 7)] {
+        let one = store
+            .series("12345678905")
+            .unwrap()
+            .melo(melo)
+            .unwrap()
+            .obis("1-0:1.8.0")
+            .unwrap()
+            .collect()
+            .await
+            .expect("collect")
+            .expect("rows");
+        assert_eq!(one.intervals.len(), 1, "{melo}");
+        assert_eq!(one.intervals[0].value, Decimal::new(want, 0), "{melo}");
+    }
+}
+
+#[tokio::test]
+async fn a_messlokation_is_parsed_rather_than_matched_as_a_string() {
+    // The failure this closes. `column_eq("melo_id", …)` takes a bare
+    // `ScalarValue`: a lower-cased or truncated Zählpunktbezeichnung matches
+    // nothing at all, and an empty series is indistinguishable from a meter that
+    // reported nothing — which is the report a settlement run would act on.
+    let harness = meterstore::testkit::TestHarness::with_config(identified_by_melo())
+        .await
+        .expect("harness");
+    harness
+        .ensure_partitions(START, START + Duration::days(2))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(START).await.expect("watermark");
+    let store = harness.store().await.expect("store");
+    store
+        .append(&[from_meter(METER_A, 10, 20_260_720_000_001)])
+        .await
+        .expect("append");
+
+    // The untyped door: silently empty.
+    let silent = store
+        .series("12345678905")
+        .unwrap()
+        .column_eq(
+            "melo_id",
+            datafusion::common::ScalarValue::Utf8(Some(METER_A.to_lowercase())),
+        )
+        .unwrap()
+        .collect()
+        .await
+        .expect("collect");
+    assert!(
+        silent.is_none(),
+        "an unparsed literal matches nothing, which is the whole problem"
+    );
+
+    // The typed one: the same input, canonicalised, finds the reading.
+    let found = store
+        .series("12345678905")
+        .unwrap()
+        .melo(METER_A.to_lowercase())
+        .unwrap()
+        .collect()
+        .await
+        .expect("collect")
+        .expect("rows");
+    assert_eq!(found.intervals[0].value, Decimal::new(10, 0));
+
+    // And a value that is not a Zählpunktbezeichnung fails at the call, naming
+    // the column, rather than becoming a predicate nothing matches.
+    let err = store
+        .series("12345678905")
+        .unwrap()
+        .melo("DE000123456789")
+        .expect_err("33 characters, and this is fourteen")
+        .to_string();
+    assert!(err.contains("melo_id"), "{err}");
+
+    // Whatever the caller is holding. A read of this store hands back a
+    // `MeloId`, and narrowing to one must not go back through a string.
+    let parsed: metering::ids::MeloId = METER_A.parse().unwrap();
+    assert!(
+        store
+            .series("12345678905")
+            .unwrap()
+            .melo(parsed)
+            .unwrap()
+            .collect()
+            .await
+            .expect("collect")
+            .is_some()
+    );
+}

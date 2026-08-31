@@ -167,8 +167,8 @@ impl fmt::Display for Version {
 ///
 /// It is the **Marktpartner-ID** of the network operator that issued the
 /// version — what MSCONS puts in `NAD+MS`, and the same identifier
-/// [`MeasurementSource::Mscons`] carries. `metering` 0.20 gave it a type, and
-/// this crate takes the type for the reason it takes [`MaloId`] rather than
+/// [`MeasurementSource::Mscons`] carries. This crate takes the parsed
+/// [`BdewCode`] for the reason it takes [`MaloId`] rather than
 /// eleven digits: past the constructor a wrong-but-plausible operator is simply
 /// a *different scope*, so a correction fails to supersede the value it corrects
 /// and both rows survive into the resolved view. There is no error anywhere and
@@ -207,11 +207,10 @@ impl fmt::Display for Version {
 /// whole number of Gastage rather than a calendar month shifted. An interval at
 /// 02:00 local on 1 March belongs to February's gas scope.
 ///
-/// So every constructor here takes a [`Sparte`]. It is not decoration: before
-/// this, a producer deriving the *correct* gas Bilanzierungsmonat had its
-/// delivery **refused** by [`covers`](Self::covers) at the write, while one
-/// deriving the calendar month was accepted — the store enforced the wrong rule
-/// and enforced it firmly.
+/// So every constructor here takes a [`Sparte`]. It is not decoration:
+/// [`covers`](Self::covers) refuses a delivery whose month is not the one the
+/// commodity balances on, so getting it wrong is a rejected delivery rather than
+/// a silently mis-scoped one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VersionScope(String);
 
@@ -515,6 +514,32 @@ impl ScopedVersion {
 mod tests {
     use super::*;
     use time::Duration;
+
+    #[test]
+    fn an_operator_arrives_as_whatever_the_caller_is_holding() {
+        // A generic `impl TryInto<BdewCode>` bound is satisfied by the caller's
+        // own type, not by a deref of it. An owned `String` — which is what a
+        // parser hands back from an MSCONS `NAD+MS` segment — therefore needs
+        // `TryFrom<String>` upstream to be accepted at all. This pins that the
+        // three shapes a caller actually holds are interchangeable.
+        let at = time::macros::datetime!(2026-07-20 00:00 UTC);
+        let owned: String = "9900000000001".to_string();
+        let borrowed: &str = "9900000000001";
+        let parsed: BdewCode = borrowed.parse().unwrap();
+
+        let from_owned = VersionScope::for_interval(owned, at, Sparte::Strom).unwrap();
+        let from_borrowed = VersionScope::for_interval(borrowed, at, Sparte::Strom).unwrap();
+        let from_parsed = VersionScope::for_interval(parsed, at, Sparte::Strom).unwrap();
+        assert_eq!(from_owned, from_borrowed);
+        assert_eq!(from_owned, from_parsed);
+
+        // And an owned one is checked exactly as a borrowed one is: the bound
+        // must not have widened into "any string".
+        let err = VersionScope::new("99".to_string(), 2026, 7)
+            .expect_err("thirteen digits, whatever the caller holds")
+            .to_string();
+        assert!(err.contains("Marktpartner-ID"), "{err}");
+    }
 
     #[test]
     fn a_scope_is_exactly_what_the_stored_column_can_hold() {
@@ -890,7 +915,7 @@ mod tests {
             "9900000000001:2026-3",   // unpadded month
             "9900000000001:202-003",  // seven characters, wrong shape
             "9900000000001",          // no separator at all
-            "99:2026-03",             // the short spelling this crate used to take
+            "99:2026-03",             // an operator too short to be a Marktpartner-ID
             "990000000000:2026-03",   // twelve digits
             "99000000000012:2026-03", // fourteen
             // `BdewCode`'s own `FromStr` trims, which is right at an ingest

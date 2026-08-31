@@ -7,6 +7,593 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.9.0] — 2026-08-31
+
+A configuration setting that could not be deployed at all, a multi-tenant catalog
+that could not be confined, `metering` 0.22, and the identifier surfaces that
+stopped short of where their own argument reaches —
+a checked column that could only be an EIC and could not say *which* EIC, and
+three read builders that could narrow to a Marktlokation but not to the meter
+under it. Plus the guards `metering`'s own release round argued for: this crate
+writes two JSON columns under a decades-long retention obligation and enables
+`metering/serde` for everyone downstream of it, and both of those facts were
+asserted in comments.
+
+### A `subject_column` in a configuration file could not be started
+
+The one that mattered. `subject_column` parses, validates, has a documentation
+page and a CLI flag that names it as a prerequisite — and nothing on the
+deployment path built the `SubjectRegistry` it resolves against, which
+`MeterStoreBuilder::build` refuses to go without. `meterstore check` passed the
+file, and then every subcommand that opens a store — `create`, `status`,
+`archive`, `query`, `maintain` — failed:
+
+```
+a subject column is declared but no subject registry was provided: the
+references would resolve to nothing and erasure would have no mapping to destroy
+```
+
+The message is right and the fix it implies was unreachable: no configuration
+file could supply a registry. `meterstore maintain --anonymise-after-years 3` —
+the § 60 Abs. 6 MsbG sweep, documented as needing exactly this — could therefore
+never be run from a configuration file at all.
+
+`Settings::connect` now builds **one** registry for the deployment whenever any
+table declares a subject column, over the same pool as the hot tier, and hands it
+to each table that asked for it. One rather than one per table because the
+mapping is deployment-wide: two tables registering the same natural identifier
+share a `SubjectRef`, and a single erasure has to unlink both. A file that
+declares no subject column gets no registry and creates none of its tables.
+
+A `[privacy]` section carries the one thing a registry needs that the pool does
+not:
+
+```toml
+[privacy]
+erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes; optional
+```
+
+That key is what turns the **suppression list** on. Without it erasure works and
+does not stay worked — once the mapping is deleted nothing distinguishes an
+erased identifier from one never seen, so a pipeline replaying old messages
+registers a fresh reference and silently re-links the subject. It is optional
+rather than required because the key must outlive every erasure and is not
+recoverable from the database: losing it exposes nothing and silently disables
+suppression, which is the one failure this crate cannot report, so a deployment
+that cannot yet hold a key securely is better off knowing than inventing one it
+will lose.
+
+Its length is checked by `meterstore check`, with no database — a key too short
+to resist a brute-force turns the suppression tombstone into the oracle it exists
+to prevent, and discovering that at the first process start means discovering it
+in a deploy rather than in CI. `MIN_ERASURE_SECRET_BYTES` is the one number, so
+the file front end and `SubjectRegistry::with_erasure_secret` cannot come to
+disagree.
+
+`Settings::to_toml` now says outright that it writes the resolved secrets rather
+than the `${VAR}` placeholders. That was already true of the connection URL's
+password and is what "round-trips" has to mean; the redaction this crate applies
+is on `Debug`, which is where a configuration reaches a log by accident.
+
+### The erasure trail was reachable only from Rust
+
+"We deleted it" is not evidence, and an auditor's question does not arrive in a
+Rust file.
+
+```bash
+meterstore erasures --limit 50
+```
+
+One list rather than one per table, because the registry is. A configuration
+whose tables declare no `subject_column` holds no mapping and says so, rather
+than printing an empty list that reads as *"nothing has been erased"*.
+
+**There is deliberately no `meterstore erase`**, and this is the reason the
+library already gives for `erase_in` existing: an Article 17 request usually
+reaches an application's own tables too — billing periods, quality assessments,
+substitute-value logs — and those must succeed or fail *in one transaction* with
+the mapping. A CLI invocation commits its own and cannot enclose them, so the
+failure mode would be the worst kind: a subject reported as erased whose derived
+rows survived. The duty that comes due on its own is a different thing, and
+`meterstore maintain --anonymise-after-years` does run it.
+
+### A Bilanzkreis was checked and a Marktpartner-ID was not
+
+`eic_column` made one argument — an identifier is *parsed rather than trusted* —
+and applied it to one identifier. The columns a German deployment actually
+declares are `bilanzkreis` and `bilanzierungsgebiet` (EIC), `lieferant`,
+`messstellenbetreiber` and `netzbetreiber` (a thirteen-digit Marktpartner-ID),
+and the underlying Marktlokation of a Kaskade or the parent of a Tranche (an
+eleven-digit MaLo-ID, check digit and all). Two of those three groups had no
+declaration at all and were plain `Utf8`, in a crate whose front page argues that
+they should not be.
+
+`ValueCheck` is the scheme, and `checked_column(name, check, nullable)` declares
+one:
+
+```rust
+.attribute_column(checked_column("bilanzkreis", ValueCheck::Eic, true))
+.attribute_column(checked_column("lieferant", ValueCheck::Bdew, true))
+.attribute_column(checked_column("unterliegende_malo", ValueCheck::Malo, true))
+```
+
+```toml
+extra_columns = [
+  { name = "bilanzkreis", check = "EIC" },
+  { name = "lieferant",   check = "BDEW" },
+]
+```
+
+**Each stops somewhere different, and the type says where** rather than leaving a
+reader to assume they are all equally strong:
+
+| `check` | Length | Shape | Arithmetic | Canonicalises |
+|---|---|---|---|---|
+| `EIC` | 16 | `0-9 A-Z -`, letter at 3, check character not `-` | **check character** | trim, uppercase |
+| `MALO` | 11 | digits, first not `0` | **check digit** | trim |
+| `MELO` | 33 | 2 letters, 6 digits, 25 alphanumerics | none exists | trim, uppercase |
+| `BDEW` | 13 | digits | **deliberately not checked** | trim |
+
+The two with arithmetic are the two where a transposition is detectable while the
+delivery that carried it is still in hand. `MELO` earns its declaration on the
+**casing** — storage holds the uppercase form, so a Messlokation arriving in two
+casings on an identity column would be two readings that never supersede each
+other — and `BDEW` on the length and alphabet, which is the whole of the rule
+that can be enforced: §2.3 of the Bildungsvorschrift exempts GS1-issued GLNs,
+which use a different check-digit procedure and are legitimate Marktpartner-IDs.
+That is the same carve-out for which `version_scope` deliberately does not check
+its operator's digit, and it is now stated in the type rather than only in the
+one place it was already reasoned about.
+
+The shape patterns are anchored on the **stored** form, so a row written in lower
+case by another writer is refused rather than becoming a second spelling. They
+live on `ValueCheck` and the DDL reads them from there, so the hot table's `CHECK`
+and the scheme cannot drift apart; `tests/it/checked_columns.rs` evaluates every
+one of them in PostgreSQL's own POSIX engine, on the pattern the server is
+actually holding.
+
+**Breaking.** `eic_column` and `VALUE_CHECK_EIC` are gone —
+`checked_column(name, ValueCheck::Eic(None), nullable)` and
+`ValueCheck::Eic(None).as_str()`. One spelling per value, which is the same rule
+this crate applies to the data.
+
+`ValueCheck` is deliberately not `#[non_exhaustive]`, unlike `Error`: a scheme
+added here is a scheme a caller matching on it has to decide about, and a `_` arm
+would let that decision be skipped silently.
+
+### `WHERE NOT complete` reported unjudgeable channels as fine
+
+The completeness report's whole claim is that *an aggregate over an incomplete
+month must not look like one over a complete month*. Its own documented SQL
+example did exactly that.
+
+A channel that declares no resolution — or a calendar one like `P1M`, which has no
+fixed count within a day — has nothing to compare against. It reports
+`missing = 0` and `surplus = 0`, and therefore `complete = true`, without anything
+having been checked. Rust has had `Completeness::is_measurable` for precisely this
+since the report existed; the **table function did not publish it**, so the two
+surfaces disagreed about what had been verified and
+
+```sql
+SELECT * FROM meter_completeness(…) WHERE NOT complete;
+```
+
+silently dropped every channel nobody could judge.
+
+`meter_completeness` now publishes a `measurable` column beside `complete`, and
+the documented query is `WHERE NOT complete OR NOT measurable`. The CLI's JSON
+summary gains `channels_unmeasurable` for the same reason — the monitoring check
+the CLI page prints was `jq -e '.channels_incomplete == 0'`, which passes a month
+nothing was verified about; it is now conjoined with the new counter. The
+`--format table` output already flagged such a row in its `NOTE` column, which is
+what made the omission visible on the other two surfaces.
+
+### A retention sweep on a restricted session erased a live subject
+
+The most serious of this round, and the only one that destroys data.
+
+§ 60 Abs. 6 MsbG erases a subject once every reading it explains has passed the
+ceiling, so the sweep computes each subject's **latest reading** and compares it
+to the cutoff. That latest reading is `max("from")` over the session running the
+sweep — and a session in `Historical`, `Operational`, `as_of` or `as_known_at`
+mode reads a view that is deliberately not current.
+
+Under `Historical` the hot window is invisible. A subject metered daily therefore
+looks last-seen at the final **archived** interval: old enough to erase, and still
+live. Under `as_known_at` every reading recorded after the ceiling is invisible,
+with the same effect. Erasure is irreversible and the audit row records that it
+happened, so nothing downstream reports it.
+
+Reproduced before fixing, with the guard removed — one store, one subject, one
+cutoff, two sessions:
+
+```
+UNRESTRICTED ERASED: 0          # correct: the subject has a current reading
+PINNED ERASED: 1
+LIVE SUBJECT STILL RESOLVES: false
+```
+
+`anonymise_before` and the catalog-wide sweep now require a session reading
+current best knowledge, the same guard `append` already had. The guard is renamed
+from `require_writable` to `require_current_knowledge`, because the rule was never
+about writing: it is that an operation whose **decision is a query against this
+session** must not run through a restricted one. Archival, snapshot expiry and
+`purge_table` stay available on a pinned session for the same reason — none of
+them decides anything from the session, they read the tiers directly.
+
+The catalog sweep checks every table **before** erasing anything, since a subject
+due-date is the latest reading across the deployment and one table reading a
+partial view understates it.
+
+The reproducibility page listed two refused operations; there are five.
+
+### A configuration mistake told a supervisor to retry forever
+
+`warehouse = "s3://…"` in a build without `object-store-s3`, or any unsupported
+scheme, raised `Error::Storage` — which `is_retryable` reports as **true**, and
+which the CLI maps to exit **75 (EX_TEMPFAIL)**. A supervisor reads that as *"try
+again"*, so a misconfigured warehouse restart-loops forever on a mistake that can
+never fix itself. `meterstore check` runs this path with no database, so it is
+reachable in CI as well as at start-up.
+
+`is_retryable`'s own documentation says false is for "everything describing the
+*input*, where a retry loops forever on a message that will never change", and
+the setting's own comment already called it "a configuration error". Both are now
+`Error::Config`.
+
+### `archive_all` flattened every table's error into one variant
+
+`MeterCatalog::archive_all` wrapped each per-table failure as
+`Error::Storage(format!("archiving {name}: {e}"))`. That destroys the variant a
+caller matches on — which this crate's error documentation makes a point of — and
+makes the result **retryable** whatever it was. `InvariantViolated` is the one
+condition the crate is most emphatic must not be retried past, and archival is
+exactly where it surfaces.
+
+The error now reaches the caller as it was raised, with the table named in a log
+line instead. `verify_invariant` on the same type already did this correctly,
+which is what made the outlier visible.
+
+### A multi-tenant catalog had to choose between the join and the boundary
+
+`MeterStore::scoped` confines the **rows** a session can see and
+`MeterCatalog::isolated` confines the **relations** it can name. The crate
+documentation presented them as the pair a service exposing SQL wants — and the
+pair left a hole exactly where a serving surface needs both, because `isolated`
+returns a single-table store. A multi-tenant deployment putting a whole catalog
+on a socket (which is what Flight SQL serves: it takes any `SqlSurface`, and
+`MeterCatalog` is one) had two options, and both were wrong: isolate to one table
+and lose the cross-table join that is the catalog's entire reason to exist, or
+serve every tenant's rows to every tenant.
+
+`MeterCatalog::scoped(column, value)` is the third corner. Every table is
+confined, the predicate is injected into each plan and enforced below the
+projection, and the join still plans — with **both** sides carrying their own:
+
+```rust
+let confined = catalog.scoped("tenant", tenant).await?;
+confined.query("SELECT … FROM readings r JOIN esa_typ2 e USING (malo_id)").await?;
+```
+
+**Every table, or none.** A column that is not in some table's merge key is
+refused, naming that table, *before any table is confined* — a scope that covered
+three tables and silently skipped the fourth is not a boundary, it is a
+boundary-shaped object that leaks one relation. A catalog whose tables do not
+share an identity column cannot be scoped as a whole, and the error says so and
+names the honest alternative. Which columns may scope a session is unchanged and
+is `MeterStore::scoped`'s own rule: only a merge-key column partitions readings.
+
+`MeterCatalog::as_known_at` and `::in_read_mode` come with it, and a scoped
+catalog stays scoped through both. `as_known_at` is the **one** reproducible read
+that can be catalog-wide: `recorded_at` is a row-level column every table carries,
+so one instant is one meaningful ceiling across all of them.
+
+**`as_of` deliberately has no catalog counterpart**, and asking for one returns an
+error that explains rather than a shrug. It pins an Iceberg *snapshot*, and a
+snapshot belongs to one table: there is no id that means the same moment in two of
+them and nothing commits two atomically, so a catalog-wide `as_of` would have to
+invent a correspondence between per-table snapshots and then call the result
+reproducible.
+
+#### And the invariant that made it possible was written four times
+
+`MeterStore::derive`'s own documentation said it was "written once because every
+derived session has to carry the *same* things forward, and the failure of
+forgetting one is silent". It was written **four** times — `as_of`,
+`in_read_mode`, `scoped` and `in_own_session` each reassembled the builder by
+hand. Four copies of an invariant whose failure is exactly the one that comment
+describes: a store gains a field, three of the four learn to carry it, and the
+fourth returns a session that quietly does not — a scoped store whose derived
+session dropped the scope answers caller-supplied SQL over every tenant.
+
+`MeterStore::to_builder` is now that one place, and the catalog's rebuild uses it
+too, so a derived *catalog* cannot drop what a derived store carries.
+
+### A busy cold-append writer was reported as a stuck one
+
+Two late corrections for the same table serialise on an advisory lease, because
+the decision (what is already stored) and the write have to be one step — the hot
+tier gets that exclusion from its primary key and Iceberg has none. The loser spun
+for **~1.6 seconds** and then failed with
+
+> another process has held the cold-append claim for the whole of 6 attempts. A
+> late correction is rare, so this means a writer is stuck rather than busy
+
+Both halves of that reasoning are optimistic. The Iceberg commit is a
+compare-and-swap that *retries* under contention, and the Parquet write before it
+is sized by the delivery — a redelivered month for one measuring point is not
+small. A bulk correction run is also the one time late corrections are **not**
+rare, which is exactly when several writers queue. So the error asserted a
+diagnosis it could not support, on the workload most likely to produce it.
+
+The budget is now ~14 s, computed from the backoff schedule in a `const` block so
+the number in the message cannot drift from the number of sleeps.
+
+**And it was the wrong error.** `Error::Storage` is what an unreachable database
+raises; this is a lock a writer declined to queue for, which is
+`Error::LockTimeout` — the variant whose documentation already says *"nothing was
+changed, so it is safe to retry"*. Both are retryable, so nothing was silently
+wrong, but conflating them wakes whoever is paged for a storage fault with
+ordinary contention between two corrections.
+
+### A load-sensitive test asserted wall clock instead of the property
+
+`creating_a_partition_does_not_block_on_a_reader` bounded partition creation at
+two seconds of wall clock to show it had not queued behind a reader's
+`ACCESS SHARE`. That is a weaker restatement of what the call's own `expect`
+already proves — the reader is held for the whole call and the DDL lock timeout is
+two seconds, so a queued statement comes back `LockTimeout` and there is no third
+outcome — and it fails on a loaded machine for a reason that has nothing to do
+with locks: the suite runs twenty-odd databases against one server.
+
+The timing bound is gone. In its place is the assertion that actually makes the
+positive mean something, and it is deterministic: the spelling this crate does
+*not* use — `CREATE TABLE … PARTITION OF` — is run against the same held reader
+and must time out on the parent's `ACCESS EXCLUSIVE`.
+
+### An Article 17 erasure was not counted at all
+
+`meterstore.retention.subjects_anonymised` counted the § 60 Abs. 6 MsbG sweep and
+nothing else, which left the crate's only irreversible operation half-instrumented:
+an erasure performed on a data subject's request incremented no counter anywhere.
+
+Folding the two into that counter would have been worse than the gap, because
+their readings are **opposite**. A flat `retention` series means the sweep is not
+running; a flat `request` series is an ordinary quarter. Summed, a deployment
+whose sweep had silently stopped but which handled the occasional request would
+look like one whose sweep was working — and that is the failure the counter's own
+documentation is about.
+
+So it is one counter, `meterstore.subjects_erased`, split by a `trigger`
+attribute (`retention` / `request`), and both paths reach it. Counted only when a
+linkage was **actually** destroyed: a repeat request is auditable and is not a
+second erasure, so counting it would report a compliance event that did not
+happen. The audit row is unchanged either way — `reason` is what a regulator
+reads; the attribute is for whoever holds the dashboard.
+
+### A Bilanzkreis and a Bilanzierungsgebiet were the same column type
+
+They share the alphabet, the length, the issuing office and the check character.
+The only thing distinguishing them is **position 3**, the ENTSO-E object type —
+`X` a party, `Y` an area. So a `check = "EIC"` column accepted either, and a `Y`
+code in the `bilanzkreis` column passed the write path, passed the `CHECK`, and
+made every MaBiS grouping over it wrong, with no error anywhere.
+
+`ValueCheck::Eic` now carries an `Option<EicType>`, and `check = "EIC:X"` is it
+in a file. Unlike the check character, this half **is** expressible as a regular
+expression:
+
+```
+EIC     ^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$
+EIC:X   ^[0-9A-Z-]{2}X[0-9A-Z-]{12}[0-9A-Z]$
+```
+
+— so declaring it strengthens the **database** constraint as well as the write
+path. It is the one part of *"is this the right kind of EIC"* PostgreSQL can
+enforce on a row this crate did not write, and it was being left on the table.
+`ValueCheck::ALL` is the eleven declarations rather than the four schemes, tied
+by a `const` assertion to `EicType::ALL` so a letter added upstream fails to
+compile here rather than becoming undeclarable; `EIC:Q` is refused at declaration
+rather than degrading to a bare `EIC`, because a column declared as holding party
+codes and silently taking any EIC is the outcome the declaration exists to rule
+out.
+
+The write path's refusal names both sides — *"this column declares object type X
+(Party), and the code carries Y (Area or Domain) at position 3"* — because
+"invalid" would send a producer to re-read a code they already have in front of
+them. It is deliberately a different message from a malformed one: nothing about
+an area code is wrong, it is in the wrong column.
+
+### Two parsers in one process, and the strict one runs first
+
+Bare `EIC` stays tolerant of an object-type letter `metering` does not list — the
+list is ENTSO-E's to extend, and a store that hard-failed on an entry added after
+its release would refuse data the market has already issued. That is the right
+call for a decade of retention, and it stops being invisible the moment an EIC
+passes through **two** parsers in one process and the other one is strict, which
+is now ordinary: a market library holding a Bilanzkreis as its own type may
+enumerate the seven letters and refuse anything else. It then rejects a row this
+store accepted, on a *read*, at a moment nobody chose.
+
+`eic_object_type(code)` alone could not express that finding, because it is null
+for two entirely different things: a value that is not an EIC at all, and an EIC
+whose type letter is unlisted. One column of nulls, and only the second is
+actionable. `eic_normalise(code)` separates them:
+
+```sql
+-- Not an EIC. Somebody wrote free text into an identifier column.
+SELECT DISTINCT bilanzkreis FROM readings
+WHERE bilanzkreis IS NOT NULL AND eic_normalise(bilanzkreis) IS NULL;
+
+-- A well-formed EIC whose object type this build does not list — the rows a
+-- strict downstream parser will reject.
+SELECT DISTINCT bilanzkreis FROM readings
+WHERE eic_normalise(bilanzkreis) IS NOT NULL
+  AND eic_object_type(bilanzkreis) IS NULL;
+```
+
+Find them on your own schedule; declare `EIC:X` to stop accepting new ones.
+`eic_normalise` is also the EIC counterpart of `obis_normalise` and does that job
+for the same reason: a foreign table may hold a code in lower case or padded, and
+a checked column holds only the trimmed uppercase form, so a literal join across
+the two returns nothing.
+
+### A typed series read could not name a Messlokation
+
+`identify_by_melo(true)` puts `melo_id` in the merge key of a *Lastgang* table,
+which is what a Marktlokation measured by two meters needs — and `SeriesQuery`
+had no `melo`. The only narrowing was `column_eq("melo_id", ScalarValue::Utf8(…))`,
+which takes a bare scalar and **does not parse it**.
+
+A Zählpunktbezeichnung is 33 characters, has no check digit, and is stored
+uppercase. So a truncated or lower-cased literal matches nothing at all —
+silently, and an empty series is indistinguishable from a meter that reported
+nothing. That is the report a settlement run would act on.
+
+```rust
+store.series(malo)?.melo(melo)?.obis("1-0:1.8.0")?.range(from, to).collect().await?;
+```
+
+It parses (`encode::parse_melo`, the counterpart of `parse_malo`) and takes
+whatever the caller is holding — a `MeloId`, a `&str` or a `String`. The first is
+the common one and now costs nothing: a read of this store hands back `MeloId`s,
+and narrowing to one of them should not go back through a string.
+`ReadingsQuery::melo` takes the same bound, where it used to take `&str` only.
+
+`CompletenessQuery::melo` and `meterstore completeness --melo` close the same gap
+on the third builder, and there the consequence is worse rather than merely
+silent: `column_eq` already accepted `melo_id` and named *"a Messlokation"* in its
+own documentation, so a lower-cased literal narrowed the report to nothing — and
+an empty completeness report does not read as *"no rows matched"*, it reads as a
+meter that has stopped delivering. That is the strongest finding the report can
+make, produced by a typo. `CompletenessQuery::malo` takes the generic bound too,
+so all three builders now accept a parsed identifier as readily as a string.
+
+The refusal that already prevented the doubled fold now names the fix that
+applies: *"narrow the read with `.melo(..)`"* where the two readings differ by
+Messlokation, and `.column_eq(..)` where they differ by a tenant. It used to name
+both regardless, and for a Messlokation the one it named first was the untyped
+door.
+
+### `metering` 0.22
+
+The floor is 0.22. Nothing in this crate changed shape for it — no bare
+`rust_decimal::Decimal` crosses a `serde` boundary here, so the feature change
+that release is about is a no-op on this side, which the new guards below now
+*establish* rather than assume.
+
+What it does give is `TryFrom<String>` on all four identifiers. A generic
+`impl TryInto<…>` bound is satisfied by the caller's own type and not by a deref
+of it, so an owned `String` — which is what an MSCONS parser hands back — needed
+`.as_str()` at one call site and `.parse()?` at the next for the very same value.
+`VersionScope::new`, `::for_interval`, `parse_malo`, `parse_melo` and both
+`melo(..)` builders now take a parsed identifier, a `&str` or a `String`
+interchangeably, and check an owned one exactly as they check a borrowed one.
+
+### The stored shape of two JSON columns was asserted in a comment
+
+`source_detail` and `provenance` are the two columns this crate writes as JSON
+rather than as a typed Arrow column, so they are the two where a representation
+decided **elsewhere in the build graph** reaches disk — which is precisely what
+`metering` 0.22 was reported for. Three guards, each mechanical:
+
+- **Every `MeasurementSource` variant is exercised**, and a `match` with no `_`
+  arm keeps the list complete: `MeasurementSource` is not `#[non_exhaustive]`, so
+  a variant added upstream now *fails to compile* rather than going quietly
+  untested. Three of the ten were not covered — `RetroactiveCorrection`,
+  `RedispatchImport` and, in that test, `VirtualMeter`.
+- **The ten tags are pinned as literals.** `source_kind` is the discriminant on
+  every stored row and the string every external engine filters on. A retag
+  upstream keeps both columns agreeing with each other, stops old rows decoding,
+  and passes every round-trip test — they all read and write through the same
+  impl.
+- **No stored JSON column may hold a floating-point number.** A float is the one
+  that would not be noticed: an exact decimal written as `30.0` reads back as
+  `30.000000000000004` on some other engine's parser, and settlement is money —
+  the reason `value` is a `Decimal128` in the first place. The scan walks arrays
+  and objects, so a field inside an enum variant is covered, which is where the
+  upstream version of this scan had missed one.
+
+### Two claims about the wire format were comments
+
+`metering` 0.22 came out of a report that `metering/serde` was changing a `serde`
+contract for crates that never named it: the feature enabled
+`rust_decimal/serde-str`, which **replaces** the global `Deserialize` for
+`Decimal`, so a service with no dependency on `metering` at all passed its own
+`cargo test -p …` and failed the workspace run. That is fixed upstream, and this
+crate is on 0.22.
+
+This crate is a library too. It writes two JSON columns under a decades-long
+retention obligation and it enables `metering/serde` for everyone downstream of
+it — so the same question has to have an answer here, and the answer was two
+prose comments in `Cargo.toml`. `tests/it/wire_format.rs` makes them mechanical,
+and needs neither Docker nor a feature flag:
+
+- **No feature that *replaces* a representation.** `serde-str`, `serde-float`,
+  `serde-arbitrary-precision` and `serde-human-readable` may not appear in the
+  manifest in any spelling. The first cut of this test knew only the
+  `crate/feature` path form and a mutation adding
+  `features = ["serde-str"]` to the `rust_decimal` line walked straight past it —
+  it checks by feature *name* now, which is the spelling-independent one.
+- **No serde-derived type may leave a field's representation to the build
+  graph.** A bare `OffsetDateTime`, `Date`, `Decimal` or `time::Duration` under a
+  `derive(Serialize)` without a `#[serde(with = …)]` is the same defect one level
+  down, and silent in both directions — a reader and a writer built with
+  different features simply disagree. None exists today; nothing was keeping that
+  true.
+- **What this crate turns on for a consumer is only additive.**
+  `metering/serde` resolves to `["dep:serde", "time/serde"]`, and `time/serde`
+  adds impls that do not otherwise exist rather than replacing any.
+
+Both guards were mutation-checked against the defect they describe, which is how
+the hole in the first one was found.
+
+### Two documentation conventions became mechanisms
+
+Both were enforced by review, which is to say not enforced.
+
+- **`no_item_doc_grows_into_a_chapter`** — no `///` block over 60 lines. A block
+  that long stands between a reader and the item it describes; module docs are
+  exempt, because a module's own documentation is where a long argument belongs.
+- **`reference_docs_are_not_a_changelog`** — no *"an earlier version"*, *"a first
+  draft"*, *"previously"* or the past-tense *"used to"* in `src/`, `tests/`, the
+  site pages or the README. Documentation says what is true; a doc that narrates
+  its own history is stale the moment the next change lands, and nothing detects
+  it. `CHANGELOG.md` is the one file the check does not read, which is the point.
+
+The second needed a grammar rule rather than a substring, because English spells
+two unrelated things the same way: *"used to cast incoming batches"* is a
+purpose and *"each used to reassemble the builder"* is a changelog. The purposive
+sense is passive or sentence-initial; anything else is a subject doing something
+it no longer does. It reads trailing comments as well as leading ones — two of the
+violations it found were after code on the line.
+
+It is a **floor rather than a proof**, and says so: the bare past tense ("it was
+~1.6 s, on the reasoning that …") is deliberately not on the list, because "it was
+written by", "it was in force" and "nothing was changed" are ordinary description
+and a rule that fired on all of them would be ignored rather than obeyed. One
+violation of that shape was found by hand.
+
+Both checks were mutation-tested against the defect they describe, and both found
+real violations — in prose written for this release and in prose that predated
+it.
+
+### Also
+
+- **A refused checked value now says three things**: which column, the domain's
+  own message about the shape it wanted, and why the check is at the *write*.
+  `ValueCheck::noun` and `::why` are the two halves, and the second is what turns
+  a format complaint into an instruction — *"the check digit is part of the
+  identifier, so a transposition is detectable here and only here, while the
+  delivery that carried it is still in hand"*, against a producer who can still
+  resend it.
+- `parse_melo` joins `parse_malo` and `canonical_obis` as a public entry point,
+  so an application writing to the hot tier directly need not reach past this
+  crate to parse the other half of a point table's merge key.
+- The `meterstore init` template documents the four `check` schemes and the
+  `[privacy]` section, both commented out, as it does every other optional
+  setting.
+
 ## [0.8.0] — 2026-08-30
 
 Three silent wrong answers — a completeness report that could not see a missing

@@ -198,11 +198,13 @@ impl PostgresHot {
                         list = sql_code_list(&codes),
                     )
                 })
-                // A checked-identifier column (`config::eic_column`) gets the
-                // half of its rule a regular expression can carry: the shape.
-                // The check *character* is arithmetic over the other fifteen, so
-                // the write path enforces that half — a row PostgreSQL accepts
-                // from another writer is well-shaped, not necessarily well-formed.
+                // A checked-identifier column (`config::checked_column`) gets
+                // the half of its rule a regular expression can carry: the
+                // shape. Whatever arithmetic the scheme has — an EIC check
+                // character, a MaLo check digit — is a function of the other
+                // characters, so the write path enforces that half; a row
+                // PostgreSQL accepts from another writer is well-shaped, not
+                // necessarily well-formed.
                 .or_else(|| {
                     crate::config::declared_value_check(f).map(|kind| {
                         format!(
@@ -1349,9 +1351,32 @@ impl PostgresHot {
 
 /// How long a late correction waits for another one to finish.
 ///
-/// Doubling from 25 ms, so ~1.6 s in total. A cold append is a read and one
-/// Iceberg commit; anything longer than that means the holder is stuck.
-const COLD_APPEND_LEASE_ATTEMPTS: u32 = 6;
+/// Doubling from 25 ms and capping the step at 800 ms, so the total is
+/// [`COLD_APPEND_LEASE_BUDGET_MS`] — about fourteen seconds.
+///
+/// The budget is sized for the operation rather than for the common case. The
+/// Iceberg commit is a compare-and-swap that *retries* under contention, and the
+/// Parquet write before it is sized by the delivery: a redelivered month for one
+/// measuring point is not small. A bulk correction run is both the largest write
+/// and the one time late corrections are not rare, so it is the case that has to
+/// fit. Past the budget the holder is stuck rather than busy, and the caller gets
+/// a retryable [`LockTimeout`](crate::Error::LockTimeout) having changed nothing.
+const COLD_APPEND_LEASE_ATTEMPTS: u32 = 22;
+
+/// The total [`COLD_APPEND_LEASE_ATTEMPTS`] wait, in milliseconds.
+///
+/// Computed from the schedule rather than written beside it, so the two cannot
+/// drift — the number reaches an operator in the error message.
+const COLD_APPEND_LEASE_BUDGET_MS: u64 = {
+    let mut total = 0;
+    let mut attempt = 0;
+    while attempt < COLD_APPEND_LEASE_ATTEMPTS {
+        let step = if attempt < 5 { attempt } else { 5 };
+        total += 25u64 << step;
+        attempt += 1;
+    }
+    total
+};
 
 /// An advisory-lock key in MeterStore's own namespace.
 ///
@@ -1470,19 +1495,15 @@ fn key_column<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a 
 
 /// The POSIX regular expression for a declared value check's *shape*.
 ///
-/// The EIC one is the ENTSO-E Reference Manual's own alphabet: sixteen
-/// characters of `0-9`, `A-Z` or `-`, an uppercase letter in position 3 (the
-/// object type), and a check character that is never `-` — §5.2 forbids it, so
-/// a body computing to one is never issued a code.
+/// The patterns are [`ValueCheck::shape_pattern`](crate::config::ValueCheck::shape_pattern)'s,
+/// so the DDL and the scheme cannot drift apart.
 ///
-/// An unknown kind renders a pattern nothing matches. A column declared as
+/// An unknown code renders a pattern nothing matches. A column declared as
 /// checked must not become an unconstrained one because this build did not
 /// recognise the declaration; the write path refuses it too, so the two agree.
 fn value_check_pattern(kind: &str) -> &'static str {
-    match kind {
-        crate::config::VALUE_CHECK_EIC => "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$",
-        _ => "$^",
-    }
+    crate::config::ValueCheck::from_code(kind)
+        .map_or("$^", crate::config::ValueCheck::shape_pattern)
 }
 
 /// Render a domain code list as a SQL `IN` list.
@@ -1964,8 +1985,7 @@ impl HotStore for PostgresHot {
 
         // Spun rather than taken with the blocking `pg_advisory_lock`, so a
         // caller waits for a bounded time and gets an error naming the contention
-        // instead of hanging on a connection that may never be released. Late
-        // corrections are rare, so a holder is on its way out.
+        // instead of hanging on a connection that may never be released.
         for attempt in 0..COLD_APPEND_LEASE_ATTEMPTS {
             let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
                 .bind(key)
@@ -1983,11 +2003,21 @@ impl HotStore for PostgresHot {
             tokio::time::sleep(std::time::Duration::from_millis(25 << attempt.min(5))).await;
         }
 
-        Err(Error::Storage(format!(
-            "{table}: another process has held the cold-append claim for the whole of \
-             {COLD_APPEND_LEASE_ATTEMPTS} attempts. A late correction is rare, so this \
-             means a writer is stuck rather than busy"
-        )))
+        // A `LockTimeout` rather than a `Storage` error, which is what this
+        // actually is: nothing was changed and the caller may retry. The
+        // distinction is not cosmetic — `Storage` is what an unreachable database
+        // raises, so conflating them wakes whoever is paged for one with the
+        // other, and ordinary contention between two late corrections is not a
+        // storage fault.
+        Err(Error::LockTimeout {
+            relation: table.to_string(),
+            operation: "cold-append claim".to_string(),
+            // The schedule's own sum rather than a measured elapsed: the number
+            // an operator reads should be the budget that was spent, not the
+            // wall clock, which on a loaded machine includes time this writer
+            // was not waiting for anything.
+            waited_ms: COLD_APPEND_LEASE_BUDGET_MS,
+        })
     }
 
     async fn ensure_partitions(
@@ -2279,40 +2309,165 @@ mod tests {
     }
 
     #[test]
-    fn the_eic_shape_pattern_admits_what_metering_parses_and_no_less() {
-        // The DDL check is a regular expression over the *shape*; the check
-        // character is arithmetic and is enforced on the write path. So the
-        // pattern must not be narrower than the domain type — a code PostgreSQL
-        // refuses and `metering` accepts is a row that cannot be stored at all.
-        let pattern = value_check_pattern(crate::config::VALUE_CHECK_EIC);
-        let matches = |code: &str| {
-            // The pattern is `^..$`-anchored and uses only classes and counts,
-            // so it is checked here against the same alphabet PostgreSQL would.
-            let body: Vec<char> = code.chars().collect();
-            let ok_char = |c: char| c.is_ascii_digit() || c.is_ascii_uppercase() || c == '-';
-            body.len() == 16
-                && body.iter().copied().all(ok_char)
-                && body[2].is_ascii_uppercase()
-                && body[15] != '-'
-        };
-        assert_eq!(pattern, "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$");
-
-        for valid in [
-            "10X168Y4E6H0041Z",
-            "10X---ENTSOE---L",
-            "11XBK0000000001A",
-            "11YN000000000016",
-        ] {
-            assert!(valid.parse::<metering::ids::Eic>().is_ok(), "{valid}");
-            assert!(matches(valid), "the DDL would refuse {valid}");
+    fn the_cold_append_lease_waits_long_enough_for_a_slow_commit() {
+        // The budget is the schedule's own sum, so the number an operator reads
+        // in the error cannot drift from the number of sleeps. The range it has
+        // to sit in is the point: a cold append is a compare-and-swap that
+        // retries plus a Parquet write sized by the delivery, so a budget short
+        // enough to expire on an ordinary contended append would report a busy
+        // holder as a stuck one.
+        let mut total = 0u64;
+        for attempt in 0..COLD_APPEND_LEASE_ATTEMPTS {
+            total += 25u64 << attempt.min(5);
         }
-        for bad in [
-            "11XBK0000000001",  // fifteen characters
-            "11xbk0000000001a", // the DDL sees what was stored, not what was typed
-            "11-BK0000000001A", // position 3 is the object type, and it is a letter
-            "11XBK0000000001-", // §5.2 forbids `-` as the check character
+        assert_eq!(total, COLD_APPEND_LEASE_BUDGET_MS);
+        assert!(
+            (10_000..60_000).contains(&COLD_APPEND_LEASE_BUDGET_MS),
+            "the budget has to cover a slow Iceberg commit under contention and \
+             still report a genuinely stuck holder rather than wait forever: {}ms",
+            COLD_APPEND_LEASE_BUDGET_MS
+        );
+
+        // And the condition is a lock this writer declined to queue for, not a
+        // storage fault — `Storage` is what an unreachable database raises, and
+        // waking whoever is paged for that with ordinary contention between two
+        // late corrections is the confusion the taxonomy exists to prevent.
+        let contended = Error::LockTimeout {
+            relation: "readings_versions".to_string(),
+            operation: "cold-append claim".to_string(),
+            waited_ms: COLD_APPEND_LEASE_BUDGET_MS,
+        };
+        assert!(contended.is_retryable(), "nothing was changed");
+        let rendered = contended.to_string();
+        assert!(rendered.contains("cold-append claim"), "{rendered}");
+        assert!(rendered.contains("nothing was changed"), "{rendered}");
+    }
+
+    #[test]
+    fn every_shape_pattern_admits_what_metering_parses_and_no_less() {
+        // The DDL check is a regular expression over the *shape*; whatever
+        // arithmetic the scheme has is enforced on the write path. So a pattern
+        // must not be narrower than the domain type — a code PostgreSQL refuses
+        // and `metering` accepts is a row that cannot be stored at all.
+        //
+        // The patterns use only anchors, character classes and bounded
+        // repetition, so they are evaluated here by the same rules PostgreSQL's
+        // POSIX engine would apply. `tests/it/checked_columns.rs` runs them
+        // against a real server, where a dialect difference would show.
+        use crate::config::{EicType, ValueCheck};
+
+        let ok = |c: char| c.is_ascii_digit() || c.is_ascii_uppercase() || c == '-';
+        let matches = |scheme: ValueCheck, code: &str| {
+            let b: Vec<char> = code.chars().collect();
+            match scheme {
+                ValueCheck::Eic(want) => {
+                    b.len() == 16
+                        && b.iter().copied().all(ok)
+                        && b[15] != '-'
+                        && match want {
+                            // The refinement pins position 3 to one letter; the
+                            // unrefined form only requires a letter there.
+                            Some(ty) => b[2].to_string() == ty.as_str(),
+                            None => b[2].is_ascii_uppercase(),
+                        }
+                }
+                ValueCheck::Malo => {
+                    b.len() == 11 && b.iter().all(char::is_ascii_digit) && b[0] != '0'
+                }
+                ValueCheck::Melo => {
+                    b.len() == 33
+                        && b[..2].iter().all(char::is_ascii_uppercase)
+                        && b[2..8].iter().all(char::is_ascii_digit)
+                        && b[8..]
+                            .iter()
+                            .all(|c| c.is_ascii_alphanumeric() && !c.is_lowercase())
+                }
+                ValueCheck::Bdew => b.len() == 13 && b.iter().all(char::is_ascii_digit),
+            }
+        };
+
+        // The pattern strings themselves, so a change to one is a deliberate
+        // change rather than a silently widened constraint.
+        assert_eq!(
+            ValueCheck::ALL.map(ValueCheck::shape_pattern),
+            [
+                "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}X[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}Y[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}Z[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}W[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}T[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}V[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[0-9A-Z-]{2}A[0-9A-Z-]{12}[0-9A-Z]$",
+                "^[1-9][0-9]{10}$",
+                "^[A-Z]{2}[0-9]{6}[0-9A-Z]{25}$",
+                "^[0-9]{13}$",
+            ]
+        );
+        for scheme in ValueCheck::ALL {
+            assert_eq!(value_check_pattern(scheme.as_str()), scheme.shape_pattern());
+        }
+        // A refined pattern is the unrefined one with position 3 pinned, and
+        // nothing else: written out per variant, they could otherwise drift.
+        for ty in EicType::ALL {
+            assert_eq!(
+                ValueCheck::Eic(Some(ty)).shape_pattern(),
+                ValueCheck::Eic(None)
+                    .shape_pattern()
+                    .replace("[A-Z]", ty.as_str()),
+                "{ty}"
+            );
+        }
+
+        // Every one of these is a value the domain type accepts, so every one
+        // has to reach the database.
+        let party = ValueCheck::Eic(Some(EicType::Party));
+        let area = ValueCheck::Eic(Some(EicType::Area));
+        for (scheme, valid) in [
+            (ValueCheck::Eic(None), "10X168Y4E6H0041Z"),
+            (ValueCheck::Eic(None), "10X---ENTSOE---L"),
+            (ValueCheck::Eic(None), "11XBK0000000001A"),
+            (ValueCheck::Eic(None), "11YN000000000016"),
+            (party, "11XBK0000000001A"),
+            (area, "11YN000000000016"),
+            (ValueCheck::Malo, "41373559241"),
+            (ValueCheck::Malo, "12345678905"),
+            (ValueCheck::Melo, "DE00056266802AO6G56M11SN51G21M24S"),
+            (ValueCheck::Bdew, "9900987654321"),
+            (ValueCheck::Bdew, "9812345678901"),
         ] {
-            assert!(!matches(bad), "the DDL would accept {bad}");
+            assert_eq!(
+                scheme.canonicalise("c", valid).ok().as_deref(),
+                Some(valid),
+                "{scheme} does not accept {valid}"
+            );
+            assert!(matches(scheme, valid), "the DDL would refuse {valid}");
+        }
+
+        for (scheme, bad) in [
+            (ValueCheck::Eic(None), "11XBK0000000001"), // fifteen characters
+            (ValueCheck::Eic(None), "11xbk0000000001a"), // the DDL sees what was stored
+            (ValueCheck::Eic(None), "11-BK0000000001A"), // position 3 is the object type
+            (ValueCheck::Eic(None), "11XBK0000000001-"), // §5.2 forbids `-` there
+            // The refinement's own half, and the whole reason it is worth
+            // declaring: both of these are valid EICs, and each is in the wrong
+            // column. The database refuses them without the write path.
+            (party, "11YN000000000016"),
+            (area, "11XBK0000000001A"),
+            (ValueCheck::Malo, "0137355924"), // ten digits, and a leading zero
+            (ValueCheck::Malo, "04137355924"), // no Vergabestelle issues one
+            (ValueCheck::Malo, "4137355924A"), // not a digit
+            (ValueCheck::Melo, "de00056266802AO6G56M11SN51G21M24S"),
+            (ValueCheck::Melo, "DEX0056266802AO6G56M11SN51G21M24S"), // 3..8 are digits
+            (ValueCheck::Melo, "DE00056266802AO6G56M11SN51G21M24"),  // 32 characters
+            (ValueCheck::Bdew, "990098765432"),                      // twelve digits
+            (ValueCheck::Bdew, "99009876543210"),                    // fourteen
+            (ValueCheck::Bdew, "99009876543A1"),                     // not a digit
+        ] {
+            assert!(
+                !matches(scheme, bad),
+                "the DDL would accept {bad} as {scheme}"
+            );
         }
     }
 

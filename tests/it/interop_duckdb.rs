@@ -8,7 +8,7 @@
 //! DuckDB is a genuinely independent implementation: a different language, a
 //! different Parquet reader, and — through its `iceberg` extension — a different
 //! reading of the Iceberg spec. That is what makes it able to falsify P2, and it
-//! is the half §17.4 could not previously check.
+//! is the half §17.4 cannot check from inside this crate.
 //!
 //! # Two levels, and the second is the one that matters
 //!
@@ -478,11 +478,11 @@ async fn a_foreign_engine_can_read_the_audit_trail() {
     // `ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose own serde
     // impl lands as `[2026,208,6,0,0,0,0,0,0]` unless `serde-human-readable` is
     // on somewhere in the graph — unreadable, and worse, decided by feature
-    // unification rather than by any crate with an opinion. `metering` 0.20
-    // settles it upstream (`wire::rfc3339`), so this crate writes the column with
-    // plain `serde` again, and this is the assertion that the result is genuinely
-    // portable: an engine that has never heard of `time` parses the timestamp as
-    // a timestamp. If it ever fails, the upstream wire format moved.
+    // unification rather than by any crate with an opinion. `metering::wire`
+    // settles it upstream, so this crate writes the column with plain `serde`,
+    // and this is the assertion that the result is genuinely portable: an engine
+    // that has never heard of `time` parses the timestamp as a timestamp. If it
+    // ever fails, the upstream wire format moved.
     let workload = MeteringWorkload::new(START)
         .seed(0xA0D17)
         .malo_ids(1)

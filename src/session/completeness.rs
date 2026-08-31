@@ -211,6 +211,7 @@ pub fn completeness_schema(discriminators: &[String]) -> SchemaRef {
         Field::new("substituted", DataType::Int64, false),
         Field::new("not_billable", DataType::Int64, false),
         Field::new("complete", DataType::Boolean, false),
+        Field::new("measurable", DataType::Boolean, false),
     ]);
     Arc::new(Schema::new(fields))
 }
@@ -287,6 +288,19 @@ pub fn completeness_batch(rows: &[Completeness], discriminators: &[String]) -> R
         Arc::new(BooleanArray::from(
             rows.iter()
                 .map(Completeness::is_complete)
+                .collect::<Vec<_>>(),
+        )),
+        // Reported beside `complete` because `complete` alone is a trap in SQL.
+        // A channel that declares no resolution — or a calendar one, which has
+        // no fixed count within a day — has nothing to compare against, so it
+        // reports `missing = 0`, `surplus = 0` and therefore `complete = true`.
+        // `WHERE NOT complete` then silently drops exactly the channels nobody
+        // could judge, which is the answer this report exists not to give. Rust
+        // has had `is_measurable` for this; the table function needs the same
+        // column or the two surfaces disagree about what was checked.
+        Arc::new(BooleanArray::from(
+            rows.iter()
+                .map(Completeness::is_measurable)
                 .collect::<Vec<_>>(),
         )),
     ]);
@@ -1143,10 +1157,37 @@ impl<'a> CompletenessQuery<'a> {
     /// computed the whole portfolio to answer a question about one meter.
     ///
     /// Parsed, so a mistyped identifier fails here rather than returning an empty
-    /// report that reads as *"this meter is fine"*.
-    pub fn malo(self, malo_id: &str) -> Result<Self> {
+    /// report that reads as *"this meter is fine"*. Takes whatever the caller is
+    /// holding — a [`MaloId`](metering::ids::MaloId), a `&str` or a `String`.
+    pub fn malo<M>(self, malo_id: M) -> Result<Self>
+    where
+        M: TryInto<metering::ids::MaloId>,
+        M::Error: std::fmt::Display,
+    {
         let malo = crate::encode::parse_malo(malo_id)?;
         self.column_eq(column::MALO_ID, ScalarValue::Utf8(Some(malo.to_string())))
+    }
+
+    /// Report one **Messlokation** — one meter.
+    ///
+    /// The narrowing a Mehrfamilienhaus needs: a Marktlokation may be measured by
+    /// several, and on a table that identifies a reading by its Messlokation each
+    /// is its own row of the report.
+    ///
+    /// Parsed, for the reason [`malo`](Self::malo) is — and here the parse does
+    /// more, because a Zählpunktbezeichnung has no check digit and is stored
+    /// uppercase: [`column_eq`](Self::column_eq) accepts `melo_id` and takes a
+    /// bare `ScalarValue`, so a lower-cased or truncated literal narrows the
+    /// report to nothing and every channel comes back silent. On a completeness
+    /// report that reads as *"this meter has stopped delivering"*, which is the
+    /// finding the report exists to make.
+    pub fn melo<M>(self, melo_id: M) -> Result<Self>
+    where
+        M: TryInto<metering::ids::MeloId>,
+        M::Error: std::fmt::Display,
+    {
+        let melo = crate::encode::parse_melo(melo_id)?;
+        self.column_eq(column::MELO_ID, ScalarValue::Utf8(Some(melo.to_string())))
     }
 
     /// Report one channel.
@@ -1906,6 +1947,47 @@ mod tests {
         let batch = completeness_batch(&rows, &[]).unwrap();
         assert_eq!(batch.schema(), completeness_schema(&[]));
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn the_sql_surface_reports_measurability_beside_completeness() {
+        // `complete` alone is a trap in SQL. A channel with no fixed daily
+        // expectation reports `missing = 0` and `surplus = 0`, so it is
+        // `complete` — and `WHERE NOT complete` then drops exactly the channels
+        // nobody could judge, reporting them as fine. Rust answers this with
+        // `is_measurable`; the table function has to carry the same column, or
+        // the two surfaces disagree about what was checked.
+        use crate::arrow::array::AsArray;
+
+        let (from, to) = day(date!(2026 - 03 - 02));
+        let judged = row(date!(2026 - 03 - 02), 96, "MEASURED");
+        let mut unjudgeable = row(date!(2026 - 03 - 02), 1, "MEASURED");
+        unjudgeable.obis_code = "1-0:2.8.0".into();
+        unjudgeable.resolution = Some("P1M".into());
+
+        let rows = roll_up(vec![judged, unjudgeable], from, to);
+        let batch = completeness_batch(&rows, &[]).unwrap();
+        assert_eq!(batch.schema(), completeness_schema(&[]));
+
+        let flag = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{name} is a published column"))
+                .as_boolean()
+                .iter()
+                .map(|v| v.expect("not null"))
+                .collect::<Vec<_>>()
+        };
+        // Both look complete; only one of them was actually checked.
+        assert_eq!(flag("complete"), vec![true, true]);
+        assert_eq!(flag("measurable"), vec![true, false]);
+        assert_eq!(
+            flag("measurable"),
+            rows.iter()
+                .map(Completeness::is_measurable)
+                .collect::<Vec<_>>(),
+            "the column and the Rust accessor must not drift"
+        );
     }
 
     #[test]

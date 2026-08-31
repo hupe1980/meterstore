@@ -44,6 +44,10 @@ pub struct Settings {
     /// The cold tier's catalog and warehouse.
     #[serde(default)]
     pub cold: ColdSettings,
+    /// The subject registry, for a deployment whose tables declare a
+    /// `subject_column`.
+    #[serde(default)]
+    pub privacy: PrivacySettings,
     /// One entry per managed table.
     #[serde(default)]
     pub tables: Vec<TableSettings>,
@@ -69,6 +73,20 @@ impl Settings {
     ///
     /// Round-trips, so a deployment can normalise a hand-written file — and so a
     /// test can assert the parse did not quietly drop a setting.
+    ///
+    /// # It writes the secrets in the clear
+    ///
+    /// [`from_toml`](Self::from_toml) interpolates `${VAR}` **before** parsing,
+    /// so what a `Settings` holds is the resolved value: the output carries the
+    /// connection URL with its password and the `[privacy]` suppression key,
+    /// not the placeholders the file was written with. That is what "round-trips"
+    /// has to mean for the claim above to hold — a renderer that wrote `${VAR}`
+    /// back would be rendering a file it never parsed.
+    ///
+    /// The redaction this crate does apply is on [`Debug`], which is where a
+    /// configuration reaches a log by accident. This is a deliberate call, so
+    /// treat its output as a secret: never log it, and write it where the
+    /// original file would go.
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self)
             .map_err(|e| Error::config(format!("cannot render configuration: {e}")))
@@ -85,6 +103,11 @@ impl Settings {
                 "no [[tables]] declared: a store with no table has nothing to archive or query",
             ));
         }
+        // `[privacy]` is a table setting one level up: it is only ever consulted
+        // because a table declared a `subject_column`, and a key too short to be
+        // safe has to fail where `meterstore check` runs rather than at the first
+        // process start — which is a deploy, not a CI step.
+        self.privacy.validate()?;
         self.tables.iter().map(TableSettings::validate).collect()
     }
 
@@ -122,10 +145,23 @@ impl Settings {
         let tables = self.validate_all()?;
         let pool = self.hot.connect().await?;
         let cold = self.cold.build().await?;
+        // One registry for the deployment, not one per table: the mapping lives
+        // in a single `meterstore_subject_map` keyed by natural identifier, and
+        // that is what makes one erasure reach every table that registered the
+        // same subject. Built only where a table asks for it, so a deployment
+        // that stores no personal reference holds no registry at all.
+        let registry = match tables
+            .iter()
+            .any(|t| crate::config::ValidatedTableConfig::subject_column(t).is_some())
+        {
+            true => Some(self.privacy.registry(pool.clone())?),
+            false => None,
+        };
         Ok(Deployment {
             hot: std::sync::Arc::new(self.hot.hot(pool.clone())),
             pool,
             cold,
+            registry,
             tables,
         })
     }
@@ -143,6 +179,92 @@ impl Settings {
                 many.len()
             ))),
         }
+    }
+}
+
+/// The subject registry a deployment's `subject_column` resolves against.
+///
+/// Present because a table declaring a `subject_column` and no registry is a
+/// column of strings nobody can resolve, which
+/// [`MeterStoreBuilder::build`](crate::MeterStoreBuilder) refuses — so without
+/// this section a `subject_column` in a file is a setting no deployment can
+/// start with. The registry itself needs nothing but the pool the hot tier
+/// already has; the one thing a file has to supply is the suppression key.
+///
+/// `Debug` is hand-written rather than derived, for the reason
+/// [`HotSettings`]'s is: this carries a secret and configuration is exactly what
+/// a service dumps into its startup log.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacySettings {
+    /// Key for the **suppression list**, at least 32 bytes. `${VAR}` is
+    /// interpolated from the environment, which is where it belongs.
+    ///
+    /// Without it erasure works and does not *stay* worked: once the mapping is
+    /// deleted nothing distinguishes an erased identifier from one never seen,
+    /// so a pipeline replaying old messages registers a fresh reference and
+    /// silently re-links the subject. That is every deployment fed by a message
+    /// broker, which is every deployment fed by MaKo.
+    ///
+    /// Optional rather than required, because the key must **outlive every
+    /// erasure** and is not recoverable from the database. A deployment that
+    /// cannot yet hold one securely is better off knowing suppression is off
+    /// than inventing a key it will lose — losing it exposes nothing and
+    /// silently disables suppression, which is the failure this crate cannot
+    /// report.
+    ///
+    /// See [`SubjectRegistry::with_erasure_secret`](crate::SubjectRegistry::with_erasure_secret).
+    #[serde(default)]
+    pub erasure_secret: Option<String>,
+}
+
+impl std::fmt::Debug for PrivacySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivacySettings")
+            .field(
+                "erasure_secret",
+                &self.erasure_secret.as_ref().map(|_| "***"),
+            )
+            .finish()
+    }
+}
+
+impl PrivacySettings {
+    /// The registry these settings describe, over `pool`.
+    ///
+    /// The pool is the hot tier's, deliberately: erasure needs storage where
+    /// deletion is real, and the registry has to live in the same database as
+    /// the application's own tables so an Article 17 cascade can be one
+    /// transaction.
+    pub fn registry(&self, pool: sqlx::PgPool) -> Result<crate::erasure::SubjectRegistry> {
+        match &self.erasure_secret {
+            Some(secret) => {
+                crate::erasure::SubjectRegistry::with_erasure_secret(pool, secret.as_bytes())
+            }
+            None => Ok(crate::erasure::SubjectRegistry::new(pool)),
+        }
+    }
+
+    /// Whatever can be checked without a database.
+    ///
+    /// Which is the key's length, and it is the setting worth checking early: a
+    /// key too short to resist a brute-force turns the suppression list into the
+    /// thing it exists to prevent, and discovering that at the first process
+    /// start means discovering it in a deploy rather than in CI.
+    pub fn validate(&self) -> Result<()> {
+        let Some(secret) = &self.erasure_secret else {
+            return Ok(());
+        };
+        if secret.len() < crate::erasure::MIN_ERASURE_SECRET_BYTES {
+            return Err(Error::config(format!(
+                "[privacy] erasure_secret is {} bytes and must be at least {}: a shorter \
+                 key can be brute-forced, and the suppression list would then leak the \
+                 identifiers it exists to forget",
+                secret.len(),
+                crate::erasure::MIN_ERASURE_SECRET_BYTES,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -445,6 +567,13 @@ pub struct Deployment {
     pub pool: sqlx::PgPool,
     /// The cold tier, and the catalogue façade over it.
     pub cold: crate::cold::ColdTier,
+    /// The deployment's subject registry, present when a table declares a
+    /// `subject_column`.
+    ///
+    /// One for the whole deployment, because the mapping is: two tables that
+    /// register the same natural identifier share a
+    /// [`SubjectRef`](crate::SubjectRef), and a single erasure unlinks both.
+    pub registry: Option<crate::erasure::SubjectRegistry>,
     /// Every table the file declares, validated, in declaration order.
     pub tables: Vec<crate::config::ValidatedTableConfig>,
 }
@@ -481,10 +610,19 @@ impl Deployment {
         )
         .await?;
         let provider = cold.table_provider(config.name()).await?;
-        Ok(crate::MeterStore::builder()
+        let mut builder = crate::MeterStore::builder()
             .hot(self.hot.clone() as std::sync::Arc<dyn crate::HotStore>)
-            .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider)
-            .table(config))
+            .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider);
+        // Only where the table asks for it. Attaching a registry to a table that
+        // declares no subject column would create the registry's two tables in a
+        // database that has no use for them, and `subject_registry()` would then
+        // report a mapping this table stores no reference to.
+        if config.subject_column().is_some()
+            && let Some(registry) = &self.registry
+        {
+            builder = builder.subject_registry(registry.clone());
+        }
+        Ok(builder.table(config))
     }
 
     /// Build a store over the **one** table the file declares.
@@ -547,6 +685,12 @@ impl std::fmt::Debug for Deployment {
                     .map(crate::config::ValidatedTableConfig::name)
                     .collect::<Vec<_>>(),
             )
+            // Whether a registry exists and whether it suppresses
+            // re-registration, and nothing more: `SubjectRegistry`'s own `Debug`
+            // reports the second as a boolean and redacts the key. Both are
+            // worth having in a startup line — suppression being off is the
+            // configuration mistake this crate cannot detect at runtime.
+            .field("subject_registry", &self.registry)
             .finish_non_exhaustive()
     }
 }
@@ -786,12 +930,13 @@ pub struct ExtraColumn {
     pub values: Option<Vec<String>>,
     /// The domain identifier this column's values must parse as, if any.
     ///
-    /// `"EIC"` is the only one, and it is
-    /// [`eic_column`](crate::config::eic_column) from a file: a Bilanzkreis or a
-    /// Bilanzierungsgebiet is a check-character-validated ENTSO-E code, not
-    /// sixteen arbitrary characters. Mutually exclusive with `values` — a fixed
-    /// vocabulary and an open identifier scheme are two different claims about
-    /// the same column.
+    /// [`checked_column`](crate::config::checked_column) from a file, taking any
+    /// [`ValueCheck`](crate::config::ValueCheck) code — `"EIC"`, `"MALO"`,
+    /// `"MELO"` or `"BDEW"`. A Bilanzkreis is a check-character-validated
+    /// ENTSO-E code and a Lieferant a thirteen-digit Marktpartner-ID, not
+    /// sixteen and thirteen arbitrary characters. Mutually exclusive with
+    /// `values` — a fixed vocabulary and an open identifier scheme are two
+    /// different claims about the same column.
     #[serde(default)]
     pub check: Option<String>,
 }
@@ -823,15 +968,13 @@ impl ExtraColumn {
                     self.name
                 )));
             }
-            return match check.as_str() {
-                crate::config::VALUE_CHECK_EIC => {
-                    Ok(crate::config::eic_column(&self.name, nullable))
-                }
-                other => Err(Error::config(format!(
-                    "extra column {:?} declares check {other:?}; the supported checks \
+            return match crate::config::ValueCheck::from_code(check) {
+                Some(scheme) => Ok(crate::config::checked_column(&self.name, scheme, nullable)),
+                None => Err(Error::config(format!(
+                    "extra column {:?} declares check {check:?}; the supported checks \
                      are {:?}",
                     self.name,
-                    [crate::config::VALUE_CHECK_EIC],
+                    crate::config::ValueCheck::known_codes(),
                 ))),
             };
         }
@@ -1083,13 +1226,17 @@ metadata_pool_max_connections = 4
 region = "eu-central-1"
 endpoint = "https://minio.internal"
 
+[privacy]
+erasure_secret = "0123456789abcdef0123456789abcdef"
+
 [[tables]]
 name = "readings"
 time_model = "interval"
 subject_column = "subject_ref"
 extra_columns = [
   { name = "tenant",        identity = true },
-  { name = "bilanzkreis" },
+  { name = "bilanzkreis",   check = "EIC" },
+  { name = "lieferant",     check = "BDEW" },
   { name = "ingest_source", values = ["MSCONS", "SMGW"] },
 ]
 
@@ -1116,6 +1263,18 @@ min_snapshots_to_keep = 20
         assert_eq!(table.name(), "readings");
         assert_eq!(table.archival_step(), Duration::DAY);
         assert_eq!(table.settlement_lag(), Duration::days(7));
+
+        // Every shape the page shows reaches the validated types, including the
+        // two the page added last: a checked identifier column and the registry
+        // a `subject_column` resolves against.
+        assert_eq!(table.subject_column(), Some("subject_ref"));
+        let checks: Vec<_> = table
+            .attribute_columns()
+            .iter()
+            .filter_map(|f| crate::config::declared_value_check(f).map(|c| (f.name().as_str(), c)))
+            .collect();
+        assert_eq!(checks, vec![("bilanzkreis", "EIC"), ("lieferant", "BDEW")]);
+        settings.validate().expect("the key is long enough");
     }
 
     #[test]
@@ -1311,18 +1470,74 @@ extra_columns = [{ name = "subject_ref", values = ["A", "B"] }]
 [[tables]]
 name = "readings"
 extra_columns = [
-  { name = "bilanzkreis",         check = "EIC" },
-  { name = "bilanzierungsgebiet", check = "EIC" },
+  { name = "bilanzkreis",         check = "EIC:X" },
+  { name = "bilanzierungsgebiet", check = "EIC:Y" },
+  { name = "any_eic",             check = "EIC" },
+  { name = "lieferant",           check = "BDEW" },
+  { name = "unterliegende_malo",  check = "MALO" },
+  { name = "referenz_melo",       check = "MELO" },
 ]
 "#;
         let table = Settings::from_toml(toml).unwrap().single_table().unwrap();
-        assert_eq!(table.attribute_columns().len(), 2);
-        for f in table.attribute_columns() {
+        let declared: Vec<_> = table
+            .attribute_columns()
+            .iter()
+            .map(|f| (f.name().as_str(), crate::config::declared_value_check(f)))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("bilanzkreis", Some("EIC:X")),
+                ("bilanzierungsgebiet", Some("EIC:Y")),
+                ("any_eic", Some("EIC")),
+                ("lieferant", Some("BDEW")),
+                ("unterliegende_malo", Some("MALO")),
+                ("referenz_melo", Some("MELO")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_object_type_a_file_cannot_enforce_is_refused_by_name() {
+        // A refinement this build does not know must not degrade to the
+        // unrefined check it does know: a column declared as holding party codes
+        // and silently accepting any EIC is the one outcome the declaration
+        // exists to rule out.
+        let err = Settings::from_toml(
+            r#"
+[[tables]]
+name = "readings"
+extra_columns = [{ name = "bilanzkreis", check = "EIC:Q" }]
+"#,
+        )
+        .expect("parses")
+        .validate()
+        .expect_err("Q is not a listed object type")
+        .to_string();
+        assert!(err.contains("EIC:Q"), "{err}");
+        assert!(
+            err.contains("EIC:X"),
+            "the message names what is accepted: {err}"
+        );
+    }
+
+    #[test]
+    fn every_value_check_the_crate_knows_is_declarable_from_a_file() {
+        // The two lists are the same list. A scheme added to `ValueCheck` and
+        // not reachable from TOML would break §14's claim silently — the file
+        // would report it as unsupported, which is indistinguishable from a
+        // typo.
+        for scheme in crate::config::ValueCheck::ALL {
+            let toml = format!(
+                "[[tables]]\nname = \"readings\"\nextra_columns = [{{ name = \"c\", check = \"{scheme}\" }}]\n"
+            );
+            let table = Settings::from_toml(&toml)
+                .unwrap_or_else(|e| panic!("{scheme} is not declarable from a file: {e}"))
+                .single_table()
+                .expect("one table");
             assert_eq!(
-                crate::config::declared_value_check(f),
-                Some(crate::config::VALUE_CHECK_EIC),
-                "{}",
-                f.name()
+                crate::config::declared_value_check(&table.attribute_columns()[0]),
+                Some(scheme.as_str())
             );
         }
     }
@@ -1359,6 +1574,96 @@ extra_columns = [{ name = "iban", check = "IBAN" }]
             .to_string();
         assert!(err.contains("IBAN"), "{err}");
         assert!(err.contains("EIC"), "{err}");
+    }
+
+    #[test]
+    fn a_suppression_key_is_a_secret_and_never_reaches_a_log() {
+        // Configuration is exactly what a service dumps into its startup log,
+        // and this one carries a key that must outlive every erasure. The
+        // `Debug` impl is hand-written for the same reason `HotSettings`'s is.
+        let settings = Settings::from_toml(
+            r#"
+[privacy]
+erasure_secret = "0123456789abcdef0123456789abcdef"
+
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+"#,
+        )
+        .expect("parses");
+        let rendered = format!("{:?}", settings.privacy);
+        assert!(!rendered.contains("0123456789"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+        assert!(format!("{settings:?}").contains("***"));
+    }
+
+    #[tokio::test]
+    async fn a_short_suppression_key_is_refused_where_it_is_used() {
+        // A short key makes the suppression oracle brute-forceable, which is the
+        // one thing the construction exists to prevent. `SubjectRegistry` says
+        // so; this checks the file front end does not route around it.
+        //
+        // The pool is lazy and never connects — the length check runs before the
+        // registry touches it — so this needs no database, only a runtime for
+        // `PgPool` to be constructed in.
+        let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
+        let err = PrivacySettings {
+            erasure_secret: Some("too short".to_string()),
+        }
+        .registry(pool.clone())
+        .expect_err("32 bytes at least")
+        .to_string();
+        assert!(err.contains("32 bytes"), "{err}");
+
+        // And `meterstore check` refuses it too, with no database at all — a key
+        // discovered too short at the first process start is discovered in a
+        // deploy rather than in CI.
+        let err = Settings::from_toml(
+            r#"
+[privacy]
+erasure_secret = "too short"
+
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+"#,
+        )
+        .expect("parses")
+        .validate()
+        .expect_err("32 bytes at least")
+        .to_string();
+        assert!(err.contains("erasure_secret"), "{err}");
+        assert!(err.contains("32"), "{err}");
+
+        // And the two shapes that are accepted: a long enough key enables
+        // suppression, no key at all leaves erasure working and not sticking.
+        let suppressing = PrivacySettings {
+            erasure_secret: Some("0123456789abcdef0123456789abcdef".to_string()),
+        }
+        .registry(pool.clone())
+        .expect("32 bytes");
+        assert!(suppressing.suppresses_reregistration());
+        assert!(
+            !PrivacySettings::default()
+                .registry(pool)
+                .expect("no key is a valid configuration")
+                .suppresses_reregistration()
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_subject_column_needs_no_privacy_section() {
+        // The commonest configuration. A registry built anyway would create two
+        // tables in a database with no use for them.
+        let settings = Settings::from_toml(
+            r#"
+[[tables]]
+name = "readings"
+"#,
+        )
+        .expect("parses");
+        assert!(settings.privacy.erasure_secret.is_none());
     }
 
     #[test]

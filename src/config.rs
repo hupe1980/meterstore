@@ -9,6 +9,14 @@ use time::Duration;
 use crate::arrow::datatypes::{DataType, Field};
 use crate::error::{Error, Result};
 
+/// The EIC **object type**, re-exported from `metering`.
+///
+/// Here because it is part of this module's own signature: a
+/// [`ValueCheck::Eic`] carries one, so a caller declaring a Bilanzkreis column
+/// needs it in scope and should not have to reach past the crate whose function
+/// they are calling to find it.
+pub use metering::ids::EicType;
+
 /// Arrow field-metadata key under which an attribute column declares its
 /// allowed-value set. The hot-table DDL reads it to render a `CHECK … IN (…)`;
 /// it is inert everywhere else (schema evolution compares name/type/nullability
@@ -45,65 +53,415 @@ pub fn coded_column(name: &str, allowed: &[&str], nullable: bool) -> Field {
 /// Read by the write path, which parses every supplied value with `metering`'s
 /// own type and stores that type's canonical spelling. Like [`CHECK_VALUES_KEY`]
 /// it is inert everywhere else, so a checked column stays a plain `Utf8` column.
-/// See [`eic_column`].
+/// See [`ValueCheck`] and [`checked_column`].
 pub const VALUE_CHECK_KEY: &str = "meterstore.value_check";
 
-/// The [`VALUE_CHECK_KEY`] value naming an ENTSO-E Energy Identification Code.
-pub const VALUE_CHECK_EIC: &str = "EIC";
+/// The domain identifier scheme a [`checked_column`]'s values must parse as.
+///
+/// Every one of these is an identifier the German market already validates
+/// somewhere, and the argument for parsing it here is the one that already makes
+/// `malo_id` a [`MaloId`](metering::ids::MaloId) rather than eleven digits: an
+/// identifier stored as an arbitrary string is a string that will one day differ
+/// from the identifier it was meant to be, in a column nothing looks at until a
+/// settlement run joins on it.
+///
+/// # Each of these stops somewhere, and it is not the same place
+///
+/// | | Length | Shape | Arithmetic | Canonicalises |
+/// |---|---|---|---|---|
+/// | [`Eic`](Self::Eic) | 16 | `0-9 A-Z -`, letter at 3, check character not `-` | **check character** | trim, uppercase |
+/// | [`Malo`](Self::Malo) | 11 | digits, first not `0` | **check digit** | trim |
+/// | [`Melo`](Self::Melo) | 33 | 2 letters, 6 digits, 25 alphanumerics | none exists | trim, uppercase |
+/// | [`Bdew`](Self::Bdew) | 13 | digits | **deliberately not checked** | trim |
+///
+/// The two with arithmetic are the two where a transposition is *detectable*
+/// while the delivery that carried it is still in hand. The other two are still
+/// worth declaring: [`Melo`](Self::Melo) canonicalises the casing, and a
+/// Messlokation in two casings on an identity column is two readings that never
+/// supersede each other; [`Bdew`](Self::Bdew) fixes the length and the alphabet,
+/// which is the whole of the rule that can be enforced — see its own
+/// documentation for why the thirteenth digit is not.
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike [`Error`]: a
+/// scheme added here is a scheme a caller matching on this has to decide about,
+/// and a `_` arm would let that decision be skipped silently. It is the same
+/// convention `metering` uses for its own closed vocabularies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueCheck {
+    /// The sixteen-character ENTSO-E **Energy Identification Code**, which is
+    /// how the German market addresses a Bilanzkreis, a Bilanzierungsgebiet, a
+    /// Regelzone and a Metering Grid Area — the two columns
+    /// [`TableConfig::attribute_column`] names in its own documentation, and the
+    /// ones a MaBiS Summenzeitreihe groups on.
+    ///
+    /// An EIC carries a **check character**, and unlike the BDEW Codenummer the
+    /// scheme has no carve-out, so a mistyped code is detectable.
+    ///
+    /// # The object type, when the column holds one kind
+    ///
+    /// `Some(_)` narrows the column to one **object type** — position 3 of the
+    /// code, and the only thing distinguishing a Bilanzkreis (`X`, a party) from
+    /// a Bilanzierungsgebiet (`Y`, an area). They share the alphabet, the
+    /// length and the check character, so an unrefined `check = "EIC"` column
+    /// accepts either and only the column *name* says which was meant. A `Y`
+    /// code in the `bilanzkreis` column then passes the write path, passes the
+    /// `CHECK`, and makes every MaBiS grouping over it wrong.
+    ///
+    /// Unlike the check character, this half **is** expressible as a regular
+    /// expression, so declaring it strengthens the database constraint as well
+    /// as the write path — it is the one part of *"is this the right kind of
+    /// EIC"* PostgreSQL can enforce on a row this crate did not write.
+    ///
+    /// `None` accepts any EIC, including one whose type letter this build's
+    /// `metering` does not list: the list is ENTSO-E's to extend, and a store
+    /// that hard-failed on an entry added after its release would refuse data
+    /// the market has already issued.
+    ///
+    /// That tolerance is worth knowing about when an EIC passes through **two**
+    /// parsers in one process and the other one is strict — see
+    /// [`eic_object_type`] and [`eic_normalise`], which are how the two are told
+    /// apart in a query.
+    ///
+    /// [`eic_object_type`]: crate::session::udf::EicObjectType
+    /// [`eic_normalise`]: crate::session::udf::EicNormalise
+    Eic(Option<EicType>),
+    /// The eleven-digit **Marktlokations-ID**, and the identifier a *Tranche*
+    /// shares the format with.
+    ///
+    /// A deployment column holds one whenever a reading references a market
+    /// location that is not the one it is keyed to — the underlying
+    /// Marktlokation of a Kaskade, the parent of a Tranche. Its check digit is
+    /// the *Lok- und Waggon-Kennzeichnungsverfahren* and has no exception, so it
+    /// is enforced exactly as `malo_id`'s own is.
+    Malo,
+    /// The thirty-three-character **Messlokations-ID** (Zählpunktbezeichnung) of
+    /// VDE-AR-N 4400 / DVGW G 2000.
+    ///
+    /// No check digit exists, so the structure is the whole of the rule: two
+    /// uppercase letters, a six-digit Netzbetreiber number, then twenty-five
+    /// alphanumerics. What this adds over a plain string is the **casing** —
+    /// values are stored uppercase, so one Messlokation cannot arrive as two.
+    Melo,
+    /// The thirteen-digit **Marktpartner-ID**, the BDEW- or DVGW-Codenummer
+    /// every market participant is addressed by.
+    ///
+    /// The commonest identifier on a deployment's own columns — a Lieferant, a
+    /// Messstellenbetreiber, a Netzbetreiber — and the one whose validation stops
+    /// soonest. BDEW *Identifikatoren in der Marktkommunikation* §2.3 gives the
+    /// Prüfziffer the same procedure as the MaLo-ID and then carves out
+    /// GS1-issued GLNs, which use a different one and are legitimate
+    /// Marktpartner-IDs. So the thirteenth digit is **not** enforced, here or in
+    /// [`VersionScope`](crate::VersionScope), and thirteen digits is the rule.
+    Bdew,
+}
 
-/// A `Utf8` column whose values must be a valid **EIC**.
+impl ValueCheck {
+    /// Every value this build accepts, in declaration order.
+    ///
+    /// The refined EIC forms are members rather than a separate list, so
+    /// iterating this is the same thing as iterating the codes — the contract
+    /// `metering`'s own coded enums keep between `ALL` and `CODES`.
+    ///
+    /// Built from [`EicType::ALL`], so a type letter added upstream extends this
+    /// array without an edit. What forces the rest of the edit is exhaustiveness:
+    /// [`as_str`](Self::as_str), [`shape_pattern`](Self::shape_pattern) and
+    /// [`noun`](Self::noun) each match `Option<EicType>` with no `_` arm, so a
+    /// new letter fails to compile until all three name it.
+    // One unrefined `Eic`, one per `EicType`, and the three non-EIC schemes.
+    pub const ALL: [Self; 1 + EicType::ALL.len() + 3] = {
+        let types = EicType::ALL;
+        // Slot 0 is the unrefined `Eic(None)` the array is filled with; slots
+        // 1..=types.len() are the refinements; the last three are the rest.
+        let mut out = [Self::Eic(None); 1 + EicType::ALL.len() + 3];
+        let mut i = 0;
+        while i < types.len() {
+            out[1 + i] = Self::Eic(Some(types[i]));
+            i += 1;
+        }
+        out[1 + types.len()] = Self::Malo;
+        out[2 + types.len()] = Self::Melo;
+        out[3 + types.len()] = Self::Bdew;
+        out
+    };
+
+    /// The stable code stored in [`VALUE_CHECK_KEY`], which is also the value a
+    /// TOML `check =` takes.
+    ///
+    /// A refined EIC is `EIC:` and the object-type letter — `"EIC:X"` for a
+    /// Bilanzkreis, `"EIC:Y"` for a Bilanzierungsgebiet. The letter is
+    /// [`EicType::as_str`], so the code, the `serde` tag and what
+    /// `eic_object_type` returns are all one spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eic(None) => "EIC",
+            Self::Eic(Some(EicType::Party)) => "EIC:X",
+            Self::Eic(Some(EicType::Area)) => "EIC:Y",
+            Self::Eic(Some(EicType::MeasurementPoint)) => "EIC:Z",
+            Self::Eic(Some(EicType::ResourceObject)) => "EIC:W",
+            Self::Eic(Some(EicType::TieLine)) => "EIC:T",
+            Self::Eic(Some(EicType::Location)) => "EIC:V",
+            Self::Eic(Some(EicType::Substation)) => "EIC:A",
+            Self::Malo => "MALO",
+            Self::Melo => "MELO",
+            Self::Bdew => "BDEW",
+        }
+    }
+
+    /// The scheme a stored code names, if this build knows it.
+    ///
+    /// `None` rather than a default: a column declared as checked and silently
+    /// written *unchecked* is the one outcome the declaration exists to rule
+    /// out, so both readers — the write path and the DDL — refuse an unknown
+    /// code rather than ignoring it. That covers `"EIC:Q"` as well as `"IBAN"`:
+    /// a refinement this build cannot enforce must not degrade to one it can.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == code)
+    }
+
+    /// Every code this build knows, for an error message that says what to write
+    /// instead.
+    #[must_use]
+    pub fn known_codes() -> Vec<&'static str> {
+        Self::ALL.into_iter().map(Self::as_str).collect()
+    }
+
+    /// The POSIX regular expression the hot table's `CHECK` uses for this
+    /// scheme's *shape*.
+    ///
+    /// The half of each rule a regular expression can carry, and it is anchored
+    /// on the **stored** form: `Eic` and `Melo` canonicalise to uppercase, so the
+    /// pattern requires uppercase and a row written in lower case by another
+    /// writer is refused rather than becoming a second spelling.
+    ///
+    /// What each pattern cannot express is the arithmetic — the EIC check
+    /// character and the MaLo check digit are functions of the other characters,
+    /// and the write path enforces those. A row written to PostgreSQL by
+    /// something other than this crate is therefore well-*shaped*, not
+    /// necessarily well-*formed*.
+    ///
+    /// An EIC **object type** is not arithmetic, so a refined `Eic` pins
+    /// position 3 in the pattern itself and the database enforces it in full.
+    #[must_use]
+    pub const fn shape_pattern(self) -> &'static str {
+        match self {
+            // The ENTSO-E Reference Manual's own alphabet: sixteen characters of
+            // `0-9`, `A-Z` or `-`, an uppercase letter in position 3 (the object
+            // type), and a check character that is never `-` — §5.2 forbids it,
+            // so a body computing to one is never issued a code.
+            Self::Eic(None) => "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$",
+            // The same, with position 3 pinned to the declared object type.
+            // Written out rather than composed, because a `const fn` cannot
+            // build a `&'static str` — and written out is also what makes the
+            // deployed pattern greppable from the constraint definition.
+            Self::Eic(Some(EicType::Party)) => "^[0-9A-Z-]{2}X[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::Area)) => "^[0-9A-Z-]{2}Y[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::MeasurementPoint)) => "^[0-9A-Z-]{2}Z[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::ResourceObject)) => "^[0-9A-Z-]{2}W[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::TieLine)) => "^[0-9A-Z-]{2}T[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::Location)) => "^[0-9A-Z-]{2}V[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(EicType::Substation)) => "^[0-9A-Z-]{2}A[0-9A-Z-]{12}[0-9A-Z]$",
+            // Eleven digits. No Codevergabestelle issues a leading zero, which
+            // is why `MaloId` refuses one — a value that parses nowhere must not
+            // pass the shape check either.
+            Self::Malo => "^[1-9][0-9]{10}$",
+            // Two uppercase letters, six digits, then twenty-five alphanumerics.
+            // The Postleitzahl group is deliberately *not* required to be
+            // numeric: real Zählpunktbezeichnungen carry letters there, and
+            // `MeloId` accepts them.
+            Self::Melo => "^[A-Z]{2}[0-9]{6}[0-9A-Z]{25}$",
+            // Thirteen digits, and that is the entire enforceable rule.
+            Self::Bdew => "^[0-9]{13}$",
+        }
+    }
+
+    /// Parse `text` with `metering`'s own type and return that type's canonical
+    /// spelling, or the error a producer should be shown.
+    ///
+    /// The write is the only place a check character is worth anything: a wrong
+    /// one found in a settlement run a month later names a row and nothing that
+    /// could correct it.
+    ///
+    /// `column` is taken rather than left to a wrapper because the whole message
+    /// is composed here: what was supplied, what the scheme wanted, the domain's
+    /// own account of the shape, and why the check is at the write. Split across
+    /// two layers those four drift apart, and a refusal a producer cannot act on
+    /// is a refusal that gets retried unchanged.
+    pub fn canonicalise(self, column: &str, text: &str) -> Result<String> {
+        let refuse = |reason: String| {
+            Error::encode(
+                column,
+                format!("{text:?} is not {}: {reason} {}", self.noun(), self.why()),
+            )
+        };
+        let parsed = |r: std::result::Result<String, metering::ParseError>| {
+            r.map_err(|e| refuse(format!("{e}.")))
+        };
+        match self {
+            Self::Eic(want) => {
+                let eic: metering::ids::Eic = text
+                    .parse()
+                    .map_err(|e: metering::ParseError| refuse(format!("{e}.")))?;
+                // The refinement, after the parse: an EIC of the wrong object
+                // type is a well-formed code in the wrong column, which is a
+                // different fault from a malformed one and deserves to be told
+                // apart in the message.
+                if let Some(want) = want {
+                    let found = eic.object_type();
+                    if found != Some(want) {
+                        return Err(refuse(format!(
+                            "this column declares object type {} ({}), and the code carries \
+                             {} at position 3.",
+                            want.as_str(),
+                            want.name(),
+                            found.map_or_else(
+                                || format!(
+                                    "{:?}, which is not a type letter this build lists",
+                                    eic.as_str().chars().nth(2).unwrap_or('?')
+                                ),
+                                |f| format!("{} ({})", f.as_str(), f.name()),
+                            ),
+                        )));
+                    }
+                }
+                Ok(eic.into())
+            }
+            Self::Malo => parsed(text.parse::<metering::ids::MaloId>().map(String::from)),
+            Self::Melo => parsed(text.parse::<metering::ids::MeloId>().map(String::from)),
+            Self::Bdew => parsed(text.parse::<metering::ids::BdewCode>().map(String::from)),
+        }
+    }
+
+    /// What a value of this scheme is, as a noun phrase — *"an EIC"*, *"a
+    /// MaLo-ID"*.
+    ///
+    /// The first half of a refusal, before the reason.
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Eic(None) => "an EIC",
+            Self::Eic(Some(EicType::Party)) => "an X (party) EIC",
+            Self::Eic(Some(EicType::Area)) => "a Y (area) EIC",
+            Self::Eic(Some(EicType::MeasurementPoint)) => "a Z (measurement point) EIC",
+            Self::Eic(Some(EicType::ResourceObject)) => "a W (resource object) EIC",
+            Self::Eic(Some(EicType::TieLine)) => "a T (tie-line) EIC",
+            Self::Eic(Some(EicType::Location)) => "a V (location) EIC",
+            Self::Eic(Some(EicType::Substation)) => "an A (substation) EIC",
+            Self::Malo => "a MaLo-ID",
+            Self::Melo => "a MeLo-ID",
+            Self::Bdew => "a Marktpartner-ID",
+        }
+    }
+
+    /// Why a producer should care that this one was refused.
+    ///
+    /// The last half, after the reason. It is the sentence that turns a format
+    /// complaint into an instruction: for the two schemes with arithmetic it
+    /// says *why here and nowhere later*, and for the two without it says what
+    /// the shape is standing in for.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::Eic(_) => {
+                "The check character is part of the code, so a transposition is detectable \
+                 here — and only here, while the delivery that carried it is still in hand."
+            }
+            Self::Malo => {
+                "The check digit is part of the identifier, so a transposition is detectable \
+                 here — and only here, while the delivery that carried it is still in hand."
+            }
+            Self::Melo => {
+                "There is no check digit, so the structure is the whole of the rule — and a \
+                 value that fails it would have been stored as a Messlokation nothing else \
+                 names."
+            }
+            Self::Bdew => {
+                "The thirteenth digit is deliberately not checked, because BDEW's \
+                 Bildungsvorschrift exempts GS1-issued GLNs — so thirteen digits is the \
+                 whole of the rule that can be enforced, and a value failing it is not a \
+                 Marktpartner-ID at all."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ValueCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ValueCheck {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::from_code(s).ok_or_else(|| {
+            Error::config(format!(
+                "unknown value check {s:?}; this build knows {:?}",
+                Self::known_codes()
+            ))
+        })
+    }
+}
+
+/// A `Utf8` column whose values must parse as a domain identifier.
 ///
-/// The sixteen-character ENTSO-E Energy Identification Code, which is what the
-/// German market addresses a **Bilanzkreis**, a **Bilanzierungsgebiet**, a
-/// Regelzone and a Metering Grid Area by — the two columns
-/// [`TableConfig::attribute_column`] names in its own documentation, and the
-/// ones a MaBiS Summenzeitreihe groups on.
+/// A deployment's own columns get the treatment `malo_id` and `melo_id` already
+/// get on the built-in ones: the value is **parsed rather than trusted**, and
+/// what is stored is the domain type's canonical spelling. Pass to
+/// [`TableConfig::attribute_column`] or [`TableConfig::identity_column`].
 ///
-/// # Why this is not just a string column
+/// Storing such a value as a plain string defers every check to whoever reads it
+/// next, which under a decade-long retention obligation is a settlement run that
+/// cannot ask the producer to resend. Canonicalising matters most on an
+/// [`identity_column`](TableConfig::identity_column): one identifier in two
+/// spellings is two merge keys, so two versions of one reading never supersede
+/// each other and every sum over them is inflated.
 ///
-/// The argument that makes `malo_id` a [`MaloId`](metering::ids::MaloId) rather
-/// than eleven digits. An EIC carries a **check character**, and unlike the BDEW
-/// Codenummer — whose Bildungsvorschrift exempts GS1-issued GLNs, which is why
-/// `version_scope` deliberately does not check its digit — the EIC scheme has no
-/// carve-out, so a mistyped code is detectable while the message that carried it
-/// is still in hand.
-///
-/// Values are stored **canonicalised** (`Eic`'s uppercase, trimmed form), for the
-/// reason [`canonical_obis`](crate::canonical_obis) exists: on an
-/// [`identity_column`](TableConfig::identity_column), one Bilanzkreis in two
-/// spellings is two readings that never supersede each other.
-///
-/// # Two checks, and each stops somewhere
-///
-/// The hot table gets a `CHECK` for the *shape*: sixteen characters of `0-9`,
-/// `A-Z` or `-`, an uppercase letter in position 3, and a check character that is
-/// not `-`. The check *character* is arithmetic over the other fifteen and no
-/// regular expression expresses it, so the write path enforces that half. A row
-/// written to PostgreSQL by something else gets the shape check and not the check
-/// character.
+/// **Two checks, and each stops somewhere.** The hot table gets a `CHECK` for
+/// the *shape* ([`ValueCheck::shape_pattern`]); the write path enforces whatever
+/// arithmetic the scheme has ([`ValueCheck::canonicalise`]). A row written to
+/// PostgreSQL by something else gets the first and not the second. [`ValueCheck`]
+/// says where each scheme stops.
 ///
 /// ```rust
-/// use meterstore::{TableConfig, eic_column};
+/// use meterstore::{EicType, TableConfig, ValueCheck, checked_column};
 ///
 /// let table = TableConfig::new("readings_versions")
-///     .attribute_column(eic_column("bilanzkreis", true))
-///     .attribute_column(eic_column("bilanzierungsgebiet", true))
+///     // A Bilanzkreis is an X (party) code and a Bilanzierungsgebiet a Y
+///     // (area) one. They differ in nothing else, so naming the object type is
+///     // what keeps one out of the other's column.
+///     .attribute_column(checked_column(
+///         "bilanzkreis",
+///         ValueCheck::Eic(Some(EicType::Party)),
+///         true,
+///     ))
+///     .attribute_column(checked_column(
+///         "bilanzierungsgebiet",
+///         ValueCheck::Eic(Some(EicType::Area)),
+///         true,
+///     ))
+///     .attribute_column(checked_column("lieferant", ValueCheck::Bdew, true))
 ///     .build()?;
-/// assert_eq!(table.attribute_columns().len(), 2);
+/// assert_eq!(table.attribute_columns().len(), 3);
 /// # Ok::<(), meterstore::Error>(())
 /// ```
 #[must_use]
-pub fn eic_column(name: &str, nullable: bool) -> Field {
+pub fn checked_column(name: &str, check: ValueCheck, nullable: bool) -> Field {
     Field::new(name, DataType::Utf8, nullable).with_metadata(std::collections::HashMap::from([(
         VALUE_CHECK_KEY.to_string(),
-        VALUE_CHECK_EIC.to_string(),
+        check.as_str().to_string(),
     )]))
 }
 
 /// The domain identifier a field's values must parse as, if it declares one.
 ///
 /// One reader for [`VALUE_CHECK_KEY`], so the write path and the DDL cannot
-/// disagree about which columns are checked.
+/// disagree about which columns are checked. The **raw** code rather than a
+/// [`ValueCheck`], because a declaration this build does not know has to reach
+/// both of them as itself: each refuses it, and refusing it by name is what tells
+/// an operator which column to fix.
 #[must_use]
 pub fn declared_value_check(field: &Field) -> Option<&str> {
     field.metadata().get(VALUE_CHECK_KEY).map(String::as_str)
@@ -778,14 +1136,16 @@ mod tests {
     }
 
     #[test]
-    fn an_eic_column_declares_the_identifier_scheme_its_values_must_parse_as() {
-        let f = eic_column("bilanzkreis", true);
-        assert_eq!(f.data_type(), &DataType::Utf8);
-        assert!(f.is_nullable());
-        assert_eq!(declared_value_check(&f), Some(VALUE_CHECK_EIC));
-        // A vocabulary and an identifier scheme are different claims, so the
-        // one key does not carry the other's value.
-        assert!(f.metadata().get(CHECK_VALUES_KEY).is_none());
+    fn a_checked_column_declares_the_identifier_scheme_its_values_must_parse_as() {
+        for scheme in ValueCheck::ALL {
+            let f = checked_column("c", scheme, true);
+            assert_eq!(f.data_type(), &DataType::Utf8);
+            assert!(f.is_nullable());
+            assert_eq!(declared_value_check(&f), Some(scheme.as_str()));
+            // A vocabulary and an identifier scheme are different claims, so
+            // the one key does not carry the other's value.
+            assert!(f.metadata().get(CHECK_VALUES_KEY).is_none());
+        }
         assert_eq!(declared_value_check(&coded_column("s", &["A"], true)), None);
         assert_eq!(
             declared_value_check(&Field::new("plain", DataType::Utf8, true)),
@@ -799,14 +1159,136 @@ mod tests {
         // arriving in two spellings is two readings that never supersede each
         // other.
         let c = base()
-            .identity_column(eic_column("bilanzkreis", false))
+            .identity_column(checked_column(
+                "bilanzkreis",
+                ValueCheck::Eic(Some(EicType::Party)),
+                false,
+            ))
             .build()
             .unwrap();
         assert!(c.merge_key().contains(&"bilanzkreis".to_string()));
         assert_eq!(
             declared_value_check(&c.identity_columns()[0]),
-            Some(VALUE_CHECK_EIC)
+            Some("EIC:X")
         );
+    }
+
+    #[test]
+    fn a_value_checks_code_round_trips_and_is_the_only_spelling() {
+        // The code is written into Arrow field metadata, read back by the DDL
+        // and by the write path, and typed into a TOML file by hand. One
+        // spelling, and `from_code` is the only reader of it.
+        for scheme in ValueCheck::ALL {
+            assert_eq!(ValueCheck::from_code(scheme.as_str()), Some(scheme));
+            assert_eq!(scheme.to_string(), scheme.as_str());
+            assert_eq!(
+                scheme.as_str().parse::<ValueCheck>().expect("known"),
+                scheme
+            );
+        }
+        assert_eq!(
+            ValueCheck::known_codes(),
+            vec![
+                "EIC", "EIC:X", "EIC:Y", "EIC:Z", "EIC:W", "EIC:T", "EIC:V", "EIC:A", "MALO",
+                "MELO", "BDEW",
+            ]
+        );
+        // Every object-type letter `metering` lists is declarable. The const
+        // assertion on `ALL` holds the count; this holds the mapping, so a
+        // letter added upstream cannot be added to `ALL` under the wrong code.
+        for ty in EicType::ALL {
+            assert_eq!(
+                ValueCheck::from_code(&format!("EIC:{}", ty.as_str())),
+                Some(ValueCheck::Eic(Some(ty))),
+                "{ty}"
+            );
+        }
+
+        // A refinement this build cannot enforce must not degrade to one it can:
+        // `EIC:Q` is refused outright rather than read as a bare `EIC`.
+        for unknown in ["IBAN", "eic", "EIC:", "EIC:Q", "EIC:XX", "EIC:x", "MALO:X"] {
+            assert_eq!(ValueCheck::from_code(unknown), None, "{unknown}");
+        }
+
+        // An unknown code names itself and the alternatives, so an operator who
+        // typed one can see what to type instead.
+        let err = "EIC:Q"
+            .parse::<ValueCheck>()
+            .expect_err("unknown")
+            .to_string();
+        assert!(err.contains("EIC:Q"), "{err}");
+        assert!(err.contains("EIC:X"), "{err}");
+    }
+
+    #[test]
+    fn canonicalising_is_the_domain_types_own_spelling() {
+        // The whole point of a checked column: what is stored is the domain
+        // type's canonical form, so one identifier cannot become two merge keys.
+        let ok = |c: ValueCheck, text: &str| c.canonicalise("declared", text).unwrap();
+        assert_eq!(
+            ok(ValueCheck::Eic(None), "  11xbk0000000001a  "),
+            "11XBK0000000001A"
+        );
+        assert_eq!(
+            ok(ValueCheck::Melo, " de00056266802ao6g56m11sn51g21m24s "),
+            "DE00056266802AO6G56M11SN51G21M24S"
+        );
+        assert_eq!(ok(ValueCheck::Malo, " 41373559241 "), "41373559241");
+        assert_eq!(ok(ValueCheck::Bdew, " 9900987654321 "), "9900987654321");
+
+        // And where each one stops. The two with arithmetic refuse a
+        // transposition; the Marktpartner-ID cannot, because BDEW's own
+        // Bildungsvorschrift carves out GS1-issued GLNs.
+        let bad = |c: ValueCheck, text: &str| {
+            c.canonicalise("declared", text)
+                .expect_err(text)
+                .to_string()
+        };
+        assert!(bad(ValueCheck::Eic(None), "11XBK0000000001B").contains("declared"));
+        assert!(bad(ValueCheck::Malo, "41373559214").contains("check digit"));
+        assert_eq!(ok(ValueCheck::Bdew, "9900987654320"), "9900987654320");
+    }
+
+    #[test]
+    fn an_eic_of_the_wrong_object_type_is_refused_and_the_message_says_which() {
+        // The failure this refinement exists for. `11XBK0000000001A` and
+        // `11YN000000000016` are both valid EICs of the same length under the
+        // same issuing office, and only position 3 says one is a Bilanzkreis and
+        // the other a Bilanzierungsgebiet. Undeclared, the column takes either.
+        let bilanzkreis = ValueCheck::Eic(Some(EicType::Party));
+        assert_eq!(
+            bilanzkreis
+                .canonicalise("bilanzkreis", "11XBK0000000001A")
+                .unwrap(),
+            "11XBK0000000001A"
+        );
+
+        let err = bilanzkreis
+            .canonicalise("bilanzkreis", "11YN000000000016")
+            .expect_err("an area code is not a party code")
+            .to_string();
+        assert!(err.contains("bilanzkreis"), "{err}");
+        // Both sides of the mismatch, because "invalid" would send the producer
+        // to read the code they already have in front of them.
+        assert!(err.contains("X (Party)"), "{err}");
+        assert!(err.contains("Y (Area or Domain)"), "{err}");
+
+        // A malformed code is still refused as malformed rather than as a type
+        // mismatch: the two are different faults and the message says which.
+        let malformed = bilanzkreis
+            .canonicalise("bilanzkreis", "11XBK0000000001B")
+            .expect_err("the check character is wrong")
+            .to_string();
+        assert!(!malformed.contains("object type"), "{malformed}");
+
+        // And the unrefined form still takes either, which is what makes the
+        // refinement a declaration rather than a rule of the scheme.
+        for code in ["11XBK0000000001A", "11YN000000000016"] {
+            assert!(
+                ValueCheck::Eic(None).canonicalise("c", code).is_ok(),
+                "{code}"
+            );
+        }
     }
 
     #[test]

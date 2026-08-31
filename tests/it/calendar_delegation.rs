@@ -1,7 +1,7 @@
 //! The DST properties MeterStore relies on, asserted against `metering`'s
 //! calendar rather than a local reimplementation.
 //!
-//! These vectors previously guarded a downstream copy of this logic. The copy is
+//! These vectors guard against a downstream copy of this logic. Such a copy is
 //! gone, but the properties still matter to completeness reporting, so they are
 //! kept here as a contract test against the upstream crate.
 

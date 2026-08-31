@@ -59,12 +59,27 @@ pub struct Metrics {
     pub rows_deduplicated: Counter<u64>,
     /// Corrections routed to the cold tier because their interval was archived.
     pub late_corrections: Counter<u64>,
-    /// Subjects whose linkage a retention sweep destroyed.
+    /// Subjects whose linkage was destroyed, by what triggered it.
     ///
-    /// **Compliance rather than health.** § 60 Abs. 6 comes due on a clock, so a
-    /// flat zero over a year is a sweep that is not running — and erasure is
-    /// irreversible, so this is the one counter here whose *rise* is worth a look.
-    pub subjects_anonymised: Counter<u64>,
+    /// **Compliance rather than health**, and the only irreversible operation
+    /// this crate performs — so it is the one counter here whose *rise* is worth
+    /// a look, and the one whose flat zero is too.
+    ///
+    /// Split by [`erasure_trigger`] because the two have opposite readings and
+    /// summing them hides both:
+    ///
+    /// - `retention` is the § 60 Abs. 6 MsbG sweep, which comes due on a clock.
+    ///   A flat zero over a year is a sweep that is **not running**.
+    /// - `request` is an Article 17 erasure, which arrives when a data subject
+    ///   asks. A flat zero is ordinary; a rise is a thing to know about.
+    ///
+    /// Folded together, a deployment whose sweep never ran but which handled the
+    /// occasional request would look like one whose sweep was working.
+    ///
+    /// No `table` attribute: the registry is deployment-wide and a subject's
+    /// linkage is destroyed everywhere at once, so attributing the count to a
+    /// table would invite a per-table sum that double-counts it.
+    pub subjects_erased: Counter<u64>,
 
     /// Rows read, by tier.
     pub rows_scanned: Counter<u64>,
@@ -118,12 +133,13 @@ impl Metrics {
                      Not a failure: nothing was changed and the next cycle retries",
                 )
                 .build(),
-            subjects_anonymised: meter
-                .u64_counter("meterstore.retention.subjects_anonymised")
+            subjects_erased: meter
+                .u64_counter("meterstore.subjects_erased")
                 .with_description(
-                    "Subjects whose linkage a § 60 Abs. 6 retention sweep destroyed. \
-                     Irreversible: a rise is worth a look, and a flat zero over a \
-                     year is a sweep that is not running",
+                    "Subjects whose linkage was destroyed, by trigger. Irreversible. \
+                     trigger=retention is the § 60 Abs. 6 sweep, where a flat zero over \
+                     a year means it is not running; trigger=request is an Article 17 \
+                     erasure, where a rise is the thing to know about",
                 )
                 .build(),
             partitions_dropped: meter
@@ -209,6 +225,20 @@ pub fn table(name: &str) -> [KeyValue; 1] {
     [KeyValue::new("table", name.to_string())]
 }
 
+/// What triggered an erasure, for [`Metrics::subjects_erased`].
+///
+/// The two are counted apart rather than summed because their readings are
+/// opposite: a flat `retention` series is a sweep that is not running, and a flat
+/// `request` series is an ordinary quarter.
+pub fn erasure_trigger(trigger: &'static str) -> [KeyValue; 1] {
+    [KeyValue::new("trigger", trigger)]
+}
+
+/// A § 60 Abs. 6 MsbG retention sweep — the duty that comes due on a clock.
+pub const TRIGGER_RETENTION: &str = "retention";
+/// An Article 17 erasure request — the duty that arrives when a subject asks.
+pub const TRIGGER_REQUEST: &str = "request";
+
 /// Table plus tier, for metrics that distinguish them.
 pub fn table_tier(name: &str, tier: &'static str) -> [KeyValue; 2] {
     [
@@ -233,7 +263,23 @@ mod tests {
             .record(0.01, &table_tier("readings", "cold"));
         // Deployment-wide, so it carries no table attribute — the empty slice is
         // as much a case as any other.
-        m.subjects_anonymised.add(1, &[]);
+        m.subjects_erased.add(1, &erasure_trigger(TRIGGER_REQUEST));
+        m.subjects_erased
+            .add(1, &erasure_trigger(TRIGGER_RETENTION));
+    }
+
+    #[test]
+    fn the_two_erasure_triggers_are_distinct_attribute_values() {
+        // They are counted apart because their readings are opposite: a flat
+        // `retention` series is a sweep that is not running, and a flat `request`
+        // series is an ordinary quarter. One value for both would fold the two
+        // and hide the first.
+        assert_ne!(TRIGGER_RETENTION, TRIGGER_REQUEST);
+        assert_ne!(
+            erasure_trigger(TRIGGER_RETENTION)[0].value,
+            erasure_trigger(TRIGGER_REQUEST)[0].value
+        );
+        assert_eq!(erasure_trigger(TRIGGER_REQUEST)[0].key.as_str(), "trigger");
     }
 
     #[test]

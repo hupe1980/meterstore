@@ -22,24 +22,35 @@ for row in store.completeness(from, to).await? {
 }
 ```
 
-`malo`, `obis` and `column_eq` narrow it — in the **scan**, not in the answer, so
-a question about one meter does not cost a scan of the portfolio:
+`malo`, `melo`, `obis` and `column_eq` narrow it — in the **scan**, not in the
+answer, so a question about one meter does not cost a scan of the portfolio:
 
 ```rust
 store.completeness(from, to).malo("41373559241")?.await?;
+store.completeness(from, to).melo(melo)?.await?;   // one meter of a Mehrfamilienhaus
 ```
 
 Identifiers are parsed and canonicalised, so a mistyped one fails at the call
-rather than returning an empty report that reads as *"this meter is fine"*. The
-narrowing applies to the [roster](#the-finding-a-range-cannot-make-about-itself)
-too, or every channel outside it would come back as silent.
+rather than returning an empty report that reads as *"this meter is fine"*. That
+matters most for `melo`: a Zählpunktbezeichnung has no check digit and is stored
+uppercase, so a lower-cased literal through `column_eq` narrows the report to
+nothing and every channel comes back **silent** — which reads as a meter that has
+stopped delivering, the strongest finding the report can make. The narrowing
+applies to the [roster](#the-finding-a-range-cannot-make-about-itself) too, or
+every channel outside it would come back as silent.
 
 Or as a table function, for the operator holding a SQL client rather than a
 compiler:
 
 ```sql
-SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
+SELECT * FROM meter_completeness('2026-03-01', '2026-04-01')
+WHERE NOT complete OR NOT measurable;
 ```
+
+`OR NOT measurable` is not defensive spelling. A channel with no fixed daily
+expectation reports `missing = 0` and `surplus = 0`, so it *is* `complete` —
+and `WHERE NOT complete` alone drops exactly the channels nobody could judge,
+reporting them as fine.
 
 | Column | Meaning |
 |---|---|
@@ -54,7 +65,8 @@ SELECT * FROM meter_completeness('2026-03-01', '2026-04-01') WHERE NOT complete;
 | `first_gap` | The earliest short **balancing** day |
 | `substituted` | Intervals carrying an Ersatzwert |
 | `not_billable` | Intervals whose quality bars them from billing |
-| `complete` | `missing == 0 && surplus == 0` |
+| `complete` | `missing == 0 && surplus == 0` — true, and not the same as "checked" |
+| `measurable` | Whether there was an expectation to compare against at all |
 
 `actual = 0` on a row is a channel that delivered nothing at all — `is_silent()`
 in Rust. Such a row exists only when the query was given a reference window, which
@@ -137,9 +149,10 @@ meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
 ```
 
 `--month YYYY-MM` is the **Bilanzierungsmonat** — cut at midnight local for
-electricity, 06:00 for gas with `--sparte GAS` — and `--malo` / `--obis` narrow
-it. It exits zero whatever it finds; `--format json` carries the rows plus
-`channels_incomplete`, `channels_silent` and `intervals_missing`.
+electricity, 06:00 for gas with `--sparte GAS` — and `--malo`, `--melo` and
+`--obis` narrow it, each parsed at the call. It exits zero whatever it finds;
+`--format json` carries the rows plus `channels_incomplete`, `channels_silent`,
+`channels_unmeasurable` and `intervals_missing`.
 [The CLI →](@/docs/cli.md#asking-whether-a-month-is-complete)
 
 ## One row per reading, not per measuring point
@@ -232,7 +245,9 @@ So `missing` and `expected - actual` can legitimately disagree.
 **No resolution means no expectation.** A series that declares none, or declares a
 calendar one like `P1M` which has no fixed count within a day, reports `actual`
 and admits it cannot judge. Assuming fifteen minutes would invent either a gap or
-a completeness.
+a completeness. Such a row is `complete` **and** not `measurable`, in SQL and in
+Rust alike — so a check that reads only the first passes a month nothing was
+verified about.
 
 A range that is not day-aligned expects only the covered fraction of each end day,
 so a billing period starting at noon does not report the morning as missing.

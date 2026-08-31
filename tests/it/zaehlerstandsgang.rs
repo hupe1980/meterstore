@@ -849,7 +849,7 @@ async fn a_meter_reads_back_register_by_register() {
     // register, and folding two interleaves two cumulative sequences so that
     // differencing the result gives advances belonging to neither.
     //
-    // Asking for all of them used to mean a hand-written `SELECT DISTINCT
+    // Asking for all of them without this means a hand-written `SELECT DISTINCT
     // obis_code` and one typed read per register. This is that question, in one
     // scan, with resolution and the tier split still inside the store.
     let (store, _warehouse) = point_store().await;

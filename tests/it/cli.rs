@@ -129,6 +129,7 @@ async fn the_commands_drive_a_real_deployment() {
             sparte: "STROM".to_string(),
             seen_since: Some("30d".to_string()),
             malo: None,
+            melo: None,
             obis: None,
             gaps_only: false,
         },
@@ -149,6 +150,7 @@ async fn the_commands_drive_a_real_deployment() {
             seen_since: None,
             // Narrowed in the scan: the report is about one meter's one channel.
             malo: Some("12345678905".to_string()),
+            melo: Some("DE0001234567890123456789012345678".to_string()),
             obis: Some("1-0:1.29.0".to_string()),
             gaps_only: true,
         },
@@ -263,4 +265,118 @@ async fn purge_needs_the_table_named_twice() {
         .run()
         .await
         .expect("status");
+}
+
+/// A configuration whose table declares a `subject_column`, so the deployment
+/// carries a subject registry.
+fn config_with_subjects(url: &str, warehouse: &std::path::Path) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    write!(
+        file,
+        r#"
+[hot]
+url = "{url}"
+max_connections = 4
+
+[cold]
+catalog = "sql"
+uri = "{url}"
+warehouse = "file://{}"
+namespace = "metering"
+file_target_bytes = 8388608
+metadata_pool_max_connections = 2
+
+[[tables]]
+name = "readings_versions"
+subject_column = "subject_ref"
+
+[tables.archival]
+settlement_lag = "1d"
+archival_step = "1d"
+"#,
+        warehouse.display(),
+    )
+    .expect("write");
+    file
+}
+
+#[tokio::test]
+async fn the_erasure_trail_is_readable_from_the_shell() {
+    // "We deleted it" is not evidence, and the trail is what a regulator asks
+    // for — from a shell, which is where an auditor's question arrives.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let file = config_with_subjects(&url, warehouse.path());
+    let path = file.path();
+
+    cli(path, Command::Create).run().await.expect("create");
+
+    // An empty trail is a fact, not an error: a deployment that has had no
+    // Article 17 request has erased nothing.
+    cli(path, Command::Erasures { limit: 50 })
+        .run()
+        .await
+        .expect("an empty trail reports as empty");
+
+    // Erase through the library — which is the only door, see `no meterstore
+    // erase` — and read it back through the shell.
+    let deployment = meterstore::Settings::from_path(path)
+        .expect("settings")
+        .connect()
+        .await
+        .expect("connect");
+    let catalog = deployment.catalog().await.expect("catalog");
+    let store = catalog.table("readings_versions").expect("table");
+    let subject = store
+        .register_subject("tenant-a:12345678905")
+        .await
+        .expect("register");
+    store
+        .erase_subject(
+            &subject,
+            "DSAR-2026-0042",
+            "privacy-team",
+            time::macros::datetime!(2026-08-31 09:00 UTC),
+        )
+        .await
+        .expect("erase");
+
+    cli(path, Command::Erasures { limit: 50 })
+        .run()
+        .await
+        .expect("the trail now holds a row");
+
+    // A row count that is not one is refused at the call rather than reaching
+    // PostgreSQL as a negative LIMIT.
+    let err = cli(path, Command::Erasures { limit: 0 })
+        .run()
+        .await
+        .expect_err("a limit is a row count");
+    assert!(err.to_string().contains("--limit"), "{err}");
+}
+
+#[tokio::test]
+async fn asking_for_erasures_where_no_subject_is_declared_says_so() {
+    // The commonest configuration has no subject column at all. An empty list
+    // there would read as "nothing has been erased", which is true and useless:
+    // the deployment holds no mapping to erase in the first place.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let file = config_file(&url, warehouse.path());
+
+    cli(file.path(), Command::Create)
+        .run()
+        .await
+        .expect("create");
+
+    let err = cli(file.path(), Command::Erasures { limit: 10 })
+        .run()
+        .await
+        .expect_err("no subject column is declared");
+    assert!(err.to_string().contains("subject_column"), "{err}");
 }

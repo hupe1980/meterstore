@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -102,19 +102,26 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # conversion, Ersatzwertbildung. MeterStore persists and queries those types —
 # it does not redefine them. Part of the mako platform (hupe1980/mako).
 #
-# 0.21 is a floor rather than a preference: three of the things this crate stores
-# are its types rather than strings it checks itself. `ids::BdewCode` is the
-# operator half of a `VersionScope`, where a wrong-but-plausible value is not an
-# error but a *different scope*. `ids::Eic` is what a `check = "EIC"` column
-# parses with, and its check character is the whole reason such a column is not
-# a plain string. `wire::rfc3339` fixes the shape `ProvenanceEntry::occurred_at`
-# is written in, which `time`'s own feature-conditional serde impl would
-# otherwise leave to feature unification.
+# The floor is a floor rather than a preference: several of the things this crate
+# stores are its types rather than strings it checks itself. All four of
+# `ids::{BdewCode, Eic, MaloId, MeloId}` are what a `check =` column parses with,
+# and their check character/check digit is the whole reason such a column is not
+# a plain string; `BdewCode` is also the operator half of a `VersionScope`, where
+# a wrong-but-plausible value is not an error but a *different scope*.
+# `wire::rfc3339` fixes the shape `ProvenanceEntry::occurred_at` is written in,
+# which `time`'s own feature-conditional serde impl would otherwise leave to
+# feature unification.
 #
-# 0.21 also moved `ObisCode::is_import`/`is_export` to a by-value receiver, being
+# 0.22 is the floor because it completes `TryFrom<String>` on all four of those
+# identifiers. A generic `impl TryInto<…>` bound is satisfied by the caller's own
+# type and not by a deref of it, so every read entry point here — `series`,
+# `readings`, both `melo(..)`, `VersionScope::for_interval` — would otherwise
+# refuse the `String` an MSCONS parser hands back.
+#
+# 0.21 moved `ObisCode::is_import`/`is_export` to a by-value receiver, being
 # derived from the new `direction()` — which `session::udf` exposes as
 # `obis_direction`, the three-valued primitive the two booleans cannot express.
-metering = { version = "0.21", features = ["serde"] }
+metering = { version = "0.22", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is
