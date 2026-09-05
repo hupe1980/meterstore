@@ -103,6 +103,15 @@ settlement_lag = "7d"
 # grid, and a window off that grid names a partition relation nothing creates.
 archival_step = "1d"
 
+# How long an archived partition is kept before its space is reclaimed.
+#
+# A query reads the tier boundary when it is *planned* and reads the tiers when
+# it *executes*. Archival between the two moves a window across the boundary the
+# plan already decided against, so the partition stays readable for this long
+# afterwards. Set it above the longest query this deployment runs; the cost is a
+# fraction of one partition's disk.
+reader_grace = "1h"
+
 [tables.maintenance]
 # A snapshot is what makes a past settlement reproducible, so this is a
 # compliance decision rather than a disk-space one — which is why expiry is

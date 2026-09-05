@@ -102,6 +102,7 @@ pub struct MeteringWorkload {
     sparte: Sparte,
     unit: MeasurementUnit,
     messlokationen: usize,
+    version: u128,
 }
 
 impl MeteringWorkload {
@@ -120,7 +121,21 @@ impl MeteringWorkload {
             sparte: Sparte::Strom,
             unit: Sparte::Strom.billing_unit(),
             messlokationen: 0,
+            version: FIRST_VERSION,
         }
+    }
+
+    /// The version a first delivery carries; a correction carries `version + 1`.
+    ///
+    /// Defaults to a fixed label, which is what a single-shot workload wants —
+    /// one delivery, one version, reproducible across runs. Set it to write a
+    /// **sequence** of restatements of the same readings: each round is a higher
+    /// version in the same scope, which is what an MSCONS correction chain is and
+    /// what a store's version resolution has to collapse. Without it a generator
+    /// can restate a reading once and never twice.
+    pub fn version(mut self, version: u128) -> Self {
+        self.version = version;
+        self
     }
 
     /// Give each Marktlokation `n` **Messlokationen**, each reporting the same
@@ -293,7 +308,7 @@ impl MeteringWorkload {
                     // generating it.
                     for (_, group) in group_by_scope(intervals, self.sparte) {
                         let anchor = group[0].from;
-                        out.push(self.stored(malo, meter, group, FIRST_VERSION, anchor)?);
+                        out.push(self.stored(malo, meter, group, self.version, anchor)?);
                     }
                 }
             }
@@ -315,7 +330,7 @@ impl MeteringWorkload {
             // scope that does not cover its intervals (§4.2).
             for (_, group) in group_by_scope(intervals, self.sparte) {
                 let anchor = group[0].from;
-                out.push(self.stored(malo, meter, group, CORRECTION_VERSION, anchor)?);
+                out.push(self.stored(malo, meter, group, self.version + 1, anchor)?);
             }
         }
 
@@ -376,13 +391,7 @@ impl MeteringWorkload {
                     }
                     for (_, group) in group_readings_by_scope(readings, self.sparte) {
                         let anchor = group[0].at;
-                        out.push(self.stored_readings(
-                            malo,
-                            meter,
-                            group,
-                            FIRST_VERSION,
-                            anchor,
-                        )?);
+                        out.push(self.stored_readings(malo, meter, group, self.version, anchor)?);
                     }
                 }
             }
@@ -404,7 +413,7 @@ impl MeteringWorkload {
             readings.sort_by_key(|r| r.at);
             for (_, group) in group_readings_by_scope(readings, self.sparte) {
                 let anchor = group[0].at;
-                out.push(self.stored_readings(malo, meter, group, CORRECTION_VERSION, anchor)?);
+                out.push(self.stored_readings(malo, meter, group, self.version + 1, anchor)?);
             }
         }
 
@@ -420,12 +429,13 @@ impl MeteringWorkload {
     }
 
     fn interval(&self, from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
-        MeterInterval {
-            from,
-            to: from + self.resolution,
-            value: kwh,
-            quality: QualityFlag::Measured,
-            obis_code: "1-0:1.8.0".parse().ok(),
+        // The named constructors rather than a struct literal: the quality is
+        // `Measured` because the constructor says so, and a field added upstream
+        // does not silently acquire a default here.
+        let interval = MeterInterval::measured(from, from + self.resolution, kwh);
+        match "1-0:1.8.0".parse() {
+            Ok(code) => interval.with_obis(code),
+            Err(_) => interval,
         }
     }
 
@@ -560,8 +570,10 @@ fn group_readings_by_scope(
 
 /// The version a first delivery carries.
 const FIRST_VERSION: u128 = 20_260_101_000_001;
-/// The version a correction carries. Higher, so it supersedes within its scope.
-const CORRECTION_VERSION: u128 = 20_260_201_000_002;
+/// The version a correction carries at the default base. Higher than
+/// [`FIRST_VERSION`], so it supersedes within its scope.
+#[cfg(test)]
+const CORRECTION_VERSION: u128 = FIRST_VERSION + 1;
 
 /// A synthetic Marktlokations-ID, `n` places into a contiguous block.
 ///

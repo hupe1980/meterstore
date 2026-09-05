@@ -232,9 +232,13 @@ impl MeterStore {
         sql: &str,
         watermarks: Vec<(String, TieringWatermark)>,
     ) -> Result<super::QueryDescription> {
-        let frame = self.sql(sql).await?;
-        let schema = Arc::new(frame.schema().as_arrow().clone());
-        let plan = frame.create_physical_plan().await.map_err(Error::from)?;
+        // The **physical** plan's schema, which is what `run` and `stream_at`
+        // report. Taking the logical one instead would plan the statement twice
+        // and let the surface that describes a query disagree with the surface
+        // that runs it — about nullability, or field metadata — which is the one
+        // thing a `describe` exists to rule out.
+        let plan = self.plan_against(sql, Vec::new(), &watermarks).await?;
+        let schema = plan.schema();
 
         Ok(super::QueryDescription::new(
             schema,
@@ -257,7 +261,7 @@ impl MeterStore {
         params: Vec<datafusion::scalar::ScalarValue>,
         watermarks: Vec<(String, TieringWatermark)>,
     ) -> Result<super::QueryResult> {
-        let plan = self.plan(sql, params).await?;
+        let plan = self.plan_against(sql, params, &watermarks).await?;
         let schema = plan.schema();
 
         // Read off the plan before executing it: the plan *is* the tier decision,
@@ -344,7 +348,7 @@ impl MeterStore {
         super::QueryDescription,
         datafusion::execution::SendableRecordBatchStream,
     )> {
-        let plan = self.plan(sql, params).await?;
+        let plan = self.plan_against(sql, params, &watermarks).await?;
         let schema = plan.schema();
         // Off the plan, before execution: the plan *is* the tier decision, and
         // asking the providers afterwards would race any other query in flight.
@@ -360,16 +364,37 @@ impl MeterStore {
     }
 
     /// Plan a statement, binding any parameters.
-    async fn plan(
+    /// Build a physical plan pinned to the boundaries the caller will report.
+    ///
+    /// The providers decide the tier split during **physical** planning, so the
+    /// boundaries travel with the plan rather than being read a second time —
+    /// see [`PlannedWatermarks`], which is where the argument lives.
+    ///
+    /// [`PlannedWatermarks`]: crate::planner::PlannedWatermarks
+    pub(crate) async fn plan_against(
         &self,
         sql: &str,
         params: Vec<datafusion::scalar::ScalarValue>,
+        watermarks: &[(String, TieringWatermark)],
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let mut frame = self.sql(sql).await?;
         if !params.is_empty() {
             frame = frame.with_param_values(params).map_err(Error::from)?;
         }
-        frame.create_physical_plan().await.map_err(Error::from)
+        if watermarks.is_empty() {
+            return frame.create_physical_plan().await.map_err(Error::from);
+        }
+
+        let pinned = watermarks.iter().fold(
+            crate::planner::PlannedWatermarks::default(),
+            |acc, (table, watermark)| acc.with(table.clone(), *watermark),
+        );
+        let (mut state, logical) = frame.into_parts();
+        state.config_mut().set_extension(Arc::new(pinned));
+        state
+            .create_physical_plan(&logical)
+            .await
+            .map_err(Error::from)
     }
 
     /// This store's validated configuration.
@@ -1398,23 +1423,18 @@ impl MeterStore {
         };
         let mut refs = std::collections::BTreeSet::new();
         for delivery in readings {
-            if let Some(datafusion::scalar::ScalarValue::Utf8(Some(value))) =
+            let Some(datafusion::scalar::ScalarValue::Utf8(Some(value))) =
                 delivery.extra.get(column)
-            {
-                refs.insert(value.clone());
+            else {
+                continue;
+            };
+            let subject = crate::erasure::SubjectRef::new(value.clone())?;
+            for reading in &delivery.readings {
+                check_subject_epoch(&subject, reading.at, delivery.sparte)?;
             }
+            refs.insert(value.clone());
         }
-        for reference in refs {
-            let subject = crate::erasure::SubjectRef::new(reference)?;
-            if registry.resolve(&subject).await?.is_none() {
-                return Err(Error::config(format!(
-                    "subject reference {subject} has no live mapping: it was \
-                     either never registered, or erased — in which case this \
-                     write is a replay that would re-link an erased subject"
-                )));
-            }
-        }
-        Ok(())
+        self.check_refs_resolve(registry, refs).await
     }
 
     /// Append values **the operator authors**, ensuring each one becomes
@@ -1626,15 +1646,26 @@ impl MeterStore {
         self.registry.as_ref()
     }
 
-    /// Register a natural identifier and get the reference to store.
+    /// Register a natural identifier for the retention epoch containing `at`,
+    /// and get the reference to store on that period's readings.
     ///
-    /// Convenience over [`SubjectRegistry::register`], so an ingest path that
-    /// already holds a `MeterStore` does not have to thread the registry
-    /// separately.
+    /// `at` is an instant *from the data* — any interval in the period being
+    /// written — not a wall clock. A reference belongs to one collection year
+    /// because § 60 Abs. 6 comes due per value, so a backfill of 2024 must carry
+    /// 2024's reference however long after the fact it arrives, and a write path
+    /// that passed `now()` here would attach this year's reference to it and
+    /// keep it attributable four years too long.
+    ///
+    /// The store checks that: a reference whose epoch does not match the year a
+    /// reading is balanced on is refused at the write.
     ///
     /// [`SubjectRegistry::register`]: crate::erasure::SubjectRegistry::register
-    pub async fn register_subject(&self, natural_id: &str) -> Result<crate::erasure::SubjectRef> {
-        self.require_registry()?.register(natural_id).await
+    pub async fn register_subject(
+        &self,
+        natural_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::erasure::SubjectRef> {
+        self.require_registry()?.register(natural_id, at).await
     }
 
     /// Destroy a subject's linkage, leaving the readings anonymous.
@@ -1648,7 +1679,7 @@ impl MeterStore {
         reason: &str,
         actor: &str,
         now: time::OffsetDateTime,
-    ) -> Result<crate::erasure::ErasureRecord> {
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
         self.require_registry()?
             .erase(subject, reason, actor, now)
             .await
@@ -1682,13 +1713,20 @@ impl MeterStore {
     /// files at all (§10.3.1), so the branch MeterStore can take is also the one
     /// that costs nothing.
     ///
-    /// # The trigger is the reading, not the registration
+    /// # The unit is a collection year, not a subject
     ///
-    /// A subject registered in 2020 may still be metered today, so a sweep keyed
-    /// to registration would erase a live customer. The cutoff is applied to the
-    /// **latest reading** attributed to each reference, over both tiers — a
-    /// subject is anonymised only once every value it explains has passed the
-    /// ceiling.
+    /// § 60 Abs. 6 runs on *"der jeweilige Messwert"*, so what comes due is a
+    /// `(subject, year)` pair rather than a subject. A reference is minted for
+    /// one collection year ([`register_subject`](Self::register_subject)) and
+    /// this deletes the mapping rows whose year has passed the ceiling — so an
+    /// active customer's 2021 values stop being attributable on schedule while
+    /// their 2026 values are untouched.
+    ///
+    /// Keyed instead to a subject's *latest* reading, as this once was, neither
+    /// half worked: a customer who stayed connected kept a decade of values
+    /// linked, and the due-date came from a query, so a sweep run through a
+    /// session that could not see the hot window would find a live customer's
+    /// last reading years old and erase it. This reads no table at all.
     ///
     /// `cutoff` is the caller's: the statutory ceiling is a calendar computation
     /// over the year a value was *erhoben*, and the earlier "no longer necessary"
@@ -1697,14 +1735,14 @@ impl MeterStore {
     /// References the registry no longer resolves are skipped, so the sweep is
     /// idempotent and a re-run writes no second audit row.
     ///
-    /// # This table only
+    /// # One registry, however many tables
     ///
-    /// The subject map is deployment-wide — one table keyed by natural identifier
-    /// — so two meterstore tables registering the same identifier share one
-    /// reference and one erasure unlinks **both**. A deployment holding more than
-    /// one stream must therefore sweep with [`MeterCatalog::anonymise_before`],
-    /// which takes the latest reading across every table; this one would destroy
-    /// a linkage the other tables still depend on.
+    /// The subject map is deployment-wide, so this and
+    /// [`MeterCatalog::anonymise_before`] do the same work: they delete mapping
+    /// rows whose collection year has passed the ceiling. Neither reads a
+    /// reading — the epoch is on the mapping row — so a table that is quiet, a
+    /// table that is quarantined and a session that cannot see the hot window
+    /// all make no difference to what comes due.
     ///
     /// [`MeterCatalog::anonymise_before`]: crate::MeterCatalog::anonymise_before
     pub async fn anonymise_before(
@@ -1714,9 +1752,6 @@ impl MeterStore {
         actor: &str,
         now: time::OffsetDateTime,
     ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-        // Erasure is irreversible and its due-date is `max(from)` over *this*
-        // session, so a restricted view does not misreport here — it destroys.
-        self.require_current_knowledge("anonymise_before")?;
         let registry = self.require_registry()?;
         if self.config.subject_column().is_none() {
             return Err(Error::config(
@@ -1726,75 +1761,9 @@ impl MeterStore {
             ));
         }
 
-        let seen = self.subject_last_seen().await?.unwrap_or_default();
-        let due: Vec<String> = seen
-            .into_iter()
-            .filter(|(_, last)| *last < cutoff)
-            .map(|(reference, _)| reference)
-            .collect();
-
-        let erased = crate::erasure::anonymise(registry, &due, reason, actor, now).await?;
-        if !erased.is_empty() {
-            warn!(
-                table = self.config.name(),
-                subjects = erased.len(),
-                %cutoff,
-                "anonymised subjects whose readings have passed the retention ceiling"
-            );
-        }
-        Ok(erased)
-    }
-
-    /// The latest interval each pseudonymous reference in this table explains.
-    ///
-    /// `None` where the table declares no subject column, which is not the same
-    /// as an empty map: one says the question does not apply here, the other
-    /// that it does and nothing is attributed. A retention sweep across several
-    /// tables has to tell them apart, because a subject is only due once **every**
-    /// table that names it has passed the ceiling.
-    ///
-    /// The **raw** relation, not the resolved one: a superseded version is still
-    /// a stored personal value, so a subject whose only recent row is a
-    /// correction that lost resolution has not passed the ceiling.
-    pub(crate) async fn subject_last_seen(
-        &self,
-    ) -> Result<Option<std::collections::BTreeMap<String, time::OffsetDateTime>>> {
-        let Some(column) = self.config.subject_column() else {
-            return Ok(None);
-        };
-
-        let sql = format!(
-            r#"SELECT "{column}" AS reference, max("{from}") AS last_seen FROM {raw}
-               WHERE "{column}" IS NOT NULL
-               GROUP BY 1"#,
-            raw = raw_name(self.config.name()),
-            from = crate::encode::schema::col::FROM,
-        );
-        let rows = self.query(&sql).await?;
-
-        let mut seen = std::collections::BTreeMap::new();
-        for batch in rows.batches() {
-            let references = column_str(batch, "reference")?;
-            let last = batch
-                .column_by_name("last_seen")
-                .and_then(|c| {
-                    c.as_any()
-                        .downcast_ref::<crate::arrow::array::TimestampMicrosecondArray>()
-                })
-                .ok_or_else(|| Error::decode("last_seen", "expected a microsecond timestamp"))?;
-            for i in 0..batch.num_rows() {
-                if crate::arrow::array::Array::is_null(references, i)
-                    || crate::arrow::array::Array::is_null(last, i)
-                {
-                    continue;
-                }
-                let at = crate::encode::schema::instant(last.value(i))?;
-                seen.entry(references.value(i).to_string())
-                    .and_modify(|held: &mut time::OffsetDateTime| *held = (*held).max(at))
-                    .or_insert(at);
-            }
-        }
-        Ok(Some(seen))
+        registry
+            .expire_epochs_before(cutoff, reason, actor, now)
+            .await
     }
 
     /// Refuse an operation whose *decision* is a query against this session,
@@ -1811,13 +1780,13 @@ impl MeterStore {
     /// half-visible view rather than from what is actually stored. The rows would
     /// land in the real table; only the reasoning about them would be wrong.
     ///
-    /// **The retention sweep**, where the consequence is worse. It erases a
-    /// subject whose latest reading predates a cutoff, and that latest reading is
-    /// `max(from)` over *this session*. Under [`Historical`] the hot window is
-    /// invisible, so a subject metered daily looks last-seen at the final
-    /// archived interval — old enough to erase, while it is still live. Erasure
-    /// has no recovery path, which makes this the one place a restricted view
-    /// destroys data rather than merely misreporting it.
+    /// The **retention sweep** is deliberately not one of them. The collection
+    /// year lives on the mapping row, so what comes due is a calendar fact about
+    /// a `(subject, year)` pair rather than a query — it consults no reading and
+    /// gives the same answer through any handle. A sweep that took its due-date
+    /// from `max(from)` over the session running it would be the one operation
+    /// where a restricted view destroys data rather than misreporting it, which
+    /// is why the epoch is stored rather than derived.
     ///
     /// The store the pinned one was derived from is unrestricted, so the fix is
     /// always to hold on to it rather than to reach through the derived handle.
@@ -1831,9 +1800,9 @@ impl MeterStore {
         Err(Error::config(format!(
             "{operation} is not available on a session in {:?} mode: this store reads a \
              pinned or restricted view, and the decision it makes is a query against what \
-             the session can see — a replay, a second network operator, a displacement \
-             report and a subject's latest reading would all be settled from the wrong \
-             state. Use the store this one was derived from",
+             the session can see — a replay, a second network operator and a displacement \
+             report would all be settled from the wrong state. Use the store this one was \
+             derived from",
             self.mode,
         )))
     }
@@ -2233,24 +2202,37 @@ impl MeterStore {
 
         let mut refs = std::collections::BTreeSet::new();
         for stored in series {
-            match stored.extra.get(column) {
-                Some(datafusion::scalar::ScalarValue::Utf8(Some(value))) => {
-                    refs.insert(value.clone());
-                }
+            let Some(datafusion::scalar::ScalarValue::Utf8(Some(value))) = stored.extra.get(column)
+            else {
                 // Absent or null: the column is nullable, and a reading whose
                 // subject is genuinely unknown is a real state. It is simply not
                 // linked to anyone, so there is nothing to verify.
-                _ => continue,
+                continue;
+            };
+            let subject = crate::erasure::SubjectRef::new(value.clone())?;
+            for interval in &stored.series.intervals {
+                check_subject_epoch(&subject, interval.from, stored.sparte)?;
             }
+            refs.insert(value.clone());
         }
 
+        self.check_refs_resolve(registry, refs).await
+    }
+
+    /// Every reference used must still resolve to a subject.
+    async fn check_refs_resolve(
+        &self,
+        registry: &crate::erasure::SubjectRegistry,
+        refs: std::collections::BTreeSet<String>,
+    ) -> Result<()> {
         for reference in refs {
             let subject = crate::erasure::SubjectRef::new(reference)?;
             if registry.resolve(&subject).await?.is_none() {
                 return Err(Error::config(format!(
                     "subject reference {subject} has no live mapping: it was \
-                     either never registered, or erased — in which case this \
-                     write is a replay that would re-link an erased subject"
+                     either never registered, erased, or its retention epoch has \
+                     expired — in the latter two cases this write is a replay that \
+                     would re-link a subject whose linkage is gone"
                 )));
             }
         }
@@ -2715,6 +2697,39 @@ fn decode_cold_rows(
 /// an exclusive lease for the run, so losing twice in a row already means the
 /// write is aimed at exactly the window being archived; a third loss is a
 /// standing conflict rather than a race.
+/// Refuse a subject reference minted for a different collection year.
+///
+/// The retention sweep comes due per `(subject, year)`, so a reference used on
+/// the wrong year's readings would keep them attributable past their ceiling —
+/// silently, since nothing downstream can tell the two apart. The year is in the
+/// reference, so this costs a string parse and no round trip.
+///
+/// The **balancing** year, not the UTC one: an interval starting
+/// `2026-12-31T23:00Z` is already 2027 in Berlin, and for gas the boundary is
+/// the Gastag — the same rule that decides a Bilanzierungsmonat.
+fn check_subject_epoch(
+    subject: &crate::erasure::SubjectRef,
+    at: time::OffsetDateTime,
+    sparte: metering::interval::Sparte,
+) -> Result<()> {
+    let epoch = subject.epoch()?;
+    let year = crate::planner::balancing_day(at, sparte).year();
+    if epoch != year {
+        return Err(Error::IntegrityViolation {
+            table: String::new(),
+            constraint: Some("subject_retention_epoch".to_string()),
+            detail: format!(
+                "subject reference {subject} belongs to retention epoch {epoch} but this \
+                 reading is balanced on {year}. A reference covers one collection year, \
+                 because § 60 Abs. 6 comes due per value — register one per year with \
+                 `register_subject(natural_id, interval.from)` rather than reusing \
+                 whichever the pipeline happened to fetch first"
+            ),
+        });
+    }
+    Ok(())
+}
+
 const BOUNDARY_ATTEMPTS: u32 = 3;
 
 /// How many rounds [`MeterStore::append_authoritative`] will try before calling
@@ -3028,8 +3043,8 @@ impl HotWriter<'_> {
         // the catalogue lookup per partition per batch is pure repetition.
         let (from, until) = {
             let ensured = self.ensured.lock().expect("writer state");
-            let mut needed = crate::watermark::align_to_step(first, step);
-            let end = crate::watermark::align_to_step(last, step) + step;
+            let mut needed = crate::watermark::align_to_step(first, step)?;
+            let end = crate::watermark::align_to_step(last, step)? + step;
             while needed < end && ensured.contains(&needed) {
                 needed += step;
             }

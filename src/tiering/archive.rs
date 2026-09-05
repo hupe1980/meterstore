@@ -10,14 +10,29 @@
 //!    Invisible to *writers* — not to readers. The watermark is published by the
 //!    cold commit at step 2, so for the whole of the scan the range still
 //!    belongs to the hot tier and a query asks PostgreSQL for it.
-//!    [`HotStore::scan_range`] therefore reads the parent **and** whatever is
-//!    detached from it, or a settlement running during archival would come back
-//!    a window short with nothing reporting it.
-//! 2. **Commit cold, then drop hot.** A crash between them leaves an orphaned
-//!    detached partition — data intact, invisible, reclaimable. The reverse
-//!    order loses data permanently.
-//! 3. **Reclaim orphans first.** A previous run that died mid-flight is repaired
-//!    before new work starts, so the two states never compound.
+//!    [`HotStore::scan_range`] therefore reads the hot tier **partition by
+//!    partition**, never through the parent: a partition relation keeps its
+//!    rows when it is detached and only its parentage changes, so a scan finds
+//!    them wherever this run has got to. Reading the parent and adding whatever
+//!    is currently detached is two reads of one catalogue, and a detach between
+//!    them loses the window entirely.
+//! 2. **Commit cold; do not drop hot.** The partition stays detached once its
+//!    window is durable in Iceberg. Dropping it here would be correct only if no
+//!    reader could still need it, and one can: a query reads the watermark when
+//!    it is **planned** and reads the tiers when it **executes**, so a plan made
+//!    a moment before the commit sends `[W, …)` to PostgreSQL and `[…, W)` to
+//!    Iceberg — and if the partition holding `[W, W+step)` is gone by the time
+//!    that plan runs, the window is in neither half and the answer is one window
+//!    short with nothing reporting it.
+//! 3. **Reclaim on a later cycle.** Orphan reclamation drops a detached partition
+//!    once its committing snapshot is older than
+//!    [`reader_grace`](crate::config::TableConfig::reader_grace), by which time
+//!    no live plan can still be holding the older boundary.
+//!
+//! The third step is therefore the *normal* path rather than a repair, which is
+//! the point: the crash-recovery route is exercised on every run instead of only
+//! after a crash. The reverse order — drop before commit — still loses data
+//! permanently, and is what the ordering above rules out.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,8 +247,9 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         //    PostgreSQL, where they can still be corrected.
         self.verify_schema(table).await?;
 
-        // 1. Repair anything a previous run left behind.
-        let orphans_reclaimed = self.reclaim_orphans(table).await?;
+        // 1. Reclaim the partitions earlier runs archived, once no query
+        //    planned against the older boundary can still be reading them.
+        let orphans_reclaimed = self.reclaim_orphans(table, now).await?;
 
         // 2. Keep the write frontier supplied with partitions. Done before
         //    archiving so a failure here surfaces even on an idle cycle —
@@ -289,8 +305,8 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         //    commit rather than one per step.
         let window = self.widen_over_empty(table, window, now).await?;
 
-        let rows = self.archive_window(table, window).await?;
-        let watermark = watermark.advance_to(window.resulting_watermark())?;
+        let rows = self.archive_window(table, window, now).await?;
+        let watermark = watermark.advance_to(table, window.resulting_watermark())?;
 
         info!(
             table,
@@ -392,7 +408,12 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
     }
 
     /// Archive one window: detach, scan, commit, drop.
-    async fn archive_window(&self, table: &str, window: ArchivalWindow) -> Result<u64> {
+    async fn archive_window(
+        &self,
+        table: &str,
+        window: ArchivalWindow,
+        now: OffsetDateTime,
+    ) -> Result<u64> {
         let partition = PartitionId::for_window(table, window);
 
         // A window with no partition holds no rows: either nothing was ever
@@ -411,6 +432,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                     crate::tiering::store::stream_of(Vec::new()),
                     WriteHints::default(),
                     window,
+                    now,
                 )
                 .await?;
             return Ok(0);
@@ -445,7 +467,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // orphaned but intact, and the next run reclaims it.
         let commit = self
             .cold
-            .append_and_commit(table, counted, hints, window)
+            .append_and_commit(table, counted, hints, window, now)
             .await?;
 
         let rows = scanned.load(Ordering::Relaxed);
@@ -459,25 +481,27 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             });
         }
 
-        // Only now is it safe to reclaim the space.
+        // The partition is **not** dropped here, and that is the whole of the
+        // reader-grace design.
         //
-        // A lock timeout here is **not** a failed archival: the rows are already
-        // durable in Iceberg and the watermark is about to advance over them.
-        // What is left behind is precisely the orphan an interrupted run leaves,
-        // and `reclaim_orphans` drops it on the next cycle. Failing the run
-        // instead would re-archive a window that is already committed.
-        if let Err(e) = self.hot.drop_partition(&partition).await {
-            match e {
-                Error::LockTimeout { .. } => warn!(
-                    table,
-                    partition = %partition.relation_name()?,
-                    error = %e,
-                    "window is committed but its partition could not be dropped; \
-                     it is now an orphan and the next cycle reclaims it"
-                ),
-                other => return Err(other),
-            }
-        }
+        // A query decides its tier split from the watermark it reads at *plan*
+        // time and reads the tiers at *execute* time. The commit above has just
+        // moved the boundary, so a plan made a moment earlier is now asking
+        // PostgreSQL for `[W, …)` and Iceberg for `[…, W)` — and this window
+        // belongs to neither. Dropping the partition now would make that plan
+        // return a window short, silently, which is the one failure mode
+        // everything else here is arranged to prevent.
+        //
+        // So the partition stays detached: invisible to writers, excluded by
+        // predicate from every plan made *after* the advance, and still read by
+        // any plan made before it (`HotStore::scan_range` includes detached
+        // relations). `reclaim_orphans` drops it a cycle later, once its
+        // committing snapshot is older than `reader_grace`.
+        debug!(
+            table,
+            partition = %partition.relation_name()?,
+            "window committed; partition retained for the reader grace"
+        );
 
         Ok(rows)
     }
@@ -495,29 +519,81 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         crate::evolution::compare(&configured, &stored).require_safe(table)
     }
 
-    /// Reclaim partitions left detached by an interrupted run.
+    /// Reclaim detached partitions whose windows are durable in the cold tier
+    /// and old enough that no live query can still be reading them.
     ///
-    /// A partition is only orphaned *after* its cold commit succeeded, so the
-    /// data is already durable and the partition can simply be dropped. The
-    /// watermark tells us so: anything wholly below it is committed.
-    async fn reclaim_orphans(&self, table: &str) -> Result<usize> {
+    /// Two conditions, and they answer different questions:
+    ///
+    /// * **Covered by the watermark** — is the data durable? A partition is
+    ///   detached before its scan and the watermark advances only when the cold
+    ///   commit lands, so anything wholly below the boundary is committed and
+    ///   dropping it destroys nothing.
+    /// * **Older than [`reader_grace`]** — can anything still be reading it? A
+    ///   query planned before the boundary moved still asks the hot tier for the
+    ///   range this partition holds. The clock for that is the *commit* that
+    ///   moved the boundary, which is durably recorded as the Iceberg snapshot's
+    ///   own timestamp — so this needs no bookkeeping of its own and survives a
+    ///   restart.
+    ///
+    /// A cold store that reports no snapshots cannot date an orphan. Such a
+    /// deployment gets no grace rather than an unbounded partition leak, and the
+    /// trade is documented on [`reader_grace`].
+    ///
+    /// [`reader_grace`]: crate::config::TableConfig::reader_grace
+    async fn reclaim_orphans(&self, table: &str, now: OffsetDateTime) -> Result<usize> {
         let orphans = self.hot.orphaned_partitions(table).await?;
         if orphans.is_empty() {
             return Ok(0);
         }
 
         let watermark = self.cold.watermark(table).await?;
+        let snapshots = self.cold.snapshots(table).await?;
+        let step = self.config.archival_step();
+        let grace = self.config.reader_grace();
         let mut reclaimed = 0;
 
         for partition in orphans {
             if partition.start() < watermark.get() {
-                warn!(
+                // The commit that first covered this partition, and therefore
+                // the moment after which no *new* plan could route a query to
+                // it. Plans made before it are what the grace waits out.
+                let covered_at = snapshots
+                    .iter()
+                    .filter(|s| s.watermark.is_some_and(|w| w.get() >= partition.end(step)))
+                    .filter_map(|s| s.archived_at)
+                    .min();
+
+                if let Some(at) = covered_at
+                    && now - at < grace
+                {
+                    debug!(
+                        table,
+                        partition = %partition.relation_name()?,
+                        committed_at = %at,
+                        "archived partition still within the reader grace; keeping it"
+                    );
+                    continue;
+                }
+
+                debug!(
                     table,
                     partition = %partition.relation_name()?,
-                    "reclaiming orphaned partition from an interrupted run"
+                    "reclaiming an archived partition past the reader grace"
                 );
-                self.hot.drop_partition(&partition).await?;
-                reclaimed += 1;
+                // A lock this drop declines to wait for must not stop the cycle.
+                // The window is already durable and the partition is already
+                // invisible, so the only cost of leaving it one more cycle is
+                // its disk — whereas failing here would stall archival behind a
+                // long query holding a lock on a relation nobody reads.
+                match self.hot.drop_partition(&partition).await {
+                    Ok(()) => reclaimed += 1,
+                    Err(Error::LockTimeout { .. }) => warn!(
+                        table,
+                        partition = %partition.relation_name()?,
+                        "could not reclaim an archived partition; retrying next cycle"
+                    ),
+                    Err(other) => return Err(other),
+                }
             } else {
                 // Detached but *not* covered by the watermark: the previous run
                 // died before committing. Dropping would lose data, so this
@@ -579,6 +655,7 @@ mod tests {
     use crate::config::TableConfig;
     use crate::tiering::store::CommitInfo;
     use crate::tiering::store::ScanSpec;
+    use crate::tiering::store::SnapshotInfo;
 
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -864,6 +941,9 @@ mod tests {
     struct FakeCold {
         watermark: Mutex<TieringWatermark>,
         committed: Mutex<Vec<(ArchivalWindow, u64)>>,
+        /// What each commit published, with the instant it landed — the same
+        /// pair a real snapshot summary carries, and what dates an orphan.
+        snapshots: Mutex<Vec<SnapshotInfo>>,
         fail_at: FailAt,
     }
 
@@ -872,6 +952,7 @@ mod tests {
             Self {
                 watermark: Mutex::new(TieringWatermark::new(watermark)),
                 committed: Mutex::new(Vec::new()),
+                snapshots: Mutex::new(Vec::new()),
                 fail_at: FailAt::Never,
             }
         }
@@ -911,11 +992,20 @@ mod tests {
             batches: crate::tiering::store::BatchStream,
             _hints: WriteHints,
             window: ArchivalWindow,
+            now: OffsetDateTime,
         ) -> Result<CommitInfo> {
             let rows = drain(batches).await?;
             // Atomic: rows and watermark land together.
             *self.watermark.lock().unwrap() = window.resulting_watermark();
             self.committed.lock().unwrap().push((window, rows));
+            let at = now;
+            self.snapshots.lock().unwrap().push(SnapshotInfo {
+                snapshot_id: self.committed.lock().unwrap().len() as i64,
+                committed_at: at,
+                archived_at: Some(at),
+                watermark: Some(window.resulting_watermark()),
+                rows: Some(rows),
+            });
 
             if self.fail_at == FailAt::AfterColdCommit {
                 return Err(Error::config("injected failure after cold commit"));
@@ -925,6 +1015,10 @@ mod tests {
                 rows,
                 watermark: window.resulting_watermark(),
             })
+        }
+
+        async fn snapshots(&self, _table: &str) -> Result<Vec<SnapshotInfo>> {
+            Ok(self.snapshots.lock().unwrap().clone())
         }
 
         async fn expire_snapshots(
@@ -1027,8 +1121,108 @@ mod tests {
         assert!(out.archived_anything());
         assert_eq!(out.rows, 96);
         assert_eq!(out.watermark.get(), D21);
-        assert_eq!(archiver.hot.dropped(), vec![D20]);
         assert_eq!(archiver.cold.commits().len(), 1);
+
+        // The window is durable, and the partition is **kept**: a query planned
+        // a moment before this commit still asks the hot tier for the range it
+        // holds. Reclaiming it is the next cycle's job.
+        assert!(archiver.hot.dropped().is_empty());
+        assert_eq!(archiver.hot.detached_starts(), vec![D20]);
+    }
+
+    #[tokio::test]
+    async fn an_archived_partition_survives_the_reader_grace_and_not_a_moment_longer() {
+        // The window between reading the watermark and reading the tiers is the
+        // one place the tiering invariant can be observed broken, and it is
+        // observed by a *reader*: a plan built at watermark W sends `[W, …)` to
+        // PostgreSQL, so the rows must still be there when it runs.
+        let hot = FakeHot::with_rows(&[(D20, 96)]);
+        let cold = FakeCold::new(D20);
+        let commit_at = datetime!(2026-07-30 00:00 UTC);
+        let archiver = Archiver::new(hot, cold, config());
+
+        archiver.run_once(commit_at).await.unwrap();
+        assert_eq!(archiver.hot.detached_starts(), vec![D20]);
+
+        // One second short of the grace: still readable.
+        let grace = config().reader_grace();
+        let out = archiver
+            .run_once(commit_at + grace - Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(out.orphans_reclaimed, 0);
+        assert!(archiver.hot.dropped().is_empty());
+        assert_eq!(archiver.hot.detached_starts(), vec![D20]);
+
+        // Past it: no plan can still hold the older boundary, so the space goes.
+        let out = archiver.run_once(commit_at + grace).await.unwrap();
+        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(archiver.hot.dropped(), vec![D20]);
+        assert!(archiver.hot.detached_starts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cold_store_that_cannot_date_a_commit_gets_no_grace() {
+        // `snapshots` is a provided method returning nothing by default, so a
+        // third-party cold store cannot say when a window became cold. Keeping
+        // the partition forever would leak disk without bound; the trade is
+        // stated on `TableConfig::reader_grace` rather than made silently.
+        struct UndatedCold(FakeCold);
+
+        #[async_trait]
+        impl ColdStore for UndatedCold {
+            async fn purge_table(&self, t: &str) -> Result<()> {
+                self.0.purge_table(t).await
+            }
+            async fn create_tables(
+                &self,
+                t: &str,
+                i: &[String],
+                e: &[crate::arrow::datatypes::Field],
+            ) -> Result<()> {
+                self.0.create_tables(t, i, e).await
+            }
+            async fn watermark(&self, t: &str) -> Result<TieringWatermark> {
+                self.0.watermark(t).await
+            }
+            async fn append_and_commit(
+                &self,
+                t: &str,
+                b: crate::tiering::store::BatchStream,
+                h: WriteHints,
+                w: ArchivalWindow,
+                now: OffsetDateTime,
+            ) -> Result<CommitInfo> {
+                self.0.append_and_commit(t, b, h, w, now).await
+            }
+            async fn expire_snapshots(
+                &self,
+                t: &str,
+                r: time::Duration,
+                k: usize,
+                n: OffsetDateTime,
+            ) -> Result<usize> {
+                self.0.expire_snapshots(t, r, k, n).await
+            }
+            async fn append_only(
+                &self,
+                t: &str,
+                b: crate::tiering::store::BatchStream,
+                h: WriteHints,
+            ) -> Result<CommitInfo> {
+                self.0.append_only(t, b, h).await
+            }
+        }
+
+        let hot = FakeHot::with_rows(&[(D20, 96)]);
+        let archiver = Archiver::new(hot, UndatedCold(FakeCold::new(D20)), config());
+
+        let at = datetime!(2026-07-30 00:00 UTC);
+        archiver.run_once(at).await.unwrap();
+        // Reclaimed on the very next cycle, however soon it runs.
+        let out = archiver.run_once(at + Duration::seconds(1)).await.unwrap();
+        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(archiver.hot.dropped(), vec![D20]);
     }
 
     #[tokio::test]
@@ -1097,12 +1291,15 @@ mod tests {
         let cold = FakeCold {
             watermark: Mutex::new(*archiver.cold.watermark.lock().unwrap()),
             committed: Mutex::new(archiver.cold.commits()),
+            snapshots: Mutex::new(archiver.cold.snapshots.lock().unwrap().clone()),
             fail_at: FailAt::Never,
         };
         let archiver = Archiver::new(hot, cold, config());
 
+        // Past the reader grace, so no plan made before the crashed run's commit
+        // can still be reading the partition it left behind.
         let out = archiver
-            .run_once(datetime!(2026-07-30 00:00 UTC))
+            .run_once(datetime!(2026-07-30 00:00 UTC) + config().reader_grace())
             .await
             .unwrap();
 
@@ -1234,7 +1431,7 @@ mod tests {
         // window keeps mapping to exactly one partition.
         assert_eq!(
             out.watermark.get(),
-            crate::watermark::align_to_step(out.watermark.get(), Duration::DAY)
+            crate::watermark::align_to_step(out.watermark.get(), Duration::DAY).unwrap()
         );
     }
 

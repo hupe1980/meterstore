@@ -77,9 +77,11 @@ let store = MeterStore::builder()
     .build()
     .await?;
 
-let subject = store.register_subject("customer-4821").await?;   // opaque reference
+// An opaque reference, for the collection year these readings belong to.
+let subject = store.register_subject("customer-4821", interval.from).await?;
 
-// Later: destroy the link. The readings stay; nothing can attribute them.
+// Later: destroy the link, in every year. The readings stay; nothing can
+// attribute them.
 store.erase_subject(&subject, "DSAR-2026-0042", "privacy-team", now).await?;
 ```
 
@@ -106,9 +108,10 @@ gets a different key and silently fails to supersede the value it corrects.
 
 **One registry spans every table in a deployment.** It is passed to each store
 builder, which reads as *per table* — and it is not. The mapping lives in one
-`meterstore_subject_map` keyed by natural identifier, so two tables that register
-the same natural id share one reference and a single `erase_subject` unlinks
-both.
+`meterstore_subject_map` keyed by `(natural identifier, collection year)`, so two
+tables that register the same natural id for the same year share one reference —
+and `erase_subject`, which answers a request about a *person*, unlinks every year
+of them in every table.
 
 That is what an Article 17 request needs rather than an accident of the schema.
 An erasure has to reach the authoritative readings **and** the non-authoritative
@@ -126,6 +129,39 @@ not resolve means either the pipeline invented it — rows unattributable from b
 — or it belongs to an already-erased subject, meaning a replay is rebuilding the
 link erasure destroyed. Neither is visible in the data afterwards, so it fails at
 the write.
+
+## The unit of erasure is a collection year
+
+§ 60 Abs. 6 runs on *"der jeweilige Messwert"* — **each value**, three years
+after the end of the calendar year it was collected in. One reference covering a
+subject's whole history cannot express that: destroy it and readings still inside
+their period are orphaned, keep it and an active customer's decade-old values
+stay attributable for as long as they remain connected.
+
+So a reference belongs to **one collection year**, and the year is part of it:
+`s2026_9f3c…`. Registering the same customer for two years gives two references,
+and the sweep expires them independently:
+
+```rust
+let y2022 = store.register_subject("customer-4821", jan_2022).await?;
+let y2026 = store.register_subject("customer-4821", jan_2026).await?;
+assert_ne!(y2022, y2026);
+```
+
+**Pass an instant from the data, not `now()`.** A backfill of 2024 arriving today
+must carry 2024's reference; `now()` would attach this year's and keep it
+attributable four years too long. A reference used on another year's readings is
+refused at the write — the year is in the reference, so the check is a string
+parse. Without it nothing downstream could tell: the column stays well-formed,
+the reference resolves, and the only symptom is a sweep that never comes due.
+
+**An Article 17 erasure still covers the person.** A DSAR names a subject, not a
+year, so `erase_subject` destroys every epoch behind the reference it is given
+and returns one audit record per year.
+
+The year is Berlin's, because the statute is: an interval starting
+`2026-12-31T23:00Z` is already 2027 locally — and for gas the Gastag rather than
+midnight, the same boundary that decides a Bilanzierungsmonat.
 
 ## Keeping a subject erased
 
@@ -185,21 +221,17 @@ let handle = catalog.maintenance()
     .spawn();
 ```
 
-Every subject whose readings have all passed the cutoff loses its mapping.
+Every linkage whose collection year has passed the cutoff is destroyed, whether
+or not the subject is still being metered.
 
-- **Keyed to the latest reading, not the registration.** A subject registered in
-  2020 may still be metered today, so a sweep keyed to when the mapping was
-  created would erase a live customer.
-- **It reads the raw versioned relation**, because a superseded version is still a
-  stored personal value.
-- **It refuses to run on a restricted session.** The latest reading is
-  `max("from")` over the session sweeping, so a store in `Historical`,
-  `Operational`, `as_of` or `as_known_at` mode would compute it from a view that
-  is deliberately not current — under `Historical` the hot window is invisible, so
-  a subject metered daily looks last-seen at the final archived interval, old
-  enough to erase and still live. That is the same failure as keying on the
-  registration, reached another way, and it is irreversible. Sweep through the
-  store the restricted one was derived from.
+- **Keyed to the collection year.** A customer registered in 2020 and still
+  metered today has their 2020 linkage expire on schedule and their 2026 one
+  untouched.
+- **It reads no table.** The year is on the mapping row, so the sweep is one
+  indexed `DELETE` against the registry: no scan, and no read mode that can skew
+  it. A due-date taken from `max("from")` over the sweeping session would be —
+  under `Historical` a customer metered daily looks last-seen at the final
+  archived interval, old enough to erase and still live, irreversibly.
 - **Idempotent**, so it runs on a schedule and a re-run writes no second audit row.
 - **`CalendarYears(3)` is not `now - 3 years`.** The statutory clock starts at the
   *Schluss des Kalenderjahres*, so a value collected on 2 January 2025 comes due on
@@ -207,28 +239,23 @@ Every subject whose readings have all passed the cutoff loses its mapping.
   direction that destroys data still inside its retention period.
   `Retention::Rolling(d)` exists for the earlier "no longer necessary" trigger,
   which is a business decision this crate has no view on.
+- **No suppression tombstone.** Suppression exists so an Article 17 erasure
+  survives a broker replay; an expiry is not a request to stop processing, and a
+  subject whose 2021 epoch expired must still be registrable for 2027.
 
-`catalog.anonymise_before(cutoff, …)` is the same sweep run once, for a deployment
-that schedules it elsewhere.
+`store.anonymise_before(cutoff, …)` and `catalog.anonymise_before(cutoff, …)`
+are the same sweep run once, for a deployment that schedules it elsewhere — and
+the same operation as each other, since the registry is deployment-wide and
+neither reads a reading.
 
-### A catalogue operation, even with one table
+### One registry for the deployment
 
-The registry is deployment-wide: one `meterstore_subject_map` keyed by natural
-identifier, so two tables registering the same identifier share one `SubjectRef`
-and a single erasure unlinks **both**. That is what an Article 17 request needs —
-it must reach the authoritative readings *and* the non-authoritative second
-stream, since "non-authoritative for settlement" says nothing about whether the
-data is personal.
-
-Swept per table, the first to reach the ceiling destroys a linkage the others
-still depend on: a measuring point whose Lastgang stopped three years ago but
-whose Zählerstandsgang is current has its live register readings orphaned,
-irreversibly, with nothing reporting it. So the cutoff is applied to the latest
-reading **in the deployment**, and a table declaring no subject column contributes
-nothing — its rows carry no reference to the subject at all.
-
-`MeterStore::anonymise_before` remains, for the single-table deployment where the
-two are the same thing.
+One `meterstore_subject_map`, keyed by `(natural identifier, collection year)`, so
+two tables registering the same identifier for the same year share one
+`SubjectRef` and a single erasure unlinks **both**. That is what an Article 17
+request needs: it must reach the authoritative readings *and* the
+non-authoritative second stream, since "non-authoritative for settlement" says
+nothing about whether the data is personal.
 
 This is also the answer to "there is no partial data expiry". The statute does not
 require deleting rows; it requires that the values stop being personal, and that

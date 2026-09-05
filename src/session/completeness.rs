@@ -1050,6 +1050,12 @@ fn expected_in_day(
         return 0;
     };
     let full = u64::from(full);
+    // Guarded before the division below, not after it: `Duration / 0` panics,
+    // and a query path is the wrong place to find that out. A day with no
+    // expected intervals has nothing to compare against either way.
+    if full == 0 {
+        return 0;
+    }
 
     let (start, end) = balancing::balancing_day_bounds(day, sparte);
     let length = end - start;

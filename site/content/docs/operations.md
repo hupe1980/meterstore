@@ -28,8 +28,12 @@ flight, exactly as `shutdown()` does, so a handle that goes out of scope cannot
 leave a task archiving against a store nobody is watching.
 
 Every replica can run the same schedule. One wins the archive lease; the others
-report `lease_contended` and stop. That is not a failure. Nor is `deferred`, the
-other benign no-op — see [locks](#locks-and-why-ddl-gives-up).
+report `lease_contended` and stop — including stopping short of **snapshot
+expiry**, which is a metadata mutation and belongs to the winner. Reading
+`system.tables` still happens everywhere, because it mutates nothing and an
+invariant violation is worth noticing from wherever it is seen. Contention is not
+a failure. Nor is `deferred`, the other benign no-op — see
+[locks](#locks-and-why-ddl-gives-up).
 
 **One loop, however many tables.** A [catalogue](@/docs/querying.md#several-tables-in-one-session)
 maintains all of its tables from one schedule:
@@ -72,9 +76,10 @@ des Kalenderjahres*, so a value collected on 2 January 2025 comes due on 31
 December 2028; the rolling spelling would erase it a year early.
 `Retention::Rolling(d)` covers the earlier "no longer necessary" trigger.
 
-**A catalogue operation even with one table.** The registry is deployment-wide, so
-one erasure unlinks a subject in every table at once and the cutoff is applied to
-the latest reading in the deployment — see
+**It reads no table.** What comes due is a `(subject, collection year)` pair, and
+the year is recorded on the mapping row — so the sweep is one indexed `DELETE`
+against the registry: no scan, no dependence on which rows a session can see, and
+the same answer through any handle. See
 [Privacy and retention](@/docs/privacy.md). A failed sweep appears in
 `outcome.failures()` under the name `<retention>`, so an alert needs no second
 place to look.
@@ -132,11 +137,11 @@ The cycle reports `deferred` and the next one tries again. Raise the timeout on 
 deployment that reports out of the same tables it writes; every second added is a
 second the whole table can stall for.
 
-The drop *after* the cold commit is the one case where a timeout changes state,
-and it is a state the design already has a name for: the window is durable in
-Iceberg, so what is left behind is exactly the orphan an interrupted run leaves,
-and orphan reclamation takes it on the next cycle. Failing the run instead would
-re-archive a window that is already committed.
+No drop follows the cold commit at all, so there is no second place a timeout can
+change state: the partition is *always* left detached and reclaimed on a later
+cycle — see [the reader grace](@/docs/architecture.md#the-reader-grace). A
+reclamation that cannot get its lock skips that partition and leaves the rest of
+the cycle running, because the only cost of keeping it one cycle longer is disk.
 
 **Alert on watermark lag, not on deferral** (`outcome.tables[..].deferred()`). A
 cycle deferring once means a long query was in flight, which is ordinary. A table
@@ -260,13 +265,30 @@ double-counts it.
 Metering schemas are regulator-defined and move on multi-year cycles, so this is
 far smaller than in a general framework — but not zero.
 
-| Change | Action | Rewrite? |
+**MeterStore detects schema drift; it does not perform schema evolution.** There
+is no `ALTER`-equivalent in the crate: it compares the schema it is configured to
+write against the one the cold table actually has, before every archival run, and
+either proceeds or halts. Applying a change is an operator's job, out of band,
+with the same Iceberg tooling that does [compaction](#compaction) — and this
+table says which changes it will then accept.
+
+| Change | Accepted? | Rewrite? |
 |---|---|---|
-| Add nullable column | Iceberg add column, fresh field id | No |
-| Rename column | Field ids are stable, historical files still read | No |
-| Widen decimal precision | Type promotion | No |
-| Drop a **nullable** column | Marked deleted, retained for time travel | No |
-| Add a **NOT NULL** column, drop one, narrow a type | **Quarantine** | — |
+| Add a **nullable** column | Yes | No |
+| Widen decimal **precision** | Yes — Iceberg type promotion | No |
+| Drop a **nullable** column | Yes | No |
+| Add a **NOT NULL** column, drop a required one, narrow a type, change a decimal's **scale** | **Quarantine** | — |
+| **Rename** a column | Reads as a drop plus an add, and is judged as both | — |
+
+That last row is worth reading twice. Iceberg resolves columns by **field id**,
+so a rename applied through Iceberg's own `UpdateSchema` costs nothing and
+historical files keep reading. MeterStore compares by **name**, because a name is
+what the encoder writes and what an external engine queries — so a rename is
+invisible to it and arrives as a drop plus an add. For a nullable attribute
+column both halves are safe and it passes; for a **non-nullable** one — every
+identity column is one — both halves are unsafe and the table halts, which is
+right rather than incidental, because renaming an identity column changes the
+merge key.
 
 Quarantine is the honest response to a change that cannot be applied safely. The
 table halts, its watermark freezes, an operator resolves it. Freezing is the
@@ -296,7 +318,7 @@ compaction with Spark, or a second deployment on an older configuration.
 | Failure | Behaviour | Recovery |
 |---|---|---|
 | Crash mid-archival, pre-commit | Partition detached, not archived; invisible to writers, still **readable** by queries | Next run refuses to drop it and names it for an operator to re-attach |
-| Crash post-commit, pre-drop | Orphaned detached partition — data intact | Next run drops it |
+| Crash post-commit | Detached partition — data intact, and exactly the state a *successful* run leaves | A later cycle reclaims it, once past the reader grace |
 | Hot partitions exhausted | **Inserts fail** | Alert on `partitions_ahead`; pre-creation is automatic but monitored |
 | Object store unavailable | Archival backpressures; cold queries fail loudly | Automatic |
 | Postgres unavailable | Archival retries; cold queries unaffected | Automatic |

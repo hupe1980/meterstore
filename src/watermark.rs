@@ -31,6 +31,16 @@ pub const ARCHIVED_RANGE_PROPERTY: &str = "meterstore.archived_range";
 /// The snapshot summary property recording the archived row count.
 pub const ROW_COUNT_PROPERTY: &str = "meterstore.row_count";
 
+/// The snapshot summary property recording **when this crate committed** the
+/// window, from the clock the caller supplied.
+///
+/// Not Iceberg's own `timestamp-ms`, which is written by whatever process
+/// commits and is therefore a second clock. The reader grace is a statement
+/// about *this* deployment's readers, so it is measured on the same clock every
+/// other archival decision is measured on — the `now` passed in — and a test
+/// that drives months in milliseconds drives the grace with them.
+pub const ARCHIVED_AT_PROPERTY: &str = "meterstore.archived_at";
+
 /// Which tier a given interval belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -76,10 +86,15 @@ impl TieringWatermark {
     }
 
     /// Advance the watermark, rejecting a backwards move.
-    pub fn advance_to(self, next: Self) -> Result<Self> {
+    ///
+    /// `table` names the table in the error, because this raises
+    /// [`InvariantViolated`](Error::InvariantViolated) — the variant an operator
+    /// is paged for — and an alert that cannot say which table it is about is an
+    /// alert nobody can act on.
+    pub fn advance_to(self, table: &str, next: Self) -> Result<Self> {
         if !self.can_advance_to(next) {
             return Err(Error::InvariantViolated {
-                table: "<unknown>".to_string(),
+                table: table.to_string(),
                 detail: format!("watermark would move backwards: {self} -> {next}"),
             });
         }
@@ -171,10 +186,20 @@ impl ArchivalWindow {
 /// be an empty archival run, not an error.
 ///
 /// `rem_euclid`, not `%`: a pre-epoch instant would otherwise round *up*.
-pub fn align_to_step(ts: OffsetDateTime, step: time::Duration) -> OffsetDateTime {
+///
+/// An instant so far from the epoch that the aligned value is not representable
+/// is an error rather than the input returned unchanged. Returning it would hand
+/// back something that is *not* on the grid from a function whose entire job is
+/// to put it there, and the symptom — a window naming a partition nothing
+/// creates — surfaces nowhere near here.
+pub fn align_to_step(ts: OffsetDateTime, step: time::Duration) -> Result<OffsetDateTime> {
     let secs = ts.unix_timestamp();
     let step_s = step.whole_seconds().max(1);
-    OffsetDateTime::from_unix_timestamp(secs - secs.rem_euclid(step_s)).unwrap_or(ts)
+    OffsetDateTime::from_unix_timestamp(secs - secs.rem_euclid(step_s)).map_err(|e| {
+        Error::config(format!(
+            "cannot align {ts} to a step of {step_s} seconds: {e}"
+        ))
+    })
 }
 
 /// Select the next archival window.
@@ -213,7 +238,7 @@ pub fn next_window(
     // The only way to get there is to change `archival_step` on a table that
     // has already archived. That is a migration, not a setting, and it fails
     // here rather than in the data.
-    if align_to_step(from, step) != from {
+    if align_to_step(from, step)? != from {
         return Err(Error::config(format!(
             "watermark {from} is not aligned to an archival step of {} seconds, so an \
              archival window would not correspond to a hot partition. The step of a \
@@ -272,8 +297,12 @@ mod tests {
         assert!(w.can_advance_to(fwd));
         assert!(w.can_advance_to(w), "idempotent re-advance is legal");
 
-        assert!(w.advance_to(back).is_err());
-        assert_eq!(w.advance_to(fwd).unwrap(), fwd);
+        let err = w.advance_to("readings_versions", back).unwrap_err();
+        assert!(
+            err.to_string().contains("readings_versions"),
+            "an invariant violation must name its table: {err}"
+        );
+        assert_eq!(w.advance_to("readings_versions", fwd).unwrap(), fwd);
     }
 
     #[test]
@@ -379,20 +408,20 @@ mod tests {
     #[test]
     fn alignment_matches_the_hot_tier_partition_bounds() {
         assert_eq!(
-            align_to_step(datetime!(2026-07-20 13:47:03 UTC), DAY),
+            align_to_step(datetime!(2026-07-20 13:47:03 UTC), DAY).unwrap(),
             datetime!(2026-07-20 00:00 UTC)
         );
         assert_eq!(
-            align_to_step(datetime!(2026-07-20 00:00 UTC), DAY),
+            align_to_step(datetime!(2026-07-20 00:00 UTC), DAY).unwrap(),
             datetime!(2026-07-20 00:00 UTC)
         );
         assert_eq!(
-            align_to_step(datetime!(2026-07-20 13:47 UTC), Duration::hours(6)),
+            align_to_step(datetime!(2026-07-20 13:47 UTC), Duration::hours(6)).unwrap(),
             datetime!(2026-07-20 12:00 UTC)
         );
         // `rem_euclid`, not `%`: a pre-epoch instant must round down too.
         assert_eq!(
-            align_to_step(datetime!(1969-12-31 13:00 UTC), DAY),
+            align_to_step(datetime!(1969-12-31 13:00 UTC), DAY).unwrap(),
             datetime!(1969-12-31 00:00 UTC)
         );
     }

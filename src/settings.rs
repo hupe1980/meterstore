@@ -762,6 +762,7 @@ impl TableSettings {
             .partition_headroom(self.hot.partition_headroom.0)
             .archival_step(self.archival.archival_step.0)
             .settlement_lag(self.archival.settlement_lag.0)
+            .reader_grace(self.archival.reader_grace.0)
             .scan_chunk_rows(self.archival.scan_chunk_rows)
             .snapshot_retention(self.maintenance.snapshot_retention.0)
             .min_snapshots_to_keep(self.maintenance.min_snapshots_to_keep);
@@ -846,6 +847,14 @@ pub struct ArchivalSettings {
     /// number of *them* is a variable amount of memory.
     #[serde(default = "default_chunk")]
     pub scan_chunk_rows: usize,
+    /// How long an archived partition is kept before its space is reclaimed.
+    ///
+    /// A query reads the tier boundary when it is *planned* and reads the tiers
+    /// when it *executes*. This is the window between the two: set it above the
+    /// longest query the deployment runs, or a plan made before archival can ask
+    /// PostgreSQL for a range that has just left it.
+    #[serde(default = "default_reader_grace")]
+    pub reader_grace: HumanDuration,
 }
 
 impl Default for ArchivalSettings {
@@ -854,6 +863,7 @@ impl Default for ArchivalSettings {
             settlement_lag: default_settlement_lag(),
             archival_step: default_archival_step(),
             scan_chunk_rows: default_chunk(),
+            reader_grace: default_reader_grace(),
         }
     }
 }
@@ -866,6 +876,9 @@ fn default_archival_step() -> HumanDuration {
 }
 const fn default_chunk() -> usize {
     crate::config::defaults::SCAN_CHUNK_ROWS
+}
+fn default_reader_grace() -> HumanDuration {
+    HumanDuration(crate::config::defaults::READER_GRACE)
 }
 
 /// Snapshot retention.

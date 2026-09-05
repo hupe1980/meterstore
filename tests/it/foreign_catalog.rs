@@ -284,6 +284,7 @@ async fn the_boundary_is_readable_through_a_foreign_catalog() {
         meterstore::tiering::store::stream_of(Vec::new()),
         Default::default(),
         meterstore::watermark::ArchivalWindow::new(START, START + Duration::DAY).expect("window"),
+        START + Duration::DAY,
     )
     .await
     .expect("commit");

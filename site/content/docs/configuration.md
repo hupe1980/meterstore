@@ -51,6 +51,7 @@ partition_headroom = "14d"       # pre-created ahead of the write frontier
 [tables.archival]
 settlement_lag = "7d"
 archival_step = "1d"             # and the partition granularity — the same number
+reader_grace = "1h"              # above the longest query this deployment runs
 scan_chunk_rows = 50_000
 
 [tables.maintenance]
@@ -159,6 +160,11 @@ Below one minute it is refused at construction: a partition relation is named
 
 ## Settings that must agree
 
+`reader_grace` must exceed the longest query the deployment runs. Nothing can
+validate that — the store cannot know — so it is stated here: too short and a
+plan made before an archival commit comes back a window short, silently. The cost
+of a generous value is disk, and it is a fraction of one partition.
+
 `settlement_lag` must cover at least one `archival_step`. It is validated at
 construction because getting it wrong degrades **silently**: a window can be
 archived while it is still receiving corrections, and they land below the
@@ -237,6 +243,7 @@ implementable against the published `iceberg` crate. Both run out of band — se
 | `archival_step` | 1 day | One window per commit, and one partition per window |
 | `settlement_lag` | 7 days | Must exceed the market's correction window |
 | `partition_headroom` | 14 days | Pre-created ahead of the write frontier |
+| `reader_grace` | 1 hour | How long an archived partition stays readable after its cold commit. A query picks its tier split at *plan* time and reads the tiers at *execute* time, so a plan made before the boundary moved still needs the rows PostgreSQL has just archived |
 | `scan_chunk_rows` | 50 000 | The bound on a scan's peak memory. **Rows, not measuring points** — meters differ by orders of magnitude in how much they report, so a fixed number of *them* is a variable amount of memory |
 | `snapshot_retention` | 10 years | Reproducibility is a compliance requirement, not a lakehouse default |
 | `min_snapshots_to_keep` | 20 | So expiry can never leave the table unreadable |

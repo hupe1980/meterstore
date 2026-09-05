@@ -22,6 +22,7 @@ mod cli;
 mod cold_partitioning;
 mod commodities;
 mod completeness_end_to_end;
+mod concurrency;
 mod containers;
 mod displacement;
 mod doc_conventions;

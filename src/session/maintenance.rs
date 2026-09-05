@@ -384,12 +384,13 @@ impl Maintenance {
             });
         }
 
-        // **After** archival, and over every store at once. A subject's readings
-        // move between tiers during a cycle, and the sweep reads the raw relation
-        // across both — so running it first would ask the question of a state the
-        // cycle was about to change. Across every store, because the registry is
-        // deployment-wide and a per-table sweep destroys linkage the other tables
-        // still depend on.
+        // **After** archival, and over every store at once. The order is no
+        // longer load-bearing — the sweep reads no relation, only the registry's
+        // own `epoch` column — but it stays last because that is where a duty
+        // that comes due on a clock belongs in a cycle whose other steps are
+        // about moving data. Over every store because the registry is
+        // deployment-wide: the stores are consulted to find it and to tell
+        // "nothing was due" apart from "this deployment stores no reference".
         let (anonymised, retention_failure) = match &self.retention {
             None => (Vec::new(), None),
             Some(sweep) => {
@@ -442,7 +443,19 @@ impl Maintenance {
     ) -> Result<TableMaintenance> {
         let archival = store.archive(now, self.max_windows).await?;
 
-        let snapshots_expired = match self.expire_snapshots {
+        // Expiry is a **metadata mutation**, so it belongs to the replica that
+        // won the archive lease and to no other. Every replica runs the same
+        // schedule by design; a loser that went on to expire snapshots anyway
+        // would have two processes rewriting one table's metadata on their own
+        // clocks, racing for a compare-and-swap that only one can win and
+        // reporting the loss as a failed cycle. It also re-stamps the boundary
+        // onto the current snapshot, which is the one step that must not
+        // interleave with a commit moving it.
+        //
+        // Reading `status` below is not a mutation, so every replica still does
+        // it — the invariant is worth checking from wherever it is noticed.
+        let contended = archival.iter().all(|o| o.lease_contended);
+        let snapshots_expired = match self.expire_snapshots && !contended {
             true => store.expire_snapshots(now).await?,
             false => 0,
         };

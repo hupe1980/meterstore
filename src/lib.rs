@@ -289,6 +289,12 @@ pub use version::{ScopedVersion, Version, VersionScope};
 pub use watermark::{Tier, TieringWatermark};
 
 /// Common imports for working with MeterStore.
+/// The names a caller actually types.
+///
+/// Narrower than the crate root on purpose: everything here is something a
+/// deployment writes in its own code. The Arrow metadata keys a declaration
+/// rides in, the retry counts, the label a scheduled sweep records — those are
+/// reachable at their own paths and are not things anyone imports.
 pub mod prelude {
     #[cfg(feature = "rest-catalog")]
     pub use crate::cold::IcebergRestCatalog;
@@ -296,8 +302,8 @@ pub mod prelude {
     pub use crate::cold::S3TablesCatalog;
     pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
     pub use crate::config::{
-        CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
-        ValueCheck, checked_column, coded_column, declared_value_check,
+        EicType, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck, checked_column,
+        coded_column,
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
     pub use crate::erasure::{
@@ -313,10 +319,9 @@ pub mod prelude {
         expected_intervals_in_balancing_day,
     };
     pub use crate::session::{
-        AUTHORITATIVE_ATTEMPTS, Completeness, CompletenessQuery, HotWriter, Maintenance,
-        MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
-        QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
-        SqlSurface, TableMaintenance,
+        Completeness, CompletenessQuery, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog,
+        MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryDescription, QueryResult,
+        ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
     };
     pub use crate::settings::{Deployment, PrivacySettings, Settings};
     pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};

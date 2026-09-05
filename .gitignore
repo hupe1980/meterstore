@@ -29,8 +29,21 @@ target
 /data
 
 # Custom
-CONCEPT.md
 .DS_Store
+
+# Primary sources (see specs/README.md). Third-party publications — statutes,
+# BNetzA Festlegungen, EDI@Energy documents, BDEW Anwendungshilfen, NIST/ENTSO-E
+# publications and the Apache format specifications — redistributed under their
+# own terms, so they are staged rather than committed. `just specs` rebuilds the
+# folder from the index.
+/specs/
+
+# Internal design notes (see concepts/README.md). Working documents: they quote
+# the regulatory and format sources by clause, and record what each design
+# decision cost. `site/` is the public narrative, `CHANGELOG.md` the history and
+# the rustdoc the API contract; `concepts/` is none of the three, and nothing in
+# the build reads it.
+/concepts/
 
 # Built documentation site (see .github/workflows/site.yml).
 site/public/

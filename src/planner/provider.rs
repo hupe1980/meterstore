@@ -154,6 +154,50 @@ impl ReadMode {
     }
 }
 
+/// The tier boundaries a statement is being planned against.
+///
+/// # Why the boundary travels with the plan
+///
+/// A caller reports the boundary an answer was computed against (P1), and the
+/// providers decide the tier split. Left to read the watermark separately, those
+/// are **two reads of a value archival is moving**: the report is taken before
+/// planning and the split during it, so an archival commit in between makes the
+/// label a statement about a boundary the answer was not computed against. For a
+/// statement over several tables it is worse — every provider reads its own, at
+/// its own moment, and no two are guaranteed consistent.
+///
+/// So the boundaries are read **once**, placed on the session config for the
+/// duration of one physical plan, and read back here. One statement, one set of
+/// boundaries, and the label is the thing that was used. A provider planned
+/// without one — a caller reaching DataFusion directly through
+/// [`MeterStore::context`](crate::MeterStore::context) — reads a fresh watermark
+/// as before.
+///
+/// [`MeterStore::context`]: crate::session::MeterStore::context
+#[derive(Debug, Clone, Default)]
+pub struct PlannedWatermarks(std::collections::HashMap<String, TieringWatermark>);
+
+impl PlannedWatermarks {
+    /// Pin `table` to `watermark` for the plan this is attached to.
+    pub fn with(mut self, table: impl Into<String>, watermark: TieringWatermark) -> Self {
+        self.0.insert(table.into(), watermark);
+        self
+    }
+
+    /// Whether anything is pinned.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The boundary pinned for `table` on this session, if any.
+    pub fn of(state: &dyn Session, table: &str) -> Option<TieringWatermark> {
+        state
+            .config()
+            .get_extension::<Self>()
+            .and_then(|pinned| pinned.0.get(table).copied())
+    }
+}
+
 /// A table spanning the hot and cold tiers.
 pub struct TieredTableProvider {
     table: String,
@@ -296,6 +340,17 @@ impl TieredTableProvider {
     /// The read mode in force.
     pub const fn mode(&self) -> ReadMode {
         self.mode
+    }
+
+    /// The boundary this scan must use: the one the statement was planned
+    /// against, or a fresh read when none was placed.
+    ///
+    /// See [`PlannedWatermarks`].
+    async fn watermark_for(&self, state: &dyn Session) -> DfResult<TieringWatermark> {
+        match PlannedWatermarks::of(state, &self.table) {
+            Some(pinned) => Ok(pinned),
+            None => self.watermark().await,
+        }
     }
 
     /// The current tier boundary.
@@ -784,7 +839,7 @@ impl TableProvider for TieredTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let watermark = self.watermark().await?;
+        let watermark = self.watermark_for(state).await?;
         self.scan_at(state, watermark, projection, filters, limit)
             .await
     }
@@ -945,6 +1000,7 @@ mod tests {
             _b: crate::tiering::store::BatchStream,
             _h: crate::tiering::store::WriteHints,
             w: ArchivalWindow,
+            _now: OffsetDateTime,
         ) -> crate::Result<CommitInfo> {
             Ok(CommitInfo {
                 snapshot_id: 1,

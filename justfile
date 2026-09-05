@@ -222,3 +222,106 @@ update:
 coverage:
     cargo llvm-cov --all-features --html
     @echo "report: target/llvm-cov/html/index.html"
+
+# --- sources ----------------------------------------------------------------
+
+# Gitignored: the files are third-party publications under their own terms.
+# Existing files are kept, so a re-run only fetches what is missing; anything
+# that cannot be fetched is reported at the end and indexed in `specs/README.md`
+# with its source.
+#
+# 📚 Rebuild `specs/` — the primary sources every citation is checked against
+specs:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+    missing=""
+    # fetch DIR FILE URL [ALT_URL]
+    fetch() {
+        mkdir -p "specs/$1"
+        if [ -s "specs/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
+        for url in "$3" "${4:-}"; do
+            [ -n "$url" ] || continue
+            if curl -fsSL -A "$ua" --retry 3 --retry-delay 5 --max-time 900 \
+                    -o "specs/$1/$2.part" "$url" \
+                    && [ -s "specs/$1/$2.part" ] \
+                    && { [ "${1}" = "format" ] || [ "$(file -b --mime-type "specs/$1/$2.part")" != "text/html" ]; }; then
+                mv "specs/$1/$2.part" "specs/$1/$2"; echo "fetched  $1/$2"; return 0
+            fi
+            rm -f "specs/$1/$2.part"
+        done
+        echo "MISSING  $1/$2  <- $3" >&2
+        missing="$missing  $1/$2  <- $3"$'\n'
+        return 0
+    }
+    # law/ — the statutes, consolidated (gesetze-im-internet.de)
+    fetch law msbg.pdf 'https://www.gesetze-im-internet.de/messbg/MsbG.pdf'
+    fetch law enwg.pdf 'https://www.gesetze-im-internet.de/enwg_2005/EnWG.pdf'
+    fetch law ao.pdf 'https://www.gesetze-im-internet.de/ao_1977/AO.pdf'
+    fetch law bdsg.pdf 'https://www.gesetze-im-internet.de/bdsg_2018/BDSG.pdf'
+    fetch law messeg.pdf 'https://www.gesetze-im-internet.de/messeg/MessEG.pdf'
+    fetch law messev.pdf 'https://www.gesetze-im-internet.de/messev/MessEV.pdf'
+    # eu/ — the Regulations, in the language the German market reads them in
+    fetch eu dsgvo-vo-eu-2016-679.pdf \
+        'https://eur-lex.europa.eu/legal-content/DE/TXT/PDF/?uri=CELEX:32016R0679'
+    fetch eu vo-eu-312-2014-gasnetzkodex-bilanzierung-de.pdf \
+        'https://eur-lex.europa.eu/legal-content/DE/TXT/PDF/?uri=CELEX:32014R0312'
+    # bnetza/ — the Festlegungen behind reproducibility and the Zählerstandsgang
+    fetch bnetza bk6-24-174-beschluss-20241024.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2024/BK6-24-174/Beschluss/BK6-24-174_Beschluss_vom_20241024.pdf?__blob=publicationFile&v=1'
+    fetch bnetza bk6-24-174-mabis-lesefassung.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2024/BK6-24-174/Beschluss/BK6-24-174_MaBiS_Lesefassung.pdf?__blob=publicationFile&v=1'
+    fetch bnetza bk6-24-174-gpke-teil1-lesefassung.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2024/BK6-24-174/Beschluss/BK6-24-174_GPKE_Teil1_Lesefassung.pdf?__blob=publicationFile&v=1'
+    # edi-energy/ — the BDEW catalogue, one file per fileId
+    fetch edi-energy mscons-ahb-3.1g.pdf 'https://www.bdew-mako.de/api/downloadFile/11929'
+    fetch edi-energy mscons-ahb-3.2.pdf 'https://www.bdew-mako.de/api/downloadFile/12172'
+    fetch edi-energy mscons-mig-2.4c.pdf 'https://www.bdew-mako.de/api/downloadFile/9645'
+    fetch edi-energy mscons-mig-2.5.pdf 'https://www.bdew-mako.de/api/downloadFile/12175'
+    fetch edi-energy allgemeine-festlegungen-6.1c.pdf 'https://www.bdew-mako.de/api/downloadFile/11916'
+    fetch edi-energy allgemeine-festlegungen-6.1d.pdf 'https://www.bdew-mako.de/api/downloadFile/12145'
+    fetch edi-energy codeliste-obis-kennzahlen-und-medien-2.5c.pdf 'https://www.bdew-mako.de/api/downloadFile/11918'
+    fetch edi-energy codeliste-zeitreihentypen-1.1d.pdf 'https://www.bdew-mako.de/api/downloadFile/8852'
+    # bdew/ — the Anwendungshilfen the identifier types are written against
+    fetch bdew bdew-awh-identifikatoren-mako-v1.2.pdf \
+        'https://www.bdew.de/media/documents/AWH_Identifikatoren-in-der-Marktkommunikation_Version.1.2.pdf'
+    fetch bdew bdew-awh-malo-id-v1.0-20170428.pdf \
+        'https://bdew-codes.de/Content/Files/MaLo/2017-04-28-BDEW-Anwendungshilfe-MaLo-ID_Version1.0_FINAL.PDF'
+    fetch bdew bdew-awh-eic-vergabe-v1.0-20171218.pdf \
+        'https://bdew-codes.de/Content/Files/EIC/Awh_20171218_EIC-Vergabe_V1-0.pdf'
+    # entsoe/ — the coding scheme an EIC column is checked against
+    fetch entsoe eic-reference-manual-5.5.pdf \
+        'https://eepublicdownloads.entsoe.eu/clean-documents/EDI/Library/EIC_Reference_Manual_Release_5_5.pdf' \
+        'https://www.entsoe.eu/Documents/EDI/Library/EIC_Reference_Manual_Release_5_5.pdf'
+    # format/ — the storage formats, from the projects that define them
+    fetch format iceberg-table-spec.md \
+        'https://raw.githubusercontent.com/apache/iceberg/main/format/spec.md'
+    fetch format iceberg-rest-catalog-open-api.yaml \
+        'https://raw.githubusercontent.com/apache/iceberg/main/open-api/rest-catalog-open-api.yaml'
+    fetch format parquet-format.md \
+        'https://raw.githubusercontent.com/apache/parquet-format/master/README.md'
+    fetch format parquet.thrift \
+        'https://raw.githubusercontent.com/apache/parquet-format/master/src/main/thrift/parquet.thrift'
+    fetch format arrow-flight-sql.proto \
+        'https://raw.githubusercontent.com/apache/arrow/main/format/FlightSql.proto'
+    fetch format arrow-flight.proto \
+        'https://raw.githubusercontent.com/apache/arrow/main/format/Flight.proto'
+    fetch format rfc3339.txt 'https://www.rfc-editor.org/rfc/rfc3339.txt'
+    fetch format rfc2104-hmac.txt 'https://www.rfc-editor.org/rfc/rfc2104.txt'
+    # postgres/ — the manual, for the two chapters the hot tier lives inside
+    fetch postgres postgresql-17-A4.pdf \
+        'https://www.postgresql.org/files/documentation/pdf/17/postgresql-17-A4.pdf'
+    # crypto/ — what the suppression list is built from
+    fetch crypto nist-fips-198-1-hmac.pdf 'https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.198-1.pdf'
+    fetch crypto nist-fips-180-4-sha2.pdf 'https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf'
+    # privacy/ — the guidance the pseudonymisation argument is measured against
+    fetch privacy edpb-guidelines-01-2025-pseudonymisation.pdf \
+        'https://www.edpb.europa.eu/system/files/2025-01/edpb_guidelines_202501_pseudonymisation_en.pdf'
+    fetch privacy bsi-tr-03109-1.pdf \
+        'https://www.bsi.bund.de/SharedDocs/Downloads/DE/BSI/Publikationen/TechnischeRichtlinien/TR03109/TR03109-1.pdf?__blob=publicationFile&v=4'
+    if [ -n "$missing" ]; then
+        echo >&2
+        echo "⚠️  not fetched (see specs/README.md for the source):" >&2
+        printf '%s' "$missing" >&2
+    fi
+    echo "📚 specs/ rebuilt"

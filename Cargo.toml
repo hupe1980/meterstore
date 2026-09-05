@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -121,7 +121,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal
 # 0.21 moved `ObisCode::is_import`/`is_export` to a by-value receiver, being
 # derived from the new `direction()` — which `session::udf` exposes as
 # `obis_direction`, the three-valued primitive the two booleans cannot express.
-metering = { version = "0.22", features = ["serde"] }
+metering = { version = "0.23", features = ["serde"] }
 
 # Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
 # Mixing the two would force a conversion at every row boundary. time-tz is

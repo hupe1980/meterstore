@@ -538,6 +538,14 @@ pub mod defaults {
     pub const SETTLEMENT_LAG: Duration = Duration::weeks(1);
     /// How far ahead of the write frontier partitions are pre-created.
     pub const PARTITION_HEADROOM: Duration = Duration::weeks(2);
+    /// How long an archived partition is retained after its cold commit before
+    /// the space is reclaimed. Must outlast the longest query — see
+    /// [`TableConfig::reader_grace`](super::TableConfig::reader_grace).
+    ///
+    /// An hour rather than the maintenance interval: matching it would leave a
+    /// query exactly one cycle of protection, and the query this store exists
+    /// for is a settlement scan over a year of a six-figure meter population.
+    pub const READER_GRACE: Duration = Duration::hours(1);
     /// Target Parquet data file size, in bytes.
     ///
     /// **A cold-tier setting, not a table setting**, and here only as the
@@ -571,6 +579,7 @@ pub struct TableConfig {
     archival_step: Duration,
     settlement_lag: Duration,
     partition_headroom: Duration,
+    reader_grace: Duration,
     scan_chunk_rows: usize,
     snapshot_retention: Duration,
     min_snapshots_to_keep: usize,
@@ -589,6 +598,7 @@ impl TableConfig {
             archival_step: defaults::ARCHIVAL_STEP,
             settlement_lag: defaults::SETTLEMENT_LAG,
             partition_headroom: defaults::PARTITION_HEADROOM,
+            reader_grace: defaults::READER_GRACE,
             scan_chunk_rows: defaults::SCAN_CHUNK_ROWS,
             snapshot_retention: defaults::SNAPSHOT_RETENTION,
             min_snapshots_to_keep: defaults::MIN_SNAPSHOTS_TO_KEEP,
@@ -657,6 +667,31 @@ impl TableConfig {
     /// Set how far ahead partitions are pre-created.
     pub fn partition_headroom(mut self, headroom: Duration) -> Self {
         self.partition_headroom = headroom;
+        self
+    }
+
+    /// Set how long an archived partition is retained before its space is
+    /// reclaimed.
+    ///
+    /// A query reads the watermark when it is **planned** and reads the tiers
+    /// when it **executes**, so a plan made before an archival commit still asks
+    /// PostgreSQL for the window that commit moved. The partition stays detached
+    /// and readable for this long afterwards; without it such a plan comes back
+    /// one window short, silently.
+    ///
+    /// Set it above the longest query the deployment runs. The cost is disk —
+    /// one extra partition per `reader_grace` worth of archival — and nothing
+    /// else: a retained partition sits below every current boundary, so the range
+    /// check skips it before it is scanned.
+    ///
+    /// **Not the maintenance interval.** That decides how often reclamation is
+    /// attempted; this decides what is eligible. Equal values leave a query one
+    /// cycle of protection, which is thin for a settlement scan.
+    ///
+    /// A cold store that cannot report snapshot commit times cannot date an
+    /// orphan, and gets no grace.
+    pub fn reader_grace(mut self, grace: Duration) -> Self {
+        self.reader_grace = grace;
         self
     }
 
@@ -822,6 +857,14 @@ impl TableConfig {
                 fmt_duration(self.archival_step),
             )));
         }
+        if self.reader_grace < Duration::ZERO {
+            return Err(Error::config(
+                "reader_grace must not be negative: it is how long an archived \
+                 partition is retained so a query planned before the boundary moved \
+                 can still read it",
+            ));
+        }
+
         if self.partition_headroom < self.archival_step {
             return Err(Error::config(
                 "partition_headroom must cover at least one archival_step, \
@@ -942,6 +985,10 @@ impl ValidatedTableConfig {
     pub fn partition_headroom(&self) -> Duration {
         self.0.partition_headroom
     }
+    /// How long an archived partition is retained before its space is reclaimed.
+    pub fn reader_grace(&self) -> Duration {
+        self.0.reader_grace
+    }
     /// Rows fetched per round trip when streaming a scan.
     pub fn scan_chunk_rows(&self) -> usize {
         self.0.scan_chunk_rows
@@ -961,6 +1008,7 @@ impl ValidatedTableConfig {
                 .collect(),
         )
         .with_chunk_rows(self.scan_chunk_rows())
+        .with_partition_step(self.archival_step())
     }
     /// How long cold snapshots are kept.
     pub fn snapshot_retention(&self) -> Duration {

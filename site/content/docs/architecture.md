@@ -84,8 +84,11 @@ the monotonicity assertion from the refreshed base on every attempt.
   → DETACH PARTITION            (O(1); invisible to writers, readable by us)
   → SELECT … ORDER BY cursor    (streamed, keyset-paged)
   → write Parquet, commit Iceberg with watermark = W + step
-  → DROP TABLE partition        (O(1), no dead tuples)
+  → leave the partition detached
   → assert the invariant
+
+  …and on a later cycle, once no plan can still need it:
+  → DROP TABLE partition        (O(1), no dead tuples)
 ```
 
 Every step of that ordering is load-bearing:
@@ -97,18 +100,62 @@ Every step of that ordering is load-bearing:
 - **Detach before scanning**, so no row can be inserted into a partition that is
   mid-archival. Invisible to *writers* — never to readers: the watermark is
   published by the cold commit, so throughout the scan the range still belongs to
-  the hot tier, and the hot scan reads the parent **and** whatever is detached
-  from it. A detached partition is either mid-archival, above the watermark and
-  asked for, or already committed, below it and outside the scan's range; never
-  both, so never read twice.
-- **Commit cold before dropping hot.** A crash between them leaves an orphaned
-  detached partition — data intact, invisible, reclaimable by the next run. The
-  reverse ordering loses data permanently.
+  the hot tier and a query must still find those rows. It does, because the hot
+  scan never reads the parent table — see below.
+- **Commit cold, and do not drop hot.** The reverse ordering loses data
+  permanently; dropping *immediately after* loses it from any query already in
+  flight — see [the reader grace](#the-reader-grace).
 - **Purge is `DROP TABLE`.** Removing 9.6 M rows a day with `DELETE` is a
   first-order PostgreSQL anti-pattern: dead tuples, WAL amplification, index
   bloat, autovacuum storms on a multi-billion-row table.
 - **Rows stream, never materialise.** Peak memory is the chunk size, by
   construction rather than by tuning.
+
+### The hot scan reads partitions, not the parent {#partition-wise-scanning}
+
+A partition relation keeps its name, its rows and its identity when it is
+detached; only its parentage changes. So the hot tier is scanned by enumerating
+its partitions and reading each **by name**.
+
+Scanning the parent and adding whatever is currently detached is two reads of one
+catalogue, and a detach landing between them puts the partition in neither — a
+whole window missing from the answer, silently.
+
+A partition created after the enumeration is not scanned: it can only hold rows
+written after the query was entitled to see them. Each partition's upper bound is
+the *next partition's start* rather than the configured step, so a gap left by an
+idle stretch over-estimates its reach. Over-inclusion costs a scan that returns
+nothing; under-inclusion loses rows.
+
+### The reader grace {#the-reader-grace}
+
+A query decides its tier split from the watermark it reads when **planned**, and
+reads the tiers when it **executes**. Archival between the two moves a window
+across a boundary the plan has already committed to:
+
+```text
+  t0  plan at watermark W          → Postgres: [W, …)   Iceberg: […, W)
+  t1  archival commits [W, W+1d)     watermark := W+1d
+  t2  execute                      → the day is in neither half
+```
+
+So the purge is **deferred**. The partition stays detached after its commit —
+invisible to writers, excluded by predicate from every plan made after the
+advance, still read by any plan made before it — and a later cycle reclaims it
+once the commit that moved the boundary is older than `reader_grace`:
+
+```toml
+[tables.archival]
+reader_grace = "1h"    # above the longest query this deployment runs
+```
+
+The clock is the one MeterStore records in the snapshot summary
+(`meterstore.archived_at`), not Iceberg's own commit timestamp, so the grace is
+measured on the same clock every other archival decision is.
+
+What an interrupted run leaves behind is exactly what a successful one leaves
+behind, so the recovery path is the ordinary path. A cold store that cannot report
+snapshot times cannot date an orphan, and gets no grace.
 
 ### Exactly one archiver per table
 
@@ -158,10 +205,11 @@ lineage, `VARIANT` and nanosecond timestamps; evaluated one at a time:
 | Default column values | Real but small — would make an added column free instead of needing a backfill. |
 | Nanosecond timestamps | None. Fifteen-minute intervals are stored at microsecond precision. |
 
-The deciding argument is reader support. Athena — among the most widely deployed
-SQL engines in AWS estates — does not read v3. For data under a ten-year
-retention obligation, writing a format a significant share of engines cannot read
-would undermine the openness Iceberg is chosen for.
+The deciding argument is reader support, checked rather than assumed: as of
+August 2026 Athena — among the most widely deployed SQL engines in AWS estates
+— creates and reads v2 only, and Trino is not v3-ready either. For data under a
+ten-year retention obligation, writing a format a significant share of engines
+cannot read would undermine the openness Iceberg is chosen for.
 
 The version is **verified after table creation** rather than requested, because
 `format-version` is a reserved property. A future library default moving to v3

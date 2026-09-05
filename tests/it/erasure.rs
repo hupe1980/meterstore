@@ -12,7 +12,14 @@
 
 use meterstore::{SubjectRef, SubjectRegistry};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use time::macros::datetime;
+
+/// An instant in the retention epoch these tests register against.
+///
+/// A reference belongs to one collection year, so every registration names the
+/// year it is for — here, 2026.
+const IN_2026: OffsetDateTime = datetime!(2026-06-01 00:00 UTC);
 
 /// A 32-byte suppression key. Test-only: a real deployment loads one from its
 /// secret manager, and losing it silently disables suppression.
@@ -44,7 +51,7 @@ async fn suppressing() -> SubjectRegistry {
 async fn a_reference_resolves_until_it_is_erased() {
     let r = registry().await;
 
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
     assert_eq!(
         r.resolve(&subject).await.unwrap().as_deref(),
         Some("customer-4821")
@@ -71,7 +78,7 @@ async fn erasure_is_irreversible() {
     // No recovery path is the condition regulators attach: a soft delete that an
     // administrator could undo would not be erasure at all.
     let r = registry().await;
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
 
     r.erase(
         &subject,
@@ -84,13 +91,13 @@ async fn erasure_is_irreversible() {
 
     // The natural identifier is unreachable from either direction.
     assert_eq!(r.resolve(&subject).await.unwrap(), None);
-    assert_eq!(r.lookup("customer-4821").await.unwrap(), None);
+    assert_eq!(r.lookup("customer-4821", IN_2026).await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn erasure_is_auditable_without_retaining_the_subject() {
     let r = registry().await;
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
 
     r.erase(
         &subject,
@@ -120,8 +127,8 @@ async fn erasure_is_auditable_without_retaining_the_subject() {
 #[tokio::test]
 async fn erasing_one_subject_leaves_every_other_intact() {
     let r = registry().await;
-    let a = r.register("customer-a").await.unwrap();
-    let b = r.register("customer-b").await.unwrap();
+    let a = r.register("customer-a", IN_2026).await.unwrap();
+    let b = r.register("customer-b", IN_2026).await.unwrap();
 
     r.erase(
         &a,
@@ -146,8 +153,8 @@ async fn registering_the_same_subject_twice_returns_one_reference() {
     // for one subject, or erasure would have to find them all.
     let r = registry().await;
 
-    let first = r.register("customer-4821").await.unwrap();
-    let second = r.register("customer-4821").await.unwrap();
+    let first = r.register("customer-4821", IN_2026).await.unwrap();
+    let second = r.register("customer-4821", IN_2026).await.unwrap();
     assert_eq!(first, second);
 }
 
@@ -157,7 +164,7 @@ async fn a_reference_reveals_nothing_about_its_subject() {
     // erasure as a re-identification path, because anyone holding the serial
     // could recompute it.
     let r = registry().await;
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
 
     assert!(!subject.as_str().contains("4821"));
     assert!(!subject.as_str().contains("customer"));
@@ -168,7 +175,7 @@ async fn erasing_an_unknown_reference_is_recorded_rather_than_ignored() {
     // A repeated request must stay auditable: answering "already done" silently
     // leaves nothing to show a regulator.
     let r = registry().await;
-    let unknown = SubjectRef::new("sub_deadbeef").unwrap();
+    let unknown = SubjectRef::new("s2026_deadbeef").unwrap();
 
     r.erase(
         &unknown,
@@ -185,7 +192,7 @@ async fn erasing_an_unknown_reference_is_recorded_rather_than_ignored() {
 #[tokio::test]
 async fn erasure_requires_a_reason() {
     let r = registry().await;
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
 
     assert!(
         r.erase(
@@ -209,7 +216,7 @@ async fn without_a_suppression_key_a_replay_silently_resurrects_a_subject() {
     // documents that replay defeats it.
     let r = registry().await;
 
-    let first = r.register("customer-4821").await.unwrap();
+    let first = r.register("customer-4821", IN_2026).await.unwrap();
     r.erase(
         &first,
         "DSAR-1",
@@ -219,7 +226,7 @@ async fn without_a_suppression_key_a_replay_silently_resurrects_a_subject() {
     .await
     .unwrap();
 
-    let second = r.register("customer-4821").await.unwrap();
+    let second = r.register("customer-4821", IN_2026).await.unwrap();
     assert_ne!(first, second, "a fresh reference, not the erased one");
     assert_eq!(
         r.resolve(&second).await.unwrap().as_deref(),
@@ -232,7 +239,7 @@ async fn without_a_suppression_key_a_replay_silently_resurrects_a_subject() {
 async fn a_suppression_key_makes_erasure_stick() {
     let r = suppressing().await;
 
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
     r.erase(
         &subject,
         "DSAR-2026-0042",
@@ -242,14 +249,14 @@ async fn a_suppression_key_makes_erasure_stick() {
     .await
     .unwrap();
 
-    let replayed = r.register("customer-4821").await;
+    let replayed = r.register("customer-4821", IN_2026).await;
     assert!(
         replayed.is_err(),
         "a replayed message must not re-link an erased subject"
     );
     assert!(r.is_suppressed("customer-4821").await.unwrap());
     // Everyone else is unaffected — suppression is per identifier, not a mode.
-    assert!(r.register("customer-9999").await.is_ok());
+    assert!(r.register("customer-9999", IN_2026).await.is_ok());
 }
 
 #[tokio::test]
@@ -260,7 +267,7 @@ async fn the_suppression_list_does_not_retain_the_identifier() {
     let r = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
     r.create_tables().await.expect("tables");
 
-    let subject = r.register("customer-4821").await.unwrap();
+    let subject = r.register("customer-4821", IN_2026).await.unwrap();
     r.erase(
         &subject,
         "DSAR-1",
@@ -288,7 +295,7 @@ async fn a_mistaken_erasure_can_be_lifted_without_restoring_the_old_link() {
     // out of the system permanently.
     let r = suppressing().await;
 
-    let original = r.register("customer-4821").await.unwrap();
+    let original = r.register("customer-4821", IN_2026).await.unwrap();
     r.erase(
         &original,
         "DSAR-1",
@@ -297,7 +304,7 @@ async fn a_mistaken_erasure_can_be_lifted_without_restoring_the_old_link() {
     )
     .await
     .unwrap();
-    assert!(r.register("customer-4821").await.is_err());
+    assert!(r.register("customer-4821", IN_2026).await.is_err());
 
     assert!(
         r.lift_suppression(
@@ -309,7 +316,7 @@ async fn a_mistaken_erasure_can_be_lifted_without_restoring_the_old_link() {
         .unwrap()
     );
 
-    let fresh = r.register("customer-4821").await.unwrap();
+    let fresh = r.register("customer-4821", IN_2026).await.unwrap();
     assert_ne!(
         fresh, original,
         "a new reference — lifting must not re-attach the erased history"
@@ -373,7 +380,10 @@ async fn erasure_can_be_enclosed_in_a_caller_s_transaction() {
         .await
         .expect("a stand-in for the caller's own tables");
 
-    let subject = registry.register("DE-METER-1").await.expect("register");
+    let subject = registry
+        .register("DE-METER-1", IN_2026)
+        .await
+        .expect("register");
     sqlx::query("INSERT INTO downstream (subject_ref) VALUES ($1)")
         .bind(subject.as_str())
         .execute(&pool)

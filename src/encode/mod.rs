@@ -2212,7 +2212,7 @@ mod tests {
             },
             MeasurementSource::AutoSubstitute {
                 method: SubstituteMethod::ZeroFill,
-                reason: SubstitutionReason::GatewayCommFailure,
+                reason: SubstitutionReason::CommunicationFailure,
             },
             MeasurementSource::RetroactiveCorrection {
                 correction_ref: "COR-42".into(),
@@ -2301,6 +2301,44 @@ mod tests {
             "a source tag changed. It is the discriminant already written into \
              source_kind on every stored row, and the string every external \
              engine filters on — this is a stored-data break"
+        );
+    }
+
+    /// The **whole** stored payload, spelled out.
+    ///
+    /// The tag assertion above covers the one column an external engine reads,
+    /// and stops there. `source_detail` holds a *nested* upstream vocabulary —
+    /// `AutoSubstitute` carries a `SubstitutionReason`, `VirtualMeter` a
+    /// `VirtualMeterKind` — and a rename inside one keeps both columns agreeing
+    /// with each other while stopping every stored row from decoding. Neither
+    /// the round-trip tests nor the tag test can see that: the first read and
+    /// write through the same impl, the second watches only the outer tag.
+    ///
+    /// So the literals are here, and an upstream rename fails with a diff
+    /// naming it.
+    #[test]
+    fn every_source_payload_has_the_shape_already_on_disk() {
+        let stored: Vec<String> = every_source_variant()
+            .iter()
+            .map(|s| encode_source(s).expect("encode").1)
+            .collect();
+
+        assert_eq!(
+            stored,
+            [
+                r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000001"}}"#,
+                r#"{"SMGW_DIRECT_PUSH":{"device_id":"d","session_id":"s"}}"#,
+                r#"{"MANUAL_ENTRY":{"operator_id":"op","reason":"dispute"}}"#,
+                r#"{"AUTO_SUBSTITUTE":{"method":"ZERO_FILL","reason":"COMMUNICATION_FAILURE"}}"#,
+                r#"{"RETROACTIVE_CORRECTION":{"corrected_by":"clearing","correction_ref":"COR-42"}}"#,
+                r#"{"VIRTUAL_METER":{"rule":"PV_SELF_CONSUMPTION","source_ids":["12345678905"]}}"#,
+                r#"{"REDISPATCH_IMPORT":{"activation_ref":"ACT-7","pid":13020}}"#,
+                r#"{"CHARGE_DETAIL_RECORD":{"cdr_id":"CDR-1","evse_id":"DE*ABC*E1234*1"}}"#,
+                r#"{"CLOCK_ALIGNED_METER_VALUE":{"evse_id":null,"transaction_id":"TX-9"}}"#,
+                r#"{"DEVICE_LOG":{"device_id":"wallbox-7","register":"1-0:1.8.0"}}"#,
+            ],
+            "the stored shape of source_detail changed. Rows already written stop \
+             decoding — this is a stored-data break, not a wire-format one"
         );
     }
 

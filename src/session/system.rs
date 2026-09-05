@@ -175,6 +175,13 @@ impl<'a> SystemTables<'a> {
                 "partition_headroom",
                 format!("{}s", c.partition_headroom().whole_seconds()),
             ),
+            // Belongs beside the two above for the same reason they belong
+            // beside each other: it is valid alone and wrong next to a query
+            // that outlives it, and nothing can check that from here.
+            entry(
+                "reader_grace",
+                format!("{}s", c.reader_grace().whole_seconds()),
+            ),
             entry(
                 "expected_hot_partitions",
                 c.expected_hot_partitions().to_string(),
@@ -600,6 +607,7 @@ mod tests {
             "archival_step",
             "partition_headroom",
             "settlement_lag",
+            "reader_grace",
             "merge_key",
             "expected_hot_partitions",
         ] {
@@ -730,6 +738,7 @@ mod tests {
             _: crate::tiering::store::BatchStream,
             _: crate::tiering::store::WriteHints,
             _: crate::watermark::ArchivalWindow,
+            _: time::OffsetDateTime,
         ) -> Result<crate::tiering::store::CommitInfo> {
             unreachable!()
         }

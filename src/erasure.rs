@@ -38,30 +38,91 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
-/// An opaque reference to a data subject, safe to store in the lake.
+/// An opaque reference to a data subject **in one retention epoch**, safe to
+/// store in the lake.
 ///
 /// Carries no personal data itself: it is meaningful only through a mapping that
 /// erasure destroys.
+///
+/// # Why a year is part of it
+///
+/// § 60 Abs. 6 MsbG comes due per *value*, so the unit of erasure is
+/// `(subject, collection year)`: one reference covering a whole history could
+/// only either orphan readings still inside their period or keep decade-old ones
+/// attributable. A sweep therefore erases epochs, consults no readings, and comes
+/// due on the calendar.
+///
+/// The spelling is `s<year>_<32 hex>`. The year is not secret — a row's `from`
+/// gives it away — and the entropy is the second half; what the prefix buys is
+/// that a reference can be checked against the row it is written to without a
+/// round trip, so one from the wrong year is refused at the write rather than
+/// quietly defeating the sweep.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SubjectRef(String);
+
+/// How a reference spells its epoch.
+const EPOCH_PREFIX: char = 's';
 
 impl SubjectRef {
     /// Wrap an externally generated reference.
     ///
     /// It must carry no personal data — a name, a meter serial or an email
     /// hashed without a secret would all survive erasure as a re-identification
-    /// path. A random token is the safe choice.
+    /// path — and it must name the retention epoch it belongs to, which
+    /// [`SubjectRegistry::register`] does for you.
     pub fn new(reference: impl Into<String>) -> Result<Self> {
         let reference = reference.into();
         if reference.trim().is_empty() {
             return Err(Error::config("subject reference must not be empty"));
         }
-        Ok(Self(reference))
+        let this = Self(reference);
+        this.epoch()?;
+        Ok(this)
+    }
+
+    /// Mint a reference for `epoch`, with no derivation from the subject.
+    ///
+    /// Deriving it — hashing a meter serial, say — would leave a
+    /// re-identification path that survives erasure, because anyone holding the
+    /// serial could recompute the reference and find the readings again.
+    ///
+    /// 128 bits from the operating system's CSPRNG. `std`'s `RandomState` would
+    /// be the convenient choice and is the wrong one: it is seeded once per
+    /// thread and then *incremented*, and its documentation is explicit that it
+    /// is not cryptographically secure. It exists to make `HashMap` collision
+    /// attacks hard, which is a weaker property than the one erasure needs.
+    fn mint(epoch: i32) -> Self {
+        let mut bytes = [0u8; 16];
+        // The OS entropy source failing is not a recoverable condition —
+        // continuing would mean minting predictable references and calling them
+        // pseudonyms.
+        getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
+        Self(format!("{EPOCH_PREFIX}{epoch}_{}", hex(&bytes)))
     }
 
     /// The reference as stored.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The retention epoch — the calendar year of the values this reference may
+    /// attribute.
+    pub fn epoch(&self) -> Result<i32> {
+        let malformed = || {
+            Error::config(format!(
+                "subject reference {:?} does not name a retention epoch: the shape is \
+                 `s<year>_<token>`, which is what lets a write check a reference against \
+                 the year of the reading it is attached to. Mint one with \
+                 `SubjectRegistry::register`",
+                self.0
+            ))
+        };
+        let rest = self.0.strip_prefix(EPOCH_PREFIX).ok_or_else(malformed)?;
+        let (year, token) = rest.split_once('_').ok_or_else(malformed)?;
+        if token.is_empty() {
+            return Err(malformed());
+        }
+        year.parse::<i32>().map_err(|_| malformed())
     }
 }
 
@@ -245,9 +306,16 @@ impl SubjectRegistry {
     pub async fn create_tables(&self) -> Result<()> {
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS meterstore_subject_map (
-                   subject_ref  TEXT PRIMARY KEY,
-                   natural_id   TEXT NOT NULL UNIQUE,
-                   registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                   subject_ref   TEXT PRIMARY KEY,
+                   natural_id    TEXT NOT NULL,
+                   -- The calendar year of the values this row may attribute.
+                   -- `(natural_id, epoch)` rather than `natural_id` alone,
+                   -- because § 60 Abs. 6 runs per value: a subject's 2020
+                   -- readings come due while their 2026 readings are current,
+                   -- and one row covering both could satisfy neither.
+                   epoch         INTEGER NOT NULL,
+                   registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                   UNIQUE (natural_id, epoch)
                )"#,
         )
         .execute(&self.pool)
@@ -265,6 +333,16 @@ impl SubjectRegistry {
                    -- replayed message can re-register the subject.
                    natural_id_hmac BYTEA
                )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(pg)?;
+
+        // The retention sweep selects on it, and it is the whole of what the
+        // sweep looks at — no reading is consulted.
+        sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS meterstore_subject_map_epoch
+                   ON meterstore_subject_map (epoch)"#,
         )
         .execute(&self.pool)
         .await
@@ -301,12 +379,13 @@ impl SubjectRegistry {
     ///
     /// Without a key the check is not merely disabled, it is impossible: erasure
     /// deletes the mapping, so nothing remains to recognise the identifier by.
-    pub async fn register(&self, natural_id: &str) -> Result<SubjectRef> {
+    pub async fn register(&self, natural_id: &str, at: OffsetDateTime) -> Result<SubjectRef> {
         if natural_id.trim().is_empty() {
             return Err(Error::config("natural identifier must not be empty"));
         }
+        let epoch = retention_epoch(at);
 
-        if let Some(existing) = self.lookup(natural_id).await? {
+        if let Some(existing) = self.lookup(natural_id, at).await? {
             return Ok(existing);
         }
 
@@ -333,15 +412,16 @@ impl SubjectRegistry {
             }
         }
 
-        let reference = new_reference();
+        let reference = SubjectRef::mint(epoch);
         let inserted = sqlx::query_scalar::<_, String>(
-            r#"INSERT INTO meterstore_subject_map (subject_ref, natural_id)
-               VALUES ($1, $2)
-               ON CONFLICT (natural_id) DO UPDATE SET natural_id = EXCLUDED.natural_id
+            r#"INSERT INTO meterstore_subject_map (subject_ref, natural_id, epoch)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (natural_id, epoch) DO UPDATE SET natural_id = EXCLUDED.natural_id
                RETURNING subject_ref"#,
         )
-        .bind(&reference)
+        .bind(reference.as_str())
         .bind(natural_id)
+        .bind(epoch)
         .fetch_one(&self.pool)
         .await
         .map_err(pg)?;
@@ -349,12 +429,14 @@ impl SubjectRegistry {
         SubjectRef::new(inserted)
     }
 
-    /// The reference for a natural identifier, if one is registered.
-    pub async fn lookup(&self, natural_id: &str) -> Result<Option<SubjectRef>> {
+    /// The reference for a natural identifier in the epoch containing `at`, if
+    /// one is registered.
+    pub async fn lookup(&self, natural_id: &str, at: OffsetDateTime) -> Result<Option<SubjectRef>> {
         let found = sqlx::query_scalar::<_, String>(
-            "SELECT subject_ref FROM meterstore_subject_map WHERE natural_id = $1",
+            "SELECT subject_ref FROM meterstore_subject_map WHERE natural_id = $1 AND epoch = $2",
         )
         .bind(natural_id)
+        .bind(retention_epoch(at))
         .fetch_optional(&self.pool)
         .await
         .map_err(pg)?;
@@ -391,7 +473,7 @@ impl SubjectRegistry {
         reason: &str,
         actor: &str,
         now: OffsetDateTime,
-    ) -> Result<ErasureRecord> {
+    ) -> Result<Vec<ErasureRecord>> {
         self.erase_triggered_by(subject, reason, actor, now, crate::observe::TRIGGER_REQUEST)
             .await
     }
@@ -412,9 +494,9 @@ impl SubjectRegistry {
         actor: &str,
         now: OffsetDateTime,
         trigger: &'static str,
-    ) -> Result<ErasureRecord> {
+    ) -> Result<Vec<ErasureRecord>> {
         let mut tx = self.pool.begin().await.map_err(pg)?;
-        let (record, destroyed) = self
+        let (records, destroyed) = self
             .erase_in_inner(&mut tx, subject, reason, actor, now)
             .await?;
         tx.commit().await.map_err(pg)?;
@@ -426,7 +508,7 @@ impl SubjectRegistry {
                 .subjects_erased
                 .add(1, &crate::observe::erasure_trigger(trigger));
         }
-        Ok(record)
+        Ok(records)
     }
 
     /// Erase inside a transaction the **caller** owns.
@@ -478,8 +560,8 @@ impl SubjectRegistry {
         reason: &str,
         actor: &str,
         now: OffsetDateTime,
-    ) -> Result<ErasureRecord> {
-        let (record, destroyed) = self
+    ) -> Result<Vec<ErasureRecord>> {
+        let (records, destroyed) = self
             .erase_in_inner(conn, subject, reason, actor, now)
             .await?;
         // Counted as a *request*, which is what a caller-owned transaction is:
@@ -494,7 +576,7 @@ impl SubjectRegistry {
                 &crate::observe::erasure_trigger(crate::observe::TRIGGER_REQUEST),
             );
         }
-        Ok(record)
+        Ok(records)
     }
 
     /// The erasure itself, and whether a linkage was actually destroyed.
@@ -509,7 +591,7 @@ impl SubjectRegistry {
         reason: &str,
         actor: &str,
         now: OffsetDateTime,
-    ) -> Result<(ErasureRecord, bool)> {
+    ) -> Result<(Vec<ErasureRecord>, bool)> {
         if reason.trim().is_empty() {
             return Err(Error::config("erasure needs a reason for the audit trail"));
         }
@@ -530,53 +612,177 @@ impl SubjectRegistry {
 
         let tombstone = natural_id.as_deref().and_then(|id| self.tombstone(id));
 
+        // **Every epoch of this subject, not just the one named.** A reference
+        // covers one collection year; an Article 17 request covers a person. A
+        // caller holding this year's reference and erasing only this year would
+        // be told the request was honoured while last year's readings stayed
+        // attributable — which is the failure this whole module exists to make
+        // impossible.
+        let targets: Vec<SubjectRef> = match natural_id.as_deref() {
+            Some(id) => sqlx::query_scalar::<_, String>(
+                "SELECT subject_ref FROM meterstore_subject_map WHERE natural_id = $1 \
+                 ORDER BY epoch FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(pg)?
+            .into_iter()
+            .map(SubjectRef::new)
+            .collect::<Result<_>>()?,
+            // Unmapped: already erased, or never registered. Audit the request
+            // against the reference given, so a repeat stays provable.
+            None => vec![subject.clone()],
+        };
+
         // Delete and audit atomically: an audit row without the deletion would
         // claim an erasure that did not happen, and a deletion without the audit
         // row would leave it unprovable.
-        let deleted = sqlx::query("DELETE FROM meterstore_subject_map WHERE subject_ref = $1")
-            .bind(subject.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(pg)?
-            .rows_affected();
+        let mut deleted = 0;
+        for target in &targets {
+            deleted += sqlx::query("DELETE FROM meterstore_subject_map WHERE subject_ref = $1")
+                .bind(target.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(pg)?
+                .rows_affected();
+        }
 
         // A repeat request keeps the first erasure's timestamp — that is when
         // the linkage actually died — but must not blank an existing tombstone,
         // which would quietly re-open re-registration.
-        sqlx::query(
-            r#"INSERT INTO meterstore_erasures
-                   (subject_ref, erased_at, reason, actor, natural_id_hmac)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (subject_ref) DO UPDATE
-                   SET natural_id_hmac =
-                       COALESCE(meterstore_erasures.natural_id_hmac, EXCLUDED.natural_id_hmac)"#,
-        )
-        .bind(subject.as_str())
-        .bind(now)
-        .bind(reason)
-        .bind(actor)
-        .bind(tombstone.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(pg)?;
+        let mut records = Vec::with_capacity(targets.len());
+        for target in targets {
+            sqlx::query(
+                r#"INSERT INTO meterstore_erasures
+                       (subject_ref, erased_at, reason, actor, natural_id_hmac)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (subject_ref) DO UPDATE
+                       SET natural_id_hmac =
+                           COALESCE(meterstore_erasures.natural_id_hmac, EXCLUDED.natural_id_hmac)"#,
+            )
+            .bind(target.as_str())
+            .bind(now)
+            .bind(reason)
+            .bind(actor)
+            .bind(tombstone.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(pg)?;
+
+            records.push(ErasureRecord {
+                subject: target,
+                erased_at: now,
+                reason: reason.to_string(),
+                actor: actor.to_string(),
+            });
+        }
 
         if deleted == 0 {
             // Already erased, or never registered. Recording it either way keeps
             // a repeated request auditable rather than silently successful.
             warn!(%subject, "erasure requested for an unmapped reference");
         } else {
-            info!(%subject, actor, "subject linkage destroyed");
+            info!(%subject, epochs = deleted, actor, "subject linkage destroyed");
         }
 
-        Ok((
-            ErasureRecord {
-                subject: subject.clone(),
+        Ok((records, deleted > 0))
+    }
+
+    /// The § 60 Abs. 6 sweep: destroy every linkage whose collection year ended
+    /// before `cutoff`.
+    ///
+    /// # This looks at no readings at all
+    ///
+    /// The duty is on *"der jeweilige Messwert"* — a value's own collection
+    /// year — so what comes due is a `(subject, epoch)` pair, and the epoch is
+    /// recorded on the mapping row. The sweep is therefore pure registry
+    /// maintenance: one `DELETE … WHERE epoch < …` against an indexed column,
+    /// with no scan of any table, no dependence on which rows a session can see,
+    /// and no way for a restricted read mode to make it destroy a live subject.
+    ///
+    /// An earlier design keyed it to the *latest* reading a subject explained.
+    /// That was wrong in both directions at once: a subject still being metered
+    /// kept its decade-old values attributable for as long as it stayed
+    /// connected, and the cutoff came from a query — so a sweep run through a
+    /// session that could not see the hot window would find a live customer's
+    /// last reading years old and erase it, irreversibly.
+    ///
+    /// Idempotent: an epoch already erased has no mapping row left to delete, so
+    /// a re-run writes no second audit row and counts nothing.
+    pub async fn expire_epochs_before(
+        &self,
+        cutoff: OffsetDateTime,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<ErasureRecord>> {
+        if reason.trim().is_empty() {
+            return Err(Error::config("erasure needs a reason for the audit trail"));
+        }
+        // An epoch is due once the whole year is behind the cutoff: the year
+        // containing the cutoff still holds values inside their period.
+        let due_before = retention_epoch(cutoff);
+
+        let mut tx = self.pool.begin().await.map_err(pg)?;
+        let due = sqlx::query_as::<_, (String, String)>(
+            "SELECT subject_ref, natural_id FROM meterstore_subject_map \
+             WHERE epoch < $1 ORDER BY epoch, natural_id FOR UPDATE",
+        )
+        .bind(due_before)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(pg)?;
+
+        let mut records = Vec::with_capacity(due.len());
+        for (reference, natural_id) in due {
+            let subject = SubjectRef::new(reference)?;
+            sqlx::query("DELETE FROM meterstore_subject_map WHERE subject_ref = $1")
+                .bind(subject.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(pg)?;
+
+            // No tombstone. Suppression exists so an Article 17 erasure survives
+            // a broker replay; a retention expiry is not a request to stop
+            // processing, and a subject whose 2020 epoch expired must still be
+            // registrable for 2027.
+            sqlx::query(
+                r#"INSERT INTO meterstore_erasures
+                       (subject_ref, erased_at, reason, actor, natural_id_hmac)
+                   VALUES ($1, $2, $3, $4, NULL)
+                   ON CONFLICT (subject_ref) DO NOTHING"#,
+            )
+            .bind(subject.as_str())
+            .bind(now)
+            .bind(reason)
+            .bind(actor)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg)?;
+
+            let _ = natural_id;
+            records.push(ErasureRecord {
+                subject,
                 erased_at: now,
                 reason: reason.to_string(),
                 actor: actor.to_string(),
-            },
-            deleted > 0,
-        ))
+            });
+        }
+        tx.commit().await.map_err(pg)?;
+
+        if !records.is_empty() {
+            crate::observe::metrics().subjects_erased.add(
+                records.len() as u64,
+                &crate::observe::erasure_trigger(crate::observe::TRIGGER_RETENTION),
+            );
+            warn!(
+                epochs = records.len(),
+                %cutoff,
+                "retention sweep destroyed linkages past the statutory ceiling"
+            );
+        }
+        Ok(records)
     }
 
     /// Whether an identifier is on the suppression list.
@@ -768,62 +974,19 @@ impl Retention {
 /// a cutoff here means nothing is due.
 const EARLIEST_CUTOFF_YEAR: i32 = -9998;
 
-/// Destroy the linkage of every reference in `due`, skipping those already gone.
+/// The retention epoch an instant falls in: its **local** calendar year.
 ///
-/// Shared by the single-table sweep and the catalog-wide one, so both are
-/// idempotent in the same way: a reference the registry no longer resolves is
-/// passed over rather than re-erased, and a re-run writes no second audit row
-/// claiming an erasure that did not happen on it.
-pub(crate) async fn anonymise(
-    registry: &SubjectRegistry,
-    due: &[String],
-    reason: &str,
-    actor: &str,
-    now: OffsetDateTime,
-) -> Result<Vec<ErasureRecord>> {
-    let mut erased = Vec::new();
-    for reference in due {
-        let subject = SubjectRef::new(reference.clone())?;
-        // Already anonymised — by an Article 17 request, or by an earlier sweep.
-        if registry.resolve(&subject).await?.is_none() {
-            continue;
-        }
-        // Counted as `retention` by `erase_triggered_by`, so a sweep run from the
-        // catalog, from one store, or from the maintenance loop all reach the
-        // same instrument under the same attribute — and none of them is
-        // mistaken for the Article 17 path, whose flat zero means the opposite.
-        erased.push(
-            registry
-                .erase_triggered_by(
-                    &subject,
-                    reason,
-                    actor,
-                    now,
-                    crate::observe::TRIGGER_RETENTION,
-                )
-                .await?,
-        );
-    }
-    Ok(erased)
-}
-
-/// A random reference with no derivation from the subject.
+/// Local because the statute is — *"der Schluss des Kalenderjahres"* is a German
+/// calendar year, so an interval starting `2026-12-31T23:00Z` is already 2027 in
+/// Berlin and belongs to the 2027 epoch, exactly as it belongs to the 2027
+/// Bilanzierungsmonat.
 ///
-/// Deriving it — hashing a meter serial, say — would leave a re-identification
-/// path that survives erasure, because anyone holding the serial could recompute
-/// the reference and find the readings again.
-///
-/// 128 bits from the operating system's CSPRNG. `std`'s `RandomState` would be
-/// the convenient choice and is the wrong one: it is seeded once per thread and
-/// then *incremented*, and its documentation is explicit that it is not
-/// cryptographically secure. It exists to make `HashMap` collision attacks hard,
-/// which is a weaker property than the one erasure needs.
-fn new_reference() -> String {
-    let mut bytes = [0u8; 16];
-    // The OS entropy source failing is not a recoverable condition — continuing
-    // would mean minting predictable references and calling them pseudonyms.
-    getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
-    format!("sub_{}", hex(&bytes))
+/// The year rather than the month or the day, because that is the granularity
+/// § 60 Abs. 6 states its ceiling in. A finer epoch would multiply mapping rows
+/// without making a single erasure come due one day earlier.
+#[must_use]
+pub fn retention_epoch(at: OffsetDateTime) -> i32 {
+    metering::calendar::local_year(at)
 }
 
 /// Lowercase hex, without pulling in a dependency for sixteen characters.
@@ -847,12 +1010,25 @@ mod tests {
     fn a_reference_must_not_be_empty() {
         assert!(SubjectRef::new("").is_err());
         assert!(SubjectRef::new("   ").is_err());
-        assert!(SubjectRef::new("sub_abc").is_ok());
+        assert!(SubjectRef::new("s2026_abc").is_ok());
+    }
+
+    #[test]
+    fn a_reference_must_name_its_retention_epoch() {
+        // Without the epoch a reference cannot be checked against the year of
+        // the reading it is attached to, and the sweep loses its whole basis.
+        assert!(SubjectRef::new("sub_abc").is_err());
+        assert!(SubjectRef::new("s_abc").is_err());
+        assert!(SubjectRef::new("s2026_").is_err());
+        assert!(SubjectRef::new("2026_abc").is_err());
+        assert_eq!(SubjectRef::new("s2026_abc").unwrap().epoch().unwrap(), 2026);
+        assert_eq!(SubjectRef::new("s-1_abc").unwrap().epoch().unwrap(), -1);
     }
 
     #[test]
     fn generated_references_do_not_repeat() {
-        let refs: std::collections::HashSet<_> = (0..1_000).map(|_| new_reference()).collect();
+        let refs: std::collections::HashSet<_> =
+            (0..1_000).map(|_| SubjectRef::mint(2026)).collect();
         assert_eq!(refs.len(), 1_000, "references must be unique");
     }
 
@@ -860,7 +1036,21 @@ mod tests {
     fn a_generated_reference_is_not_derived_from_anything() {
         // Two calls must differ, or the reference is a function of its input and
         // erasure could be undone by recomputing it.
-        assert_ne!(new_reference(), new_reference());
+        assert_ne!(SubjectRef::mint(2026), SubjectRef::mint(2026));
+    }
+
+    #[test]
+    fn a_minted_reference_carries_the_epoch_it_was_minted_for() {
+        assert_eq!(SubjectRef::mint(2024).epoch().unwrap(), 2024);
+    }
+
+    #[test]
+    fn the_retention_epoch_is_the_berlin_year() {
+        use time::macros::datetime;
+        // 23:00 UTC on New Year's Eve is already next year in Berlin, and the
+        // statute counts German calendar years.
+        assert_eq!(retention_epoch(datetime!(2026-12-31 22:59 UTC)), 2026);
+        assert_eq!(retention_epoch(datetime!(2026-12-31 23:00 UTC)), 2027);
     }
 
     /// A pool that never connects — enough to construct a registry.
@@ -998,13 +1188,13 @@ mod tests {
         // The audit trail outlives the mapping, so anything personal in it would
         // survive the erasure it documents.
         let record = ErasureRecord {
-            subject: SubjectRef::new("sub_abc").unwrap(),
+            subject: SubjectRef::new("s2026_abc").unwrap(),
             erased_at: OffsetDateTime::UNIX_EPOCH,
             reason: "DSAR-2026-0042".to_string(),
             actor: "privacy-team".to_string(),
         };
         let rendered = format!("{record:?}");
-        assert!(rendered.contains("sub_abc"));
+        assert!(rendered.contains("s2026_abc"));
         assert!(rendered.contains("DSAR-2026-0042"));
     }
 }

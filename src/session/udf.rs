@@ -51,6 +51,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use metering::IntervalResolution;
+use metering::QualityFlag;
 use metering::calendar;
 use metering::ids::{Eic, EicType, Regelzone};
 use metering::interval::{Direction, Sparte};
@@ -254,6 +255,152 @@ impl ScalarUDFImpl for ObisPredicate {
         let (_, codes) = as_obis(&args)?;
         let out: crate::arrow::array::BooleanArray =
             codes.iter().map(|c| c.map(|c| (self.test)(&c))).collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// A stored `quality` string as `metering`'s own flag, or null.
+///
+/// Unparseable is an **error** rather than a null, exactly as an OBIS code is:
+/// the column is written from `QualityFlag::as_str` and constrained to that list
+/// on the hot tier, so a value outside it means something wrote the warehouse
+/// that should not have — and answering "not billable" for it would let the row
+/// pass a filter as though the question had been asked and settled.
+fn as_quality(args: &ScalarFunctionArgs) -> DfResult<(StringArray, Vec<Option<QualityFlag>>)> {
+    let raw = as_strings(args, 0)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        if raw.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let text = raw.value(i);
+        out.push(Some(text.parse::<QualityFlag>().map_err(|e| {
+            DataFusionError::Execution(format!("{text:?} is not a quality flag: {e}"))
+        })?));
+    }
+    Ok((raw, out))
+}
+
+/// One of `metering::QualityFlag`'s predicates, as a SQL function.
+///
+/// # Why the `quality` column needs these at all
+///
+/// It is a code list, and the questions asked of it are statutory. *"May this be
+/// billed"* is § 60 Abs. 2 MsbG, and a caller spelling it
+/// `quality IN ('MEASURED', 'SUBSTITUTED')` has written a second copy of a
+/// statute into a dashboard — one that no longer agrees with the crate the day
+/// the list moves. [`completeness`](crate::session::CompletenessQuery) already
+/// delegates the same question upstream rather than keeping a local copy; this
+/// is that delegation reaching SQL.
+struct QualityPredicate {
+    name: &'static str,
+    test: fn(QualityFlag) -> bool,
+    signature: Signature,
+}
+
+impl std::fmt::Debug for QualityPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QualityPredicate")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PartialEq for QualityPredicate {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+impl Eq for QualityPredicate {}
+impl std::hash::Hash for QualityPredicate {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl QualityPredicate {
+    fn new(name: &'static str, test: fn(QualityFlag) -> bool) -> Self {
+        Self {
+            name,
+            test,
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for QualityPredicate {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, flags) = as_quality(&args)?;
+        let out: crate::arrow::array::BooleanArray =
+            flags.iter().map(|q| q.map(|q| (self.test)(q))).collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// `quality_market_code(quality)` — the MSCONS `QTY` Mengen-Qualifier, or null.
+///
+/// `220` Wahrer Wert, `67` Ersatzwert, `187` Prognosewert, `Z18` Vorläufiger
+/// Wert, `20` Nicht verwendbarer Wert — what a consumer building an MSCONS out
+/// of the warehouse puts in the message.
+///
+/// **Null is an answer, not a gap.** `CALCULATED`, `CORRECTED` and `UNKNOWN`
+/// have no qualifier of their own, and
+/// [`QualityFlag::market_code`](metering::QualityFlag::market_code) says what the
+/// market uses instead. Returning the nearest-looking code would put a claim in a
+/// message nobody made, so the rows a writer must resolve first are exactly the
+/// ones this cannot answer for:
+///
+/// ```sql
+/// SELECT DISTINCT quality FROM readings
+/// WHERE quality_market_code(quality) IS NULL;
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct QualityMarketCode {
+    signature: Signature,
+}
+
+impl Default for QualityMarketCode {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for QualityMarketCode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "quality_market_code"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let (_, flags) = as_quality(&args)?;
+        let out: StringArray = flags
+            .iter()
+            .map(|q| q.and_then(|q| q.market_code()))
+            .collect();
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
@@ -1052,7 +1199,19 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::from(EicRegelzone::default()),
         ScalarUDF::from(EicObjectType::default()),
         ScalarUDF::from(EicNormalise::default()),
+        ScalarUDF::from(QualityMarketCode::default()),
     ];
+    // The two statutory questions asked of a stored quality flag, delegated
+    // upstream for the reason completeness delegates the first of them.
+    for (name, test) in [
+        (
+            "quality_is_billable",
+            QualityFlag::is_billable as fn(QualityFlag) -> bool,
+        ),
+        ("quality_is_provisional", QualityFlag::is_provisional),
+    ] {
+        udfs.push(ScalarUDF::from(QualityPredicate::new(name, test)));
+    }
     // One-to-one with `metering::obis`'s own predicates. Listed rather than
     // generated so that adding one upstream is a deliberate act here, and so the
     // SQL name and the method it wraps sit on the same line.
@@ -1092,6 +1251,105 @@ mod tests {
             ctx.register_udf(udf);
         }
         ctx
+    }
+
+    async fn one_str(sql: &str) -> Option<String> {
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let array = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 result");
+        (!array.is_null(0)).then(|| array.value(0).to_string())
+    }
+
+    async fn one_bool_q(sql: &str) -> Option<bool> {
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let array = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::BooleanArray>()
+            .expect("boolean result");
+        (!array.is_null(0)).then(|| array.value(0))
+    }
+
+    #[tokio::test]
+    async fn quality_market_code_is_the_qty_qualifier() {
+        // The codes an MSCONS writer puts in the message, read off the stored
+        // column rather than mapped by hand at every consumer.
+        assert_eq!(
+            one_str("SELECT quality_market_code('MEASURED')")
+                .await
+                .as_deref(),
+            Some("220")
+        );
+        assert_eq!(
+            one_str("SELECT quality_market_code('SUBSTITUTED')")
+                .await
+                .as_deref(),
+            Some("67")
+        );
+        assert_eq!(
+            one_str("SELECT quality_market_code('ESTIMATED')")
+                .await
+                .as_deref(),
+            Some("187")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flag_with_no_qualifier_is_null_rather_than_the_nearest_code() {
+        // The useful half of the answer: these are the rows a message writer has
+        // to resolve before it can transmit anything, and a nearest-looking code
+        // would put a claim in a market message that nobody made.
+        for flag in ["CALCULATED", "CORRECTED", "UNKNOWN"] {
+            assert_eq!(
+                one_str(&format!("SELECT quality_market_code('{flag}')")).await,
+                None,
+                "{flag} has no QTY qualifier of its own"
+            );
+        }
+        assert_eq!(one_str("SELECT quality_market_code(NULL)").await, None);
+    }
+
+    #[tokio::test]
+    async fn billability_is_metering_s_rule_reaching_sql() {
+        // § 60 Abs. 2 MsbG, asked of the column rather than spelled out as an
+        // `IN` list that stops agreeing with the statute the day the list moves.
+        assert_eq!(
+            one_bool_q("SELECT quality_is_billable('MEASURED')").await,
+            Some(true)
+        );
+        assert_eq!(
+            one_bool_q("SELECT quality_is_billable('SUBSTITUTED')").await,
+            Some(true)
+        );
+        assert_eq!(
+            one_bool_q("SELECT quality_is_billable('FAULTY')").await,
+            Some(false)
+        );
+        assert_eq!(
+            one_bool_q("SELECT quality_is_provisional('PRELIMINARY')").await,
+            Some(true)
+        );
+        assert_eq!(one_bool_q("SELECT quality_is_billable(NULL)").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_quality_outside_the_code_list_is_an_error() {
+        // The column is written from `QualityFlag::as_str` and constrained to
+        // that list, so a value outside it means something else wrote the
+        // warehouse. Answering "not billable" would let the row pass a filter as
+        // though the question had been asked and settled.
+        assert!(
+            ctx()
+                .sql("SELECT quality_is_billable('probably fine')")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .is_err()
+        );
     }
 
     async fn one_date(sql: &str) -> Option<Date> {

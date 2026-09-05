@@ -604,6 +604,43 @@ a reader can see which three rules it rests on. The total-vs-tariff rule stays i
 application code for the same reason: it describes two registers' coverage, not
 one row.
 
+## Quality is a code list, and the questions asked of it are statutory
+
+`quality` holds `metering`'s own spelling — `MEASURED`, `SUBSTITUTED`,
+`ESTIMATED`, `PRELIMINARY`, `FAULTY`, `CALCULATED`, `CORRECTED`, `UNKNOWN`.
+
+| Function | |
+|---|---|
+| `quality_is_billable` | § 60 Abs. 2 MsbG, asked of the column |
+| `quality_is_provisional` | Whether the value is still expected to change |
+| `quality_market_code` | The MSCONS `QTY` Mengen-Qualifier, or **null** |
+
+```sql
+-- Not `quality IN ('MEASURED', 'SUBSTITUTED')`, which is a copy of a statute
+-- that stops agreeing with it the day the list moves.
+SELECT malo_id, SUM(value) FROM readings
+ WHERE quality_is_billable(quality)
+ GROUP BY 1;
+```
+
+`quality_market_code` is what a consumer building an MSCONS out of the warehouse
+needs: `220` Wahrer Wert, `67` Ersatzwert, `187` Prognosewert, `Z18` Vorläufiger
+Wert, `20` Nicht verwendbarer Wert.
+
+**Null is an answer.** `CALCULATED`, `CORRECTED` and `UNKNOWN` have no qualifier
+of their own — the market expresses each another way — so the rows a message
+writer must resolve before transmitting are exactly the ones this returns null
+for:
+
+```sql
+SELECT DISTINCT quality FROM readings
+ WHERE quality_market_code(quality) IS NULL;
+```
+
+A value outside the code list is an **error**, not a null: the column is
+constrained to that list, so anything else means something wrote the warehouse
+that should not have.
+
 ## The other stored identifier
 
 | Function | Returns |

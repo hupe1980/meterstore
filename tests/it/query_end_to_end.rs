@@ -183,6 +183,7 @@ impl Harness {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+                D18,
             )
             .await
             .expect("seed watermark");
@@ -237,6 +238,164 @@ impl Harness {
             .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
             .value(0)
     }
+}
+
+#[tokio::test]
+async fn a_plan_built_before_archival_still_reads_the_window_archival_moved() {
+    // The one place the tiering invariant is observable broken, and it is a
+    // *reader* that observes it.
+    //
+    // A query decides its tier split from the watermark it reads when it is
+    // **planned**, and reads the tiers when it **executes**. Archival between
+    // those two moments moves a window from hot to cold: the plan is already
+    // asking PostgreSQL for `[W, …)` and Iceberg for `[…, W)`, so if the hot
+    // partition is gone by the time the plan runs, the window is in neither
+    // half — one day short, silently, on the settlement query most likely to be
+    // long enough to overlap a maintenance cycle.
+    //
+    // The fix is that archival does not reclaim the partition it just archived;
+    // `reader_grace` keeps it detached, and a detached partition is still read.
+    // This test is the regression, so it splits `plan` from `execute`
+    // deliberately — which is exactly what `DataFrame::collect` does in one step.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let ctx = store.context();
+
+    // Plan now — this is where the watermark is read.
+    let plan = store
+        .sql(&format!(r#"SELECT count(*) AS n FROM "{TABLE}""#))
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+
+    // Archival runs while the plan is held, moving two days out of PostgreSQL.
+    h.archive_through(ARCHIVE_AS_OF).await;
+    let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
+        .fetch_one(h.hot.pool())
+        .await
+        .unwrap();
+    assert_eq!(still_hot, 96, "two days should have left the parent table");
+
+    // Execute the plan built against the older boundary.
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("execute");
+    use datafusion::arrow::array::AsArray;
+    let n = batches[0]
+        .column(0)
+        .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+        .value(0);
+
+    assert_eq!(
+        n, 288,
+        "a plan made before the boundary moved must still see every row; \
+         got {n} of 288, so archival reclaimed a partition a live plan needed"
+    );
+}
+
+#[tokio::test]
+async fn the_reported_boundary_is_the_one_the_plan_was_built_against() {
+    // P1 says correctness is observable rather than assumed, and the observable
+    // is this label. It was read separately from the split that used it — once
+    // before planning for the report, once during planning by each provider — so
+    // an archival commit in between made the label name a boundary the answer was
+    // not computed against. Over several tables it compounded: every provider
+    // read its own, at its own moment.
+    //
+    // The boundary now travels with the plan, so the two cannot differ. The
+    // observable property is that a query reports the split it actually used:
+    // rows below the reported watermark came from Iceberg, rows at or above it
+    // from PostgreSQL, and the counts add up.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let result = store
+        .query(&format!(r#"SELECT count(*) AS n FROM "{TABLE}""#))
+        .await
+        .expect("query");
+
+    let reported = result.watermark();
+    assert_eq!(
+        reported.get(),
+        D20,
+        "the reported boundary must be the live one"
+    );
+
+    // The rows the answer was computed from, split at the boundary it claims.
+    let below: i64 = h
+        .scalar(
+            ReadMode::Unified,
+            &format!(
+                r#"SELECT count(*) FROM "{TABLE}" WHERE "from" < TIMESTAMP '2026-07-20T00:00:00Z'"#
+            ),
+        )
+        .await;
+    let at_or_above: i64 = h
+        .scalar(
+            ReadMode::Unified,
+            &format!(
+                r#"SELECT count(*) FROM "{TABLE}" WHERE "from" >= TIMESTAMP '2026-07-20T00:00:00Z'"#
+            ),
+        )
+        .await;
+    assert_eq!(below, 192, "two days are below the reported boundary");
+    assert_eq!(at_or_above, 96, "one day is at or above it");
+    assert!(
+        result.touched_hot_tier(),
+        "and the answer says it read the hot tier, because it did"
+    );
+}
+
+#[tokio::test]
+async fn describing_a_statement_agrees_with_running_it() {
+    // `describe` is what a Flight SQL client calls before it starts rendering a
+    // stream, and its whole justification is that answering by *running* the
+    // query would cost two scans. That only holds if the two surfaces cannot
+    // disagree — so the description has to come off the same physical plan the
+    // run does, not off the logical one, where nullability and field metadata
+    // are not yet settled.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
+    h.archive_through(ARCHIVE_AS_OF).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let sql = format!(r#"SELECT malo_id, sum(value) AS kwh FROM "{TABLE}" GROUP BY 1"#);
+
+    let described = store.describe(&sql).await.expect("describe");
+    let ran = store.query(&sql).await.expect("query");
+
+    assert_eq!(
+        described.schema().as_ref(),
+        ran.schema().as_ref(),
+        "a description that does not match the result is worse than no description"
+    );
+    assert_eq!(described.watermark(), ran.watermark());
+    assert_eq!(described.touched_hot_tier(), ran.touched_hot_tier());
 }
 
 #[tokio::test]
@@ -1347,6 +1506,7 @@ async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            D18,
         )
         .await
         .expect("seed watermark");

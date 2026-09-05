@@ -1892,12 +1892,18 @@ fn pg_ddl(relation: &str, operation: &str, timeout: Duration, e: sqlx::Error) ->
 /// Which partitions a catalog lookup should return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attachment {
-    /// Attached and detached alike. A detached partition still holds rows, so
-    /// anything deciding whether a time range is empty has to see it.
+    /// Attached and detached alike.
+    ///
+    /// What a **scan** wants, always: a detached partition still holds its rows,
+    /// and the whole reason the hot tier is read partition by partition is that
+    /// a relation's contents do not change when its parentage does.
     Any,
     /// Detached only — a standalone relation still carrying the naming
-    /// convention but with no parent in `pg_inherits`, which is what an
-    /// interrupted archival run leaves behind.
+    /// convention but with no parent in `pg_inherits`.
+    ///
+    /// What a *reclamation* wants: this is the set of partitions whose window is
+    /// already durable in the cold tier and whose space is waiting on the reader
+    /// grace, plus anything an interrupted run left behind.
     Detached,
 }
 
@@ -2032,7 +2038,7 @@ impl HotStore for PostgresHot {
         }
 
         let mut created = Vec::new();
-        let mut start = crate::watermark::align_to_step(from, step);
+        let mut start = crate::watermark::align_to_step(from, step)?;
 
         while start < until {
             let id = PartitionId::new(table, start);
@@ -2156,41 +2162,62 @@ impl HotStore for PostgresHot {
             return Ok(Box::pin(futures::stream::empty()));
         }
 
-        // The parent, **plus whatever is currently detached from it**.
+        // **Partition by partition, never through the parent.**
         //
-        // Archival detaches a partition before it reads it and drops it only
-        // after the cold commit lands (§8.2). Between those two moments the
-        // rows are in neither relation a query would look at: the parent no
-        // longer inherits them, Iceberg has not been told about them yet, and
-        // the watermark — which is published *by* that commit — still says the
-        // hot tier owns the range. A scan of the parent alone therefore returns
-        // a whole window short for as long as writing it takes, which for a day
-        // at metering volume is not an instant, and reports nothing.
+        // Archival detaches a partition before reading it and leaves it detached
+        // until a later cycle reclaims it. Throughout that window the rows still
+        // belong to the hot tier — the watermark is published by the *commit*,
+        // not by the detach — so a query asking for the range must find them.
         //
-        // Including the detached relations closes that window, and cannot
-        // double-count. A detached partition is in exactly one of two states:
+        // A partition relation is stable under a detach: it keeps its name, its
+        // rows and its identity, and only its parentage changes. So enumerating
+        // the partitions and scanning each by name reads the same rows whatever
+        // archival does in between, and reads each exactly once.
         //
-        // * **Mid-archival** — not yet in Iceberg, and the watermark has not
-        //   passed it, so this scan's range (which starts at the watermark)
-        //   covers it and it is read from here. Correct, and read once.
-        // * **Orphaned** — the commit landed, so the watermark is past it and
-        //   the range starts above it. The `from` predicate excludes every row.
-        //   It also covers the third state, an orphan whose commit *failed*:
-        //   those rows are below no watermark, so they are read here and stay
-        //   visible while an operator repairs the run.
+        // Scanning the parent and adding whatever is currently detached is two
+        // reads of one catalogue: a detach landing between them puts the
+        // partition in neither, and a whole window vanishes with nothing to
+        // report.
         //
-        // The cost is one `pg_class` lookup per scan, which is a fraction of
-        // what the tiered provider already pays to read the watermark.
-        let mut streams: Vec<BatchStream> = vec![self.chunked_scan(table, range, spec)];
-        for partition in partitions_of(&self.pool, table, Attachment::Detached).await? {
+        // A partition created after the enumeration is not scanned — it can only
+        // hold rows written after a query was entitled to see them.
+        let partitions = partitions_of(&self.pool, table, Attachment::Any).await?;
+
+        // Ascending, and each one's exclusive upper bound is the next one's
+        // start — the *actual* layout rather than the configured step, so an
+        // idle stretch that left a gap in the grid over-estimates a partition's
+        // reach and includes it. Over-inclusion costs a scan that returns
+        // nothing; under-inclusion loses rows.
+        let mut streams: Vec<BatchStream> = Vec::new();
+        for (i, partition) in partitions.iter().enumerate() {
+            let start = partition.start();
+            let end = partitions.get(i + 1).map(|next| next.start());
+
+            let starts_after_range = range.end().is_some_and(|to| start >= to);
+            let ends_before_range = match (end, range.start()) {
+                (Some(end), Some(from)) => end <= from,
+                _ => false,
+            };
+            if starts_after_range || ends_before_range {
+                continue;
+            }
+
             let name = partition.relation_name()?;
-            debug!(table, partition = %name, "including a detached partition in the scan");
+            debug!(table, partition = %name, "scanning a hot partition");
             streams.push(self.chunked_scan(&name, range, spec));
         }
 
         match streams.len() {
+            // No partition can hold a row in range, so neither can the table.
+            0 => Ok(Box::pin(futures::stream::empty())),
             1 => Ok(streams.pop().expect("length checked")),
-            _ => Ok(Box::pin(futures::stream::select_all(streams))),
+            // Sequential rather than interleaved: the partitions are disjoint, so
+            // nothing is gained by polling them together, and one page in flight
+            // at a time keeps a wide scan from holding a connection per partition.
+            _ => {
+                use futures::StreamExt;
+                Ok(Box::pin(futures::stream::iter(streams).flatten()))
+            }
         }
     }
 
@@ -2303,7 +2330,8 @@ mod tests {
         // and archives as empty (§7.2). This asserts the hot tier uses the
         // shared one rather than a private copy.
         assert_eq!(
-            crate::watermark::align_to_step(datetime!(2026-07-20 13:47:03 UTC), Duration::DAY),
+            crate::watermark::align_to_step(datetime!(2026-07-20 13:47:03 UTC), Duration::DAY)
+                .unwrap(),
             datetime!(2026-07-20 00:00 UTC)
         );
     }

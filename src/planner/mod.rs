@@ -34,7 +34,7 @@ pub use calendar::{
     balancing_month_bounds, bilanzierungsmonat, day_boundary, expected_intervals_in_balancing_day,
 };
 pub use predicate::{range_filters, time_range};
-pub use provider::{ReadMode, SnapshotSelector, TieredTableProvider};
+pub use provider::{PlannedWatermarks, ReadMode, SnapshotSelector, TieredTableProvider};
 pub use resolved::ResolvedTableProvider;
 pub use split::{TierSplit, TimeRange, split};
 pub use version::{FileStats, Resolution, VersionStats, resolution_sql};

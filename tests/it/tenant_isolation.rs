@@ -444,6 +444,7 @@ async fn identity_columns_survive_archival_into_the_cold_tier() {
             stream_of(Vec::new()),
             WriteHints::default(),
             meterstore::watermark::ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            D20,
         )
         .await
         .expect("seed watermark");

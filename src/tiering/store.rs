@@ -41,6 +41,13 @@ pub struct ScanSpec {
     extra: Vec<String>,
     /// Rows per round trip, or `None` for the store's own default.
     chunk_rows: Option<usize>,
+    /// The partition granularity, or `None` if the caller did not say.
+    ///
+    /// A scan that knows the step knows a detached partition's exclusive end
+    /// from its start, and can therefore skip one that cannot hold a row in
+    /// range. Without it such a partition is scanned and returns nothing —
+    /// correct, and wasted.
+    partition_step: Option<time::Duration>,
 }
 
 impl ScanSpec {
@@ -50,6 +57,7 @@ impl ScanSpec {
             merge_key,
             extra,
             chunk_rows: None,
+            partition_step: None,
         }
     }
 
@@ -68,6 +76,17 @@ impl ScanSpec {
     /// The configured chunk size, if the caller set one.
     pub fn chunk_rows(&self) -> Option<usize> {
         self.chunk_rows
+    }
+
+    /// Declare the partition granularity of the table being scanned.
+    pub fn with_partition_step(mut self, step: time::Duration) -> Self {
+        self.partition_step = (step > time::Duration::ZERO).then_some(step);
+        self
+    }
+
+    /// The partition granularity, if the caller declared one.
+    pub fn partition_step(&self) -> Option<time::Duration> {
+        self.partition_step
     }
 
     /// A spec for a table with no deployment columns.
@@ -147,7 +166,12 @@ pub fn partitions_ahead(
     now: OffsetDateTime,
     step: time::Duration,
 ) -> usize {
-    let frontier = crate::watermark::align_to_step(now, step);
+    // An instant that cannot be aligned is one no partition could ever hold, so
+    // the honest count is zero — the same reading as "the frontier is exhausted",
+    // which is what `partitions_ahead` is alerted on.
+    let Ok(frontier) = crate::watermark::align_to_step(now, step) else {
+        return 0;
+    };
     starts.iter().filter(|start| **start >= frontier).count()
 }
 
@@ -203,6 +227,16 @@ impl PartitionId {
     /// The partition's inclusive lower bound.
     pub fn start(&self) -> OffsetDateTime {
         self.start
+    }
+
+    /// The partition's exclusive upper bound, given the granularity it was
+    /// created at.
+    ///
+    /// The identifier records only the start, because that is what the relation
+    /// name carries; the step comes from the table's configuration and is the
+    /// same for every partition of it.
+    pub fn end(&self, step: time::Duration) -> OffsetDateTime {
+        self.start + step
     }
 
     /// Recover a partition identifier from a physical relation name.
@@ -485,12 +519,18 @@ pub trait ColdStore: Send + Sync {
     /// Atomicity is the whole contract: the rows and the watermark that
     /// describes them must become durable together, or a crash leaves a
     /// watermark claiming data that was never written.
+    ///
+    /// `now` is the caller's clock, recorded in the summary as
+    /// [`ARCHIVED_AT_PROPERTY`](crate::watermark::ARCHIVED_AT_PROPERTY). It is
+    /// what the reader grace is measured against, so that every archival
+    /// decision reads the same clock rather than half of them reading Iceberg's.
     async fn append_and_commit(
         &self,
         table: &str,
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        now: OffsetDateTime,
     ) -> Result<CommitInfo>;
 
     /// Expire snapshots older than `retain_for`, keeping at least `retain_last`.
@@ -615,6 +655,12 @@ pub struct SnapshotInfo {
     /// out-of-band compaction, say. Those are legitimate and readable; they just
     /// do not move the tier boundary.
     pub watermark: Option<TieringWatermark>,
+    /// When *this crate* committed it, on the clock the caller supplied.
+    ///
+    /// Distinct from [`committed_at`](Self::committed_at), which is Iceberg's
+    /// own timestamp and therefore a different clock. `None` for a foreign
+    /// commit, and for a store that does not record one.
+    pub archived_at: Option<OffsetDateTime>,
     /// Rows the commit added, as recorded in its summary.
     pub rows: Option<u64>,
 }
@@ -744,9 +790,10 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        now: OffsetDateTime,
     ) -> Result<CommitInfo> {
         (**self)
-            .append_and_commit(table, batches, hints, window)
+            .append_and_commit(table, batches, hints, window, now)
             .await
     }
 

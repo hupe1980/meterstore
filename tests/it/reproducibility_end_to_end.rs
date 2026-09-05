@@ -176,6 +176,7 @@ impl Harness {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+                D18,
             )
             .await
             .expect("seed watermark");
@@ -774,6 +775,7 @@ async fn a_contended_archiver_does_nothing_rather_than_racing() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            D18,
         )
         .await
         .unwrap();
@@ -1132,6 +1134,7 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            D18,
         )
         .await
         .unwrap();
@@ -1193,6 +1196,7 @@ async fn writes_during_archival_are_never_stranded_below_the_watermark() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            D18,
         )
         .await
         .unwrap();

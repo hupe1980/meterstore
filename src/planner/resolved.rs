@@ -103,20 +103,21 @@ impl ResolvedTableProvider {
         }
     }
 
-    /// Whether this scan can skip resolution, against a known watermark.
+    /// Whether resolution can be skipped without reading statistics.
     ///
-    /// Errors are not propagated: failing to *prove* elision is not a query
-    /// failure, it just means doing the work. A statistics read that fails
-    /// should make the query slow, never wrong and never broken.
+    /// `None` means the cheap checks were inconclusive and the decision needs
+    /// the per-file statistics — which is the only case where the *order* of the
+    /// two catalogue reads matters, and therefore the only case
+    /// [`resolution_from_stats`](Self::resolution_from_stats) is reached.
     ///
     /// The watermark is passed in rather than read here, and the scan then uses
     /// the same value. Reading it twice left a window in which archival advanced
     /// the boundary between the decision and the scan.
-    async fn resolution_for(
+    fn resolution_without_stats(
         &self,
         watermark: crate::watermark::TieringWatermark,
         filters: &[Expr],
-    ) -> Resolution {
+    ) -> Option<Resolution> {
         // A pinned read is judged from statistics of the *current* snapshot,
         // which describe files the pinned snapshot may not contain and miss
         // corrections it does. A version ceiling and a transaction-time ceiling
@@ -124,7 +125,7 @@ impl ResolvedTableProvider {
         // read always resolves rather than eliding — eliding would scan the raw
         // rows directly and bypass the ceiling entirely.
         if self.raw.mode().forces_resolution() {
-            return Resolution::Required;
+            return Some(Resolution::Required);
         }
 
         let split = self.raw.split_at(watermark, filters);
@@ -132,11 +133,43 @@ impl ResolvedTableProvider {
         // Any hot rows in range: the hot tier has no per-file statistics, so
         // nothing here can prove it correction-free.
         if split.hot.is_some() {
-            return Resolution::Required;
+            return Some(Resolution::Required);
         }
-        let Some(cold) = split.cold else {
+        if split.cold.is_none() {
             // Neither tier in range — an empty scan resolves to itself.
-            return Resolution::Elided;
+            return Some(Resolution::Elided);
+        }
+        None
+    }
+
+    /// The decision the per-file statistics support.
+    ///
+    /// # This is read *after* the scan is built, and that ordering is the point
+    ///
+    /// `IcebergTableProvider::scan` loads the table when it is called and pins
+    /// the snapshot it found; `version_stats` loads the table when *it* is
+    /// called. Two loads, two snapshots — and read in the other order, a late
+    /// correction committing between them would be present in the scan and
+    /// absent from the evidence. Elision would fire on statistics that did not
+    /// describe the files about to be read, and the corrected interval would come
+    /// back twice, in a settlement figure, with nothing reporting it.
+    ///
+    /// Read afterwards, the statistics come from a snapshot **at least as new**
+    /// as the scan's. A file the statistics know about and the scan will not read
+    /// can only add overlap, and overlap only ever pushes the decision towards
+    /// `Required` — the direction this module is already committed to, where
+    /// being wrong costs a window function and never a wrong number.
+    ///
+    /// Errors are not propagated: failing to *prove* elision is not a query
+    /// failure, it just means doing the work. A statistics read that fails should
+    /// make the query slow, never wrong and never broken.
+    async fn resolution_from_stats(
+        &self,
+        watermark: crate::watermark::TieringWatermark,
+        filters: &[Expr],
+    ) -> Resolution {
+        let Some(cold) = self.raw.split_at(watermark, filters).cold else {
+            return Resolution::Required;
         };
 
         // An open bound means "everything the tier holds on that side", so it
@@ -177,8 +210,28 @@ impl TableProvider for ResolvedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let watermark = self.raw.watermark().await?;
-        let resolution = self.resolution_for(watermark, filters).await;
+        let watermark = match super::PlannedWatermarks::of(state, &self.table) {
+            Some(pinned) => pinned,
+            None => self.raw.watermark().await?,
+        };
+
+        // Where the cheap checks settle it, nothing is built speculatively.
+        // Where they do not, the raw scan is built **first** so the statistics
+        // that judge it are read from a snapshot at least as new as the one it
+        // pinned — see `resolution_from_stats`.
+        let (resolution, raw_scan) = match self.resolution_without_stats(watermark, filters) {
+            Some(decided) => (decided, None),
+            None => {
+                let scan = self
+                    .raw
+                    .scan_at(state, watermark, projection, filters, limit)
+                    .await?;
+                (
+                    self.resolution_from_stats(watermark, filters).await,
+                    Some(scan),
+                )
+            }
+        };
 
         let metrics = crate::observe::metrics();
         let attrs = crate::observe::table(&self.table);
@@ -190,11 +243,16 @@ impl TableProvider for ResolvedTableProvider {
         if resolution.is_elided() {
             // The raw table already emits one row per key, so it *is* the
             // resolved table for this range — scanned against the same watermark
-            // the elision decision was made against.
-            return self
-                .raw
-                .scan_at(state, watermark, projection, filters, limit)
-                .await;
+            // the elision decision was made against, and against the snapshot the
+            // statistics were judged against.
+            return match raw_scan {
+                Some(scan) => Ok(scan),
+                None => {
+                    self.raw
+                        .scan_at(state, watermark, projection, filters, limit)
+                        .await
+                }
+            };
         }
 
         let mut builder = LogicalPlanBuilder::from(self.resolution.clone());

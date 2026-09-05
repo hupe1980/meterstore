@@ -540,22 +540,21 @@ impl MeterCatalog {
         Ok(out)
     }
 
-    /// Anonymise every subject whose readings **in every table** predate `cutoff`.
+    /// Destroy every linkage whose collection year has passed `cutoff`.
     ///
-    /// # Why not [`MeterStore::anonymise_before`] run per table
+    /// # Identical to [`MeterStore::anonymise_before`], and that is the point
     ///
     /// The subject registry is deployment-wide: one `meterstore_subject_map`
-    /// keyed by natural identifier, so two tables registering the same identifier
-    /// share one [`SubjectRef`] and one erasure unlinks both. Swept per table, the
-    /// first to reach the ceiling destroys a linkage the others still depend on —
-    /// a measuring point whose Lastgang stopped three years ago but whose register
-    /// readings are current has the live ones orphaned, irreversibly, and nothing
-    /// reports it, because from that table's view the subject really had passed
-    /// the ceiling.
+    /// keyed by `(natural identifier, collection year)`, so two tables that
+    /// register the same identifier for the same year share one [`SubjectRef`]
+    /// and one expiry unlinks both.
     ///
-    /// So the cutoff is applied to the **latest reading in the deployment**. A
-    /// table declaring no subject column contributes nothing: its rows carry no
-    /// reference to the subject at all.
+    /// What comes due is decided by the calendar against the `epoch` column, so
+    /// neither this nor the per-table form reads a reading — which is why they
+    /// cannot disagree. An earlier design applied the cutoff to the *latest
+    /// reading in the deployment*, and needed this method to exist because the
+    /// per-table form would then destroy a linkage another table still depended
+    /// on. That hazard is gone with the rule that created it.
     ///
     /// Idempotent and safe on a schedule; see
     /// [`Maintenance::anonymise_after`](super::Maintenance::anonymise_after).
@@ -572,11 +571,19 @@ impl MeterCatalog {
     }
 }
 
-/// The catalog-wide retention sweep, over any set of stores.
+/// The deployment-wide retention sweep, over any set of stores.
 ///
-/// Shared with [`Maintenance`](super::Maintenance), whose store list is the same
-/// one a catalog holds — so the scheduled sweep and the manual one cannot come to
-/// different conclusions about which subjects are due.
+/// Shared with [`Maintenance`](super::Maintenance), so the scheduled sweep and
+/// the manual one cannot come to different conclusions.
+///
+/// # It reads no table
+///
+/// The mapping row carries the collection year it may attribute, so what comes
+/// due is decided by the calendar and an indexed `epoch` column — not by
+/// `max("from")` over whatever a session can see. The stores are consulted only
+/// to find the registry and to check that some table actually stores a subject
+/// reference, which is the difference between "nothing was due" and "this
+/// deployment has no linkage to destroy".
 pub(crate) async fn anonymise_across<'a>(
     stores: impl Iterator<Item = &'a MeterStore>,
     cutoff: OffsetDateTime,
@@ -584,28 +591,15 @@ pub(crate) async fn anonymise_across<'a>(
     actor: &str,
     now: OffsetDateTime,
 ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-    let mut latest: BTreeMap<String, OffsetDateTime> = BTreeMap::new();
     let mut registry = None;
     let mut subject_tables = 0usize;
 
     for store in stores {
-        // Checked per table and before anything is erased. A subject's due-date
-        // is `max(from)` across the deployment, so one table reading a pinned or
-        // half-visible view understates it — and the sweep would erase a subject
-        // whose live readings that table simply could not see. Erasure has no
-        // recovery path.
-        store.require_current_knowledge("the retention sweep")?;
-        let Some(seen) = store.subject_last_seen().await? else {
+        if store.config().subject_column().is_none() {
             continue;
-        };
+        }
         subject_tables += 1;
         registry = registry.or_else(|| store.subject_registry());
-        for (reference, at) in seen {
-            latest
-                .entry(reference)
-                .and_modify(|held| *held = (*held).max(at))
-                .or_insert(at);
-        }
     }
 
     if subject_tables == 0 {
@@ -622,22 +616,9 @@ pub(crate) async fn anonymise_across<'a>(
         )
     })?;
 
-    let due: Vec<String> = latest
-        .into_iter()
-        .filter(|(_, last)| *last < cutoff)
-        .map(|(reference, _)| reference)
-        .collect();
-
-    let erased = crate::erasure::anonymise(registry, &due, reason, actor, now).await?;
-    if !erased.is_empty() {
-        tracing::warn!(
-            tables = subject_tables,
-            subjects = erased.len(),
-            %cutoff,
-            "anonymised subjects whose readings have passed the retention ceiling"
-        );
-    }
-    Ok(erased)
+    registry
+        .expire_epochs_before(cutoff, reason, actor, now)
+        .await
 }
 
 /// Every relation a logical plan scans, by name.

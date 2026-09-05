@@ -261,6 +261,7 @@ impl TestHarness {
                 crate::tiering::store::stream_of(Vec::new()),
                 crate::tiering::store::WriteHints::default(),
                 ArchivalWindow::new(at - step, at)?,
+                at,
             )
             .await
             .map(|_| ())

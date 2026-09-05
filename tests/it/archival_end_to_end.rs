@@ -241,6 +241,7 @@ async fn archives_a_window_end_to_end() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            D20,
         )
         .await
         .unwrap();
@@ -262,7 +263,13 @@ async fn the_watermark_survives_being_read_back_from_the_snapshot() {
 
     let window = ArchivalWindow::new(D20, D21).unwrap();
     h.cold
-        .append_and_commit(TABLE, stream_of(Vec::new()), WriteHints::default(), window)
+        .append_and_commit(
+            TABLE,
+            stream_of(Vec::new()),
+            WriteHints::default(),
+            window,
+            NOW,
+        )
         .await
         .unwrap();
 
@@ -278,7 +285,7 @@ async fn the_watermark_advances_monotonically_across_commits() {
     for (from, to) in [(D20, D21), (D21, D22)] {
         let w = ArchivalWindow::new(from, to).unwrap();
         h.cold
-            .append_and_commit(TABLE, stream_of(Vec::new()), WriteHints::default(), w)
+            .append_and_commit(TABLE, stream_of(Vec::new()), WriteHints::default(), w, NOW)
             .await
             .unwrap();
         assert_eq!(h.cold.watermark(TABLE).await.unwrap().get(), to);
@@ -296,6 +303,7 @@ async fn a_correction_append_does_not_move_the_watermark() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            D21,
         )
         .await
         .unwrap();
@@ -325,6 +333,7 @@ async fn catch_up_drains_a_backlog_and_then_stops() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            D20,
         )
         .await
         .unwrap();
@@ -357,6 +366,7 @@ async fn the_invariant_holds_after_archival() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            D20,
         )
         .await
         .unwrap();
@@ -388,6 +398,7 @@ async fn an_orphan_from_an_interrupted_run_is_reclaimed() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            D21,
         )
         .await
         .unwrap();
@@ -416,6 +427,7 @@ async fn parquet_files_are_actually_written_to_the_warehouse() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            D20,
         )
         .await
         .unwrap();
@@ -466,6 +478,7 @@ async fn snapshot_expiry_bounds_metadata_growth() {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(from, to).unwrap(),
+                to,
             )
             .await
             .unwrap();
@@ -507,6 +520,7 @@ async fn expiry_removes_exactly_what_meterstore_selected() {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(from, to).unwrap(),
+                to,
             )
             .await
             .unwrap();
@@ -565,6 +579,7 @@ async fn expiry_never_removes_the_current_snapshot() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            D21,
         )
         .await
         .unwrap();
@@ -600,6 +615,7 @@ async fn expiry_cannot_strand_the_boundary_behind_a_foreign_commit() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            D21,
         )
         .await
         .unwrap();
@@ -635,6 +651,7 @@ async fn the_boundary_can_be_restamped_onto_a_foreign_snapshot() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            D21,
         )
         .await
         .unwrap();

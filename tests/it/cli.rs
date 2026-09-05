@@ -331,7 +331,10 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
     let catalog = deployment.catalog().await.expect("catalog");
     let store = catalog.table("readings_versions").expect("table");
     let subject = store
-        .register_subject("tenant-a:12345678905")
+        .register_subject(
+            "tenant-a:12345678905",
+            time::macros::datetime!(2026-07-20 00:00 UTC),
+        )
         .await
         .expect("register");
     store

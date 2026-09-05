@@ -34,8 +34,8 @@ use crate::error::{Error, Result};
 use crate::planner::SnapshotSelector;
 use crate::tiering::store::{BatchStream, ColdStore, CommitInfo, SnapshotInfo, WriteHints};
 use crate::watermark::{
-    ARCHIVED_RANGE_PROPERTY, ArchivalWindow, ROW_COUNT_PROPERTY, TieringWatermark,
-    WATERMARK_PROPERTY,
+    ARCHIVED_AT_PROPERTY, ARCHIVED_RANGE_PROPERTY, ArchivalWindow, ROW_COUNT_PROPERTY,
+    TieringWatermark, WATERMARK_PROPERTY,
 };
 
 /// An Iceberg-backed cold tier.
@@ -507,6 +507,10 @@ impl IcebergCold {
                     watermark: properties
                         .get(WATERMARK_PROPERTY)
                         .and_then(|v| TieringWatermark::from_property(v).ok()),
+                    archived_at: properties.get(ARCHIVED_AT_PROPERTY).and_then(|v| {
+                        OffsetDateTime::parse(v, &time::format_description::well_known::Rfc3339)
+                            .ok()
+                    }),
                     rows: properties
                         .get(ROW_COUNT_PROPERTY)
                         .and_then(|v| v.parse().ok()),
@@ -766,8 +770,16 @@ impl IcebergCold {
                 (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
                 (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
             ]);
-            if let Summary::Advance(window) = summary {
+            if let Summary::Advance(window, archived_at) = summary {
                 properties.insert(ARCHIVED_RANGE_PROPERTY.to_string(), window.to_property()?);
+                properties.insert(
+                    ARCHIVED_AT_PROPERTY.to_string(),
+                    archived_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|e| {
+                            crate::error::Error::encode(ARCHIVED_AT_PROPERTY, e.to_string())
+                        })?,
+                );
             }
 
             let txn = Transaction::new(&base);
@@ -922,8 +934,9 @@ impl IcebergCold {
 /// What a commit's snapshot summary should say about the tier boundary.
 #[derive(Debug, Clone, Copy)]
 enum Summary {
-    /// Archival: advance the boundary to the window's exclusive end.
-    Advance(ArchivalWindow),
+    /// Archival: advance the boundary to the window's exclusive end, recording
+    /// the caller's clock so the reader grace is measured on it.
+    Advance(ArchivalWindow, OffsetDateTime),
     /// A late correction: restate whatever the base already published. The
     /// boundary is about which tier owns a range, and a correction does not
     /// change that.
@@ -936,14 +949,14 @@ impl Summary {
         let current = watermark_of(base)?;
         match self {
             Self::Preserve => Ok(current),
-            Self::Advance(window) => {
+            Self::Advance(window, _) => {
                 let next = window.resulting_watermark();
                 // Asserted against the commit base, not only by the caller. An
                 // archiver that read a stale watermark, or a second archiver
                 // racing the first, would otherwise publish a boundary that moves
                 // backwards over rows PostgreSQL has already purged.
                 current
-                    .advance_to(next)
+                    .advance_to(table, next)
                     .map_err(|_| Error::InvariantViolated {
                         table: table.to_string(),
                         detail: format!(
@@ -1252,11 +1265,12 @@ impl ColdStore for IcebergCold {
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        now: OffsetDateTime,
     ) -> Result<CommitInfo> {
         // The watermark rides along in the same commit as the data. That is the
         // atomicity that makes recovery trivial — and the reason the summary is
         // derived from the commit base rather than fixed up front.
-        self.append_with_summary(table, batches, hints, Summary::Advance(window))
+        self.append_with_summary(table, batches, hints, Summary::Advance(window, now))
             .await
     }
 

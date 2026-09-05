@@ -40,10 +40,11 @@ durable together or not at all. There is no external checkpoint store to fall ou
 of sync, and recovery is just reading the watermark back.
 
 **Purge is `DROP TABLE`, never `DELETE`.** The hot table is time-partitioned, so
-archiving a window detaches and drops exactly one partition — an O(1) catalogue
-operation. Deleting a day of readings for 100 k meters row by row would leave
-~9.6 M dead tuples for autovacuum to clean up, competing with the very workload
-the tiering exists to protect.
+an archived window is exactly one partition: detached when it is read, dropped a
+cycle later once no query planned against the old boundary can still need it —
+an O(1) catalogue operation either way. Deleting a day of readings for 100 k
+meters row by row would leave ~9.6 M dead tuples for autovacuum to clean up,
+competing with the very workload the tiering exists to protect.
 
 **Corrections are versions, not overwrites.** The MSCONS application handbook
 specifies that a correction is made by *versioning* the value. Nothing is updated
@@ -101,8 +102,9 @@ Bilanzierungsmonat is a whole number of balancing days,
 **An open format for regulated data.** Standard Iceberg v2 on object storage,
 readable by Spark, Trino, DuckDB, Snowflake and PyIceberg with MeterStore nowhere
 in the data path. For data under a decade-long retention obligation, avoiding
-format lock-in is the whole procurement argument — and it is
-[tested against real engines](@/docs/interop.md), not asserted.
+format lock-in is the whole procurement argument — and the output is
+[read back by DuckDB and PyIceberg](@/docs/interop.md) in the test suite, not
+asserted.
 
 **Time travel as compliance.** MaBiS settlement must be reproducible. Pin an
 Iceberg snapshot plus a version ceiling to reconstruct what was known at a point

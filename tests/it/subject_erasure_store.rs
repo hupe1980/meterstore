@@ -258,7 +258,7 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
 async fn a_registered_reference_is_accepted() {
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821").await.unwrap();
+    let subject = store.register_subject("customer-4821", D20).await.unwrap();
     let outcome = store.append(&[reading(Some(subject.as_str()))]).await;
 
     assert!(outcome.is_ok(), "a live mapping must write: {outcome:?}");
@@ -273,7 +273,7 @@ async fn an_unregistered_reference_is_refused() {
     let (store, _w) = store_with_subjects().await;
 
     let err = store
-        .append(&[reading(Some("sub_deadbeefdeadbeefdeadbeefdeadbeef"))])
+        .append(&[reading(Some("s2026_deadbeefdeadbeefdeadbeefdeadbeef"))])
         .await
         .expect_err("an unbacked reference must be refused");
 
@@ -289,7 +289,7 @@ async fn a_replay_after_erasure_cannot_rebuild_the_link() {
     // hours later a broker redelivers a batch from before it.
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821").await.unwrap();
+    let subject = store.register_subject("customer-4821", D20).await.unwrap();
     store
         .append(&[reading(Some(subject.as_str()))])
         .await
@@ -314,7 +314,7 @@ async fn a_replay_after_erasure_cannot_rebuild_the_link() {
 
     // And the ingest path cannot get a working reference by re-registering.
     assert!(
-        store.register_subject("customer-4821").await.is_err(),
+        store.register_subject("customer-4821", D20).await.is_err(),
         "re-registration must stay suppressed"
     );
 }
@@ -325,7 +325,7 @@ async fn the_readings_survive_erasure_and_stop_being_attributable() {
     // requires them — and what is destroyed is the ability to say whose they are.
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821").await.unwrap();
+    let subject = store.register_subject("customer-4821", D20).await.unwrap();
     store
         .append(&[reading(Some(subject.as_str()))])
         .await
@@ -372,10 +372,16 @@ async fn the_retention_sweep_anonymises_only_subjects_past_the_ceiling() {
     // request for it — it comes due on its own.
     let (store, _w) = store_with_subjects().await;
 
-    let old = store.register_subject("customer-moved-out").await.unwrap();
-    let current = store.register_subject("customer-still-here").await.unwrap();
-
     let long_ago = datetime!(2021-03-01 00:00 UTC);
+    let old = store
+        .register_subject("customer-moved-out", long_ago)
+        .await
+        .unwrap();
+    let current = store
+        .register_subject("customer-still-here", D20)
+        .await
+        .unwrap();
+
     store
         .append(&[reading_at(long_ago, Some(old.as_str()))])
         .await
@@ -428,92 +434,141 @@ async fn the_retention_sweep_anonymises_only_subjects_past_the_ceiling() {
 }
 
 #[tokio::test]
-async fn a_retention_sweep_over_a_catalog_waits_for_every_table() {
-    // The bug this exists for. The registry is deployment-wide, so one erasure
-    // unlinks a subject in *both* tables — which means a per-table sweep run on
-    // the table that reached the ceiling first destroys a linkage the other
-    // table's live readings still depend on. Irreversibly, and with nothing
-    // reporting it, because from that table's point of view the subject really
-    // had passed the ceiling.
+async fn a_reference_from_the_wrong_collection_year_is_refused_at_the_write() {
+    // The guarantee the epoch buys is only real if a reference cannot be used on
+    // another year's readings. Nothing downstream could tell: the column is
+    // well-formed, the reference resolves, and the only symptom would be that the
+    // sweep never comes due for those rows — years later, and unattributably.
+    //
+    // The year is in the reference, so the check costs a string parse.
+    let (store, _w) = store_with_subjects().await;
+
+    let this_year = store
+        .register_subject("customer-4821", D20)
+        .await
+        .expect("register 2026");
+
+    let err = store
+        .append(&[reading_at(OLD, Some(this_year.as_str()))])
+        .await
+        .expect_err("a 2026 reference must not attribute a 2022 reading");
+
+    let msg = err.to_string();
+    assert!(msg.contains("retention epoch"), "{msg}");
+    assert!(msg.contains("2026") && msg.contains("2022"), "{msg}");
+
+    // The right reference for that year is accepted, and it is a different one.
+    let that_year = store
+        .register_subject("customer-4821", OLD)
+        .await
+        .expect("register 2022");
+    assert_ne!(this_year, that_year);
+    store
+        .append(&[reading_at(OLD, Some(that_year.as_str()))])
+        .await
+        .expect("the reference minted for that year is accepted");
+}
+
+#[tokio::test]
+async fn an_article_17_erasure_reaches_every_year_of_a_subject() {
+    // A DSAR names a person, not a year. A caller holding this year's reference
+    // and erasing only this year would be told the request was honoured while
+    // last year's readings stayed attributable.
+    let (store, _w) = store_with_subjects().await;
+    let registry = store.subject_registry().expect("configured");
+
+    let old = store
+        .register_subject("customer-4821", OLD)
+        .await
+        .expect("register 2022");
+    let current = store
+        .register_subject("customer-4821", D20)
+        .await
+        .expect("register 2026");
+
+    let erased = store
+        .erase_subject(&current, "DSAR-2026-0042", "privacy-team", D21)
+        .await
+        .expect("erase");
+
+    assert_eq!(erased.len(), 2, "both years: {erased:?}");
+    assert!(registry.resolve(&old).await.unwrap().is_none());
+    assert!(registry.resolve(&current).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_sweep_expires_one_year_of_a_subject_and_leaves_the_rest() {
+    // The property the earlier design could not provide, and the reason a
+    // reference is scoped to a collection year.
+    //
+    // § 60 Abs. 6 MsbG runs on *"der jeweilige Messwert"*: a value collected in
+    // 2021 comes due at the end of 2024 whether or not the same customer is
+    // still being metered today. Keyed to a subject's *latest* reading — as this
+    // once was — an active customer's decade-old values stayed attributable for
+    // as long as they stayed connected, and the sweep could never say so.
+    //
+    // Keyed to the epoch, the two are independent: 2021 goes, 2026 stays, and
+    // the readings themselves are never consulted.
     let (catalog, _w) = catalog_with_subjects().await;
     let authoritative = catalog.table(TABLE).expect("first table");
     let second = catalog.table(SECOND_TABLE).expect("second table");
+    let registry = authoritative.subject_registry().expect("configured");
 
-    // One subject: old on the authoritative stream, current on the other. The
-    // shape of a measuring point whose Lastgang stopped but whose second stream
-    // is still being delivered.
-    let straddling = authoritative
-        .register_subject("customer-straddling")
+    // One person, two collection years, one natural identifier.
+    let then = authoritative
+        .register_subject("customer-still-here", OLD)
         .await
-        .expect("register");
-    // And one that is old everywhere, which really has come due.
-    let due = authoritative
-        .register_subject("customer-due")
+        .expect("register 2022");
+    let now_ref = authoritative
+        .register_subject("customer-still-here", D20)
         .await
-        .expect("register");
+        .expect("register 2026");
+    assert_ne!(then, now_ref, "a year is its own unit of erasure");
 
-    // Distinct interval starts, because `subject_ref` is an attribute rather than
-    // part of the merge key: two readings sharing `(malo_id, obis_code, from)`
-    // are one reading, and the second would be deduplicated away.
     authoritative
-        .append(&[reading_at(OLD, Some(straddling.as_str()))])
-        .await
-        .expect("old reading");
-    authoritative
-        .append(&[reading_at(OLD + Duration::minutes(15), Some(due.as_str()))])
+        .append(&[reading_at(OLD, Some(then.as_str()))])
         .await
         .expect("old reading");
     second
-        .append(&[reading_at(D20, Some(straddling.as_str()))])
+        .append(&[reading_at(D20, Some(now_ref.as_str()))])
         .await
         .expect("current reading");
 
     let cutoff = datetime!(2023-01-01 00:00 UTC);
-    let registry = authoritative.subject_registry().expect("configured");
-
     let erased = catalog
         .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
         .await
         .expect("sweep");
 
-    assert_eq!(
-        erased.len(),
-        1,
-        "only the subject due everywhere: {erased:?}"
-    );
-    assert_eq!(erased[0].subject, due);
+    assert_eq!(erased.len(), 1, "one epoch came due: {erased:?}");
+    assert_eq!(erased[0].subject, then);
     assert!(
-        registry.resolve(&due).await.unwrap().is_none(),
-        "the subject past the ceiling in every table is unlinked"
+        registry.resolve(&then).await.unwrap().is_none(),
+        "the expired year is unlinked"
     );
     assert!(
-        registry.resolve(&straddling).await.unwrap().is_some(),
-        "a subject still delivering on the second stream must survive: erasing it \
-         would orphan readings that have not come due, in a table the sweep was \
-         not even looking at"
+        registry.resolve(&now_ref).await.unwrap().is_some(),
+        "and the current year is untouched — the same person, still metered"
     );
 
-    // Idempotent across the catalog too.
+    // Idempotent.
     let again = catalog
         .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
         .await
         .expect("second sweep");
     assert!(again.is_empty());
 
-    // And the difference is real rather than a coincidence: the *per-table*
-    // sweep, run on the table that reached the ceiling, does erase the
-    // straddling subject — which is why it is documented as single-table only.
+    // The per-table sweep is the same operation: the registry is
+    // deployment-wide and the epoch is on the mapping row, so neither sweep
+    // looks at a table's contents and the two cannot disagree.
     let per_table = authoritative
         .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
         .await
         .expect("per-table sweep");
-    assert_eq!(
-        per_table.len(),
-        1,
-        "the single-table sweep sees only its own table, so it treats the \
-         straddling subject as due: {per_table:?}"
+    assert!(
+        per_table.is_empty(),
+        "nothing is left due, whichever handle asks: {per_table:?}"
     );
-    assert_eq!(per_table[0].subject, straddling);
 }
 
 #[tokio::test]
@@ -524,7 +579,7 @@ async fn the_scheduled_sweep_is_the_catalog_sweep() {
     let store = catalog.table(TABLE).expect("first table");
 
     let subject = store
-        .register_subject("customer-old")
+        .register_subject("customer-old", OLD)
         .await
         .expect("register");
     store
@@ -603,71 +658,68 @@ async fn declaring_a_subject_column_without_a_registry_fails_at_build() {
 }
 
 #[tokio::test]
-async fn a_sweep_from_a_restricted_view_is_refused_rather_than_erasing_a_live_subject() {
-    // The one place a restricted read mode destroys data instead of misreporting
-    // it. A subject's due-date is `max(from)` over the session running the sweep
-    // — so under `Historical`, which sees the cold tier only, a subject metered
-    // daily looks last-seen at the final archived interval. Old enough to erase,
-    // and still live. Erasure has no recovery path.
+async fn a_sweep_needs_no_session_at_all_so_a_restricted_view_cannot_skew_it() {
+    // A sweep whose due-date came from `max(from)` over the session running it
+    // would be the one operation where a restricted read mode destroys data
+    // rather than misreporting it: under `Historical`, which sees the cold tier
+    // only, a customer metered daily looks last-seen at the final archived
+    // interval — old enough to erase, still live, and no recovery path.
+    //
+    // The epoch is on the mapping row instead, so what comes due is a calendar
+    // fact about a `(subject, year)` pair. No reading is consulted and every
+    // handle gives the same answer, which is why no read mode has to be refused.
     let (store, _w) = store_with_subjects().await;
 
-    let live = store.register_subject("customer-still-here").await.unwrap();
+    let live = store
+        .register_subject("customer-still-here", D20)
+        .await
+        .unwrap();
     store
         .append(&[reading_at(D20, Some(live.as_str()))])
         .await
         .expect("a current reading, in the hot window");
 
+    // A cutoff far in the future: under the old rule every restricted mode would
+    // have found this subject due and erased it.
     let cutoff = datetime!(2030-01-01 00:00 UTC);
 
-    // Every restricted posture is refused, not just the pinned ones: `Historical`
-    // is the dangerous one precisely because it is the mode a reporting service
-    // would already be holding.
     for mode in [
         meterstore::ReadMode::Historical,
         meterstore::ReadMode::Operational,
     ] {
         let restricted = store.in_read_mode(mode).await.expect("derived session");
-        let err = restricted
-            .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
+        let erased = restricted
+            .anonymise_before(
+                datetime!(2023-01-01 00:00 UTC),
+                "§ 60 Abs. 6 MsbG",
+                "job",
+                D21,
+            )
             .await
-            .expect_err("a sweep must not decide from a partial view")
-            .to_string();
-        assert!(err.contains("anonymise_before"), "{mode:?}: {err}");
+            .expect("a sweep decides from the calendar, not from what it can see");
+        assert!(erased.is_empty(), "{mode:?} erased {erased:?}");
         assert!(
-            err.contains("Use the store this one was derived from"),
-            "{err}"
+            store
+                .subject_registry()
+                .unwrap()
+                .resolve(&live)
+                .await
+                .unwrap()
+                .is_some(),
+            "{mode:?} must not touch a live epoch"
         );
     }
 
-    let pinned = store
-        .as_known_at(datetime!(2020-01-01 00:00 UTC))
-        .await
-        .expect("pinned session");
-    assert!(
-        pinned
-            .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
-            .await
-            .is_err(),
-        "a transaction-time ceiling hides every reading recorded after it"
-    );
-
-    // The linkage survived all four refusals.
-    assert!(
-        store
-            .subject_registry()
-            .unwrap()
-            .resolve(&live)
-            .await
-            .unwrap()
-            .is_some(),
-        "nothing was erased"
-    );
-
-    // And the unrestricted store still sweeps, so the guard did not just turn the
-    // feature off.
+    // And the 2026 epoch does come due once the cutoff passes it — from a
+    // restricted session as readily as from the store it was derived from,
+    // because neither consults a reading.
     let erased = store
+        .in_read_mode(meterstore::ReadMode::Historical)
+        .await
+        .expect("derived session")
         .anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", D21)
         .await
-        .expect("the store it was derived from is unrestricted");
-    assert_eq!(erased.len(), 1);
+        .expect("sweep");
+    assert_eq!(erased.len(), 1, "{erased:?}");
+    assert_eq!(erased[0].subject, live);
 }

@@ -7,6 +7,211 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.10.0] — 2026-09-05
+
+An audit found three ways a query could return a wrong number and one way the
+retention duty could not be discharged at all. All four are the same kind of
+defect — a decision taken from state read at one moment and served from state
+read at another — and none would have raised an error.
+
+`metering` 0.23 landed in the same release, and its replacement of an invented
+vocabulary with the market's own fired the stored-shape risk this crate had
+written down but never seen.
+
+### A query planned before an archival run came back a window short
+
+**The serious one.** A query decides its tier split from the tiering watermark it
+reads when it is *planned*, and reads the tiers when it *executes*. Archival
+between those two moments moved a window across a boundary the plan had already
+committed to: the cold half was planned as `from < W` and excluded the day Iceberg
+now held, the hot half asked PostgreSQL for it, and archival had just dropped the
+partition.
+
+A `SELECT count(*)` over three days of readings, planned before an archival run
+and executed after it, returned **96 of 288 rows** — with no error, on the class
+of long-running settlement query most likely to overlap a maintenance cycle. The
+write path already re-routed an append the boundary moved under; the read path had
+no equivalent guard.
+
+The purge is now **deferred**. Archival leaves the partition detached — invisible
+to writers, still read by any plan made before the advance, excluded by predicate
+from every plan made after it — and a later cycle reclaims it once the commit that
+moved the boundary is older than the new `reader_grace` (default 15 minutes,
+settable per table and in `[tables.archival]`). The crash-recovery path is now the
+normal path, so it is exercised on every run rather than only after a crash.
+
+`ColdStore::append_and_commit` takes `now` and records it in the snapshot summary
+as `meterstore.archived_at`. The grace is measured on the caller's clock rather
+than on Iceberg's own commit timestamp, because the crate's rule is that the clock
+is a parameter — and a safety property read from two clocks disagrees exactly
+where a test drives months in milliseconds.
+
+### A query running during a detach lost the window being archived
+
+Found by the new concurrency suite on its first run, and the third instance of one
+shape. Archival detaches a partition before reading it, and the hot scan read the
+parent table **plus whatever was currently detached from it**. Those are two reads
+of one catalogue: a detach landing between them puts the partition in neither, so
+a count over a fixed, fully written range returned **3840 rows of 4608** — one day
+short — while archival ran beside it.
+
+The parent is no longer scanned at all. The partitions are enumerated once and
+each is read by name, because a partition relation is stable under a detach: it
+keeps its name, its rows and its identity, and only its parentage changes. The
+special case is gone rather than patched, each row is read exactly once, and a
+partition's upper bound comes from the next partition's start rather than the
+configured step, so a gap left by an idle stretch is over-estimated rather than
+skipped.
+
+### Merge elision could double-count a correction
+
+The same shape, one layer down. `IcebergTableProvider::scan` pins the snapshot it
+loads; `version_stats` loads the table separately. Read in that order, a late
+correction committing between the two was present in the files the scan would read
+and absent from the evidence the elision decision was made on — so resolution was
+skipped over files that needed it and the corrected interval came back twice.
+
+The statistics are now read **after** the scan is built, so they come from a
+snapshot at least as new as the one it pinned. A file they know about and the scan
+will not read can only add overlap, and overlap only pushes towards resolving —
+the direction where being wrong costs a window function rather than a restatement.
+
+### § 60 Abs. 6 comes due per value, and the sweep worked per subject
+
+`[MsbG § 60 Abs. 6]` runs on *"der jeweilige Messwert"*: each value, three years
+after the end of the calendar year it was collected in. One reference covering a
+subject's whole history cannot express that. The sweep erased a subject only once
+**every** reading it explained had passed the cutoff, so a customer who stayed
+connected kept a decade of values attributable indefinitely — and the due-date came
+from `max("from")` over the session running the sweep, which made an irreversible
+operation depend on which rows a read mode could see.
+
+The unit of erasure is now `(subject, collection year)`:
+
+- `SubjectRegistry::register(natural_id, at)` and
+  `MeterStore::register_subject(natural_id, at)` take an instant **from the data**
+  and mint a reference for that collection year. The year is part of the
+  reference (`s2026_9f3c…`).
+- A reference used on another year's readings is **refused at the write**. Without
+  that check the guarantee would be a convention: the column stays well-formed,
+  the reference resolves, and the only symptom is a sweep that never comes due.
+- `anonymise_before` deletes mapping rows whose year has passed the ceiling. It
+  reads **no table** — one indexed `DELETE` — so no read mode can skew it and none
+  has to be refused. `MeterStore::anonymise_before` and
+  `MeterCatalog::anonymise_before` are now the same operation.
+- `erase_subject` still answers a request about a *person*: it destroys every
+  epoch behind the reference it is given and returns one `ErasureRecord` per year,
+  so `erase`, `erase_in` and `erase_subject` return `Vec<ErasureRecord>`.
+- `meterstore_subject_map` gains an `epoch` column and is keyed by
+  `(natural_id, epoch)`. Recreate it; the crate is unpublished and the schema
+  changes in place.
+
+`MeterStore::subject_last_seen` and the cross-table maximum behind the catalogue
+sweep are deleted — the hazard they guarded was created by taking the due-date
+from readings.
+
+### A result's reported boundary was read separately from the one it used
+
+`QueryResult::watermark()` says which boundary an answer was computed against, and
+it was read *before* planning while the tier split was decided *during* it. An
+archival commit in between made the label name a boundary the answer was not
+computed against; over a catalogue every provider read its own, at its own moment,
+and no two were guaranteed consistent.
+
+The boundaries are now read once and travel with the plan
+(`planner::PlannedWatermarks`, placed on the session config for one physical
+plan), so the label is the thing that was used — and a statement costs half as
+many catalogue round trips as before.
+
+### A replica that lost the archive lease still expired snapshots
+
+The lease is taken and released inside `archive`, and expiry ran after it — so
+every replica did it, on its own clock, racing for a compare-and-swap only one can
+win, in the one step that re-stamps the tier boundary onto the current snapshot.
+The documentation said the losers "stop"; they did not. Expiry now runs only for
+the replica that won the lease. Reading `system.tables` still runs everywhere,
+because it mutates nothing.
+
+### `metering` 0.23
+
+`SubstitutionReason`'s variants are all new: EDI@Energy publishes the list
+(`STS+Z40`, 28 reasons, MSCONS MIG 2.4c) and the crate had seven of its own
+devising. `MeasurementSource::AutoSubstitute` carries one, so the payload written
+into `source_detail` changed spelling — a **stored-data** break rather than a
+wire-format one, since rows already written stop decoding. Unpublished, so this is
+a hard cut.
+
+What caught it was a compile error in a fixture that happened to name the renamed
+variant. That is luck, not a check, so the whole `source_detail` payload of every
+`MeasurementSource` variant is now a **literal in the test** rather than only the
+outer `source_kind` tag. A nested vocabulary — `AutoSubstitute` holds a
+`SubstitutionReason`, `VirtualMeter` a `VirtualMeterKind` — can be renamed
+upstream while both columns keep agreeing with each other and every round-trip
+test keeps passing, because they all read and write through the same impl.
+
+The testkit's interval generator uses `MeterInterval::measured`/`with_obis`
+rather than a struct literal, so a field added upstream cannot silently acquire a
+default in generated workloads.
+
+### Quality is queryable
+
+The `quality` column was opaque in SQL, so a consumer asking the two questions
+that get asked of it had to answer them itself:
+
+| Function | |
+|---|---|
+| `quality_is_billable` | § 60 Abs. 2 MsbG, asked of the column rather than spelled `quality IN ('MEASURED', 'SUBSTITUTED')` |
+| `quality_is_provisional` | Whether the value is still expected to change |
+| `quality_market_code` | The MSCONS `QTY` Mengen-Qualifier — `220`, `67`, `187`, `Z18`, `20` |
+
+`quality_market_code` returns **null** for `CALCULATED`, `CORRECTED` and
+`UNKNOWN`, which is the useful half: those have no qualifier of their own, so the
+rows a message writer must resolve before transmitting are exactly the ones it
+cannot answer for. A value outside the code list is an error rather than a null —
+the column is written from `QualityFlag::as_str` and constrained to that list, so
+anything else means something wrote the warehouse that should not have.
+
+Completeness already delegated billability upstream rather than keeping a local
+copy of the statute; this is that delegation reaching SQL.
+
+### Also
+
+- `reader_grace` defaults to **1 hour**, not the maintenance interval. Matching
+  the interval leaves a query exactly one cycle of protection, which is thin for
+  the settlement scan this store exists for. It is reported in `system.config`,
+  beside the other settings that are each valid alone and wrong beside one
+  another.
+- `MeteringWorkload::version` sets the version a generated delivery carries, so a
+  test can emit a *sequence* of restatements rather than one. The concurrency
+  suite needs it; a deployment running the testkit over its own configuration may
+  too.
+- `TieringWatermark::advance_to` takes the table name, so the
+  `InvariantViolated` it raises names the table an operator is being paged about
+  instead of `<unknown>`.
+- `align_to_step` returns `Result`. An instant it cannot align used to come back
+  unchanged — not on the grid, from the function whose job is to put it there,
+  with the symptom surfacing as an archival window naming a partition nothing
+  creates.
+- `ScanSpec` carries the partition granularity, so a hot scan skips a detached
+  partition that cannot hold a row in range rather than scanning it to find out.
+- The prelude no longer re-exports `CHECK_VALUES_KEY`, `VALUE_CHECK_KEY`,
+  `declared_value_check`, `AUTHORITATIVE_ATTEMPTS` or `RETENTION_LABEL`. They are
+  Arrow metadata keys and retry counts, still reachable at their own paths and not
+  things a deployment types.
+- `describe` reported the **logical** plan's schema while `query` and `stream`
+  reported the physical one, so the surface that tells a Flight SQL client what a
+  statement produces could disagree with the surface that produces it. It now
+  comes off the same physical plan, which also halves what a description costs.
+- `expected_in_day` divided by an interval count it had not yet checked for zero.
+  Unreachable today, and a panic in a query path is the wrong place to discover
+  that it stopped being unreachable.
+- The schema-evolution documentation said a rename costs nothing because Iceberg
+  matches by field id. This crate compares by **name**, so a rename reads as a drop
+  plus an add — free for a nullable attribute column, a quarantine for a required
+  one. It also does not *perform* schema evolution at all; it detects drift and
+  halts, and the documentation now says which changes it will accept once an
+  operator applies them out of band.
+
 ## [0.9.0] — 2026-08-31
 
 A configuration setting that could not be deployed at all, a multi-tenant catalog

@@ -60,9 +60,11 @@ carry most of the weight:
   boundary into the snapshot summary in the same commit as the data. Iceberg
   commits are a compare-and-swap, so rows and boundary become durable together or
   not at all.
-- **Purge is `DROP TABLE`, never `DELETE`.** The hot table is time-partitioned, so
-  archiving a window drops exactly one partition. Deleting a day of readings for
-  100 k meters row by row would leave ~9.6 M dead tuples for autovacuum.
+- **Purge is `DROP TABLE`, never `DELETE` — and deferred.** An archived window
+  is exactly one partition: detached when it is read, dropped a cycle later once
+  no query planned against the old boundary can still need it. Deleting a day of
+  readings for 100 k meters row by row would leave ~9.6 M dead tuples for
+  autovacuum.
 - **Corrections are versions, not overwrites.** MSCONS corrects a value by
   *versioning* it, so the store needs only Iceberg's `append` — and a past
   settlement stays reproducible.
@@ -245,15 +247,24 @@ meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
 
 Personal data comes with a clock rather than a request. § 60 Abs. 6 MsbG says
 erase or anonymise *at the latest* three years after the end of the year a value
-was collected in, so the sweep is a scheduled job — and a **catalogue** one,
-because one subject map spans every table and a per-table sweep would orphan
-readings the other tables still hold:
+was collected in — **per value**, so the unit of erasure is a `(subject,
+collection year)` pair rather than a subject. A reference is minted for one year
+and the sweep expires years independently, which is the only way an active
+customer's 2021 readings can stop being attributable while their 2026 readings
+stay linked:
 
 ```rust
+let subject = store.register_subject("customer-4821", interval.from).await?;
+
 catalog.maintenance()
     .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
     .spawn();
 ```
+
+The year is in the reference, so a reference used on another year's readings is
+refused at the write — otherwise nothing downstream could tell, and the only
+symptom would be a sweep that never came due. The sweep itself reads no readings
+at all: it is one indexed `DELETE` against the registry.
 
 A table declaring a `subject_column` needs the registry it resolves against, and
 a configuration file supplies it — one for the whole deployment, because the
@@ -348,7 +359,7 @@ WHERE eic_normalise(bilanzkreis) IS NOT NULL
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
 | PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
-| `metering` | **0.22 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.23 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
@@ -409,17 +420,20 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**892 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+**910 tests**: unit, property, doc and integration against real PostgreSQL 16 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle over
-generated workloads, covering both record shapes. **DuckDB** and **PyIceberg**
-read the output and agree with it, down to the audit trail's timestamps. The lock
+generated workloads, covering both record shapes. Ingest, archival and reads also
+run **against one table at once**, which is the only way to reach the states that
+exist between two steps rather than inside one. **DuckDB** and **PyIceberg** read
+the output and agree with it, down to the audit trail's timestamps. The lock
 behaviour is asserted against a real server holding a real conflicting lock, not
-argued. Compression against PostgreSQL row storage is **measured** rather than
-targeted — ~109× (457 B/row against 4.2 B/row; the measurement suite carries the
-caveats).
+argued. Compression against PostgreSQL row storage is
+**measured** rather than targeted — ~109× (457 B/row against 4.2 B/row; the
+measurement suite carries the caveats).
 
 Missing: query-latency benchmarks on reference hardware, so the p99 targets remain
-aspirational; Spark and Trino interop. Compaction and general orphan-file cleanup
+aspirational; Spark and Trino interop; a soak across two replicas, which is the
+shape the archive lease exists for. Compaction and general orphan-file cleanup
 [run out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
 because `iceberg-rust` exposes neither.
 

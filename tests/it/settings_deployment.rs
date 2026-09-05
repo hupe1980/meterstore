@@ -312,7 +312,7 @@ archival_step = "1d"
     // reads. `create_tables` had to have created the registry's own two tables,
     // or none of this reaches a relation.
     let subject = store
-        .register_subject("tenant-a:12345678905")
+        .register_subject("tenant-a:12345678905", START)
         .await
         .expect("register");
     store
@@ -329,7 +329,7 @@ archival_step = "1d"
     // And the suppression list holds: a replaying pipeline does not re-link the
     // subject it just erased.
     let err = store
-        .register_subject("tenant-a:12345678905")
+        .register_subject("tenant-a:12345678905", START)
         .await
         .expect_err("suppressed");
     assert!(err.to_string().contains("erased"), "{err}");
