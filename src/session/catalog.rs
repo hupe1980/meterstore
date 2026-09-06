@@ -569,6 +569,104 @@ impl MeterCatalog {
     ) -> Result<Vec<crate::erasure::ErasureRecord>> {
         anonymise_across(self.stores.values(), cutoff, reason, actor, now).await
     }
+
+    /// The registry every subject-bearing table in this catalog shares.
+    ///
+    /// One `meterstore_subject_map` for the deployment, so there is one to
+    /// return rather than one per table. `None` when no table declares a subject
+    /// column.
+    #[must_use]
+    pub fn subject_registry(&self) -> Option<&crate::erasure::SubjectRegistry> {
+        self.stores.values().find_map(MeterStore::subject_registry)
+    }
+
+    /// Destroy a subject's linkage across the whole deployment, named the way an
+    /// Article 17 request names it.
+    ///
+    /// The catalog is where this belongs: a request is about a person, the
+    /// mapping is deployment-wide, and unlinking every epoch of an identifier
+    /// reaches every table that registered it — the authoritative Lastgang and
+    /// the non-authoritative second stream together.
+    ///
+    /// [`MeterStore::erase_subject_by_id`] is the same operation through one
+    /// table's handle, and cannot disagree with it.
+    pub async fn erase_subject_by_id(
+        &self,
+        natural_id: &str,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        self.require_registry()?
+            .erase_all(natural_id, reason, actor, now)
+            .await
+    }
+
+    /// Every retention epoch this deployment still links `natural_id` to,
+    /// ascending.
+    ///
+    /// What an Article 17 request needs before it can be answered, and what an
+    /// Article 15 one is asking for. Empty once every epoch has been erased or
+    /// has expired.
+    pub async fn subject_epochs(&self, natural_id: &str) -> Result<Vec<i32>> {
+        self.require_registry()?.epochs(natural_id).await
+    }
+
+    /// [`subject_epochs`](Self::subject_epochs) with the reference and the
+    /// registration time as well.
+    pub async fn subject_registrations(
+        &self,
+        natural_id: &str,
+    ) -> Result<Vec<crate::erasure::SubjectRegistration>> {
+        self.require_registry()?.registrations(natural_id).await
+    }
+
+    /// Whether an identifier is on the suppression list.
+    ///
+    /// The answer to *"why is this registration failing?"*, which is otherwise
+    /// indistinguishable from a configuration fault.
+    pub async fn is_subject_suppressed(&self, natural_id: &str) -> Result<bool> {
+        self.require_registry()?.is_suppressed(natural_id).await
+    }
+
+    /// Let an identifier be registered again after an erasure carried out
+    /// against the wrong subject.
+    ///
+    /// It does not restore the old link, and it is itself audited. See
+    /// [`SubjectRegistry::lift_suppression`](crate::erasure::SubjectRegistry::lift_suppression).
+    pub async fn lift_subject_suppression(
+        &self,
+        natural_id: &str,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        self.require_registry()?
+            .lift_suppression(natural_id, reason, actor, now)
+            .await
+    }
+
+    /// The erasure audit trail, deployment-wide.
+    ///
+    /// One `meterstore_erasures` for the deployment, so this is the whole trail
+    /// rather than one table's share of it.
+    pub async fn erasures(
+        &self,
+        query: &crate::erasure::ErasureQuery,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        self.require_registry()?.erasures(query).await
+    }
+
+    /// The shared registry, or the error that says why there is none.
+    fn require_registry(&self) -> Result<&crate::erasure::SubjectRegistry> {
+        self.subject_registry().ok_or_else(|| {
+            Error::config(
+                "no table in this catalog declares a subject column, so this \
+                 deployment holds no subject mapping: there is nothing to enumerate \
+                 and nothing to erase",
+            )
+        })
+    }
 }
 
 /// The deployment-wide retention sweep, over any set of stores.

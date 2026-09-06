@@ -1656,16 +1656,89 @@ impl MeterStore {
     /// that passed `now()` here would attach this year's reference to it and
     /// keep it attributable four years too long.
     ///
+    /// `sparte` is the commodity of those readings, because the epoch is the
+    /// year of the day they are **balanced** on and for gas that day runs 06:00
+    /// to 06:00. It is the same [`retention_epoch`] the write path checks the
+    /// reference with, so what this mints is by construction what that accepts —
+    /// see [`retention_epoch`] for the six hours a year it matters over.
+    ///
     /// The store checks that: a reference whose epoch does not match the year a
     /// reading is balanced on is refused at the write.
     ///
+    /// [`retention_epoch`]: crate::erasure::retention_epoch
     /// [`SubjectRegistry::register`]: crate::erasure::SubjectRegistry::register
     pub async fn register_subject(
         &self,
         natural_id: &str,
         at: time::OffsetDateTime,
+        sparte: metering::interval::Sparte,
     ) -> Result<crate::erasure::SubjectRef> {
-        self.require_registry()?.register(natural_id, at).await
+        self.require_registry()?
+            .register(natural_id, at, sparte)
+            .await
+    }
+
+    /// Every retention epoch this deployment still links `natural_id` to.
+    ///
+    /// The question [`register_subject`](Self::register_subject) cannot answer:
+    /// a reference names one collection year, so *"what do we still hold on this
+    /// person?"* needs the mapping enumerated rather than probed year by year.
+    /// Ascending, and empty once every epoch has been erased or has expired.
+    ///
+    /// The registry is deployment-wide, so this is the same answer through any
+    /// table's handle.
+    pub async fn subject_epochs(&self, natural_id: &str) -> Result<Vec<i32>> {
+        self.require_registry()?.epochs(natural_id).await
+    }
+
+    /// [`subject_epochs`](Self::subject_epochs) with the reference and the
+    /// registration time as well.
+    pub async fn subject_registrations(
+        &self,
+        natural_id: &str,
+    ) -> Result<Vec<crate::erasure::SubjectRegistration>> {
+        self.require_registry()?.registrations(natural_id).await
+    }
+
+    /// Whether an identifier is on the suppression list.
+    ///
+    /// The answer to *"why is this registration failing?"*, which is otherwise
+    /// indistinguishable from a configuration fault. `false` where no suppression
+    /// key is configured, because there is then nothing to check against — not
+    /// because the identifier was never erased.
+    pub async fn is_subject_suppressed(&self, natural_id: &str) -> Result<bool> {
+        self.require_registry()?.is_suppressed(natural_id).await
+    }
+
+    /// Let an identifier be registered again after an erasure carried out
+    /// against the wrong subject.
+    ///
+    /// It does not restore the old link — the mapping is gone and the readings
+    /// stay unattributable — and it is itself audited, because it reverses a
+    /// compliance decision. See
+    /// [`SubjectRegistry::lift_suppression`](crate::erasure::SubjectRegistry::lift_suppression).
+    pub async fn lift_subject_suppression(
+        &self,
+        natural_id: &str,
+        reason: &str,
+        actor: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<bool> {
+        self.require_registry()?
+            .lift_suppression(natural_id, reason, actor, now)
+            .await
+    }
+
+    /// The erasure audit trail, deployment-wide.
+    ///
+    /// One list rather than one per table: the registry is shared, so a subject's
+    /// linkage is destroyed everywhere at once and concatenating per table would
+    /// report every row as many times as the deployment has tables.
+    pub async fn erasures(
+        &self,
+        query: &crate::erasure::ErasureQuery,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        self.require_registry()?.erasures(query).await
     }
 
     /// Destroy a subject's linkage, leaving the readings anonymous.
@@ -1682,6 +1755,33 @@ impl MeterStore {
     ) -> Result<Vec<crate::erasure::ErasureRecord>> {
         self.require_registry()?
             .erase(subject, reason, actor, now)
+            .await
+    }
+
+    /// Destroy a subject's linkage, named the way a request names it.
+    ///
+    /// An Article 17 request arrives with a customer number, a contract, an
+    /// occupancy — never with the opaque token the lake stores. This takes that
+    /// identifier and unlinks **every** retention epoch behind it, returning one
+    /// record per epoch.
+    ///
+    /// With a suppression key configured, an identifier this deployment holds no
+    /// mapping for is still recorded and refused thereafter — a request that
+    /// arrived before the ingest did is honoured rather than lost. See
+    /// [`SubjectRegistry::erase_all`](crate::erasure::SubjectRegistry::erase_all).
+    ///
+    /// The registry is deployment-wide, so this reaches every table that
+    /// registered the same identifier — the authoritative Lastgang and the
+    /// non-authoritative second stream together.
+    pub async fn erase_subject_by_id(
+        &self,
+        natural_id: &str,
+        reason: &str,
+        actor: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        self.require_registry()?
+            .erase_all(natural_id, reason, actor, now)
             .await
     }
 
@@ -2220,21 +2320,31 @@ impl MeterStore {
     }
 
     /// Every reference used must still resolve to a subject.
+    ///
+    /// One round trip for the whole batch rather than one per reference. A
+    /// delivery carries a reference per measuring point, so a query each would
+    /// put the registry on the write path proportionally to batch size — for a
+    /// check that is a set membership test.
     async fn check_refs_resolve(
         &self,
         registry: &crate::erasure::SubjectRegistry,
         refs: std::collections::BTreeSet<String>,
     ) -> Result<()> {
-        for reference in refs {
-            let subject = crate::erasure::SubjectRef::new(reference)?;
-            if registry.resolve(&subject).await?.is_none() {
-                return Err(Error::config(format!(
-                    "subject reference {subject} has no live mapping: it was \
-                     either never registered, erased, or its retention epoch has \
-                     expired — in the latter two cases this write is a replay that \
-                     would re-link a subject whose linkage is gone"
-                )));
-            }
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let wanted: Vec<String> = refs.into_iter().collect();
+        let live = registry.resolvable(&wanted).await?;
+
+        // `wanted` is a `BTreeSet` drained in order, so the reference reported
+        // is the same one on every run of the same batch.
+        if let Some(missing) = wanted.iter().find(|r| !live.contains(*r)) {
+            return Err(Error::config(format!(
+                "subject reference {missing} has no live mapping: it was \
+                 either never registered, erased, or its retention epoch has \
+                 expired — in the latter two cases this write is a replay that \
+                 would re-link a subject whose linkage is gone"
+            )));
         }
         Ok(())
     }
@@ -2704,16 +2814,19 @@ fn decode_cold_rows(
 /// silently, since nothing downstream can tell the two apart. The year is in the
 /// reference, so this costs a string parse and no round trip.
 ///
-/// The **balancing** year, not the UTC one: an interval starting
-/// `2026-12-31T23:00Z` is already 2027 in Berlin, and for gas the boundary is
-/// the Gastag — the same rule that decides a Bilanzierungsmonat.
+/// [`retention_epoch`] is the rule, and is the **same call**
+/// [`MeterStore::register_subject`] mints with. Two rules for one year would
+/// disagree over the six hours after midnight on 1 January for gas, where the
+/// only reference the API could mint is one this check refuses.
+///
+/// [`retention_epoch`]: crate::erasure::retention_epoch
 fn check_subject_epoch(
     subject: &crate::erasure::SubjectRef,
     at: time::OffsetDateTime,
     sparte: metering::interval::Sparte,
 ) -> Result<()> {
     let epoch = subject.epoch()?;
-    let year = crate::planner::balancing_day(at, sparte).year();
+    let year = crate::erasure::retention_epoch(at, sparte);
     if epoch != year {
         return Err(Error::IntegrityViolation {
             table: String::new(),
@@ -2722,8 +2835,10 @@ fn check_subject_epoch(
                 "subject reference {subject} belongs to retention epoch {epoch} but this \
                  reading is balanced on {year}. A reference covers one collection year, \
                  because § 60 Abs. 6 comes due per value — register one per year with \
-                 `register_subject(natural_id, interval.from)` rather than reusing \
-                 whichever the pipeline happened to fetch first"
+                 `register_subject(natural_id, interval.from, sparte)` rather than \
+                 reusing whichever the pipeline happened to fetch first. A delivery \
+                 that genuinely spans a balancing-year boundary needs splitting at it, \
+                 one reference each side"
             ),
         });
     }

@@ -81,6 +81,20 @@ pub struct Metrics {
     /// table would invite a per-table sum that double-counts it.
     pub subjects_erased: Counter<u64>,
 
+    /// Registrations refused because the identifier is on the suppression list.
+    ///
+    /// **The replay alarm.** Every one of these is a pipeline handing the store
+    /// an identifier whose linkage Article 17 destroyed — a broker redelivering a
+    /// batch from before the erasure, a reprocessing job reading an old offset, a
+    /// nightly import from a system that never learned. The registration is
+    /// refused, so nothing is re-linked; what the counter reports is that
+    /// something upstream is still carrying data it should have dropped, which is
+    /// a finding in its own right and is invisible from the erasure counter.
+    ///
+    /// Zero is the expected reading. A rise that does not decay means an upstream
+    /// system needs the erasure applying to it too.
+    pub registrations_suppressed: Counter<u64>,
+
     /// Rows read, by tier.
     pub rows_scanned: Counter<u64>,
     /// How long it took to *plan* a tiered scan.
@@ -140,6 +154,15 @@ impl Metrics {
                      trigger=retention is the § 60 Abs. 6 sweep, where a flat zero over \
                      a year means it is not running; trigger=request is an Article 17 \
                      erasure, where a rise is the thing to know about",
+                )
+                .build(),
+            registrations_suppressed: meter
+                .u64_counter("meterstore.registrations_suppressed")
+                .with_description(
+                    "Registrations refused because the identifier is on the suppression \
+                     list. Zero is the expected reading: each one is a pipeline replaying \
+                     data from before an Article 17 erasure, which is refused here and \
+                     still needs fixing upstream",
                 )
                 .build(),
             partitions_dropped: meter
@@ -230,14 +253,14 @@ pub fn table(name: &str) -> [KeyValue; 1] {
 /// The two are counted apart rather than summed because their readings are
 /// opposite: a flat `retention` series is a sweep that is not running, and a flat
 /// `request` series is an ordinary quarter.
-pub fn erasure_trigger(trigger: &'static str) -> [KeyValue; 1] {
-    [KeyValue::new("trigger", trigger)]
+///
+/// The value comes from [`ErasureTrigger`](crate::erasure::ErasureTrigger) rather
+/// than from a string constant of
+/// this module's own, so the attribute on the counter and the column in the
+/// audit trail cannot come to disagree about how a duty is spelled.
+pub fn erasure_trigger(trigger: crate::erasure::ErasureTrigger) -> [KeyValue; 1] {
+    [KeyValue::new("trigger", trigger.as_str())]
 }
-
-/// A § 60 Abs. 6 MsbG retention sweep — the duty that comes due on a clock.
-pub const TRIGGER_RETENTION: &str = "retention";
-/// An Article 17 erasure request — the duty that arrives when a subject asks.
-pub const TRIGGER_REQUEST: &str = "request";
 
 /// Table plus tier, for metrics that distinguish them.
 pub fn table_tier(name: &str, tier: &'static str) -> [KeyValue; 2] {
@@ -250,6 +273,7 @@ pub fn table_tier(name: &str, tier: &'static str) -> [KeyValue; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::erasure::ErasureTrigger;
 
     #[test]
     fn instruments_build_without_an_sdk() {
@@ -263,9 +287,11 @@ mod tests {
             .record(0.01, &table_tier("readings", "cold"));
         // Deployment-wide, so it carries no table attribute — the empty slice is
         // as much a case as any other.
-        m.subjects_erased.add(1, &erasure_trigger(TRIGGER_REQUEST));
         m.subjects_erased
-            .add(1, &erasure_trigger(TRIGGER_RETENTION));
+            .add(1, &erasure_trigger(ErasureTrigger::Request));
+        m.subjects_erased
+            .add(1, &erasure_trigger(ErasureTrigger::Retention));
+        m.registrations_suppressed.add(1, &[]);
     }
 
     #[test]
@@ -274,12 +300,18 @@ mod tests {
         // `retention` series is a sweep that is not running, and a flat `request`
         // series is an ordinary quarter. One value for both would fold the two
         // and hide the first.
-        assert_ne!(TRIGGER_RETENTION, TRIGGER_REQUEST);
         assert_ne!(
-            erasure_trigger(TRIGGER_RETENTION)[0].value,
-            erasure_trigger(TRIGGER_REQUEST)[0].value
+            ErasureTrigger::Retention.as_str(),
+            ErasureTrigger::Request.as_str()
         );
-        assert_eq!(erasure_trigger(TRIGGER_REQUEST)[0].key.as_str(), "trigger");
+        assert_ne!(
+            erasure_trigger(ErasureTrigger::Retention)[0].value,
+            erasure_trigger(ErasureTrigger::Request)[0].value
+        );
+        assert_eq!(
+            erasure_trigger(ErasureTrigger::Request)[0].key.as_str(),
+            "trigger"
+        );
     }
 
     #[test]

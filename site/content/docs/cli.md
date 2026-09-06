@@ -277,16 +277,35 @@ path, which is why the name has to be given twice.
 
 ```bash
 meterstore erasures --limit 50
+
+# What an auditor actually asks for: a period, and one duty.
+meterstore erasures --since 2026-07-01T00:00:00Z --until 2026-10-01T00:00:00Z \
+                    --trigger retention
 ```
 
-"We deleted it" is not evidence. Every erasure writes a row saying **when, why
-and by whom** — and deliberately not *whose*, since the natural identifier is the
-thing being destroyed. This is the report a regulator asks for.
+"We deleted it" is not evidence. Every erasure writes a row saying **when, why,
+by whom** and **which duty it discharged** — and deliberately not *whose*, since
+the natural identifier is the thing being destroyed. This is the report a
+regulator asks for.
+
+The TRIGGER column is `request` for an Article 17 erasure and `retention` for the
+§ 60 Abs. 6 sweep — [different legal bases](@/docs/privacy.md#the-trail-as-evidence),
+asked about separately.
+
+`--since`/`--until` are half-open, so consecutive quarters tile. A backwards
+period, an unknown `--trigger` and a non-positive `--limit` are refused rather
+than printing an empty trail, which would read as "nothing was erased".
 
 The registry is deployment-wide, so the trail is one list rather than one per
 table. A configuration whose tables declare no `subject_column` holds no mapping
 at all, and says so rather than printing an empty list that reads as "nothing has
 been erased".
+
+Two rows read differently. `— (suppression only)` in SUBJECT is a request that
+named an identifier this deployment held no mapping for — one that arrived before
+the delivery did: no linkage to destroy, and honoured by refusing the identifier
+from then on. An indented `suppression lifted …` line is an erasure carried out
+against the wrong subject and released, with who did it and why.
 
 ## No `meterstore erase`
 
@@ -297,8 +316,9 @@ An Article 17 request usually reaches an application's own tables too — billin
 periods, quality assessments, substitute-value logs — and those must succeed or
 fail **together** with the mapping. A CLI invocation commits its own transaction
 and cannot enclose them, so the failure mode is the worst kind: a subject
-reported as erased whose derived rows survived. `SubjectRegistry::erase_in` takes
-a transaction the caller owns, which is where that erasure belongs.
+reported as erased whose derived rows survived. `SubjectRegistry::erase_in` and
+`erase_all_in` take a transaction the caller owns, which is where that erasure
+belongs.
 [Privacy and retention →](@/docs/privacy.md)
 
 The duty that comes due on its own is a different matter, and the CLI does run

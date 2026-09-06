@@ -28,6 +28,8 @@ region = "eu-central-1"          # non-secret half of the S3 credentials
 # deployment is refused at startup: the references would resolve to nothing.
 [privacy]
 erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes, turns on suppression
+# Keys that no longer write tombstones and must still recognise them.
+# retired_erasure_secrets = ["${METERSTORE_ERASURE_SECRET_2025}"]
 
 [[tables]]
 name = "readings_versions"
@@ -92,6 +94,12 @@ identifier share a `SubjectRef`, and a single erasure unlinks both.
 **suppression list**, without which a replaying pipeline silently re-links a
 subject whose mapping was deleted.
 [Why it is optional →](@/docs/privacy.md#configuring-it)
+
+`retired_erasure_secrets` holds the keys that no longer write tombstones and must
+still recognise the ones they wrote — a tombstone cannot be re-keyed, so rotation
+is additive and both entries are needed. Same 32-byte floor; retired keys without
+an `erasure_secret` are refused.
+[Rotating the key →](@/docs/privacy.md#rotating-the-key)
 
 `meterstore check` validates the same file from a shell, connecting to nothing —
 which is what makes it a CI step rather than a deployment-time surprise. See

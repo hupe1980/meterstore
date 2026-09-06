@@ -312,24 +312,35 @@ archival_step = "1d"
     // reads. `create_tables` had to have created the registry's own two tables,
     // or none of this reaches a relation.
     let subject = store
-        .register_subject("tenant-a:12345678905", START)
+        .register_subject(
+            "tenant-a:12345678905",
+            START,
+            metering::interval::Sparte::Strom,
+        )
         .await
         .expect("register");
     store
         .erase_subject(&subject, "DSAR-2026-0042", "dpo", START)
         .await
         .expect("erase");
-    let trail = registry.erasures(10).await.expect("trail");
+    let trail = registry
+        .erasures(&meterstore::ErasureQuery::new().limit(10))
+        .await
+        .expect("trail");
     assert_eq!(trail.len(), 1);
     assert_eq!(trail[0].reason, "DSAR-2026-0042");
     assert_eq!(trail[0].actor, "dpo");
     // The trail proves an erasure happened without recording whom it concerned.
-    assert_eq!(trail[0].subject, subject);
+    assert_eq!(trail[0].subject, Some(subject));
 
     // And the suppression list holds: a replaying pipeline does not re-link the
     // subject it just erased.
     let err = store
-        .register_subject("tenant-a:12345678905", START)
+        .register_subject(
+            "tenant-a:12345678905",
+            START,
+            metering::interval::Sparte::Strom,
+        )
         .await
         .expect_err("suppressed");
     assert!(err.to_string().contains("erased"), "{err}");

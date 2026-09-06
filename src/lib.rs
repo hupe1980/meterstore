@@ -267,7 +267,9 @@ pub use config::{
 };
 pub use encode::{StoredReadings, canonical_obis, parse_malo, parse_melo};
 pub use erasure::{
-    ErasureRecord, MIN_ERASURE_SECRET_BYTES, Retention, SubjectRef, SubjectRegistry,
+    DEFAULT_ERASURE_LIMIT, ErasureQuery, ErasureRecord, ErasureTrigger, MIN_ERASURE_SECRET_BYTES,
+    MIN_REFERENCE_TOKEN_CHARS, Retention, SubjectRef, SubjectRegistration, SubjectRegistry,
+    SuppressionLift, retention_epoch,
 };
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
@@ -307,7 +309,8 @@ pub mod prelude {
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
     pub use crate::erasure::{
-        ErasureRecord, MIN_ERASURE_SECRET_BYTES, Retention, SubjectRef, SubjectRegistry,
+        ErasureQuery, ErasureRecord, ErasureTrigger, MIN_ERASURE_SECRET_BYTES, Retention,
+        SubjectRef, SubjectRegistration, SubjectRegistry, SuppressionLift, retention_epoch,
     };
     pub use crate::error::{Error, Result};
     pub use crate::evolution::{Compatibility, SchemaChange};

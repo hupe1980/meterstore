@@ -316,10 +316,18 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
 
     // An empty trail is a fact, not an error: a deployment that has had no
     // Article 17 request has erased nothing.
-    cli(path, Command::Erasures { limit: 50 })
-        .run()
-        .await
-        .expect("an empty trail reports as empty");
+    cli(
+        path,
+        Command::Erasures {
+            limit: 50,
+            since: None,
+            until: None,
+            trigger: None,
+        },
+    )
+    .run()
+    .await
+    .expect("an empty trail reports as empty");
 
     // Erase through the library — which is the only door, see `no meterstore
     // erase` — and read it back through the shell.
@@ -334,6 +342,7 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
         .register_subject(
             "tenant-a:12345678905",
             time::macros::datetime!(2026-07-20 00:00 UTC),
+            metering::interval::Sparte::Strom,
         )
         .await
         .expect("register");
@@ -347,18 +356,75 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
         .await
         .expect("erase");
 
-    cli(path, Command::Erasures { limit: 50 })
-        .run()
-        .await
-        .expect("the trail now holds a row");
+    cli(
+        path,
+        Command::Erasures {
+            limit: 50,
+            since: None,
+            until: None,
+            trigger: None,
+        },
+    )
+    .run()
+    .await
+    .expect("the trail now holds a row");
+
+    // Narrowed the way an auditor narrows it: a period and a duty. Both are
+    // parsed here rather than reaching PostgreSQL as text.
+    cli(
+        path,
+        Command::Erasures {
+            limit: 50,
+            since: Some("2026-08-01T00:00:00Z".to_string()),
+            until: Some("2026-09-01T00:00:00Z".to_string()),
+            trigger: Some("request".to_string()),
+        },
+    )
+    .run()
+    .await
+    .expect("a period and a duty");
 
     // A row count that is not one is refused at the call rather than reaching
     // PostgreSQL as a negative LIMIT.
-    let err = cli(path, Command::Erasures { limit: 0 })
+    let err = cli(
+        path,
+        Command::Erasures {
+            limit: 0,
+            since: None,
+            until: None,
+            trigger: None,
+        },
+    )
+    .run()
+    .await
+    .expect_err("a limit is a row count");
+    assert!(err.to_string().contains("--limit"), "{err}");
+
+    // And the flags that cannot mean anything say so, rather than reporting an
+    // empty trail — which would read as "nothing was erased".
+    for (since, until, trigger) in [
+        (Some("last tuesday"), None, None),
+        (None, None, Some("sweep")),
+        (
+            Some("2026-10-01T00:00:00Z"),
+            Some("2026-07-01T00:00:00Z"),
+            None,
+        ),
+    ] {
+        let err = cli(
+            path,
+            Command::Erasures {
+                limit: 50,
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+                trigger: trigger.map(str::to_string),
+            },
+        )
         .run()
         .await
-        .expect_err("a limit is a row count");
-    assert!(err.to_string().contains("--limit"), "{err}");
+        .expect_err("{since:?} {until:?} {trigger:?} should be refused");
+        assert!(!err.to_string().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -377,9 +443,17 @@ async fn asking_for_erasures_where_no_subject_is_declared_says_so() {
         .await
         .expect("create");
 
-    let err = cli(file.path(), Command::Erasures { limit: 10 })
-        .run()
-        .await
-        .expect_err("no subject column is declared");
+    let err = cli(
+        file.path(),
+        Command::Erasures {
+            limit: 10,
+            since: None,
+            until: None,
+            trigger: None,
+        },
+    )
+    .run()
+    .await
+    .expect_err("no subject column is declared");
     assert!(err.to_string().contains("subject_column"), "{err}");
 }

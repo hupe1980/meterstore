@@ -425,15 +425,28 @@ pub fn snapshots(rows: &[(String, SnapshotInfo)], format: Format) -> Result<()> 
 /// and a trail that retained it would defeat the exercise. What it proves is that
 /// an erasure happened, when, why and by whom, which is what a regulator asks
 /// for.
+///
+/// A row with no reference is a **pre-emptive suppression**: a request that named
+/// an identifier this deployment held no mapping for. There was no linkage to
+/// destroy and the request was still honoured, by refusing the identifier from
+/// then on — so it belongs in the trail, and the column says so rather than
+/// leaving a blank that reads as a rendering fault.
 pub fn erasures(rows: &[ErasureRecord], format: Format) -> Result<()> {
     let document = json!({
         "erasures": rows
             .iter()
             .map(|r| json!({
-                "subject_ref": r.subject.as_str(),
+                "subject_ref": r.subject.as_ref().map(crate::erasure::SubjectRef::as_str),
+                "epoch": r.epoch(),
                 "erased_at": instant(r.erased_at),
                 "reason": r.reason,
                 "actor": r.actor,
+                "trigger": r.trigger.as_str(),
+                "lifted": r.lifted.as_ref().map(|l| json!({
+                    "at": instant(l.at),
+                    "actor": l.actor,
+                    "reason": l.reason,
+                })),
             }))
             .collect::<Vec<_>>(),
     });
@@ -446,15 +459,34 @@ pub fn erasures(rows: &[ErasureRecord], format: Format) -> Result<()> {
             println!("no erasures recorded");
             return;
         }
-        println!("{:<26} {:<40} {:<24} REASON", "ERASED", "SUBJECT", "ACTOR");
+        println!(
+            "{:<26} {:<10} {:<40} {:<20} REASON",
+            "ERASED", "TRIGGER", "SUBJECT", "ACTOR"
+        );
         for r in rows {
             println!(
-                "{:<26} {:<40} {:<24} {}",
+                "{:<26} {:<10} {:<40} {:<20} {}",
                 instant(r.erased_at),
-                r.subject.as_str(),
+                r.trigger.as_str(),
+                r.subject
+                    .as_ref()
+                    .map_or("— (suppression only)", crate::erasure::SubjectRef::as_str),
                 r.actor,
                 r.reason,
             );
+            // Indented under the row it reverses, rather than as a column of its
+            // own: a lift is rare, and a column that is empty on almost every
+            // row costs forty characters of width on all of them.
+            if let Some(lift) = &r.lifted {
+                println!(
+                    "{:<26} {:<10} suppression lifted {} by {}: {}",
+                    "",
+                    "",
+                    instant(lift.at),
+                    lift.actor,
+                    lift.reason
+                );
+            }
         }
     })
 }

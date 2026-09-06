@@ -216,6 +216,30 @@ pub struct PrivacySettings {
     /// See [`SubjectRegistry::with_erasure_secret`](crate::SubjectRegistry::with_erasure_secret).
     #[serde(default)]
     pub erasure_secret: Option<String>,
+
+    /// Retired keys: they no longer write tombstones and must still recognise
+    /// the ones they wrote.
+    ///
+    /// A tombstone is `HMAC(key, identifier)` and the identifier was destroyed in
+    /// the same transaction that wrote it, so it can never be re-keyed. Replacing
+    /// `erasure_secret` without listing the old key here silently stops every
+    /// erasure recorded before the change from being recognised, and
+    /// re-registration re-opens for all of them at once — the one failure this
+    /// crate cannot report.
+    ///
+    /// So rotation is *additive*: move the outgoing key here and put the new one
+    /// in `erasure_secret`. A key stays here for as long as the erasures it
+    /// recorded must stay suppressed, which for an Article 17 erasure is
+    /// indefinitely. Each is subject to the same length floor, because it is the
+    /// **older** tombstones a retired key covers.
+    ///
+    /// ```toml
+    /// [privacy]
+    /// erasure_secret = "${METERSTORE_ERASURE_SECRET}"
+    /// retired_erasure_secrets = ["${METERSTORE_ERASURE_SECRET_2025}"]
+    /// ```
+    #[serde(default)]
+    pub retired_erasure_secrets: Vec<String>,
 }
 
 impl std::fmt::Debug for PrivacySettings {
@@ -224,6 +248,10 @@ impl std::fmt::Debug for PrivacySettings {
             .field(
                 "erasure_secret",
                 &self.erasure_secret.as_ref().map(|_| "***"),
+            )
+            .field(
+                "retired_erasure_secrets",
+                &self.retired_erasure_secrets.len(),
             )
             .finish()
     }
@@ -237,12 +265,21 @@ impl PrivacySettings {
     /// the application's own tables so an Article 17 cascade can be one
     /// transaction.
     pub fn registry(&self, pool: sqlx::PgPool) -> Result<crate::erasure::SubjectRegistry> {
-        match &self.erasure_secret {
-            Some(secret) => {
-                crate::erasure::SubjectRegistry::with_erasure_secret(pool, secret.as_bytes())
-            }
-            None => Ok(crate::erasure::SubjectRegistry::new(pool)),
-        }
+        // Checked here as well as at `meterstore check`, so a caller building a
+        // registry straight from a file gets the message that names the setting
+        // rather than the one that names a ring position.
+        self.validate()?;
+        let Some(secret) = &self.erasure_secret else {
+            // Retired keys without a current one would be a ring that cannot
+            // write — caught by `validate`, so reaching here means suppression
+            // is genuinely off.
+            return Ok(crate::erasure::SubjectRegistry::new(pool));
+        };
+        // The current key first: it is the one new tombstones are written under,
+        // and the rest are read-only.
+        let mut ring: Vec<&[u8]> = vec![secret.as_bytes()];
+        ring.extend(self.retired_erasure_secrets.iter().map(String::as_bytes));
+        crate::erasure::SubjectRegistry::with_erasure_keys(pool, &ring)
     }
 
     /// Whatever can be checked without a database.
@@ -253,16 +290,36 @@ impl PrivacySettings {
     /// start means discovering it in a deploy rather than in CI.
     pub fn validate(&self) -> Result<()> {
         let Some(secret) = &self.erasure_secret else {
+            // A ring of retired keys with nothing to write with enforces the
+            // list it looks configured for and records no new tombstone, which
+            // is the shape of a botched rotation: the outgoing key was moved and
+            // the incoming one never arrived.
+            if !self.retired_erasure_secrets.is_empty() {
+                return Err(Error::config(
+                    "[privacy] retired_erasure_secrets is set but erasure_secret is \
+                     not: retired keys only recognise tombstones already written, so \
+                     as configured every erasure from now on records nothing and \
+                     re-registration is silently allowed. Set erasure_secret to the \
+                     key that should be writing",
+                ));
+            }
             return Ok(());
         };
-        if secret.len() < crate::erasure::MIN_ERASURE_SECRET_BYTES {
-            return Err(Error::config(format!(
-                "[privacy] erasure_secret is {} bytes and must be at least {}: a shorter \
-                 key can be brute-forced, and the suppression list would then leak the \
-                 identifiers it exists to forget",
-                secret.len(),
-                crate::erasure::MIN_ERASURE_SECRET_BYTES,
-            )));
+        for (label, key) in std::iter::once(("erasure_secret".to_string(), secret)).chain(
+            self.retired_erasure_secrets
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (format!("retired_erasure_secrets[{i}]"), k)),
+        ) {
+            if key.len() < crate::erasure::MIN_ERASURE_SECRET_BYTES {
+                return Err(Error::config(format!(
+                    "[privacy] {label} is {} bytes and must be at least {} bytes: a \
+                     shorter key can be brute-forced, and the suppression list would \
+                     then leak the identifiers it exists to forget",
+                    key.len(),
+                    crate::erasure::MIN_ERASURE_SECRET_BYTES,
+                )));
+            }
         }
         Ok(())
     }
@@ -1623,6 +1680,7 @@ subject_column = "subject_ref"
         let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
         let err = PrivacySettings {
             erasure_secret: Some("too short".to_string()),
+            ..PrivacySettings::default()
         }
         .registry(pool.clone())
         .expect_err("32 bytes at least")
@@ -1653,6 +1711,7 @@ subject_column = "subject_ref"
         // suppression, no key at all leaves erasure working and not sticking.
         let suppressing = PrivacySettings {
             erasure_secret: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..PrivacySettings::default()
         }
         .registry(pool.clone())
         .expect("32 bytes");
@@ -1663,6 +1722,71 @@ subject_column = "subject_ref"
                 .expect("no key is a valid configuration")
                 .suppresses_reregistration()
         );
+    }
+
+    #[tokio::test]
+    async fn rotating_the_erasure_key_keeps_the_outgoing_one_reading() {
+        // A tombstone is `HMAC(key, identifier)` and the identifier was
+        // destroyed with it, so it can never be re-keyed. Replacing the key
+        // without retiring the old one silently stops every earlier erasure from
+        // being recognised — the one failure this crate cannot report — so the
+        // file has to be able to say both.
+        let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
+        let settings = Settings::from_toml(
+            r#"
+[privacy]
+erasure_secret = "0123456789abcdef0123456789abcdef"
+retired_erasure_secrets = ["fedcba9876543210fedcba9876543210"]
+
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+"#,
+        )
+        .expect("parses");
+        settings.validate().expect("both keys are long enough");
+
+        let registry = settings.privacy.registry(pool.clone()).expect("ring");
+        assert!(registry.suppresses_reregistration());
+        assert_eq!(registry.erasure_key_count(), 2);
+
+        // A retired key is held to the same floor: it is the *older* tombstones
+        // it covers, so it is exactly the ones worth inverting.
+        let err = Settings::from_toml(
+            r#"
+[privacy]
+erasure_secret = "0123456789abcdef0123456789abcdef"
+retired_erasure_secrets = ["short"]
+
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+"#,
+        )
+        .expect("parses")
+        .validate()
+        .expect_err("a weak retired key is still a weak key")
+        .to_string();
+        assert!(err.contains("retired_erasure_secrets[0]"), "{err}");
+
+        // And a ring with nothing to write with is a botched rotation: the
+        // outgoing key was moved and the incoming one never arrived, so every
+        // erasure from now on records no tombstone at all.
+        let err = Settings::from_toml(
+            r#"
+[privacy]
+retired_erasure_secrets = ["0123456789abcdef0123456789abcdef"]
+
+[[tables]]
+name = "readings"
+subject_column = "subject_ref"
+"#,
+        )
+        .expect("parses")
+        .validate()
+        .expect_err("retired keys cannot write")
+        .to_string();
+        assert!(err.contains("erasure_secret"), "{err}");
     }
 
     #[test]

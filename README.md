@@ -254,7 +254,7 @@ customer's 2021 readings can stop being attributable while their 2026 readings
 stay linked:
 
 ```rust
-let subject = store.register_subject("customer-4821", interval.from).await?;
+let subject = store.register_subject("customer-4821", interval.from, sparte).await?;
 
 catalog.maintenance()
     .anonymise_after(Retention::CalendarYears(3), "§ 60 Abs. 6 MsbG", "retention-job")
@@ -266,6 +266,19 @@ refused at the write — otherwise nothing downstream could tell, and the only
 symptom would be a sweep that never came due. The sweep itself reads no readings
 at all: it is one indexed `DELETE` against the registry.
 
+`sparte` is in it because the epoch is the year of the day a reading is
+**balanced** on, and for gas that is the Gastag — 06:00 to 06:00 local. One rule,
+`retention_epoch(at, sparte)`, serves the mint and the write's check, so they
+cannot disagree; for everything but gas it is the Berlin calendar year.
+
+An Article 17 request names a person, not a year or an opaque token, so that is an
+entry point too:
+
+```rust
+let years = catalog.subject_epochs("customer-4821").await?;
+catalog.erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", now).await?;
+```
+
 A table declaring a `subject_column` needs the registry it resolves against, and
 a configuration file supplies it — one for the whole deployment, because the
 mapping is:
@@ -276,10 +289,17 @@ erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes; turns on suppr
 ```
 
 `meterstore erasures` reads the audit trail from a shell, because *"we deleted
-it"* is not evidence. There is deliberately no `meterstore erase`: an Article 17
-request usually reaches an application's own tables too, and those must succeed
-or fail in **one transaction** with the mapping — which `erase_in` gives and a
-CLI invocation cannot.
+it"* is not evidence. Every row records which duty it discharged, so
+`--since`/`--until` and `--trigger` ask for a period rather than a page. There is
+deliberately no `meterstore erase`: an Article 17 request usually reaches an
+application's own tables too, and those must succeed or fail in **one
+transaction** with the mapping — which `erase_in` gives and a CLI invocation
+cannot.
+
+The suppression key is a **ring**: a tombstone is `HMAC(key, identifier)` and the
+identifier was destroyed with it, so it can never be re-keyed and a single key
+could never be rotated. `erasure_secret` writes; `retired_erasure_secrets` keep
+being read.
 
 `meter_local_day` is not a convenience, and for **gas it is the wrong function**.
 `Europe/Berlin` observes daylight saving, so the UTC day boundary sits at 01:00

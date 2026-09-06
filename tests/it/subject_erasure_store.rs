@@ -258,7 +258,10 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
 async fn a_registered_reference_is_accepted() {
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821", D20).await.unwrap();
+    let subject = store
+        .register_subject("customer-4821", D20, Sparte::Strom)
+        .await
+        .unwrap();
     let outcome = store.append(&[reading(Some(subject.as_str()))]).await;
 
     assert!(outcome.is_ok(), "a live mapping must write: {outcome:?}");
@@ -289,7 +292,10 @@ async fn a_replay_after_erasure_cannot_rebuild_the_link() {
     // hours later a broker redelivers a batch from before it.
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821", D20).await.unwrap();
+    let subject = store
+        .register_subject("customer-4821", D20, Sparte::Strom)
+        .await
+        .unwrap();
     store
         .append(&[reading(Some(subject.as_str()))])
         .await
@@ -314,7 +320,10 @@ async fn a_replay_after_erasure_cannot_rebuild_the_link() {
 
     // And the ingest path cannot get a working reference by re-registering.
     assert!(
-        store.register_subject("customer-4821", D20).await.is_err(),
+        store
+            .register_subject("customer-4821", D20, Sparte::Strom)
+            .await
+            .is_err(),
         "re-registration must stay suppressed"
     );
 }
@@ -325,7 +334,10 @@ async fn the_readings_survive_erasure_and_stop_being_attributable() {
     // requires them — and what is destroyed is the ability to say whose they are.
     let (store, _w) = store_with_subjects().await;
 
-    let subject = store.register_subject("customer-4821", D20).await.unwrap();
+    let subject = store
+        .register_subject("customer-4821", D20, Sparte::Strom)
+        .await
+        .unwrap();
     store
         .append(&[reading(Some(subject.as_str()))])
         .await
@@ -374,11 +386,11 @@ async fn the_retention_sweep_anonymises_only_subjects_past_the_ceiling() {
 
     let long_ago = datetime!(2021-03-01 00:00 UTC);
     let old = store
-        .register_subject("customer-moved-out", long_ago)
+        .register_subject("customer-moved-out", long_ago, Sparte::Strom)
         .await
         .unwrap();
     let current = store
-        .register_subject("customer-still-here", D20)
+        .register_subject("customer-still-here", D20, Sparte::Strom)
         .await
         .unwrap();
 
@@ -398,7 +410,7 @@ async fn the_retention_sweep_anonymises_only_subjects_past_the_ceiling() {
         .expect("sweep");
 
     assert_eq!(erased.len(), 1, "only the subject past the ceiling");
-    assert_eq!(erased[0].subject, old);
+    assert_eq!(erased[0].subject.as_ref(), Some(&old));
 
     let registry = store.subject_registry().unwrap();
     assert!(
@@ -444,7 +456,7 @@ async fn a_reference_from_the_wrong_collection_year_is_refused_at_the_write() {
     let (store, _w) = store_with_subjects().await;
 
     let this_year = store
-        .register_subject("customer-4821", D20)
+        .register_subject("customer-4821", D20, Sparte::Strom)
         .await
         .expect("register 2026");
 
@@ -459,7 +471,7 @@ async fn a_reference_from_the_wrong_collection_year_is_refused_at_the_write() {
 
     // The right reference for that year is accepted, and it is a different one.
     let that_year = store
-        .register_subject("customer-4821", OLD)
+        .register_subject("customer-4821", OLD, Sparte::Strom)
         .await
         .expect("register 2022");
     assert_ne!(this_year, that_year);
@@ -478,11 +490,11 @@ async fn an_article_17_erasure_reaches_every_year_of_a_subject() {
     let registry = store.subject_registry().expect("configured");
 
     let old = store
-        .register_subject("customer-4821", OLD)
+        .register_subject("customer-4821", OLD, Sparte::Strom)
         .await
         .expect("register 2022");
     let current = store
-        .register_subject("customer-4821", D20)
+        .register_subject("customer-4821", D20, Sparte::Strom)
         .await
         .expect("register 2026");
 
@@ -516,11 +528,11 @@ async fn a_sweep_expires_one_year_of_a_subject_and_leaves_the_rest() {
 
     // One person, two collection years, one natural identifier.
     let then = authoritative
-        .register_subject("customer-still-here", OLD)
+        .register_subject("customer-still-here", OLD, Sparte::Strom)
         .await
         .expect("register 2022");
     let now_ref = authoritative
-        .register_subject("customer-still-here", D20)
+        .register_subject("customer-still-here", D20, Sparte::Strom)
         .await
         .expect("register 2026");
     assert_ne!(then, now_ref, "a year is its own unit of erasure");
@@ -541,7 +553,7 @@ async fn a_sweep_expires_one_year_of_a_subject_and_leaves_the_rest() {
         .expect("sweep");
 
     assert_eq!(erased.len(), 1, "one epoch came due: {erased:?}");
-    assert_eq!(erased[0].subject, then);
+    assert_eq!(erased[0].subject.as_ref(), Some(&then));
     assert!(
         registry.resolve(&then).await.unwrap().is_none(),
         "the expired year is unlinked"
@@ -579,7 +591,7 @@ async fn the_scheduled_sweep_is_the_catalog_sweep() {
     let store = catalog.table(TABLE).expect("first table");
 
     let subject = store
-        .register_subject("customer-old", OLD)
+        .register_subject("customer-old", OLD, Sparte::Strom)
         .await
         .expect("register");
     store
@@ -671,7 +683,7 @@ async fn a_sweep_needs_no_session_at_all_so_a_restricted_view_cannot_skew_it() {
     let (store, _w) = store_with_subjects().await;
 
     let live = store
-        .register_subject("customer-still-here", D20)
+        .register_subject("customer-still-here", D20, Sparte::Strom)
         .await
         .unwrap();
     store
@@ -721,5 +733,221 @@ async fn a_sweep_needs_no_session_at_all_so_a_restricted_view_cannot_skew_it() {
         .await
         .expect("sweep");
     assert_eq!(erased.len(), 1, "{erased:?}");
-    assert_eq!(erased[0].subject, live);
+    assert_eq!(erased[0].subject.as_ref(), Some(&live));
+}
+
+/// The same reading, as gas.
+///
+/// Gas is the only commodity whose balancing day is not the calendar day, so it
+/// is the only one where the epoch and the wall-clock year can disagree.
+fn gas_reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
+    let interval = metering::interval::MeterInterval {
+        from,
+        to: from + Duration::minutes(15),
+        value: rust_decimal::Decimal::new(42, 0),
+        quality: metering::QualityFlag::Measured,
+        obis_code: "7-1:99.33.0".parse().ok(),
+    };
+    let series = MeasurementSeries::new(
+        "11111111115".parse().unwrap(),
+        "7-1:99.33.0".parse().ok(),
+        vec![interval],
+        MeasurementSource::ManualEntry {
+            operator_id: "test".to_string(),
+            reason: "fixture".to_string(),
+        },
+        datetime!(2026-07-27 06:00 UTC),
+    );
+
+    let stored = StoredSeries::of(
+        Sparte::Gas,
+        series,
+        ScopedVersion::new(
+            VersionScope::for_interval("9900000000001", from, Sparte::Gas).unwrap(),
+            Version::new(1).unwrap(),
+        ),
+        datetime!(2026-07-27 06:00 UTC),
+    );
+
+    match subject {
+        Some(s) => stored.with_extra("subject_ref", ScalarValue::Utf8(Some(s.to_string()))),
+        None => stored,
+    }
+}
+
+#[tokio::test]
+async fn a_gas_reading_in_the_first_hours_of_the_year_is_storable() {
+    // The regression. `2026-01-01T00:00Z` is 01:00 on New Year's Day in Berlin:
+    // calendar year 2026, and still Gastag 2025-12-31 — the day it is balanced,
+    // settled and invoiced on.
+    //
+    // Were `register_subject` to read the epoch off the local calendar while the
+    // write path checks it against the balancing year, the only reference the
+    // public API could mint for such a reading would be one the write refuses —
+    // and the error would prescribe the very call that cannot satisfy it. Six
+    // hours of gas a year, unstorable.
+    let (store, _w) = store_with_subjects().await;
+    let at = datetime!(2026-01-01 0:00 UTC);
+
+    let subject = store
+        .register_subject("customer-4821", at, Sparte::Gas)
+        .await
+        .expect("register");
+    assert_eq!(
+        subject.epoch().unwrap(),
+        2025,
+        "the year the Gastag is balanced in, not the one the wall clock shows"
+    );
+
+    let outcome = store
+        .append(&[gas_reading_at(at, Some(subject.as_str()))])
+        .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(outcome.unwrap().total(), 1);
+}
+
+#[tokio::test]
+async fn the_same_instant_is_a_different_epoch_for_electricity() {
+    // The other half of the rule: electricity balances on the calendar day, so
+    // the same instant is 2026 — and the reference minted for gas must not be
+    // accepted on it, because the two come due a year apart.
+    let (store, _w) = store_with_subjects().await;
+    let at = datetime!(2026-01-01 0:00 UTC);
+
+    let gas = store
+        .register_subject("customer-4821", at, Sparte::Gas)
+        .await
+        .expect("register gas");
+    let power = store
+        .register_subject("customer-4821", at, Sparte::Strom)
+        .await
+        .expect("register electricity");
+    assert_eq!(power.epoch().unwrap(), 2026);
+    assert_ne!(gas, power);
+
+    store
+        .append(&[reading_at(at, Some(power.as_str()))])
+        .await
+        .expect("the electricity reference is accepted on an electricity reading");
+
+    let err = store
+        .append(&[reading_at(at, Some(gas.as_str()))])
+        .await
+        .expect_err("a 2025 reference must not attribute a 2026 reading");
+    let msg = err.to_string();
+    assert!(msg.contains("retention epoch"), "{msg}");
+    assert!(msg.contains("2025") && msg.contains("2026"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_subjects_epochs_can_be_enumerated_from_the_store() {
+    // An Article 17 request names a person, so answering it starts with "which
+    // years do we still link?". Without an enumeration a consumer has to guess a
+    // window and probe it year by year.
+    let (store, _w) = store_with_subjects().await;
+
+    store
+        .register_subject("customer-4821", OLD, Sparte::Strom)
+        .await
+        .expect("register 2022");
+    store
+        .register_subject("customer-4821", D20, Sparte::Strom)
+        .await
+        .expect("register 2026");
+
+    assert_eq!(
+        store.subject_epochs("customer-4821").await.unwrap(),
+        vec![2022, 2026]
+    );
+    assert_eq!(
+        store
+            .subject_registrations("customer-4821")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store.subject_epochs("never-seen").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_article_17_request_can_be_answered_from_the_identifier_alone() {
+    // What a request actually carries: a customer number, not the opaque token
+    // the lake stores.
+    let (catalog, _w) = catalog_with_subjects().await;
+    let authoritative = catalog.table(TABLE).expect("first table");
+    let second = catalog.table(SECOND_TABLE).expect("second table");
+    let registry = authoritative.subject_registry().expect("configured");
+
+    let then = authoritative
+        .register_subject("customer-4821", OLD, Sparte::Strom)
+        .await
+        .expect("register 2022");
+    let now_ref = authoritative
+        .register_subject("customer-4821", D20, Sparte::Strom)
+        .await
+        .expect("register 2026");
+
+    authoritative
+        .append(&[reading_at(OLD, Some(then.as_str()))])
+        .await
+        .expect("old reading");
+    second
+        .append(&[reading_at(D20, Some(now_ref.as_str()))])
+        .await
+        .expect("current reading");
+
+    let erased = catalog
+        .erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", D21)
+        .await
+        .expect("erase");
+
+    assert_eq!(erased.len(), 2, "every epoch of the person: {erased:?}");
+    assert!(registry.resolve(&then).await.unwrap().is_none());
+    assert!(registry.resolve(&now_ref).await.unwrap().is_none());
+    assert!(
+        catalog
+            .subject_epochs("customer-4821")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The readings themselves survive in both tables — anonymised, not deleted.
+    for (store, table) in [(authoritative, TABLE), (second, SECOND_TABLE)] {
+        let rows = store
+            .query(&format!(
+                "SELECT subject_ref FROM {} WHERE subject_ref IS NOT NULL",
+                store.raw_table()
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{table}: {e}"));
+        assert_eq!(
+            rows.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
+            1,
+            "{table} keeps its row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_arrives_before_the_ingest_is_still_honoured() {
+    // The pipeline has not delivered this customer yet, so there is no linkage
+    // to destroy — and the half of the request that matters is the other one.
+    let (store, _w) = store_with_subjects().await;
+
+    let recorded = store
+        .erase_subject_by_id("customer-not-yet-here", "DSAR-2026-0100", "dpo", D21)
+        .await
+        .expect("erase");
+
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].subject.is_none(), "{recorded:?}");
+    assert!(
+        store
+            .register_subject("customer-not-yet-here", D20, Sparte::Strom)
+            .await
+            .is_err(),
+        "the delivery that follows must not rebuild the link"
+    );
 }

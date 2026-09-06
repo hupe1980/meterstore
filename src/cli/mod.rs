@@ -307,10 +307,26 @@ pub enum Command {
     ///
     /// The registry is deployment-wide, so the trail is one list rather than one
     /// per table.
+    ///
+    /// `--since`/`--until` and `--trigger` are what turn it into evidence for a
+    /// period: a bare row cap answers "what happened lately", and an auditor asks
+    /// "what happened in Q3" and "show me that the retention sweep runs".
     Erasures {
         /// Most rows to show, newest first.
         #[arg(long, default_value_t = 50, value_name = "N")]
         limit: i64,
+        /// Only erasures at or after this instant (RFC 3339).
+        #[arg(long, value_name = "INSTANT")]
+        since: Option<String>,
+        /// Only erasures strictly before this instant (RFC 3339).
+        ///
+        /// Half-open with `--since`, so consecutive periods tile without
+        /// reporting the row on the boundary twice.
+        #[arg(long, value_name = "INSTANT")]
+        until: Option<String>,
+        /// Only one duty: `request` for Article 17, `retention` for § 60 Abs. 6.
+        #[arg(long, value_name = "TRIGGER")]
+        trigger: Option<String>,
     },
 
     /// Destroy a table: every partition, the catalogue entry and the data files.
@@ -452,7 +468,21 @@ async fn run(cli: &Cli) -> Result<()> {
         Command::Explain { sql } => explain(cli, sql).await,
         Command::Snapshots { table } => snapshots(cli, table.as_deref()).await,
         Command::Serve { addr, catalog_addr } => serve(cli, addr, catalog_addr.as_deref()).await,
-        Command::Erasures { limit } => erasures(cli, *limit).await,
+        Command::Erasures {
+            limit,
+            since,
+            until,
+            trigger,
+        } => {
+            erasures(
+                cli,
+                *limit,
+                since.as_deref(),
+                until.as_deref(),
+                trigger.as_deref(),
+            )
+            .await
+        }
         Command::Purge { table, confirm } => purge(cli, table, confirm).await,
     }
 }
@@ -901,24 +931,38 @@ fn bind_address(addr: &str) -> Result<std::net::SocketAddr> {
 /// second stream together. The trail is therefore read from the first table that
 /// carries a registry, not concatenated per table, which would report every row
 /// as many times as the deployment has tables.
-async fn erasures(cli: &Cli, limit: i64) -> Result<()> {
+async fn erasures(
+    cli: &Cli,
+    limit: i64,
+    since: Option<&str>,
+    until: Option<&str>,
+    trigger: Option<&str>,
+) -> Result<()> {
     if limit <= 0 {
         return Err(Error::config(format!(
             "--limit is a row count and must be positive; got {limit}"
         )));
     }
+    let mut query = crate::ErasureQuery::new().limit(limit);
+    if let Some(text) = since {
+        query = query.since(parse_instant("--since", text)?);
+    }
+    if let Some(text) = until {
+        query = query.until(parse_instant("--until", text)?);
+    }
+    if let Some(text) = trigger {
+        query = query.trigger(text.parse()?);
+    }
+
     let catalog = load(cli).await?;
-    let registry = catalog
-        .tables()
-        .find_map(crate::MeterStore::subject_registry)
-        .ok_or_else(|| {
-            Error::config(
-                "no table in this configuration declares a subject_column, so this \
-                 deployment holds no subject mapping and there is nothing to erase or \
-                 to report. See the privacy documentation",
-            )
-        })?;
-    render::erasures(&registry.erasures(limit).await?, cli.format)
+    if catalog.subject_registry().is_none() {
+        return Err(Error::config(
+            "no table in this configuration declares a subject_column, so this \
+             deployment holds no subject mapping and there is nothing to erase or \
+             to report. See the privacy documentation",
+        ));
+    }
+    render::erasures(&catalog.erasures(&query).await?, cli.format)
 }
 
 async fn purge(cli: &Cli, table: &str, confirm: &str) -> Result<()> {

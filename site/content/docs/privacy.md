@@ -78,11 +78,11 @@ let store = MeterStore::builder()
     .await?;
 
 // An opaque reference, for the collection year these readings belong to.
-let subject = store.register_subject("customer-4821", interval.from).await?;
+let subject = store.register_subject("customer-4821", interval.from, sparte).await?;
 
 // Later: destroy the link, in every year. The readings stay; nothing can
-// attribute them.
-store.erase_subject(&subject, "DSAR-2026-0042", "privacy-team", now).await?;
+// attribute them. A request names a person, so it can be entered as one.
+store.erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", now).await?;
 ```
 
 | Property | How it is met |
@@ -97,7 +97,10 @@ is no argument to have about whether ciphertext is still personal data, because
 the linking data is actually gone.
 
 **References come from the OS CSPRNG.** A reference an attacker can predict or
-recompute is a re-identification path that survives erasure.
+recompute is a re-identification path that survives erasure. The shape is
+checked, since that is the checkable part: `s<year>_<token>`, token ≥ 22
+characters from `A-Z a-z 0-9 . _ -`. Hex, base64url and a UUID all pass; the
+customer number a pipeline substitutes when it has no reference to hand does not.
 
 **It is an attribute column, never an identity column.** A measuring point
 produces one reading per interval whoever occupies it, so the reference is
@@ -143,8 +146,8 @@ So a reference belongs to **one collection year**, and the year is part of it:
 and the sweep expires them independently:
 
 ```rust
-let y2022 = store.register_subject("customer-4821", jan_2022).await?;
-let y2026 = store.register_subject("customer-4821", jan_2026).await?;
+let y2022 = store.register_subject("customer-4821", jan_2022, Sparte::Strom).await?;
+let y2026 = store.register_subject("customer-4821", jan_2026, Sparte::Strom).await?;
 assert_ne!(y2022, y2026);
 ```
 
@@ -155,13 +158,54 @@ refused at the write — the year is in the reference, so the check is a string
 parse. Without it nothing downstream could tell: the column stays well-formed,
 the reference resolves, and the only symptom is a sweep that never comes due.
 
-**An Article 17 erasure still covers the person.** A DSAR names a subject, not a
-year, so `erase_subject` destroys every epoch behind the reference it is given
-and returns one audit record per year.
+### The year is the one the readings are balanced in
 
-The year is Berlin's, because the statute is: an interval starting
-`2026-12-31T23:00Z` is already 2027 locally — and for gas the Gastag rather than
-midnight, the same boundary that decides a Bilanzierungsmonat.
+`erasure::retention_epoch(at, sparte)` is the rule, and both sides read it — the
+mint and the write's check are the same call. The commodity is in it because the
+epoch is the year of the day a reading is **settled** on, and for gas that is the
+Gastag, 06:00 to 06:00 local.
+
+It matters for six hours a year. A gas reading at `2026-01-01T00:00Z` is 01:00 on
+New Year's Day in Berlin and still Gastag 2025-12-31 — balanced in the December
+Bilanzierungsmonat, invoiced with 2025, epoch 2025. That also keeps a delivery
+whole: a Gastag spanning New Year has intervals in two local years but one
+balancing year, so an MSCONS Lastgang for it stays one series with one reference.
+A delivery that genuinely crosses a balancing-year boundary is split at it.
+
+The **sweep** keeps the plain calendar year: the `epoch` column is one integer
+shared by every commodity, so there is no `sparte` to ask it with, and taking the
+gas boundary there would push every epoch a year later — the direction that keeps
+personal data past its ceiling. For everything but gas the two are the same
+number, and the year is Berlin's either way.
+
+### Answering a request that names a person
+
+A DSAR arrives with a customer number, a contract or an occupancy — never with
+the opaque token the lake stores, and never with a year. So the identifier is an
+entry point of its own:
+
+```rust
+// What is still linked, if anything.
+let years = catalog.subject_epochs("customer-4821").await?;   // e.g. [2024, 2025, 2026]
+
+// Unlink every one of them, in every table.
+let records = catalog
+    .erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", now)
+    .await?;
+```
+
+`erase_subject`, given a reference, does the same thing: it resolves the
+reference to its identifier and destroys **every** epoch behind it, one audit
+record per year. Erasing only the year whose reference the caller happened to
+hold would report the request as honoured while last year's readings stayed
+attributable.
+
+**A request may arrive before the delivery does.** There is then no linkage to
+destroy, and the other half of the request still stands: *do not start*. With a
+suppression key configured this writes the tombstone anyway and the delivery that
+follows is refused — the audit row names no reference, so `ErasureRecord::subject`
+is `None`. Without a key nothing could recognise the identifier later, so nothing
+is recorded and the call returns empty.
 
 ## Keeping a subject erased
 
@@ -192,8 +236,38 @@ a real customer out permanently. Lifting restores the ability to *register* agai
 under a new reference. It does not restore the old link, and the audit row
 survives.
 
+**Lifting is itself audited** — `lifted_at`, `lifted_by` and `lift_reason` on the
+erasure rows it clears, returned as `ErasureRecord::lifted`. It reverses a
+compliance decision, so the trail has to show who authorised it and not only that
+a registration reappeared.
+
+**Refused registrations are counted.** `meterstore.registrations_suppressed` is
+the replay alarm: each one is a system upstream still carrying data from before an
+erasure. Refused here, still to be fixed there. Zero is the expected reading.
+
+### Rotating the key
+
 The key must outlive every erasure and is not recoverable from the database.
 Losing it exposes nothing; it silently disables suppression.
+
+**A tombstone can never be re-keyed** — it is `HMAC(key, identifier)` and the
+identifier was destroyed in the same transaction that wrote it. So the key is a
+**ring**: the first key writes every new tombstone, every key is checked on a
+lookup, and rotation is additive.
+
+```toml
+[privacy]
+erasure_secret = "${METERSTORE_ERASURE_SECRET}"                  # writes
+retired_erasure_secrets = ["${METERSTORE_ERASURE_SECRET_2025}"]  # still read
+```
+
+Retiring a key stops it writing; it does not mean it can be destroyed. A key stays
+in the ring for as long as the erasures it recorded must stay suppressed —
+indefinitely, for Article 17. What rotation bounds is a key's window as a *writing*
+key, which is what a compromise of it costs. Retired keys meet the same 32-byte
+floor, since it is the older tombstones they cover, and `retired_erasure_secrets`
+without an `erasure_secret` is refused at startup as the half-finished rotation it
+is.
 
 **In memory it is redacted *and* wiped.** `Debug` prints only whether a key is
 configured, so it cannot reach a log line; the buffer holding it is zeroized on
@@ -248,15 +322,6 @@ are the same sweep run once, for a deployment that schedules it elsewhere — an
 the same operation as each other, since the registry is deployment-wide and
 neither reads a reading.
 
-### One registry for the deployment
-
-One `meterstore_subject_map`, keyed by `(natural identifier, collection year)`, so
-two tables registering the same identifier for the same year share one
-`SubjectRef` and a single erasure unlinks **both**. That is what an Article 17
-request needs: it must reach the authoritative readings *and* the
-non-authoritative second stream, since "non-authoritative for settlement" says
-nothing about whether the data is personal.
-
 This is also the answer to "there is no partial data expiry". The statute does not
 require deleting rows; it requires that the values stop being personal, and that
 is `O(1)` without rewriting a byte.
@@ -276,6 +341,10 @@ name = "readings_versions"
 subject_column = "subject_ref"
 ```
 
+`create_tables` checks the columns it is about to write, so a registry carrying
+an earlier shape of these tables is refused there — naming what to drop — rather
+than at the first erasure, as a missing-column error.
+
 `Settings::connect()` builds **one** registry for the whole deployment, over the
 same pool as the hot tier — because the mapping is deployment-wide, and because
 erasure needs storage where deletion is real and in the same database as the
@@ -294,6 +363,32 @@ no `meterstore erase`: an Article 17 request usually reaches an application's ow
 tables too, and those must succeed or fail in **one transaction** with the
 mapping — which `SubjectRegistry::erase_in` gives and a CLI invocation cannot.
 
+## The trail as evidence
+
+Every row records **which duty it discharged** — `request` for Article 17,
+`retention` for § 60 Abs. 6. They are different legal bases and are asked about
+separately, and `reason` is free text a deployment writes for itself, so a sweep
+that had stopped running would otherwise be invisible behind the requests that
+kept arriving. The same value is the `trigger` attribute on
+`meterstore.subjects_erased`, so the counter and the trail cannot disagree.
+
+`ErasureQuery` narrows it the way evidence is asked for — a period and a duty:
+
+```rust
+let q3 = catalog.erasures(
+    &ErasureQuery::new()
+        .since(datetime!(2026-07-01 0:00 UTC))
+        .until(datetime!(2026-10-01 0:00 UTC))
+        .trigger(ErasureTrigger::Retention)
+        .limit(10_000),
+).await?;
+```
+
+The period is half-open, so consecutive quarters tile. A backwards period or a
+non-positive limit is **refused** rather than returning nothing: an empty result
+reads as *"nothing was erased"*, which is the one answer an audit query must not
+give by accident.
+
 ## What it requires of the deployment
 
 **The pseudonymous reference must be the *only* link.** A 15-minute series is
@@ -301,10 +396,9 @@ potentially re-identifiable by singling out, so if another system holds the same
 series against a name, deleting this mapping achieves nothing. Erasure is a
 property of the whole estate; this module guarantees its own part.
 
-**Granularity is your choice.** A reference may stand for a customer, a contract,
-or an occupancy period. A market location outlives its occupants, so keying by
-measuring point alone would erase a previous tenant's data along with the
-requester's.
+**Granularity is your choice**, and it is global — see above: a Marktlokation
+outlives its occupants, so `(tenant, MaLo)` or an occupancy period is usually what
+a subject means.
 
 ## General security posture
 

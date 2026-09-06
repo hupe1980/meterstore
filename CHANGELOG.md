@@ -7,6 +7,205 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.12.0] — 2026-09-06
+
+An audit of the subject registry after 0.11. One key that could never be
+rotated, three compliance actions whose record was thinner than the action, and
+two integrity floors that were convention rather than check.
+
+### The suppression key could not be rotated
+
+The documentation said the key "must outlive every erasure and is not recoverable
+from the database" and stopped there. The consequence it did not draw is that
+such a key can never be **replaced**: a tombstone is `HMAC(key, identifier)` and
+the identifier was destroyed in the same transaction that wrote it — deliberately,
+since keeping it would defeat the erasure — so there is no input from which to
+recompute the tag under a new key.
+
+Changing the secret therefore stops every erasure recorded before the change from
+being recognised, and re-registration re-opens for all of them at once. Nothing
+reports it: the tombstones are still there and simply stop matching.
+
+The registry now holds a **key ring**.
+
+- `SubjectRegistry::with_erasure_keys(pool, &[current, ..retired])`. `keys[0]`
+  writes every new tombstone; every key is checked on a lookup.
+  `with_erasure_secret` is the one-key case of it.
+- `[privacy] retired_erasure_secrets` is the configuration half. Rotation is
+  additive: move the outgoing key there, put the new one in `erasure_secret`.
+- Retiring is not destroying. A key stays in the ring for as long as the erasures
+  it recorded must stay suppressed — indefinitely, for Article 17. What rotation
+  buys is that a key's window as a *writing* key is bounded, which is what a
+  compromise of it costs.
+- Retired keys are held to the same 32-byte floor, because it is the **older**
+  tombstones a retired key covers. A ring of retired keys with no
+  `erasure_secret` is refused at startup as the half-finished rotation it is:
+  every erasure from then on would record no tombstone at all.
+- `lift_suppression` clears the tombstone under every key, so an identifier is
+  genuinely liftable rather than half-lifted.
+
+### Lifting a suppression left only a log line
+
+It reverses a compliance decision — it lets an identifier be registered again
+after a certified erasure — and the only record of it was a `warn!`. A reviewer
+reading the trail saw an erasure, then a live registration for the same person,
+and nothing in between to say who authorised the middle step.
+
+`meterstore_erasures` gains `lifted_at`, `lifted_by` and `lift_reason`, written
+onto the rows the lift clears and returned as `ErasureRecord::lifted`
+([`SuppressionLift`]). `lift_suppression` takes `now`, like every other operation
+in the crate — the clock is a parameter here, and this was the one place it was
+not.
+
+### The trail could not tell a statutory expiry from a request
+
+The code has carried the distinction since the erasure counter existed; the audit
+row did not. `reason` is caller-supplied free text and cannot carry it: two
+deployments spell one duty differently, and a § 60 Abs. 6 sweep that had stopped
+running was invisible behind the Article 17 requests that kept arriving.
+
+- `ErasureTrigger` — `Request` or `Retention` — is now a column on every erasure
+  row **and** the `trigger` attribute on `meterstore.subjects_erased`. One type,
+  so the counter and the trail cannot come to disagree.
+  `observe::TRIGGER_REQUEST`/`TRIGGER_RETENTION` are gone.
+- `SubjectRegistry::erasures` takes an `ErasureQuery`: a half-open `since`/`until`
+  period, a trigger, and a limit. A backwards period or a non-positive limit is
+  **refused** rather than returning nothing — an empty result reads as "nothing
+  was erased", which is the one answer an audit query must not give by accident.
+- `meterstore erasures` grows `--since`, `--until` and `--trigger`, and prints the
+  trigger and any lift.
+- `MeterStore::erasures` and `MeterCatalog::erasures` expose the trail without
+  reaching for the registry, beside `is_subject_suppressed` and
+  `lift_subject_suppression`.
+
+### A refused re-registration was logged and not counted
+
+Every one is a pipeline handing the store an identifier from before an Article 17
+erasure — a broker redelivering, a reprocessing job on an old offset, a nightly
+import from a system that never learned. It is refused, so nothing is re-linked;
+what it reports is that something upstream still carries data it should have
+dropped. `meterstore.registrations_suppressed` is that alarm, and zero is the
+expected reading.
+
+### Two integrity floors were convention rather than check
+
+- **A reference's shape.** `SubjectRef::new` accepted `s2026_abc`. The token must
+  now be at least [`MIN_REFERENCE_TOKEN_CHARS`] (22) characters from
+  `A-Z a-z 0-9 . _ -` — hex, base64url and a UUID all clear it. Nothing can tell
+  128 random bits from a padded counter; what this rules out is the failure that
+  happens, a pipeline with no reference to hand putting a customer number in the
+  column. That resolves cleanly, looks exactly like a pseudonym in every table
+  that stores it, and is a re-identification path that survives erasure.
+- **The epoch, written twice.** `meterstore_subject_map` carries a `CHECK` that
+  the reference's own `s<year>_` prefix matches its `epoch` column. A row where
+  they disagreed would be swept on one year while refusing readings from the
+  other, with both halves looking well formed.
+
+### `create_tables` was silent about a registry it could not use
+
+`CREATE TABLE IF NOT EXISTS` is idempotent and therefore silent: against a
+database holding an earlier shape of these tables it created nothing, reported
+success, and the divergence surfaced later as `column "trigger" does not exist`
+— at an erasure, which is a compliance operation, from an error saying nothing
+about what to do. It now checks the columns it is about to write and says to drop
+and recreate the two tables, at the setup step where that can be acted on.
+
+Recreate both registry tables; the crate is unpublished and the schema changes in
+place. The mapping is rebuilt by re-registering; the audit trail is not, so export
+it first if the deployment has erased anything.
+
+[`SuppressionLift`]: https://docs.rs/meterstore/latest/meterstore/erasure/struct.SuppressionLift.html
+[`MIN_REFERENCE_TOKEN_CHARS`]: https://docs.rs/meterstore/latest/meterstore/erasure/constant.MIN_REFERENCE_TOKEN_CHARS.html
+
+## [0.11.0] — 2026-09-06
+
+Two defects in the subject registry, reported from an integration of 0.10. One
+made a class of gas reading impossible to store; the other left an Article 17
+request answerable only by guesswork.
+
+### A gas reading in the first hours of the year could not be stored
+
+`register_subject(natural_id, at)` minted the reference for
+`retention_epoch(at)`, the **local calendar year**. The write path validated it
+against `balancing_day(at, sparte).year()`, the **balancing** year. For
+electricity those always agree; for gas they disagree for six hours a year,
+because the Gastag runs 06:00 to 06:00 — a reading at `2026-01-01T00:00Z`
+(01:00 Berlin on 1 January) is balanced on Gastag **2025-12-31** while its local
+year is **2026**.
+
+The reference `register_subject` minted for that instant was the only one the
+documented API could produce, and the write refused it — with an error naming
+the very call that could not satisfy it:
+
+> subject reference `s2026_…` belongs to retention epoch 2026 but this reading is
+> balanced on 2025 … register one per year with
+> `register_subject(natural_id, interval.from)`
+
+There is now **one rule**, `erasure::retention_epoch(at, sparte)` — the balancing
+year — and both the mint and the check are that call, so they cannot drift again:
+
+- `SubjectRegistry::register`, `SubjectRegistry::lookup` and
+  `MeterStore::register_subject` take a `Sparte`. `register_in_epoch` and
+  `lookup_in_epoch` are the primitives for a caller that already holds the epoch.
+- A Gastag spanning New Year has intervals in two local years but **one**
+  balancing year, so an MSCONS Lastgang for that day stays one delivery with one
+  reference. On the calendar rule it would have had to be split.
+- Those six hours expire with 2025 rather than 2026 — a year earlier than the
+  calendar reading of `[MsbG § 60 Abs. 6]` requires, which is the compliant
+  direction, since three years is a ceiling.
+- The **sweep** keeps the plain calendar year: the `epoch` column is one integer
+  shared by every commodity, so there is no `sparte` to ask with, and taking the
+  gas boundary there would push every epoch — electricity included — a year
+  later.
+
+### A natural identifier's epochs could not be enumerated
+
+A reference belongs to one collection year, which is right. But `SubjectRegistry`
+exposed `lookup(natural_id, at)` and nothing answering *"which epochs does this
+identifier still have references for?"* — so honouring an Article 17 request, which
+is about a person rather than a year, meant guessing a window and probing once per
+candidate year, or reading `meterstore_subject_map` across the crate boundary. A
+guess one year short reports a subject as fully erased while a mapping survives.
+
+- `SubjectRegistry::registrations`, `epochs` and `references` enumerate what an
+  identifier still has, oldest epoch first. `SubjectRegistration` is the row.
+- `SubjectRegistry::erase_all(natural_id, …)` and `erase_all_in` take the
+  identifier a request actually names. `MeterStore::erase_subject_by_id` and
+  `MeterCatalog::erase_subject_by_id` are the store- and deployment-level forms,
+  beside `subject_epochs` and `subject_registrations` on both.
+- With a suppression key configured, `erase_all` honours a request for an
+  identifier the deployment holds **no** mapping for — a request that arrived
+  before the delivery did. There is no linkage to destroy, so what it writes is
+  the tombstone, and the later registration is refused. `ErasureRecord::subject`
+  is therefore `Option<SubjectRef>`, and `ErasureRecord::epoch()` reads the year
+  off it.
+- `meterstore_erasures` gains a `BIGSERIAL` primary key and `subject_ref` becomes
+  a nullable `UNIQUE` column, so such a row can exist at all. Recreate it; the
+  crate is unpublished and the schema changes in place.
+
+### Registration and erasure raced
+
+`register` checked the suppression list and then inserted; `erase` wrote the
+tombstone and deleted the mapping. Neither locked anything the other held —
+registration is about a row that does not exist yet — so the interleaving that
+ends with a live mapping for a subject the audit trail says was erased was
+possible, and nothing downstream could report it. Both paths now take a
+transaction-scoped advisory lock on the identifier before any row lock, so the
+order is total and they cannot deadlock. `erase_in` needs a transaction rather
+than a bare connection for it, and says so.
+
+### Two write-path costs
+
+- The store checked each subject reference in a batch with its own query. A
+  delivery carries a reference per measuring point, so a set-membership test grew
+  with batch size; `SubjectRegistry::resolvable` answers for the whole batch in
+  one round trip, and deliberately does not hand back the identifiers behind it.
+- The retention sweep issued a `SELECT … FOR UPDATE` and then a `DELETE` and an
+  `INSERT` per row, holding a transaction open across all of them. It is now one
+  `DELETE … RETURNING` and one bulk `INSERT` — the one operation here whose row
+  count is unbounded, since a deployment's whole 2021 comes due on one January
+  morning.
+
 ## [0.10.0] — 2026-09-05
 
 An audit found three ways a query could return a wrong number and one way the
