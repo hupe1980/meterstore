@@ -82,6 +82,26 @@ correction restating an attribute is the same shape at a smaller scale.
   catalogue is now an escape hatch such a consumer can take.
 - `sqlx-postgres` joins the single-sourced dependency gate.
 
+### Every feature set is tested, not only type-checked
+
+Making the catalogue backends features gave the matrix something new to be wrong
+about, and it found two things a type check cannot see.
+
+- **`cli` names `sql-catalog`.** A library caller brings its own
+  `Arc<dyn Catalog>`; the CLI has only the configuration file, so
+  `--no-default-features --features cli` would have compiled a binary that
+  refused every `catalog =` value at runtime.
+- **`meterstore check` refuses a catalogue this build cannot construct.** It
+  promises to validate without connecting, so answering "valid" for a file that
+  cannot open a cold tier was the lie P6 forbids. `CatalogKind::require_compiled_in`
+  is the one place that decides, so validation and construction cannot disagree.
+
+The matrix itself now runs `cargo test --lib` per feature set rather than
+`cargo check --all-targets`, and `just features` exports `-D warnings` to match
+what CI sets globally — a local gate weaker than the remote one reports success
+for the run that matters. That combination is what surfaced the documented
+example's dependence on `object-store-s3` as well as on a catalogue.
+
 ### The `§N` markers are gone
 
 166 of them across 33 source files cited a single-file predecessor of the design

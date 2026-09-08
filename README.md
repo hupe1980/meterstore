@@ -441,7 +441,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**949 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+**950 tests**: unit, property, doc and integration against real PostgreSQL 16 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. Ingest, archival and reads also
 run **against one table at once**, which is the only way to reach the states that
