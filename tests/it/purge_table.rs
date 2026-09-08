@@ -155,7 +155,7 @@ async fn the_table_name_must_be_repeated() {
 
 #[tokio::test]
 async fn purging_one_table_leaves_another_intact() {
-    // The decommissioning case: a table per tenant (§15.2.1) means one tenant
+    // The decommissioning case: a table per tenant means one tenant
     // leaving must not touch the others. They share a catalog, a warehouse root
     // and a PostgreSQL database, so this is not self-evident.
     let harness = TestHarness::start().await.expect("harness");

@@ -8,7 +8,7 @@
 //! DuckDB is a genuinely independent implementation: a different language, a
 //! different Parquet reader, and — through its `iceberg` extension — a different
 //! reading of the Iceberg spec. That is what makes it able to falsify P2, and it
-//! is the half §17.4 cannot check from inside this crate.
+//! is the half this crate cannot check from inside itself.
 //!
 //! # Two levels, and the second is the one that matters
 //!
@@ -41,7 +41,7 @@
 //! DuckDB needs to know which metadata document is current. A REST catalog tells
 //! an engine directly; the **SQL catalog** keeps the pointer in PostgreSQL and
 //! writes no `version-hint.text` beside the files, so an engine pointed at the
-//! bare directory has to glob and guess. §13.7.1 predicted that SQL-catalog
+//! bare directory has to glob and guess. The façade exists because SQL-catalog
 //! deployments need the façade for exactly this class of reason — this is that
 //! prediction, demonstrated. It is a property of the catalog choice, not of the
 //! files.
@@ -245,7 +245,7 @@ async fn duckdb_reads_the_iceberg_table_through_its_metadata() {
 
 #[tokio::test]
 async fn duckdb_applying_the_published_sql_gets_the_right_answer() {
-    // §13.7.2's mitigation against a foreign engine, which is the only setting
+    // The mitigation against a foreign engine, which is the only setting
     // where it matters. The SQL comes from the store unmodified — the same text
     // `system.resolution` serves — with only the table name bound to an
     // `iceberg_scan` over the metadata.
@@ -279,7 +279,7 @@ async fn duckdb_applying_the_published_sql_gets_the_right_answer() {
 #[tokio::test]
 async fn duckdb_confirms_the_naive_query_double_counts() {
     // The hazard, demonstrated in the engine an operator would actually use.
-    // §13.7.2 argues this is why the raw table is named `_versions`; here it is,
+    // This is why the raw table is named `_versions`; here it is,
     // in DuckDB, rather than asserted.
     let workload = MeteringWorkload::new(START)
         .seed(0xBAD2)
@@ -338,7 +338,7 @@ async fn duckdb_sees_the_snapshot_history_a_reproducible_read_pins_to() {
 
 #[tokio::test]
 async fn duckdb_sees_the_values_as_themselves() {
-    // §7.1.1: the data is self-describing. Read by a foreign engine, quality is
+    // The data is self-describing. Read by a foreign engine, quality is
     // `MEASURED` and the value is a decimal — not an integer code needing this
     // crate's source, and not a float that has already lost the settlement's
     // last place.

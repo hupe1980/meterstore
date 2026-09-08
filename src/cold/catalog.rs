@@ -5,7 +5,7 @@
 //! `Arc<dyn Catalog>`, so a deployment can bring a REST catalog, Glue, or anything
 //! else. But the *common* deployment — a `SqlCatalog` on the same PostgreSQL that
 //! backs the hot tier, over an object-store warehouse — is the same wiring every
-//! time: pick the OpenDAL backend from the URI scheme, forward object-store
+//! time: pick the storage backend from the URI scheme, forward object-store
 //! credentials into the catalog properties, and bound the catalog's metadata pool.
 //!
 //! That wiring lives here rather than in each application, because it is
@@ -21,11 +21,14 @@
 //!
 //! # Object-store backends are features
 //!
-//! `file://` and `memory://` are always available. The cloud backends are behind
-//! features so a file-only deployment does not compile the AWS/GCS/Azure SDKs:
-//! `object-store-s3`, `object-store-gcs`, `object-store-azure` (or `object-store-all`).
-//! A warehouse whose scheme needs a backend that was not compiled in is a clear
-//! error at construction, not a silent fallback.
+//! `file://` and `memory://` are always available, through `iceberg`'s own
+//! `LocalFsStorageFactory` and `MemoryStorageFactory`. The cloud backends are
+//! behind `object-store-s3`, `object-store-gcs` and `object-store-azure` (or
+//! `object-store-all`), and they are the only thing that pulls OpenDAL — which
+//! costs an XML parser, a second HTTP client and a second TLS stack, none of
+//! which a warehouse on local disk has any use for. A warehouse whose scheme
+//! needs a backend that was not compiled in is a clear error at construction,
+//! not a silent fallback.
 
 use std::sync::Arc;
 
@@ -116,7 +119,7 @@ fn is_s3_scheme(scheme: &str) -> bool {
     matches!(scheme, "s3" | "s3a" | "s3n" | "minio" | "r2")
 }
 
-/// The OpenDAL storage backend for a warehouse URI, chosen by scheme.
+/// The storage backend for a warehouse URI, chosen by scheme.
 ///
 /// A scheme whose backend feature was not compiled in is an error rather than a
 /// silent fallback to the local filesystem, which would write a "cloud" warehouse
@@ -130,15 +133,18 @@ fn is_s3_scheme(scheme: &str) -> bool {
 pub(crate) fn warehouse_factory(
     warehouse_uri: &str,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>> {
-    use iceberg_storage_opendal::OpenDalStorageFactory;
     let scheme = warehouse_scheme(warehouse_uri);
     Ok(match scheme {
-        "file" => Arc::new(OpenDalStorageFactory::Fs),
-        "memory" => Arc::new(OpenDalStorageFactory::Memory),
+        // `iceberg`'s own, not OpenDAL's. The two behave identically here and the
+        // dependency does not: OpenDAL reaches this crate only through the cloud
+        // backends, so routing the always-available schemes through the built-ins
+        // is what lets `iceberg-storage-opendal` be optional at all.
+        "file" => Arc::new(iceberg::io::LocalFsStorageFactory),
+        "memory" => Arc::new(iceberg::io::MemoryStorageFactory),
         "s3" | "s3a" | "s3n" | "minio" | "r2" => {
             #[cfg(feature = "object-store-s3")]
             {
-                Arc::new(OpenDalStorageFactory::S3 {
+                Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::S3 {
                     customized_credential_load: None,
                 })
             }
@@ -150,7 +156,7 @@ pub(crate) fn warehouse_factory(
         "gs" | "gcs" => {
             #[cfg(feature = "object-store-gcs")]
             {
-                Arc::new(OpenDalStorageFactory::Gcs)
+                Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::Gcs)
             }
             #[cfg(not(feature = "object-store-gcs"))]
             return Err(Error::config(format!(
@@ -160,7 +166,7 @@ pub(crate) fn warehouse_factory(
         "abfss" | "abfs" | "azdls" => {
             #[cfg(feature = "object-store-azure")]
             {
-                Arc::new(OpenDalStorageFactory::Azdls)
+                Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::Azdls)
             }
             #[cfg(not(feature = "object-store-azure"))]
             return Err(Error::config(format!(
@@ -267,8 +273,8 @@ impl std::fmt::Debug for IcebergSqlCatalog<'_> {
 
 #[cfg(feature = "sql-catalog")]
 impl IcebergSqlCatalog<'_> {
-    /// Build the cold tier: a `SqlCatalog` over PostgreSQL, an OpenDAL object-store
-    /// backend chosen from the warehouse scheme, and an [`IcebergCold`] writing into
+    /// Build the cold tier: a `SqlCatalog` over PostgreSQL, a storage backend
+    /// chosen from the warehouse scheme, and an [`IcebergCold`] writing into
     /// the namespace.
     pub async fn build(&self) -> Result<ColdTier> {
         let storage = |e: iceberg::Error| Error::Storage(e.to_string());

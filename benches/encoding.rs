@@ -1,6 +1,6 @@
 //! Benchmarks for the paths every row travels.
 //!
-//! §18 states targets and admits none of them are measured. These close the part
+//! The performance targets are stated and unmeasured. These close the part
 //! that can be measured without infrastructure: the per-row cost of encoding,
 //! decoding and planning, which is what the archival-throughput and query-latency
 //! targets are ultimately made of.
@@ -14,7 +14,7 @@
 //! Not here: archival throughput, query latency, and the compression ratio.
 //! Those need a real PostgreSQL and a real object store, so they belong to a
 //! harness-driven suite rather than to `criterion` — measuring them against
-//! in-memory fakes would produce numbers that look like the §18 targets and mean
+//! in-memory fakes would produce numbers that look like the targets and mean
 //! nothing.
 //!
 //! # Why the fixtures are shaped like real deliveries

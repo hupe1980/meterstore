@@ -35,6 +35,11 @@ invariant violation is worth noticing from wherever it is seen. Contention is no
 a failure. Nor is `deferred`, the other benign no-op — see
 [locks](#locks-and-why-ddl-gives-up).
 
+The lease is a session-scoped advisory lock held over a connection the lease owns,
+which is the part worth stating: a lock taken on a connection that then returns to
+the pool is released the moment another caller checks it out. Two replicas racing
+to archive one table are run in the test suite, not argued.
+
 **One loop, however many tables.** A [catalogue](@/docs/querying.md#several-tables-in-one-session)
 maintains all of its tables from one schedule:
 

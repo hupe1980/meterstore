@@ -1,6 +1,6 @@
 //! The read-only Iceberg REST façade, exercised as HTTP.
 //!
-//! §13.7.1's whole claim is that a SQL-catalog deployment can point Spark,
+//! The whole claim of the façade is that a SQL-catalog deployment can point Spark,
 //! Trino, DuckDB or PyIceberg at this endpoint and have them read the history
 //! straight from object storage. Two properties carry that claim, and both are
 //! about the *wire* rather than about the handlers:
@@ -10,7 +10,8 @@
 //!   route that 404s stops it at the handshake.
 //! * **A mutating verb is refused with the reason, in the envelope the spec
 //!   defines.** An external writer would place rows in the cold tier without
-//!   MeterStore knowing, which is the one thing §6.3 cannot survive. A bodiless
+//!   MeterStore knowing, which is the one thing the tiering invariant cannot
+//!   survive. A bodiless
 //!   `405` would be refused too — and would read to a client as a broken
 //!   endpoint rather than as a read-only one, which is precisely the confusion
 //!   `ApiError` exists to prevent.

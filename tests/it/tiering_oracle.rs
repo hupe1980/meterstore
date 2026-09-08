@@ -1,4 +1,4 @@
-//! The tiering oracle (§17.3), against real PostgreSQL and a real Iceberg
+//! The tiering oracle, against real PostgreSQL and a real Iceberg
 //! warehouse.
 //!
 //! > For any archival history and any query range, a query over the unified view
@@ -127,7 +127,8 @@ async fn a_clean_workload_matches_the_reference_across_the_boundary() {
 async fn corrections_resolve_to_the_same_values_the_reference_holds() {
     // A corrected interval must be returned once, at its latest version. Read
     // from the raw table it would appear twice, and the sum would be inflated by
-    // exactly the corrections — the failure §13.7.2 exists to prevent.
+    // exactly the corrections — the failure the two relation names exist to
+    // prevent.
     let workload = MeteringWorkload::new(START)
         .seed(0xC0DE)
         .malo_ids(4)
@@ -563,7 +564,7 @@ async fn run_readings(
 
 #[tokio::test]
 async fn a_zaehlerstandsgang_matches_the_reference_across_the_boundary() {
-    // §17.3's property over the *other* record type.
+    // The oracle's property over the *other* record type.
     //
     // Two Messlokationen per Marktlokation, because that is the shape a merge key
     // without `melo_id` folds into one reading: the meters agree on the channel

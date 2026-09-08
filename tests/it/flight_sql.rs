@@ -1,6 +1,6 @@
 //! Flight SQL over the unified view, against a real client.
 //!
-//! §13.7.3's justification is narrow and specific: the hot tier lives in
+//! The justification is narrow and specific: the hot tier lives in
 //! PostgreSQL and is not in the Iceberg catalog, so **the unified hot + cold view
 //! is the one thing an external client cannot assemble for itself**. Everything
 //! else it might want is better served by reading the catalog directly.
@@ -202,7 +202,7 @@ async fn results_carry_the_boundary_they_were_computed_against() {
 
 #[tokio::test]
 async fn a_corrected_interval_is_counted_once_over_flight() {
-    // The §13.7.2 trap does not exist here — `readings` is the resolved table —
+    // The resolution trap does not exist here — `readings` is the resolved table —
     // but that has to be true through this surface too, because a BI tool
     // pointed at the raw table would double-count exactly as an Iceberg engine
     // would.
@@ -464,7 +464,7 @@ async fn preparing_a_statement_does_not_run_it() {
 /// A catalog holding a billing table and a non-authoritative second stream,
 /// both populated and both archived through the boundary.
 ///
-/// The shape §15.3 calls ordinary: a statement mentioning both tables is the
+/// The ordinary shape: a statement mentioning both tables is the
 /// second thing an external client cannot assemble for itself.
 async fn two_table_catalog() -> (TestHarness, meterstore::MeterCatalog) {
     use meterstore::config::TableConfig;

@@ -7,7 +7,7 @@
 
 // Real infrastructure, so the fixtures live behind `testkit` like every other
 // suite that needs them: `testkit::postgres` is what shares one container
-// across the binary instead of starting one per test (§17.2.0.1).
+// across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
 use metering::interval::Sparte;

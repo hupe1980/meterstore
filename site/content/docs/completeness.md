@@ -250,14 +250,12 @@ Rust alike — so a check that reads only the first passes a month nothing was
 verified about.
 
 A range that is not day-aligned expects only what it covers on each end day, so a
-billing period starting at noon does not report the morning as missing. What is
-counted is **interval starts inside the range**, not the covered duration divided
-by the step — a reading belongs to the range when its own `from` does, which is
-the predicate the scan underneath applies. The two differ whenever the range ends
-off the grid: over `[00:00, 00:07)` a division gives nothing expected while the
-interval starting at 00:00 is squarely inside the range and is counted in
-`actual`, so the final day of any report ending at `now()` would show a surplus
-that never happened.
+billing period starting at noon does not report the morning as missing. What it
+counts is **interval starts inside the range**, not the covered duration divided
+by the step: a reading belongs to the range when its own `from` does. The two
+part whenever the range ends off the grid — over `[00:00, 00:07)` a division
+expects nothing while the interval at 00:00 is counted in `actual`, and the day
+reports a surplus that never happened.
 
 ## Where the work happens
 

@@ -226,6 +226,11 @@ pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
                 safe: field.is_nullable(),
             }),
             Ok(existing) => {
+                // Two independent questions, deliberately not an `else if`. A
+                // column can change type *and* nullability in one declaration,
+                // and reporting only the first hides the second: a promotion is
+                // safe on its own, so a widened decimal that also became
+                // required would pass a gate whose whole job is to refuse that.
                 if existing.data_type() != field.data_type() {
                     changes.push(SchemaChange::Retyped {
                         name: field.name().clone(),
@@ -233,7 +238,8 @@ pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
                         to: field.data_type().clone(),
                         safe: is_promotable(existing.data_type(), field.data_type()),
                     });
-                } else if existing.is_nullable() != field.is_nullable() {
+                }
+                if existing.is_nullable() != field.is_nullable() {
                     changes.push(SchemaChange::Nullability {
                         name: field.name().clone(),
                         // Widening only. Narrowing would forbid nulls that may
@@ -316,6 +322,39 @@ mod tests {
         assert!(c.is_identical());
         assert!(c.is_safe());
         assert!(c.require_safe("readings").is_ok());
+    }
+
+    #[test]
+    fn a_safe_promotion_does_not_hide_an_unsafe_narrowing_on_the_same_column() {
+        // Type and nullability are independent questions about one column, and a
+        // declaration can change both at once. Reported as an `else if`, the
+        // promotion — which is safe on its own — would be the only change seen,
+        // and a column that also became required would pass the gate whose whole
+        // job is to refuse exactly that.
+        let stored = schema(vec![Field::new("value", DataType::Decimal128(18, 6), true)]);
+        let configured = schema(vec![Field::new(
+            "value",
+            DataType::Decimal128(20, 6),
+            false,
+        )]);
+
+        let report = compare(&configured, &stored);
+        assert_eq!(report.changes.len(), 2, "{report:?}");
+        assert!(
+            report
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::Retyped { safe: true, .. })),
+            "widening a decimal's precision is a promotion: {report:?}"
+        );
+        assert!(
+            report
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::Nullability { safe: false, .. })),
+            "requiring a column that may already hold nulls is not safe: {report:?}"
+        );
+        assert!(report.require_safe("readings_versions").is_err());
     }
 
     #[test]

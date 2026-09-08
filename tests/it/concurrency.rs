@@ -384,3 +384,157 @@ async fn corrections_landing_during_a_scan_are_never_double_counted() {
         "the audit trail must hold every version: {stored} rows for {EXPECTED_ROWS} readings"
     );
 }
+
+// ── Two replicas ────────────────────────────────────────────────────────────
+//
+// Everything above runs three roles in **one** process against one pool. The
+// archive lease exists for a different shape: every replica of a deployment runs
+// the same schedule, and exactly one must win each table. A session-scoped
+// advisory lock is what makes that true, and "session-scoped" is the trap — a
+// lock taken on a connection that then returns to the pool is released the moment
+// another caller checks it out.
+//
+// A second `PostgresHot` over its **own** `PgPool` is what a second replica
+// actually is: the same database, the same warehouse, no shared connection.
+
+/// A second replica over the same database and warehouse as the harness.
+///
+/// Its own pool, so its advisory lock is taken on a session the first replica
+/// cannot reach — which is the whole of what is being tested. Sharing the
+/// harness's pool would make the lock re-entrant and the test vacuous.
+async fn second_replica(harness: &TestHarness) -> Arc<meterstore::PostgresHot> {
+    let pool = sqlx::PgPool::connect(harness.url())
+        .await
+        .expect("second replica pool");
+    Arc::new(meterstore::PostgresHot::new(pool))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_one_replica_holds_is_refused_to_another_and_released_to_it() {
+    // The mechanism, asserted directly rather than inferred from a race: while A
+    // holds the lease B cannot take it, and once A releases it B can. Both halves
+    // matter — a lock that is never granted is as broken as one always granted,
+    // and it is the second half that a connection returning to the pool breaks.
+    use meterstore::tiering::HotStore;
+
+    let (harness, _store) = seeded().await;
+    let table = harness.config().name();
+    let a = harness.hot().clone();
+    let b = second_replica(&harness).await;
+
+    let held = a
+        .try_archive_lease(table)
+        .await
+        .expect("lease query")
+        .expect("an uncontended lease is granted");
+
+    assert!(
+        b.try_archive_lease(table)
+            .await
+            .expect("lease query")
+            .is_none(),
+        "a second replica took a lease the first holds"
+    );
+
+    // A different table is a different lock: one busy table must not stop a
+    // deployment archiving the others.
+    assert!(
+        b.try_archive_lease("some_other_table")
+            .await
+            .expect("lease query")
+            .is_some(),
+        "the lease is per table, not per deployment"
+    );
+
+    held.release().await.expect("release");
+
+    let after = b
+        .try_archive_lease(table)
+        .await
+        .expect("lease query")
+        .expect("the lease is available once released");
+    after.release().await.expect("release");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_replicas_racing_to_archive_leave_the_range_exact() {
+    // The deployment shape the lease exists for, run rather than argued. Two
+    // archivers, two pools, one table, the same `now` — repeatedly.
+    //
+    // What is asserted is safety, not who wins: scheduling decides that, and a
+    // test that required a particular winner would be asserting the runtime's
+    // behaviour rather than this crate's. A losing replica reports
+    // `lease_contended` and changes nothing, so across any interleaving the row
+    // count must be untouched, the watermark must only advance, and the invariant
+    // must hold at every step.
+    use meterstore::{Archiver, tiering::ColdStore};
+
+    let (harness, store) = seeded().await;
+    let before = resolved_count(&store).await;
+    assert_eq!(before, EXPECTED_ROWS, "the fixture is what it claims");
+
+    let table = harness.config().name();
+    let a = Archiver::new(
+        harness.hot().clone(),
+        harness.cold().clone(),
+        harness.config().clone(),
+    );
+    let b = Archiver::new(
+        second_replica(&harness).await,
+        harness.cold().clone(),
+        harness.config().clone(),
+    );
+
+    let mut watermark = harness.cold().watermark(table).await.expect("watermark");
+    let mut contended = 0usize;
+    let mut archived = 0usize;
+
+    for day in 1..=DAYS + 1 {
+        let now = START + Duration::days(day + 1);
+        let (ra, rb) = tokio::join!(a.run_once(now), b.run_once(now));
+        let (ra, rb) = (ra.expect("replica a"), rb.expect("replica b"));
+
+        for outcome in [&ra, &rb] {
+            if outcome.lease_contended {
+                contended += 1;
+            }
+            if outcome.archived_anything() {
+                archived += 1;
+            }
+        }
+
+        // Both replicas doing real work in one cycle is the failure the lease
+        // exists to prevent: they would target the window above the same
+        // watermark and one would commit rows the other had already taken.
+        assert!(
+            !(ra.archived_anything() && rb.archived_anything()),
+            "both replicas archived in one cycle: a={ra:?} b={rb:?}"
+        );
+
+        let now_watermark = harness.cold().watermark(table).await.expect("watermark");
+        assert!(
+            now_watermark >= watermark,
+            "the watermark moved backwards: {watermark} -> {now_watermark}"
+        );
+        watermark = now_watermark;
+
+        // Checked every cycle rather than at the end: a violation that appears
+        // and is then archived over would be invisible to a final assertion.
+        a.verify_invariant()
+            .await
+            .expect("invariant after the race");
+
+        assert_eq!(
+            resolved_count(&store).await,
+            before,
+            "archival moved rows between tiers; it must not change how many there are"
+        );
+    }
+
+    assert!(archived > 0, "neither replica ever archived anything");
+    // Reported rather than asserted: contention is a scheduling outcome, and a
+    // run where the two never overlapped is a valid run of a correct system. In
+    // practice every cycle contends — 7 archived, 7 contended, repeatably — so
+    // the race is real rather than two archivers politely taking turns.
+    println!("two-replica race: {archived} archived, {contended} contended");
+}

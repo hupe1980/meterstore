@@ -86,7 +86,7 @@ async fn a_first_value_reports_an_insert_and_supersedes_nothing() {
     assert!(d.superseded.is_none());
     assert_eq!(d.written.value, Decimal::new(10, 0));
     assert!(d.effect.changed_current_value());
-    // The interval boundaries both come off the written row: a §60 audit row
+    // The interval boundaries both come off the written row: a § 60 MsbG audit row
     // built from a displacement covers `[from, to)`, not a zero-width `[from, from)`.
     assert_eq!(d.from, START);
     assert_eq!(

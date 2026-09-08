@@ -9,14 +9,15 @@
 //! It opens the written Parquet **files directly, by path**, with a bare
 //! DataFusion session that has none of this crate's providers registered — the
 //! same position an external engine is in once its catalog has told it where the
-//! files are. That covers the half of §17.4 that can be checked hermetically:
+//! files are. That covers the half of the open-format claim that can be checked
+//! hermetically:
 //!
 //! - the bytes are standard Parquet, readable without `iceberg-rust`;
 //! - the values survive — decimals at full precision, quality flags as the
-//!   self-describing strings §7.1.1 promises rather than opaque integers;
-//! - the tuning §10.2 documents is actually in the footer;
+//!   self-describing strings the schema promises rather than opaque integers;
+//! - the documented cold-layout tuning is actually in the footer;
 //! - and, decisively, **the published resolution SQL turns the raw versioned
-//!   rows into the same answer MeterStore gives** (§13.7.2).
+//!   rows into the same answer MeterStore gives**.
 //!
 //! It does *not* start a container. The suites that do are siblings —
 //! `interop_duckdb` and `interop_pyiceberg` run the real engines, and
@@ -24,12 +25,12 @@
 //! stored. This one is the hermetic floor beneath them: it needs no Docker, so
 //! it still rules out the failure mode that matters most — output only this
 //! crate's own reader can make sense of — on a machine that cannot run the rest.
-//! Spark remains open (§20.3).
+//! Spark remains open.
 //!
 //! # Why the naive query is asserted to be *wrong*
 //!
 //! One test below deliberately checks that summing the raw files double-counts.
-//! The trap in §13.7.2 is a claim about what happens to an engine that does not
+//! The resolution trap is a claim about what happens to an engine that does not
 //! apply the resolution SQL, and a mitigation for a hazard nobody has
 //! demonstrated is a mitigation nobody will bother to apply.
 
@@ -181,7 +182,7 @@ async fn the_files_are_readable_without_meterstore_or_iceberg() {
 
 #[tokio::test]
 async fn the_published_resolution_sql_gives_an_external_engine_the_right_answer() {
-    // §13.7.2's mitigation, actually exercised. The SQL comes from the store —
+    // The mitigation, actually exercised. The SQL comes from the store —
     // the same text `system.resolution` serves — and runs unmodified against
     // files opened by a session that has never heard of MeterStore.
     let workload = MeteringWorkload::new(START)
@@ -212,7 +213,8 @@ async fn the_published_resolution_sql_gives_an_external_engine_the_right_answer(
 async fn the_naive_query_really_does_double_count() {
     // The hazard the naming and the published SQL exist to prevent. If this ever
     // stopped being true the mitigation would be theatre — and note that
-    // compaction would make it *incidentally* true, which is exactly why §13.7.2
+    // compaction would make it *incidentally* true, which is exactly why the
+    // resolution trap
     // calls the trap dangerous rather than merely inconvenient.
     let workload = MeteringWorkload::new(START)
         .seed(0xBAD)
@@ -237,7 +239,7 @@ async fn the_naive_query_really_does_double_count() {
 
 #[tokio::test]
 async fn stored_values_are_self_describing() {
-    // §7.1.1: an engine reading the Parquet sees `MEASURED`, not an opaque `2`
+    // An engine reading the Parquet sees `MEASURED`, not an opaque `2`
     // whose meaning lives in this crate's source. That is the difference between
     // an open format and a format with a decoder ring.
     let workload = MeteringWorkload::new(START)
@@ -308,7 +310,8 @@ async fn decimals_survive_at_full_precision_outside_this_crate() {
 
 #[tokio::test]
 async fn the_footer_carries_the_tuning_the_design_claims() {
-    // §10.2 lists settings the performance targets depend on. A claim about a
+    // The cold layout lists settings the performance targets depend on. A claim
+    // about a
     // file's layout is checkable by reading the file, and nothing else here
     // would notice if a writer property silently stopped applying.
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -333,7 +336,7 @@ async fn the_footer_carries_the_tuning_the_design_claims() {
     assert_eq!(sorting.len(), 2, "malo_id then from");
     assert!(sorting.iter().all(|c| !c.descending));
 
-    // Bloom filters on the lookup columns — §10.2 calls this the highest-leverage
+    // Bloom filters on the lookup columns — the highest-leverage
     // setting in the table, and it is what the single-meter latency target rests
     // on.
     for name in ["malo_id", "obis_code"] {

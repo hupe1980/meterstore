@@ -1,6 +1,6 @@
 //! The cold layout's partition spec, and what it actually prunes.
 //!
-//! §10.1 partitions by the declared identity columns and then `month(from)`.
+//! The cold layout partitions by the declared identity columns, then `month(from)`.
 //! Both halves are asserted because a partition spec is the kind of thing that
 //! can be documented and absent — the table created unpartitioned, or a
 //! `buckets` setting validated by configuration and read by nothing.

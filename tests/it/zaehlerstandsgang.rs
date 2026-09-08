@@ -20,7 +20,6 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::QualityFlag;
 use metering::interval::{MeasurementUnit, Sparte};
 use metering::measurement_series::MeasurementSource;
@@ -62,7 +61,7 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
         .load(
             "meterstore",
             std::collections::HashMap::from([
@@ -699,7 +698,7 @@ async fn the_current_meter_reading_is_one_row_not_a_history() {
     // What a register is asked for most often, and what a range read answers
     // expensively. `latest` resolves it with `ORDER BY … DESC LIMIT 1` at the
     // storage layer rather than by folding a decade of quarter-hours and taking
-    // the maximum — on the one table §7.4 exists because it grows without bound.
+    // the maximum — on the one table that exists because it grows without bound.
     let (store, _warehouse) = point_store().await;
     store
         .append_readings(&[zsg(START, 96, 100_000, 3)])

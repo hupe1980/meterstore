@@ -7,6 +7,86 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.13.0] — 2026-09-08
+
+A dependency-surface pass, from a consumer's `cargo deny` over the combined
+workspace graph. A default build no longer compiles an XML parser, a second HTTP
+client or a second TLS stack, and `testkit` no longer puts a second `rustls`
+crypto provider in the graph.
+
+### OpenDAL is behind the cloud object stores, and only there
+
+`iceberg` 0.10 ships `LocalFsStorageFactory` and `MemoryStorageFactory` of its
+own, so `file://` and `memory://` never needed OpenDAL. They now use those, and
+`iceberg-storage-opendal` is optional — pulled by `object-store-s3`, `-gcs` and
+`-azure`, which is where an object store's HTTP and XML actually are.
+
+`opendal-core` depends on `quick-xml` **unconditionally**, not behind a feature,
+so `default-features = false` on OpenDAL does not remove it and nothing short of
+not depending on OpenDAL does. Measured on a default build:
+
+| | Before | After |
+|---|---|---|
+| Crates compiled | 427 | **374** |
+| `quick-xml` (RUSTSEC-2026-0194, -0195) | present | **absent** |
+| `opendal-core` | present | **absent** |
+| `reqwest` majors | 0.12 **and** 0.13 | 0.12 only |
+| `rustls` | present | **absent** |
+
+The two `quick-xml` advisories are now reachable only under the cloud features,
+and `cargo deny check` at default features reports them as not encountered. Two
+`reqwest` majors and two TLS stacks in one binary go with them.
+
+### `testkit` no longer adds a second `rustls` provider
+
+`testcontainers` and `testcontainers-modules` both default to `["ring"]`, which
+enables `rustls/ring` through `bollard`. Every other `rustls` in the graph is
+`aws-lc-rs`, and two providers compiled in with neither installed as the process
+default is a `rustls` panic. Both are now taken with `default-features = false`
+and their own `aws-lc-rs` feature, so `--all-features` resolves one provider.
+
+`ring` itself remains, reached only from `parquet`, where it implements Parquet
+modular encryption and is not a `rustls` provider. `iceberg` enables
+`parquet/encryption` unconditionally, so it is not removable here.
+
+### Two replicas, run rather than argued
+
+The archive lease exists for the shape where every replica runs the same schedule
+and one must win. Nothing ran it. `concurrency.rs` now builds a second
+`PostgresHot` over its own `PgPool` — the same database and warehouse, no shared
+connection, which is what a second process is — and does two things with it.
+
+The lease is asserted directly: while one replica holds it a second is refused, a
+different table is not, and releasing hands it over. The last is the half that a
+connection returning to the pool would break, and it is why the lock is
+session-scoped over a connection the lease owns.
+
+Then the two race to archive one table for seven cycles. Every cycle one wins and
+one reports `lease_contended`, and after each the row count, the tiering invariant
+and the watermark's monotonicity are asserted. Both archiving in one cycle — the
+failure the lease exists to prevent — is refused outright.
+
+### A safe promotion no longer hides an unsafe narrowing
+
+`evolution::compare` reported a column's type change and its nullability change as
+an `else if`, so only the first was seen. A widened decimal that also became
+required would have passed the quarantine gate: the promotion is safe on its own,
+and the narrowing — which forbids nulls that may already be stored — was never
+reported. Two independent questions, now answered independently.
+
+Not reachable from a configuration file today, since deployment columns are `Utf8`
+only and the core schema's types and nullability are fixed in code. It is a hole
+in a gate whose entire job is to refuse this class, which is reason enough.
+
+### Not fixed, and why
+
+`libbz2-rs-sys` (licence `bzip2-1.0.6`) arrives through `datafusion`'s
+`compression` default. `iceberg-datafusion` declares `datafusion` **with default
+features**, and cargo feature unification is additive — so `default-features =
+false` on this crate's own `datafusion` edge does not remove it. Verified: the
+same manifest without `iceberg-datafusion` drops `libbz2-rs-sys`; with it, the
+crate stays. Moves when `iceberg-datafusion` moves.
+
 ## [0.12.0] — 2026-09-07
 
 An audit pass. Two correctness defects that produced a plausible wrong number

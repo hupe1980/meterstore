@@ -260,7 +260,7 @@ async fn the_database_carries_the_shape_and_says_so_in_its_own_regex_engine() {
         (ValueCheck::Eic(None), "11YN00000000001", false), // fifteen characters
         (ValueCheck::Eic(None), "11yn000000000016", false), // the column holds what was stored
         (ValueCheck::Eic(None), "11-N000000000016", false), // position 3 is an object-type letter
-        (ValueCheck::Eic(None), "11YN00000000001-", false), // §5.2 forbids `-` as a check character
+        (ValueCheck::Eic(None), "11YN00000000001-", false), // EIC-Vergabe § 5.2 forbids `-` as a check character
         (ValueCheck::Eic(None), "11YN0000000000!6", false),
         // A valid EIC carrying a type letter the manual does not list. The
         // unrefined column takes it — the list is ENTSO-E's to extend — and it

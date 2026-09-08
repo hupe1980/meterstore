@@ -1,6 +1,6 @@
-//! The §18 figures that need real storage, measured rather than asserted.
+//! The performance figures that need real storage, measured rather than asserted.
 //!
-//! §1.1's whole argument is that a row store cannot hold this volume
+//! The whole argument for tiering is that a row store cannot hold this volume
 //! economically, and the ">10× vs Postgres" figure supporting it had never been
 //! measured. Neither had archival throughput. Both need a real PostgreSQL and a
 //! real object store — against fakes they would produce numbers that look like
@@ -8,7 +8,7 @@
 //!
 //! # These are floors, not the published figures
 //!
-//! A test container on a developer machine is not the §18 reference hardware
+//! A test container on a developer machine is not the reference hardware
 //! (8 vCPU / 32 GiB, S3 in-region), and the volumes here are thousands of rows
 //! rather than millions. So the assertions are deliberately loose: they catch a
 //! **regression or a collapse** — compression falling to nothing because an
@@ -64,7 +64,7 @@ async fn hot_bytes(harness: &TestHarness) -> u64 {
 
 #[tokio::test]
 async fn the_cold_tier_compresses_against_postgres_row_storage() {
-    // §18's headline number, and §1.1's whole argument. Measured on a small
+    // The headline number, and the whole argument for tiering. Measured on a small
     // volume, so the assertion is a floor rather than the published figure —
     // but a ratio near 1 would mean an encoding silently stopped applying, and
     // that is exactly what this is here to catch.
@@ -115,7 +115,7 @@ async fn the_cold_tier_compresses_against_postgres_row_storage() {
         iceberg as f64 / rows as f64,
     );
 
-    // The §18 target is >10×, and this fixture clears it by an order of
+    // The target is >10×, and this fixture clears it by an order of
     // magnitude — but read the number with its caveats, which run in *both*
     // directions:
     //
@@ -130,7 +130,7 @@ async fn the_cold_tier_compresses_against_postgres_row_storage() {
     // statistics, bloom filters, page index — is a large fixed cost that a real
     // 512 MiB partition amortises away.
     //
-    // The assertion is the §18 target itself, because the fixture clears it
+    // The assertion is the target itself, because the fixture clears it
     // comfortably and a drop below would mean an encoding stopped applying.
     assert!(
         ratio > 10.0,
@@ -142,7 +142,7 @@ async fn the_cold_tier_compresses_against_postgres_row_storage() {
 
 #[tokio::test]
 async fn archival_throughput_does_not_collapse() {
-    // §18 targets 500 k rows/s on reference hardware. This is a container on a
+    // The target is 500 k rows/s on reference hardware. This is a container on a
     // developer machine over a few thousand rows, so it cannot check that — what
     // it catches is a change that makes archival *orders of magnitude* slower,
     // such as a per-row round trip creeping back into the scan.
@@ -176,11 +176,11 @@ async fn archival_throughput_does_not_collapse() {
     let per_second = rows as f64 / elapsed.as_secs_f64();
     println!(
         "archival: {rows} rows in {:.2?} — {per_second:.0} rows/s \
-         (§18 target 500 000 rows/s on reference hardware)",
+         (target 500 000 rows/s on reference hardware)",
         elapsed
     );
 
-    // Far below the §18 target, and expected to be: each window here is ~5 700
+    // Far below the target, and expected to be: each window here is ~5 700
     // rows, so the fixed per-window cost — catalog compare-and-swap, file
     // creation, footer — dominates entirely. A real 9.6 M-row window amortises
     // all of it. The number above is the useful output; what follows is only a
@@ -207,7 +207,7 @@ async fn archival_throughput_does_not_collapse() {
 
 #[tokio::test]
 async fn archival_memory_does_not_scale_with_the_window() {
-    // §18 budgets < 512 MiB steady state, and the design's claim is stronger
+    // The budget is < 512 MiB steady state, and the design's claim is stronger
     // than a budget: *nothing on the path holds a window*. That is a structural
     // property, so it is checked structurally — the scan is asked for a chunk
     // far smaller than the partition, and archival must still complete.

@@ -1,7 +1,7 @@
 //! Resolutions finer than 15 minutes.
 //!
 //! iMSys already delivers 1-minute and 1-second values over the SMGW HAN
-//! interface, and §14a steering needs them; the quarter-hour is the *settlement*
+//! interface, and § 14a steering needs them; the quarter-hour is the *settlement*
 //! grain, not the only one a store will be asked to hold. Nothing in MeterStore
 //! is written against 96 — the expected interval count is asked of
 //! [`metering::calendar::intervals_in_day`] per declared resolution — but until

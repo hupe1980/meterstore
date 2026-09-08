@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -15,46 +15,30 @@ readme = "README.md"
 # 1.94), not by this crate's own syntax, which needs only 1.88.
 rust-version = "1.94"
 
-# docs.rs otherwise builds default features only, which would document neither
-# Flight SQL nor the catalog facade nor the testkit — all three of which the
-# crate-level documentation talks about. A published crate whose docs describe
-# surfaces the docs do not contain is worse than one that says less.
+# The crate documentation describes Flight SQL, the façade and the testkit, none
+# of which are default features.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# Debug info, and why it is turned down rather than left at the default.
-#
-# This crate's dependency graph is DataFusion + Arrow + Iceberg + sqlx + tonic +
-# axum, and every one of ~20 integration test binaries links the whole of it
-# statically. At the default `debug = true` each binary is **~420 MB**, almost
-# all of it DWARF for code this crate did not write. Twenty of those exhaust a
-# CI runner's disk, and the failure is not a tidy "no space left": `rust-lld`
-# takes a **bus error** writing an output it cannot extend, which reads as a
-# linker bug and is not one.
-#
-# `line-tables-only` for this crate keeps `file:line` in a panic backtrace —
-# which is the whole of what a failing test needs — and dropping it entirely for
-# dependencies removes the bulk. Set `debug = true` locally when stepping
-# through a dependency in a debugger.
+# Full debug info makes each integration test binary ~420 MB, almost all of it
+# DWARF for dependencies; twenty of those exhaust a CI runner's disk and `rust-lld`
+# reports it as a bus error. `line-tables-only` keeps `file:line` in a backtrace,
+# which is what a failing test needs. Set `debug = true` locally to step through a
+# dependency.
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
-# Dependencies are compiled once and executed constantly by the integration
-# suites, which drive a real PostgreSQL and a real Iceberg warehouse through
-# DataFusion. `opt-level = 1` on them alone leaves this crate unoptimised and
-# fully debuggable while removing the worst of the debug-build tax on the code
-# doing the actual work.
+# Compiled once, executed constantly by the integration suites. Optimising them
+# alone leaves this crate unoptimised and debuggable.
 opt-level = 1
 
 [lints.rust]
-# Large dependency trees (DataFusion + Iceberg) produce test binaries whose
-# unwind tables exceed the 16 MB the macOS linker can encode compactly. The
-# resulting note is about debug-info layout, not about this crate's code, and
-# there is no action to take — but `-D warnings` would otherwise fail the build
-# on developer machines while passing in CI.
+# Test binaries here exceed the 16 MB of unwind tables the macOS linker encodes
+# compactly. The note is about debug-info layout, not this crate's code, and there
+# is nothing to act on — but `-D warnings` would fail the build locally.
 linker_messages = "allow"
 
 [dependencies]
@@ -64,10 +48,8 @@ linker_messages = "allow"
 # two majors give mutually incompatible `TableProvider` and `RecordBatch` types.
 datafusion = "53.1"
 async-trait = "0.1"
-# The same `arrow` DataFusion already pulls (re-exported as `crate::arrow`),
-# declared only to switch on the `json` feature so `QueryResult::to_json` can walk
-# a `RecordBatch` into JSON rows. Pinned to the shared 58 major; the duplicate gate
-# fails the build if it ever diverges from DataFusion's arrow.
+# The `arrow` DataFusion already pulls, declared only for the `json` feature that
+# `QueryResult::to_json` needs. The duplicate gate catches any divergence.
 arrow = { version = "58.4", default-features = false, features = ["json"] }
 
 # --- Cold Tier: Apache Iceberg ---
@@ -79,97 +61,62 @@ iceberg-datafusion = "0.10"
 # whole resolve graph — feature on or not. A workspace that also links an embedded
 # SQLite therefore cannot resolve until this is turned off.
 iceberg-catalog-sql = { version = "0.10", optional = true }
-# `file://` and `memory://` are the always-on baseline (local dev, tests, and a
-# single-node file warehouse). The cloud object stores are opt-in features so a
-# file-only deployment does not compile the AWS/GCS/Azure SDKs — see the
-# `object-store-*` features below.
-iceberg-storage-opendal = { version = "0.10", default-features = false, features = ["opendal-fs", "opendal-memory"] }
-# The REST catalogue client behind `IcebergRestCatalog`, which is the cold tier on
-# Polaris, Lakekeeper, Nessie or Gravitino. On by default because a REST catalogue
-# is the shape a deployment picks when it has not picked one: it is what every
-# engine already speaks, so such a deployment needs no facade at all.
-#
-# It has nothing to do with `catalog-facade`, which serves the REST *protocol*
-# over whatever catalogue is in use and is built on axum.
+# The cloud object stores only: `file://` and `memory://` use `iceberg`'s own
+# factories. Optional because `opendal-core` depends on `quick-xml`
+# unconditionally and on a second `reqwest` and rustls — a whole HTTP stack a
+# warehouse on local disk has no use for.
+iceberg-storage-opendal = { version = "0.10", default-features = false, optional = true }
+# `IcebergRestCatalog`: Polaris, Lakekeeper, Nessie, Gravitino. Default, because
+# it is what `CatalogKind::Rest` selects and what every engine already speaks.
+# Unrelated to `catalog-facade`, which serves the REST protocol over whatever
+# catalogue is in use.
 iceberg-catalog-rest = { version = "0.10", optional = true }
-# AWS S3 Tables. Not the Iceberg REST endpoint — that one authenticates with
-# SigV4, which `iceberg-catalog-rest` cannot sign — but the **native** S3 Tables
-# API through the AWS SDK, which signs for itself. Optional because it pulls the
-# AWS SDK, which a non-AWS deployment has no reason to compile.
+# AWS S3 Tables through its native API. Not the Iceberg REST endpoint, which
+# authenticates with SigV4 that `iceberg-catalog-rest` cannot sign.
 iceberg-catalog-s3tables = { version = "0.10", optional = true }
 
 # --- Hot Tier: PostgreSQL ---
-# `default-features = false`: the defaults are `["any", "macros", "migrate",
-# "json"]` and this crate uses none of them — every statement is a runtime
-# `sqlx::query`. They also carry the optional SQLite driver, hence the note on
-# `iceberg-catalog-sql` above.
+# The defaults (`any`, `macros`, `migrate`, `json`) are unused here — every
+# statement is a runtime `sqlx::query` — and carry the optional SQLite driver.
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
-# `time` and `rust_decimal` are asked of the driver rather than of the `sqlx`
-# facade. `sqlx/time` names `sqlx-sqlite?/time`, and naming an optional dependency
-# is enough to put it in the resolve graph; `sqlx-postgres/time` is `["dep:time",
-# "sqlx-core/time"]` and mentions no SQLite. Feature unification makes the two
-# identical for this crate's code.
+# Asked of the driver, not the facade: `sqlx/time` names `sqlx-sqlite?/time`, and
+# naming an optional dependency is enough to put it in the resolve graph.
+# Unification makes the two identical for this crate's code.
 sqlx-postgres = { version = "0.8", default-features = false, features = ["time", "rust_decimal"] }
 
 # --- Domain Layer ---
-# `metering` owns the domain: MeterInterval, MeasurementSeries, QualityFlag,
-# MeasurementUnit, IntervalResolution, DST-aware billing aggregation, gas
-# conversion, Ersatzwertbildung. MeterStore persists and queries those types —
-# it does not redefine them. Part of the mako platform (hupe1980/mako).
+# The domain: every quantity, calendar, unit, quality flag and identifier is its
+# type. This crate stores them and computes with none of them. Part of the mako
+# platform (hupe1980/mako).
 #
-# The floor is a floor rather than a preference: several of the things this crate
-# stores are its types rather than strings it checks itself. All four of
-# `ids::{BdewCode, Eic, MaloId, MeloId}` are what a `check =` column parses with,
-# and their check character/check digit is the whole reason such a column is not
-# a plain string; `BdewCode` is also the operator half of a `VersionScope`, where
-# a wrong-but-plausible value is not an error but a *different scope*.
-# `wire::rfc3339` fixes the shape `ProvenanceEntry::occurred_at` is written in,
-# which `time`'s own feature-conditional serde impl would otherwise leave to
-# feature unification.
-#
-# 0.22 is the floor because it completes `TryFrom<String>` on all four of those
-# identifiers. A generic `impl TryInto<…>` bound is satisfied by the caller's own
-# type and not by a deref of it, so every read entry point here — `series`,
-# `readings`, both `melo(..)`, `VersionScope::for_interval` — would otherwise
-# refuse the `String` an MSCONS parser hands back.
-#
-# 0.21 moved `ObisCode::is_import`/`is_export` to a by-value receiver, being
-# derived from the new `direction()` — which `session::udf` exposes as
-# `obis_direction`, the three-valued primitive the two booleans cannot express.
+# A floor rather than a preference: `ids::{BdewCode, Eic, MaloId, MeloId}` are
+# what a `check =` column parses with and what a `VersionScope` carries, and
+# `wire::rfc3339` fixes the shape the `provenance` column is written in.
 metering = { version = "0.23", features = ["serde"] }
 
-# Timestamps and DST follow `metering`'s choice (time + time-tz), NOT chrono.
-# Mixing the two would force a conversion at every row boundary. time-tz is
-# load-bearing: Europe/Berlin DST gives 92- and 100-interval days, and every
-# daily aggregate depends on getting that right.
+# `metering`'s choice, not chrono: mixing the two would convert at every row.
+# Europe/Berlin DST gives 92- and 100-interval days, which every daily aggregate
+# depends on.
 #
-# Deliberately **not** `serde-human-readable`. `time`'s serde impl is
-# feature-conditional — an `OffsetDateTime` goes into JSON as a nine-element
-# ordinal-date array without it and as a `time`-formatted string with it — which
-# would make the on-disk shape of this crate's `provenance` column a function of
-# what else happens to be in the binary. Enabling it here would only move that
-# decision rather than remove it, and would impose a global feature on every
-# other crate in the graph. `encode::encode_provenance` writes that column
-# explicitly instead, so the stored form depends on nothing but this crate.
+# Deliberately not `serde-human-readable`: `time`'s serde impl is
+# feature-conditional, so enabling it would make the stored shape of the
+# `provenance` column depend on what else is in the binary.
+# `encode::encode_provenance` writes it explicitly instead.
 time = { version = "0.3", features = ["macros"] }
 time-tz = "2"
 # Settlement is money — never f64.
 rust_decimal = "1"
 
 # --- Erasure ---
-# Pseudonymous references must be unpredictable: a reference an attacker can
-# guess or recompute is a re-identification path that survives erasure. This is
-# the OS CSPRNG, not `std`'s hash seed, which is explicitly documented as not
-# cryptographically secure.
+# The OS CSPRNG, not `std`'s hash seed: a guessable subject reference is a
+# re-identification path that survives erasure.
 getrandom = "0.4"
 # Keyed hash of an erased identifier, so a replaying pipeline can be refused
 # without the audit trail retaining the identifier it just erased.
 hmac = "0.12"
 sha2 = "0.10"
-# The erasure key is the one secret this crate copies and holds for the life of
-# the process, and `SubjectRegistry` is `Clone` — so every derived session would
-# otherwise leave another copy of it on the heap at drop. Already in the graph
-# through `rustls`; declared so the key can be wiped rather than merely redacted.
+# `SubjectRegistry` is `Clone`, so every derived session holds another copy of the
+# erasure key. Declared so it is wiped on drop rather than merely redacted.
 zeroize = "1.9"
 
 # --- Runtime ---
@@ -177,67 +124,61 @@ tokio = { version = "1.0", features = ["full"] }
 futures-util = "0.3"
 
 # --- Optional ---
-# The command-line front end (`cli` feature). Optional because a library
-# consumer has no use for an argument parser, and `clap`'s derive machinery is
-# not free to compile.
+# The `cli` front end. Optional: a library consumer has no use for an argument
+# parser.
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"], optional = true }
-# A `tracing` subscriber, for the CLI alone. The library deliberately installs
-# none — a library that captures the global subscriber takes the decision away
-# from the application embedding it — but a binary *is* the application.
+# For the CLI alone. The library installs no subscriber: capturing the global one
+# takes the decision away from the application embedding it.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-testcontainers = { version = "0.27", optional = true }
-testcontainers-modules = { version = "0.15", features = ["postgres"], optional = true }
+# The default of each is `["ring"]`, which enables `rustls/ring` through `bollard`.
+# Every other rustls here is `aws-lc-rs`, and two providers with neither installed
+# as the process default is a `rustls` panic.
+testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"], optional = true }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres", "aws-lc-rs"], optional = true }
 tempfile = { version = "3.27", optional = true }
 axum = { version = "0.8", optional = true }
 thiserror = "2.0.19"
 tracing = "0.1.44"
 serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
-# Pinned to the same major as `arrow` (itself sourced via datafusion). The CI
-# duplicate-dependency gate fails the build if these ever diverge, because two
-# parquet versions mean two incompatible `WriterProperties` types.
+# Same major as `arrow`; the duplicate gate fails the build if they diverge.
 parquet = { version = "58.4", default-features = false, features = ["arrow", "zstd", "snap"] }
 async-stream = "0.3.6"
 futures = "0.3.33"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 toml = "1.1"
-# --- Serving: Flight SQL (§13.7.3) ---
-# Pinned to the same major as `arrow`, which is itself sourced via datafusion.
-# The duplicate-dependency gate covers `arrow`, so a Flight version pulling a
-# second one fails the build rather than producing two mutually unusable
-# `RecordBatch` types. `tonic` and `prost` follow arrow-flight's own floors.
+# --- Serving: Flight SQL ---
+# Same major as `arrow`. `tonic` and `prost` follow arrow-flight's own floors.
 arrow-flight = { version = "58.4", features = ["flight-sql"], optional = true }
 tonic = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 
 [dev-dependencies]
-# The planner's safety properties (§17.1). `time_range` may only ever be wrong in
-# the widening direction and `split` must be exhaustive and disjoint; both are
-# silent when broken, and the shapes that break them are the ones nobody writes a
-# case for.
+# The planner's safety properties: `time_range` may only err by widening, and
+# `split` must be exhaustive and disjoint. Both are silent when broken.
 proptest = "1.11"
 serde_json = "1.0.151"
 tempfile = "3.27.0"
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres", "aws-lc-rs"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 # Turns a bound `TcpListener` into the connection stream tonic serves, so the
 # Flight tests can take an ephemeral port instead of racing on a fixed one.
 tokio-stream = { version = "0.1", features = ["net"] }
-# `ServiceExt::oneshot`, so the catalog façade's routes are exercised as HTTP —
-# a method and a path in, a status and a parsed error envelope out — without
-# binding a port. Already in the graph via axum; declared for the `util` feature.
+# `ServiceExt::oneshot`, so the façade's routes are exercised as HTTP without
+# binding a port.
 tower = { version = "0.5", features = ["util"] }
 # Collects an `axum::body::Body` back into bytes in those tests.
 http-body-util = "0.1"
 
 [features]
 default = ["rest-catalog", "sql-catalog"]
-# Cold-tier object-store backends for `IcebergSqlCatalog`. `file://`/`memory://`
-# are always available; these add the cloud stores (and their SDKs) on demand.
-object-store-s3 = ["iceberg-storage-opendal/opendal-s3"]
-object-store-gcs = ["iceberg-storage-opendal/opendal-gcs"]
-object-store-azure = ["iceberg-storage-opendal/opendal-azdls"]
+# Cold-tier object-store backends. `file://` and `memory://` are always available
+# through `iceberg`'s own factories; these add the cloud stores, and with them
+# OpenDAL, its XML parser and a second HTTP/TLS stack.
+object-store-s3 = ["dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-s3"]
+object-store-gcs = ["dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-gcs"]
+object-store-azure = ["dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-azdls"]
 object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 # The cold tier on an Iceberg REST catalogue — Polaris, Lakekeeper, Nessie,
 # Gravitino. Default, because `CatalogKind::Rest` is what a configuration file
@@ -247,54 +188,36 @@ rest-catalog = ["dep:iceberg-catalog-rest"]
 # The cold tier on a PostgreSQL-backed Iceberg SQL catalogue: one database to
 # operate. Default; turn it off in a workspace that also links SQLite.
 sql-catalog = ["dep:iceberg-catalog-sql"]
-# Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
+# Read-only Iceberg REST endpoint, for deployments on the SQL catalogue.
 catalog-facade = ["dep:axum"]
-# AWS S3 Tables as the cold-tier catalogue (§12.1). Optional because it pulls the
-# AWS SDK, which a non-AWS deployment has no reason to compile.
-#
-# The `object-store-s3` implication is stated rather than relied upon:
-# `iceberg-catalog-s3tables` hard-enables `opendal-s3` today, so feature
-# unification already turns it on, but that is *its* implementation detail. A
-# table bucket's data files are in S3 either way, and a catalogue that compiled
-# but could not open a file would be a trap.
+# AWS S3 Tables as the cold-tier catalogue. The `object-store-s3` implication is
+# stated rather than relied upon: a table bucket's data files are in S3 either
+# way, and a catalogue that compiled but could not open one would be a trap.
 s3tables = ["dep:iceberg-catalog-s3tables", "object-store-s3"]
-# Arrow Flight SQL over the unified hot + cold view (§13.7.3). The one surface
-# an external client cannot assemble for itself.
+# Arrow Flight SQL over the unified hot + cold view — the one surface an external
+# client cannot assemble for itself.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
 # The reference suite drives a real warehouse through the SQL catalogue, so it
 # names that feature rather than assuming the default set is on.
 testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile", "sql-catalog"]
-# The `meterstore` command-line tool: create tables, archive, query, serve.
+# The `meterstore` command-line tool. Off by default: a service embedding this
+# should not compile an argument parser.
 #
-# Off by default because this crate is a library first and a binary second — a
-# service embedding it should not compile an argument parser. `cargo install
-# meterstore --features cli` is the other half of that trade.
-#
-# It pulls both serving surfaces, because `meterstore serve` is the one
-# subcommand a caller cannot assemble from the others, and a CLI whose most
-# useful verb is half missing from the obvious install line is a CLI nobody
-# finds. The two answer different questions: Flight SQL is the unified hot + cold
-# view, and the façade is what lets an external engine read the history without
-# this process in the data path at all.
-#
-# It names `sql-catalog` too, because a binary has to be able to open a cold tier:
-# a library caller brings its own `Arc<dyn Catalog>`, and the CLI has only the
-# configuration file. Built with `--no-default-features --features cli` it would
-# otherwise compile and then refuse every `catalog =` value at runtime.
+# It names both serving surfaces because `serve` is the one verb a caller cannot
+# assemble from the others, and `sql-catalog` because a binary has to be able to
+# open a cold tier — a library caller brings its own `Arc<dyn Catalog>`, the CLI
+# has only the configuration file.
 cli = ["dep:clap", "dep:tracing-subscriber", "flight", "catalog-facade", "sql-catalog"]
 
-# The command-line tool. `required-features` rather than a separate crate: it is
-# a thin front end over the same public API, and splitting it into a workspace
-# member would mean a second version number to keep in step with the library it
-# can only ever be used with.
+# `required-features` rather than a separate crate: a thin front end over the same
+# public API, and a workspace member would mean a second version number.
 [[bin]]
 name = "meterstore"
 path = "src/bin/meterstore.rs"
 required-features = ["cli"]
 
-# Benchmarks run under `cargo bench`, not under `cargo test`: criterion's own
-# harness collects samples, and the default one would treat each benchmark as a
-# test and report nothing useful.
+# `cargo bench`, not `cargo test`: criterion collects samples, and the default
+# harness would report nothing useful.
 [[bench]]
 name = "encoding"
 harness = false

@@ -38,10 +38,16 @@ ignore = [
 
     # `quick-xml` quadratic attribute checking, and unbounded namespace
     # allocation. Both are denial of service against a parser fed **untrusted**
-    # XML. Reached through `opendal-core` and `reqsign-aws-v4`, which parse
-    # responses from the configured object store and its IAM endpoint — trusted
-    # infrastructure, not attacker-supplied input. No patched version exists
-    # within the range opendal pins, so this cannot be resolved by updating.
+    # XML, and both are reached only under `object-store-s3` / `-gcs` / `-azure`:
+    # `opendal-core` depends on `quick-xml` unconditionally, so the only way off
+    # it is not to depend on OpenDAL, which a default build no longer does.
+    # `file://` and `memory://` are served by `iceberg`'s own factories.
+    #
+    # Where the features *are* on, what is parsed is the configured object store's
+    # and IAM endpoint's own responses — trusted infrastructure, not
+    # attacker-supplied input — and no patched version exists within the range
+    # opendal pins. Listed because `just deny` runs `--all-features`; a default
+    # build reports them as not encountered.
     # Revisit: when opendal releases against a patched quick-xml.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",

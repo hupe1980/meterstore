@@ -7,7 +7,7 @@
 
 // Real infrastructure, so the fixtures live behind `testkit` like every other
 // suite that needs them: `testkit::postgres` is what shares one container
-// across the binary instead of starting one per test (§17.2.0.1).
+// across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
@@ -26,7 +26,6 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::MeasurementSource;
 use sqlx::PgPool;
 use time::macros::datetime;
@@ -62,7 +61,7 @@ impl Harness {
 
         let warehouse = tempfile::tempdir().expect("temp warehouse");
         let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
             .load(
                 "meterstore",
                 std::collections::HashMap::from([
@@ -1475,7 +1474,7 @@ async fn eliding_returns_the_same_rows_as_resolving() {
 
 #[tokio::test]
 async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
-    // The embedded topology (§5.2): one process both archives and answers
+    // The embedded topology: one process both archives and answers
     // queries. A cold provider that froze its snapshot at construction would
     // make every archived row vanish — gone from PostgreSQL because the
     // partition was dropped, invisible in Iceberg because the provider still

@@ -45,11 +45,11 @@ Optional features, all off unless you need them:
 |---|---|
 | `rest-catalog` *(default)* | `IcebergRestCatalog` — the cold tier on a REST catalogue |
 | `sql-catalog` *(default)* | `IcebergSqlCatalog` — the cold tier's metadata in the hot tier's own PostgreSQL |
-| `object-store-s3` / `-gcs` / `-azure` / `-all` | Cloud object stores. `file://` and `memory://` are always available |
+| `object-store-s3` / `-gcs` / `-azure` / `-all` | Cloud object stores, and the only thing that pulls OpenDAL. `file://` and `memory://` are always available without it |
 | `catalog-facade` | A read-only Iceberg REST endpoint, for deployments on the SQL catalog |
 | `s3tables` | AWS S3 Tables as the cold-tier catalogue (implies `object-store-s3`) |
 | `flight` | Arrow Flight SQL over the unified hot + cold view |
-| `cli` | The `meterstore` command-line tool (implies `flight` and `catalog-facade`) |
+| `cli` | The `meterstore` command-line tool (implies `flight`, `catalog-facade` and `sql-catalog`) |
 | `testkit` | The real-infrastructure harness, workload generator and correctness oracle |
 
 Both catalogue features are on by default and both can be turned off. Dropping

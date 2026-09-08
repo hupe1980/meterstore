@@ -3,12 +3,12 @@
 //! Four claims that are only worth making if they are tested end to end:
 //!
 //! - **Reproducibility.** A settlement rerun against a pinned snapshot and a
-//!   version ceiling returns what was known then, not what is known now (§6.4).
+//!   version ceiling returns what was known then, not what is known now.
 //! - **Completeness.** A missing interval is information, and the expectation
-//!   comes from the DST-aware calendar rather than a hardcoded 96 (§9.6).
+//!   comes from the DST-aware calendar rather than a hardcoded 96.
 //! - **Provenance.** Every result carries the boundary it was computed against,
 //!   and says which tiers produced it (P1).
-//! - **Single archiver.** Two archivers cannot both own the detach window (§5.2).
+//! - **Single archiver.** Two archivers cannot both own the detach window.
 //!
 //! Each of these is a claim about behaviour under real storage, so a fake would
 //! prove nothing about the parts that actually fail — snapshot pinning, catalog
@@ -16,7 +16,7 @@
 
 // Real infrastructure, so the fixtures live behind `testkit` like every other
 // suite that needs them: `testkit::postgres` is what shares one container
-// across the binary instead of starting one per test (§17.2.0.1).
+// across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
@@ -35,7 +35,6 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::MeasurementSource;
 use sqlx::PgPool;
 use time::macros::datetime;
@@ -72,7 +71,7 @@ impl Harness {
 
         let warehouse = tempfile::tempdir().expect("temp warehouse");
         let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
             .load(
                 "meterstore",
                 std::collections::HashMap::from([
@@ -524,7 +523,8 @@ async fn completeness_reports_a_gap_across_both_tiers() {
     assert_eq!(row.missing, 6);
     assert!(!row.is_complete());
     // The gap is reported against the **Berlin** day, and that is the whole
-    // reason §9.5 exists. The six missing intervals are the last six of the UTC
+    // reason the balancing-day functions exist. The six missing intervals are the
+    // last six of the UTC
     // day 2026-07-19 — 22:30Z to 24:00Z — which in Berlin is 00:30 to 02:00 on
     // the *20th*. A completeness report grouped on UTC days would name the 19th
     // and send an operator looking at the wrong day's delivery.
@@ -689,7 +689,7 @@ async fn a_typed_read_of_a_meter_with_no_data_is_absence_not_zero() {
 
 #[tokio::test]
 async fn a_malo_id_from_a_message_never_reaches_the_sql_text() {
-    // §19.7: user values are bound, never concatenated — and the identifier is
+    // User values are bound, never concatenated — and the identifier is
     // *parsed* before it is bound, so an injection attempt is refused a layer
     // earlier: it is not a MaLo-ID, so there is no query to run. Both layers are
     // asserted here.
@@ -729,7 +729,7 @@ async fn a_malo_id_from_a_message_never_reaches_the_sql_text() {
 
 #[tokio::test]
 async fn only_one_archiver_may_hold_a_table_at_a_time() {
-    // §5.2. The detach window is the one state where the tiering invariant is
+    // The detach window is the one state where the tiering invariant is
     // relaxed, and it is only safe because exactly one process owns it.
     let h = Harness::start().await;
 
@@ -814,7 +814,7 @@ async fn a_contended_archiver_does_nothing_rather_than_racing() {
 #[tokio::test]
 async fn the_resolution_sql_is_reachable_from_a_sql_client() {
     // The primary mitigation for the version-resolution trap, available to the
-    // person holding a Trino session (§13.7.2).
+    // person holding a Trino session.
     let h = Harness::start().await;
     h.archive_through(D19).await;
 
@@ -941,7 +941,7 @@ async fn a_matching_schema_reports_no_changes() {
 #[tokio::test]
 async fn declaring_a_new_identity_column_quarantines_rather_than_corrupting() {
     // An identity column joins the merge key, so adding one to a table that
-    // already holds rows changes what "the same reading" means. §11 halts.
+    // already holds rows changes what "the same reading" means. Quarantine halts.
     let h = Harness::start().await;
     let store = meterstore::MeterStore::builder()
         .hot(Arc::clone(&h.hot) as Arc<dyn HotStore>)
@@ -986,7 +986,7 @@ async fn a_store_can_be_built_before_its_tables_exist() {
 
     let warehouse = tempfile::tempdir().expect("temp warehouse");
     let catalog = SqlCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
         .load(
             "meterstore",
             std::collections::HashMap::from([
@@ -1110,7 +1110,8 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
 
 #[tokio::test]
 async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
-    // §5.2 asserted against genuine concurrency rather than a sequential
+    // One archiver per table, asserted against genuine concurrency rather than a
+    // sequential
     // stand-in. The earlier lease tests take the lock and then check that a
     // second caller is refused, which proves the lock works but not that the
     // *archiver* is safe when two of them start at the same instant.
@@ -1176,7 +1177,8 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
 
 #[tokio::test]
 async fn writes_during_archival_are_never_stranded_below_the_watermark() {
-    // The other half of §6.3's hard case. While a window is being archived, a
+    // The other half of the invariant's hard case. While a window is being
+    // archived, a
     // correction can arrive for an interval inside it — and if it were written
     // to PostgreSQL it would land below the advancing watermark, where no query
     // looks: accepted, and then silently invisible.

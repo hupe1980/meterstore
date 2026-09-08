@@ -8,7 +8,7 @@
 
 // Real infrastructure, so the fixtures live behind `testkit` like every other
 // suite that needs them: `testkit::postgres` is what shares one container
-// across the binary instead of starting one per test (§17.2.0.1).
+// across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
 use metering::interval::Sparte;
@@ -28,7 +28,6 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use metering::measurement_series::{MeasurementSeries, MeasurementSource};
 use sqlx::PgPool;
 use time::macros::datetime;
@@ -49,7 +48,7 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
         .load(
             "meterstore",
             std::collections::HashMap::from([
@@ -417,7 +416,7 @@ async fn a_missing_identity_value_is_rejected_rather_than_defaulted() {
 
 #[tokio::test]
 async fn identity_columns_survive_archival_into_the_cold_tier() {
-    // §20.2 claimed extra columns were threaded end to end — encoder, both
+    // Extra columns are threaded end to end — encoder, both
     // tables, the `ON CONFLICT` target, the scan projection and the resolution
     // `PARTITION BY`. The **archival** scan was missed, and it is the one path
     // that carries them from PostgreSQL into Iceberg. A tenant discriminator

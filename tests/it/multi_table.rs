@@ -12,7 +12,7 @@
 //! correctness bug; both are the kind of missing ergonomics that pushes an
 //! operator into hand-written glue that then *is* a correctness bug.
 //!
-//! §15.3's consistency model is unchanged and asserted here: each table keeps
+//! The consistency model is unchanged and asserted here: each table keeps
 //! its own watermark, its own archiver and its own lease. Only the query
 //! surface is shared.
 
@@ -223,7 +223,7 @@ async fn isolating_an_unknown_table_names_what_is_there() {
 
 #[tokio::test]
 async fn a_result_carries_every_table_boundary_not_one() {
-    // P1 across tables. Two tables genuinely have two watermarks (§15.3), so a
+    // P1 across tables. Two tables genuinely have two watermarks, so a
     // result that reported one number would be attributing a figure spanning
     // both to a boundary that governs only one of them.
     let (_h, catalog) = two_tables().await;
@@ -386,7 +386,7 @@ async fn system_tables_show_every_table() {
 
 #[tokio::test]
 async fn each_table_keeps_its_own_watermark_and_archiver() {
-    // §15.3 is unchanged by the shared session: archiving one table must not
+    // The model is unchanged by the shared session: archiving one table must not
     // move the other's boundary, because nothing is transactional across them
     // and pretending otherwise would be the distributed transaction this design
     // exists without.
@@ -497,7 +497,7 @@ async fn an_empty_catalog_is_refused() {
 async fn two_tables_whose_registered_names_collide_are_refused() {
     // `readings` and `readings_versions` are different *physical* names and the
     // same *registered* ones: both raw halves land on `readings_versions` and
-    // both resolved halves on `readings` (§13.7.2). Comparing the configured
+    // both resolved halves on `readings`. Comparing the configured
     // names alone lets the pair through, and the failure then arrives from
     // inside DataFusion naming a relation the caller never wrote down.
     let harness = TestHarness::start().await.expect("harness");
@@ -565,7 +565,8 @@ async fn a_catalog_with_mixed_read_modes_is_refused() {
 
 #[tokio::test]
 async fn a_cross_table_query_takes_bound_parameters() {
-    // §19.7 across tables. Without this the only way to filter a multi-table
+    // The serving posture across tables. Without this the only way to filter a
+    // multi-table
     // query by a value from a market message is to build the string by hand.
     let (_h, catalog) = two_tables().await;
 
@@ -594,7 +595,7 @@ async fn a_cross_table_query_takes_bound_parameters() {
 #[cfg(feature = "flight")]
 #[tokio::test]
 async fn a_flight_client_over_a_catalog_store_sees_every_table() {
-    // Claimed in §13.8 as an emergent property rather than a feature, so it is
+    // An emergent property rather than a feature, so it is
     // worth checking that it emerges. `FlightSqlServer` takes one `MeterStore`;
     // a store built inside a catalog carries the shared session, so pointing a
     // client at any of them should reach all of the tables.
@@ -674,7 +675,7 @@ async fn a_flight_client_over_a_catalog_store_sees_every_table() {
 #[tokio::test]
 async fn one_maintenance_loop_covers_every_table_and_names_them_apart() {
     // The operational half of what a catalogue is for. Each table keeps its own
-    // watermark, archiver and lease (§15.3); only the scheduling is shared, which
+    // watermark, archiver and lease; only the scheduling is shared, which
     // is what gives a deployment one place to ask whether upkeep is keeping up.
     let (_h, catalog) = two_tables().await;
 
