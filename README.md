@@ -391,9 +391,10 @@ built standalone and *attached* instead.
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
 Glue — and that seam is driven end to end by the test suite rather than asserted.
 Three are built for you: a PostgreSQL-backed SQL catalogue on the same database as
-the hot tier, a REST catalogue (`rest-catalog`, on by default), and AWS S3 Tables
-behind the `s3tables` feature. A configuration file builds whichever it names —
-`Settings::connect()` returns the pool, both tiers and every validated table.
+the hot tier (`sql-catalog`, on by default), a REST catalogue (`rest-catalog`, on
+by default), and AWS S3 Tables behind the `s3tables` feature. A configuration file
+builds whichever it names — all three, by `catalog = "sql" | "rest" | "s3tables"` —
+and `Settings::connect()` returns the pool, both tiers and every validated table.
 [Details](https://hupe1980.github.io/meterstore/docs/getting-started/).
 
 MeterStore needs only `SELECT` plus ownership of its own tables: no server
@@ -440,7 +441,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**910 tests**: unit, property, doc and integration against real PostgreSQL 16 and
+**949 tests**: unit, property, doc and integration against real PostgreSQL 16 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle over
 generated workloads, covering both record shapes. Ingest, archival and reads also
 run **against one table at once**, which is the only way to reach the states that
@@ -477,9 +478,9 @@ tonic, about 9 GB, which exhausts a CI runner's disk and fails as a linker bus
 error rather than as "no space left". A container per test cost seven times the
 wall clock of a database per test, for the same isolation.
 
-`datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`
-and `sqlx` must each appear exactly once in the dependency graph; `just deps`
-fails the build otherwise. Two versions of `arrow` mean two incompatible
+`datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`,
+`sqlx` and `sqlx-postgres` must each appear exactly once in the dependency graph;
+`just deps` fails the build otherwise. Two versions of `arrow` mean two incompatible
 `RecordBatch` types, and two of `sqlx` mean two incompatible `PgPool` types —
 neither fails obviously.
 

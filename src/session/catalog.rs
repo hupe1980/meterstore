@@ -1,6 +1,6 @@
 //! Several tables in one session.
 //!
-//! §15.3 fixes the consistency model: **each table has its own watermark, its
+//! The consistency model is fixed: **each table has its own watermark, its
 //! own archiver and its own lease**, and nothing is transactional across them.
 //! That is deliberate — a cross-table commit would mean a distributed
 //! transaction between PostgreSQL and an Iceberg catalog, which is precisely
@@ -221,7 +221,7 @@ impl MeterCatalog {
     /// [`MeterStore::as_of`] deliberately has **no** catalog counterpart. It pins
     /// an Iceberg *snapshot*, and a snapshot belongs to one table — there is no
     /// single id that means the same moment in two of them, and no commit that
-    /// makes two snapshots atomic (§15.3: nothing is transactional across
+    /// makes two snapshots atomic (nothing is transactional across
     /// tables). A catalog-wide `as_of` would have to invent a correspondence
     /// between per-table snapshots and call the result reproducible. Pin each
     /// table with [`table`](Self::table) and `as_of`, or use this, whose axis is
@@ -308,7 +308,7 @@ impl MeterCatalog {
     /// The provenance a [`QueryResult`] carries is the **union** across the
     /// tables the plan touched: the watermarks of all of them, and the tiers
     /// any of them scanned. A single watermark would be a fiction here, because
-    /// two tables genuinely have two boundaries (§15.3) and a figure spanning
+    /// two tables genuinely have two boundaries and a figure spanning
     /// both was computed against both.
     ///
     /// # Caller-supplied SQL reaches every registered relation
@@ -324,7 +324,7 @@ impl MeterCatalog {
 
     /// [`query`](Self::query) with positional parameters.
     ///
-    /// The same guarantee a single store gives (§19.7): values reach the engine
+    /// The same guarantee a single store gives: values reach the engine
     /// bound, never concatenated into the SQL text. Present because a catalog is
     /// *the* multi-table query surface — without it, the only way to filter a
     /// cross-table query by a MaLo-ID from a market message would be to build the
@@ -383,7 +383,7 @@ impl MeterCatalog {
 
         let mut watermarks = Vec::with_capacity(self.stores.len());
         for (name, store) in &self.stores {
-            // A store answers to both of the relations it registers (§13.7.2),
+            // A store answers to both of the relations it registers,
             // and a caller may legitimately query either.
             let touched =
                 scanned.contains(&store.raw_table()) || scanned.contains(&store.resolved_table());
@@ -443,7 +443,7 @@ impl MeterCatalog {
 
     /// Upkeep for **every** table, as one scheduled loop.
     ///
-    /// Each table keeps its own watermark, archiver and lease (§15.3) — that
+    /// Each table keeps its own watermark, archiver and lease — that
     /// cannot be otherwise and is not what this changes. What it changes is the
     /// *scheduling*: a deployment running a timer per table pays for the same
     /// thing this type exists to stop paying for — no single place to ask whether
@@ -824,7 +824,7 @@ impl MeterCatalogBuilder {
         //
         // The check is on the names each table will *register*, not on the names
         // it was configured with. Those differ, and the difference is the whole
-        // trap: §13.7.2 derives both relations from the physical name by adding
+        // trap: both relations are derived from the physical name by adding
         // or stripping `_versions`, so `readings` and `readings_versions` are two
         // distinct configurations that register the same pair of relations.
         // Comparing configured names lets that pair through, and DataFusion then

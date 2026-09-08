@@ -36,7 +36,7 @@
 //! column.
 //!
 //! It is not used, because that rests on the spec being the one this crate wrote.
-//! A table repartitioned out of band — the compaction §10.3.1 tells an operator
+//! A table repartitioned out of band — the compaction this crate tells an operator
 //! to run with Spark — could carry a field on an attribute column, and the
 //! inference would then be silently wrong in the direction that returns a
 //! superseded row.
@@ -149,7 +149,7 @@ impl FileStats {
 /// Files are swept into *maximal runs* of overlap rather than compared pairwise,
 /// so three files where the first and third are disjoint but both meet the second
 /// land in one group. That can require resolution where a pairwise test would
-/// not; it can never permit it where a pairwise test would not. §17.1's rule
+/// not; it can never permit it where a pairwise test would not. The widening rule
 /// again: the error may only ever be in the slow direction.
 pub fn plan(files: &[FileStats]) -> Resolution {
     if files.is_empty() {
@@ -305,7 +305,7 @@ pub fn resolution_sql_with_key(
         .join(", ");
 
     // The derived table is aliased because this exact text is published for
-    // external engines (§13.7.2) and PostgreSQL — the SQL catalog's own
+    // external engines and PostgreSQL — the SQL catalog's own
     // database, and a likely place for an operator to paste it — rejects an
     // unaliased subquery outright. Trino, Spark, DuckDB and DataFusion all
     // accept the alias, so one spelling works everywhere.

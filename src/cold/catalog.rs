@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+#[cfg(feature = "sql-catalog")]
 use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
@@ -94,6 +95,7 @@ fn warehouse_scheme(warehouse_uri: &str) -> &str {
 }
 
 /// Whether a scheme is S3 or S3-compatible.
+#[cfg(feature = "sql-catalog")]
 fn is_s3_scheme(scheme: &str) -> bool {
     matches!(scheme, "s3" | "s3a" | "s3n" | "minio" | "r2")
 }
@@ -160,6 +162,7 @@ pub(crate) fn warehouse_factory(
 
 /// Inject S3-family credential/endpoint props (the `SqlCatalog` forwards catalog
 /// props to the FileIO, so these reach the S3 operator). No-op for non-S3 schemes.
+#[cfg(feature = "sql-catalog")]
 fn apply_warehouse_auth(
     props: &mut HashMap<String, String>,
     warehouse_uri: &str,
@@ -201,6 +204,8 @@ fn apply_warehouse_auth(
 /// password — usually the *same* password as the hot tier's, since the
 /// recommended deployment puts the catalogue on the same database.
 #[derive(Clone)]
+#[cfg(feature = "sql-catalog")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sql-catalog")))]
 pub struct IcebergSqlCatalog<'a> {
     /// PostgreSQL URL for the catalog's own metadata (create/load table).
     pub database_url: &'a str,
@@ -223,6 +228,7 @@ pub struct IcebergSqlCatalog<'a> {
     pub auth: &'a WarehouseAuth,
 }
 
+#[cfg(feature = "sql-catalog")]
 impl std::fmt::Debug for IcebergSqlCatalog<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergSqlCatalog")
@@ -243,6 +249,7 @@ impl std::fmt::Debug for IcebergSqlCatalog<'_> {
     }
 }
 
+#[cfg(feature = "sql-catalog")]
 impl IcebergSqlCatalog<'_> {
     /// Build the cold tier: a `SqlCatalog` over PostgreSQL, an OpenDAL object-store
     /// backend chosen from the warehouse scheme, and an [`IcebergCold`] writing into
@@ -558,6 +565,7 @@ impl ColdTier {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sql-catalog")]
     #[test]
     fn neither_the_password_nor_the_secret_key_reaches_a_log_line() {
         // Configuration is exactly what a service dumps at startup and exactly
@@ -688,6 +696,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sql-catalog")]
     #[test]
     fn auth_props_are_injected_only_for_s3_schemes() {
         use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION};

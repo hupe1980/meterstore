@@ -48,7 +48,7 @@ use crate::watermark::{ArchivalWindow, TieringWatermark, next_window};
 /// Tally rows as they pass, without holding on to them.
 ///
 /// The archiver has to compare what it scanned against what the cold store
-/// committed (§8.2), and a streaming write gives it no other place to learn the
+/// committed, and a streaming write gives it no other place to learn the
 /// first number.
 fn count_rows(batches: BatchStream, counter: Arc<AtomicU64>) -> BatchStream {
     use futures::StreamExt;
@@ -168,7 +168,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         let metrics = crate::observe::metrics();
         let attrs = crate::observe::table(self.config.name());
 
-        // Exactly one archiver per table (§5.2). The window between detaching a
+        // Exactly one archiver per table. The window between detaching a
         // partition and dropping it is the only state where the tiering
         // invariant is relaxed, and it is only safe because one process owns it.
         // Two archivers would both target the window above the same watermark,
@@ -239,7 +239,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
     async fn run_once_inner(&self, now: OffsetDateTime) -> Result<ArchivalOutcome> {
         let table = self.config.name();
 
-        // 0. Refuse to archive into a layout nobody agreed on (§11). Checked
+        // 0. Refuse to archive into a layout nobody agreed on. Checked
         //    every run rather than at construction, because the cold table can be
         //    changed out of band — by an operator running compaction with Spark,
         //    or by a second deployment on an older configuration. Failing here
@@ -337,7 +337,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
     /// one step at a time, a deployment created in 2026 therefore commits one
     /// empty Iceberg snapshot per day since 1970 before it reaches a single real
     /// row: some twenty thousand commits, capped at a few dozen per maintenance
-    /// cycle, and twenty thousand snapshots retained for the ten years §10.5
+    /// cycle, and twenty thousand snapshots retained for the ten years snapshot
     /// keeps them. The store is unusable for days and its metadata never
     /// recovers.
     ///
@@ -349,7 +349,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
     ///
     /// Rows live in partitions. A range with no partition therefore holds no
     /// rows, so a window covering it archives nothing and the watermark may pass
-    /// over it in one move: the §6.3 invariant is about *which tier owns a range*
+    /// over it in one move: the tiering invariant is about *which tier owns a range*
     /// and both tiers own nothing here.
     ///
     /// The widened window still stops at the archival horizon, so it never
@@ -444,7 +444,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
 
         // Asked before the scan, while the partition is still whole: it sizes
         // the bloom filter on `malo_id`, which the writer fixes before it sees a
-        // row and which §10.2 calls the highest-leverage setting in the layout.
+        // row and is the highest-leverage setting in the cold layout.
         let hints = WriteHints {
             distinct_malo_ids: self.hot.distinct_malo_ids(&partition).await?,
         };
@@ -457,7 +457,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // The rows are counted **as they stream**, not collected. Materialising
         // a partition to count it would put archival's peak memory in
         // proportion to the window — ~9.6 M rows for a day at 100 k measuring
-        // points — which is the §18 budget it would blow first. The counter is
+        // points — which is the memory budget it would blow first. The counter is
         // shared so the check below still compares what was scanned against what
         // was committed.
         let scanned = Arc::new(AtomicU64::new(0));
@@ -1498,7 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_contended_lease_makes_the_run_a_no_op() {
-        // Exactly one archiver per table (§5.2). A second replica running the
+        // Exactly one archiver per table. A second replica running the
         // same schedule must discover it has nothing to do — not block, not
         // fail, and above all not detach a partition the first one owns.
         let hot = FakeHot::with_rows(&[(D20, 96)]).lease_held_elsewhere();

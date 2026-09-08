@@ -33,7 +33,8 @@ ddl_lock_timeout = "3s"
 # already speaks, so an external reader needs nothing extra. "sql" for a
 # PostgreSQL-backed catalogue on the same database as the hot tier, which is one
 # fewer service to run and needs the JDBC catalogue implementation on the far
-# side.
+# side. "s3tables" for an AWS S3 Tables bucket, where `warehouse` below is the
+# table bucket ARN and `uri` is unused.
 catalog = "sql"
 uri = "${DATABASE_URL}"
 

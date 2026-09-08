@@ -35,7 +35,7 @@ pub fn stream_of(batches: Vec<RecordBatch>) -> BatchStream {
 /// columns loudly, getting `merge_key` wrong drops **rows** silently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanSpec {
-    /// The table's merge key (§7.3).
+    /// The table's merge key.
     merge_key: Vec<String>,
     /// Deployment columns to select alongside the core schema.
     extra: Vec<String>,
@@ -124,7 +124,7 @@ impl ScanSpec {
     /// unique.
     ///
     /// **Its prefix must be the declared sort order.** Archived files carry
-    /// `sorting_columns = (malo_id, from)` in the Parquet footer (§10.2), and a
+    /// `sorting_columns = (malo_id, from)` in the Parquet footer, and a
     /// reader is entitled to trust it. Ordering by `(malo_id, obis_code, from,
     /// …)` would still be unique but would make that declaration false, so the
     /// remaining key columns are appended *after* `(malo_id, from)` rather than
@@ -183,7 +183,7 @@ pub fn partitions_ahead(
 pub struct WriteHints {
     /// Distinct `malo_id` values in what is about to be written.
     ///
-    /// Sizes the bloom filter on the column §10.2 calls the highest-leverage
+    /// Sizes the bloom filter on the highest-leverage column of the cold
     /// one. `None` means unknown, and the writer falls back to a conservative
     /// default. Neither direction is a correctness matter — over-sizing costs
     /// metadata bytes, under-sizing costs false positives and therefore row
@@ -424,7 +424,7 @@ pub trait HotStore: Send + Sync {
     /// a day at 100 k measuring points is ~9.6 M rows, and materialising a
     /// partition before writing any of it would make archival's peak memory
     /// proportional to the window rather than to the chunk size — which is the
-    /// §18 budget it would blow first.
+    /// memory budget it would blow first.
     async fn scan_detached(&self, partition: &PartitionId, spec: &ScanSpec) -> Result<BatchStream>;
 
     /// Distinct `malo_id` values in a detached partition, if the store can say.
@@ -504,7 +504,7 @@ pub trait ColdStore: Send + Sync {
     /// Destroy the table, its metadata and its data files.
     ///
     /// The only way this crate deletes stored readings. Everything else is
-    /// append-only (§4.2): a correction is a new version, erasure destroys a
+    /// append-only: a correction is a new version, erasure destroys a
     /// mapping rather than rows, and a hot partition drop reclaims space for
     /// rows that are already durable here.
     async fn purge_table(&self, table: &str) -> Result<()>;
@@ -556,7 +556,7 @@ pub trait ColdStore: Send + Sync {
     /// Put the tiering boundary back on the current snapshot.
     ///
     /// A commit from anything other than MeterStore — the out-of-band compaction
-    /// §10.3.1 recommends — carries no watermark, so the boundary lookup has to
+    /// this crate recommends — carries no watermark, so the boundary lookup has to
     /// walk back the parent chain to find one. That works, and it makes snapshot
     /// expiry dangerous: a hole anywhere in the chain strands the boundary and
     /// every query fails at once.
@@ -618,7 +618,7 @@ pub trait ColdStore: Send + Sync {
     /// The schema the cold table actually has, if it can be read.
     ///
     /// `None` means the store cannot report one, in which case the schema check
-    /// (§11) is skipped rather than assumed to pass.
+    /// is skipped rather than assumed to pass.
     async fn stored_schema(
         &self,
         _table: &str,
@@ -877,6 +877,31 @@ mod tests {
         let a = PartitionId::new("readings", datetime!(2026-07-20 00:00 UTC));
         let b = PartitionId::new("readings", datetime!(2026-07-20 06:00 UTC));
         assert_ne!(a.relation_name().unwrap(), b.relation_name().unwrap());
+    }
+
+    #[test]
+    fn a_sibling_tables_partition_is_never_read_as_this_tables() {
+        // `partitions_of` selects on `relname LIKE '<table>\_%'`, so a sibling
+        // table's partitions reach this table's enumeration — and that
+        // enumeration decides what the archiver detaches and *drops*. The suffix
+        // must parse whole, which is what keeps them apart.
+        for sibling in ["readings_2026", "readings_gas", "readings_2026_07"] {
+            let partition = PartitionId::new(sibling, datetime!(2026-07-20 00:00 UTC));
+            let name = partition.relation_name().unwrap();
+            assert!(
+                name.starts_with("readings_"),
+                "{name} is what the LIKE pattern offers"
+            );
+            assert!(
+                PartitionId::from_relation_name("readings", &name).is_err(),
+                "{name} belongs to {sibling} and must not parse as a partition of readings"
+            );
+            // And it still parses as its own table's, so the sibling is intact.
+            assert_eq!(
+                PartitionId::from_relation_name(sibling, &name).unwrap(),
+                partition
+            );
+        }
     }
 
     #[test]

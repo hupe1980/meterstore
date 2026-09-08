@@ -12,7 +12,7 @@
 //!
 //! And the question a register is asked most often is *what does the meter read
 //! now* — an `ORDER BY … DESC LIMIT 1` at the storage layer rather than a scan of
-//! a decade followed by a maximum in memory, on the table §7.4 exists because it
+//! a decade followed by a maximum in memory, on the table that exists because it
 //! grows without bound.
 //!
 //! # It refuses to fold two registers, and says which
@@ -344,7 +344,7 @@ impl<'a> ReadingsQuery<'a> {
 
         // Every value is bound; only the column *name* is interpolated, and every
         // name here is either a core column or one checked against the store's
-        // declared set (§19.7).
+        // declared set.
         let mut bind = |sql: &str, value: ScalarValue| {
             params.push(value);
             conditions.push(sql.replace("$?", &format!("${}", params.len())));

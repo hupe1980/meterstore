@@ -180,7 +180,7 @@ impl ArchivalWindow {
 /// Truncate an instant down to a multiple of `step`, measured from the Unix epoch.
 ///
 /// Hot partition bounds and archival windows are aligned the same way, which is
-/// what makes a window correspond to exactly one partition (§7.2). Written once
+/// what makes a window correspond to exactly one partition. Written once
 /// here rather than per tier, because two implementations that rounded
 /// differently would produce windows no partition holds — and the symptom would
 /// be an empty archival run, not an error.
@@ -228,7 +228,7 @@ pub fn next_window(
 
     let from = watermark.get();
 
-    // A window must correspond to exactly one hot partition (§7.2), and
+    // A window must correspond to exactly one hot partition, and
     // partitions are created on `align_to_step` boundaries. A watermark that is
     // not on one produces windows whose `PartitionId` names a relation nothing
     // ever creates — so every window looks empty, the watermark walks straight

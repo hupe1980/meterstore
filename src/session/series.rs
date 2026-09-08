@@ -5,7 +5,7 @@
 //! should not have to decode Arrow to get there, and one that wants a `DataFrame`
 //! should not have to go through this.
 //!
-//! There is nothing to derive and nothing to declare (§13.6). The row type is
+//! There is nothing to derive and nothing to declare. The row type is
 //! `metering`'s, so a derive macro could not be implemented for it anyway, and
 //! per-deployment columns are configuration rather than fields.
 //!
@@ -15,7 +15,7 @@
 //! parameters. The OBIS code is canonicalised on the way in for a second reason:
 //! it is part of the merge key, so `1-0:1.8.0` and `1-0:1.8.0*255` are the same
 //! channel and a literal comparison against the stored spelling would silently
-//! return nothing (§7.1.2).
+//! return nothing.
 
 use std::collections::BTreeMap;
 
@@ -84,7 +84,7 @@ impl<'a> SeriesQuery<'a> {
     /// key. A deployment that declares an identity column — a tenant, a reporting
     /// party — stores two parties' readings for one MaLo as distinct rows, but an
     /// unscoped [`series`](crate::session::MeterStore::series) read spans them and
-    /// folds them into a single series (§4.2). Naming the identity that scopes the
+    /// folds them into a single series. Naming the identity that scopes the
     /// read keeps them apart. Repeatable: each call adds one equality predicate,
     /// and the value is bound as a parameter, never concatenated into the SQL.
     ///
@@ -1078,7 +1078,7 @@ mod tests {
         // same instant, two values, and the fold would hand `metering::aggregate`
         // both. Both write paths refuse a second operator, so getting here means
         // integrity constraints are off or something else wrote the rows; this is
-        // the after-the-fact detection §7.3 says a duplicated scope otherwise has
+        // the after-the-fact detection a duplicated scope otherwise has
         // none of.
         let mut second = one_interval("1-0:1.8.0");
         second.series.intervals[0].value = rust_decimal::Decimal::new(99, 1);

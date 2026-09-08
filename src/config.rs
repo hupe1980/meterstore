@@ -248,8 +248,9 @@ impl ValueCheck {
         match self {
             // The ENTSO-E Reference Manual's own alphabet: sixteen characters of
             // `0-9`, `A-Z` or `-`, an uppercase letter in position 3 (the object
-            // type), and a check character that is never `-` — §5.2 forbids it,
-            // so a body computing to one is never issued a code.
+            // type), and a check character that is never `-` — the EIC-Vergabe
+            // § 5.2 forbids it there, so a body computing to one is never issued
+            // a code.
             Self::Eic(None) => "^[0-9A-Z-]{2}[A-Z][0-9A-Z-]{12}[0-9A-Z]$",
             // The same, with position 3 pinned to the declared object type.
             // Written out rather than composed, because a `const fn` cannot

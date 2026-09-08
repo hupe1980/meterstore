@@ -2,7 +2,7 @@
 //!
 //! Everything here produces a [`ValidatedTableConfig`](crate::config::ValidatedTableConfig) — the builder's own output
 //! type — so a deployment configured from a file and one configured in Rust pass
-//! through exactly the same cross-field checks (§14). There is no second
+//! through exactly the same cross-field checks. There is no second
 //! validation path to keep in step, and no setting reachable from one and not the
 //! other.
 //!
@@ -11,7 +11,7 @@
 //! It names them; it does not open them. A `hot.url` becomes a
 //! [`HotSettings`] the application uses to build its own `PgPool`, because the
 //! pool is usually shared with the rest of the service and MeterStore never owns
-//! a connection (P3, §13.5). The same goes for the catalog: the file records
+//! a connection (P3). The same goes for the catalog: the file records
 //! which one and where, and the application constructs it.
 //!
 //! # Environment interpolation
@@ -96,7 +96,7 @@ impl Settings {
     ///
     /// Runs the full cross-field validation, so a file whose `settlement_lag`
     /// is shorter than its `archival_step` fails here rather than stranding
-    /// corrections below the watermark in production (§8.1).
+    /// corrections below the watermark in production.
     pub fn validate(&self) -> Result<Vec<crate::config::ValidatedTableConfig>> {
         if self.tables.is_empty() {
             return Err(Error::config(
@@ -329,7 +329,7 @@ impl PrivacySettings {
 ///
 /// `Debug` is hand-written rather than derived: a connection URL carries a
 /// password, and configuration is exactly what a service dumps into its startup
-/// log (§19.7).
+/// log.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HotSettings {
@@ -443,16 +443,20 @@ const fn default_max_connections() -> u32 {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColdSettings {
-    /// `rest` or `sql`.
+    /// `rest`, `sql` or `s3tables`.
     #[serde(default)]
     pub catalog: CatalogKind,
-    /// Catalog endpoint (REST) or connection URL (SQL).
+    /// Catalog endpoint (REST) or connection URL (SQL). Unused by `s3tables`,
+    /// which is addressed entirely by the table bucket ARN in `warehouse`.
     ///
     /// Never logged in full: the `Debug` impl redacts it, because the SQL form
     /// is a connection URL and carries a password.
     #[serde(default)]
     pub uri: String,
     /// Warehouse root — `s3://…`, `gs://…`, or a local path.
+    ///
+    /// For `catalog = "s3tables"` this is the **table bucket ARN** instead:
+    /// S3 Tables owns the object layout, so there is no warehouse URI to give.
     #[serde(default)]
     pub warehouse: String,
     /// Namespace the tables live in.
@@ -525,7 +529,11 @@ impl ColdSettings {
     /// scheme this build did not compile in — fails here rather than as an
     /// obscure failure at the first commit.
     pub fn validate(&self) -> Result<()> {
-        if self.uri.trim().is_empty() {
+        // S3 Tables is addressed by one ARN and nothing else: the table bucket is
+        // the warehouse, and the AWS SDK resolves both the endpoint and the
+        // credentials. Asking it for a `uri` would be asking for a value with
+        // nowhere to go.
+        if self.catalog != CatalogKind::S3Tables && self.uri.trim().is_empty() {
             return Err(Error::config(match self.catalog {
                 CatalogKind::Rest => {
                     "[cold] uri is empty: a REST catalog is reached by its \
@@ -536,13 +544,17 @@ impl ColdSettings {
                      PostgreSQL and there is no database named. It is normally the same URL \
                      as [hot] url"
                 }
+                CatalogKind::S3Tables => unreachable!("excluded by the guard above"),
             }));
         }
         if self.warehouse.trim().is_empty() {
-            return Err(Error::config(
+            return Err(Error::config(if self.catalog == CatalogKind::S3Tables {
+                "[cold] warehouse is empty: S3 Tables names its table bucket by ARN — \
+                 arn:aws:s3tables:<region>:<account>:bucket/<name>"
+            } else {
                 "[cold] warehouse is empty: the catalog holds metadata, and the data files \
-                 need somewhere to live — file://, memory://, s3://, gs:// or abfss://",
-            ));
+                 need somewhere to live — file://, memory://, s3://, gs:// or abfss://"
+            }));
         }
         if self.namespace.trim().is_empty() {
             return Err(Error::config("[cold] namespace must not be empty"));
@@ -562,7 +574,11 @@ impl ColdSettings {
         // feature was not compiled in is a configuration error rather than a
         // silent fallback to local disk. Asked here so it fails at validation
         // rather than at the first commit.
-        crate::cold::catalog::warehouse_factory(&self.warehouse)?;
+        // Skipped for S3 Tables: `warehouse` is an ARN there, not a URI with a
+        // scheme naming an object-store backend. The catalogue owns the layout.
+        if self.catalog != CatalogKind::S3Tables {
+            crate::cold::catalog::warehouse_factory(&self.warehouse)?;
+        }
         Ok(())
     }
 
@@ -570,6 +586,7 @@ impl ColdSettings {
     pub async fn build(&self) -> Result<crate::cold::ColdTier> {
         self.validate()?;
         match self.catalog {
+            #[cfg(feature = "sql-catalog")]
             CatalogKind::Sql => {
                 crate::cold::IcebergSqlCatalog {
                     database_url: &self.uri,
@@ -604,6 +621,28 @@ impl ColdSettings {
             #[cfg(not(feature = "rest-catalog"))]
             CatalogKind::Rest => Err(Error::config(
                 "[cold] catalog = \"rest\" needs the meterstore `rest-catalog` feature, \
+                 which was not compiled in",
+            )),
+            #[cfg(not(feature = "sql-catalog"))]
+            CatalogKind::Sql => Err(Error::config(
+                "[cold] catalog = \"sql\" needs the meterstore `sql-catalog` feature, \
+                 which was not compiled in",
+            )),
+            #[cfg(feature = "s3tables")]
+            CatalogKind::S3Tables => {
+                crate::cold::S3TablesCatalog {
+                    table_bucket_arn: &self.warehouse,
+                    namespace: &self.namespace,
+                    file_target_bytes: self.file_target_bytes,
+                    endpoint_url: self.endpoint.as_deref(),
+                    region: self.region.as_deref(),
+                }
+                .build()
+                .await
+            }
+            #[cfg(not(feature = "s3tables"))]
+            CatalogKind::S3Tables => Err(Error::config(
+                "[cold] catalog = \"s3tables\" needs the meterstore `s3tables` feature, \
                  which was not compiled in",
             )),
         }
@@ -757,12 +796,16 @@ impl std::fmt::Debug for Deployment {
 #[serde(rename_all = "lowercase")]
 pub enum CatalogKind {
     /// Iceberg REST catalog. Every engine speaks it, so nothing extra is needed
-    /// for external access (§13.7.1).
+    /// for external access.
     #[default]
     Rest,
     /// PostgreSQL-backed SQL catalog. External engines need the JDBC catalog
     /// implementation, which support for is uneven.
     Sql,
+    /// AWS S3 Tables. The table bucket *is* the warehouse, so `warehouse` holds
+    /// its ARN and `uri` is unused — Athena, EMR and Glue already know it.
+    #[serde(rename = "s3tables")]
+    S3Tables,
 }
 
 /// One managed table.
@@ -798,7 +841,7 @@ pub struct TableSettings {
     /// Snapshot retention.
     #[serde(default)]
     pub maintenance: MaintenanceSettings,
-    /// Columns beyond the core schema (§7.3).
+    /// Columns beyond the core schema.
     ///
     /// The `identity` flag is the load-bearing one: an identity column joins the
     /// merge key, so two rows differing in it are different readings. A tenant
@@ -806,7 +849,7 @@ pub struct TableSettings {
     /// correction supersede another's reading.
     #[serde(default)]
     pub extra_columns: Vec<ExtraColumn>,
-    /// The column holding pseudonymous subject references (§19.4).
+    /// The column holding pseudonymous subject references.
     #[serde(default)]
     pub subject_column: Option<String>,
 }
@@ -854,7 +897,7 @@ impl TableSettings {
                     "subject_column {subject:?} is also declared as an identity column: a \
                      pseudonymous reference must never join the merge key, or a correction \
                      derived from a re-registered reference silently fails to supersede the \
-                     value it corrects (§19.4)"
+                     value it corrects"
                 )));
             }
             config = config.subject_column(subject);
@@ -976,7 +1019,7 @@ const fn default_min_snapshots() -> usize {
 pub struct ExtraColumn {
     /// Column name.
     pub name: String,
-    /// Storage type. Only `string` is supported (§7.3).
+    /// Storage type. Only `string` is supported.
     #[serde(default = "default_column_type")]
     pub r#type: String,
     /// Whether this column is part of a reading's **identity**.
@@ -993,7 +1036,7 @@ pub struct ExtraColumn {
     /// ingestion source, a delivery status, a Zählzeit. A value outside the set
     /// fails the write rather than being read back later as an unknown code.
     ///
-    /// Present because §14's whole claim for this file is that it is a front end
+    /// Present because this file's whole claim is that it is a front end
     /// over the *same* validated types, with no setting reachable from one and
     /// not the other.
     #[serde(default)]
@@ -1144,7 +1187,7 @@ pub fn format_human_duration(d: Duration) -> String {
 ///
 /// A year is 365 days and a week is 7. Neither is a calendar unit here — these
 /// configure retention and headroom, not interval arithmetic, and the calendar
-/// that *does* matter is `metering`'s (§9.5).
+/// that *does* matter is `metering`'s.
 fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
     let trimmed = text.trim();
     let split = trimmed
@@ -1485,6 +1528,63 @@ identify_by_melo = false
     }
 
     #[test]
+    fn every_catalogue_kind_is_reachable_from_a_file() {
+        // A backend the crate can construct but a file cannot name is a backend
+        // the CLI cannot reach at all, since it has no other way in.
+        for (name, kind) in [
+            ("rest", CatalogKind::Rest),
+            ("sql", CatalogKind::Sql),
+            ("s3tables", CatalogKind::S3Tables),
+        ] {
+            let toml = format!(
+                r#"
+[hot]
+url = "postgresql://localhost/edm"
+
+[cold]
+catalog = "{name}"
+uri = "https://catalog.internal"
+warehouse = "arn:aws:s3tables:eu-central-1:123456789012:bucket/edm"
+
+[[tables]]
+name = "readings"
+"#
+            );
+            let settings = Settings::from_toml(&toml).expect("{name} parses");
+            assert_eq!(settings.cold.catalog, kind);
+        }
+    }
+
+    #[test]
+    fn s3_tables_is_addressed_by_arn_and_asks_for_no_uri() {
+        // The table bucket *is* the warehouse: there is no URI whose scheme picks
+        // an object-store backend, so the scheme check must not run and an empty
+        // `uri` must not be an error. Both would refuse a correct file.
+        let base = r#"
+[hot]
+url = "postgresql://localhost/edm"
+
+[cold]
+catalog = "s3tables"
+warehouse = "arn:aws:s3tables:eu-central-1:123456789012:bucket/edm"
+
+[[tables]]
+name = "readings"
+"#;
+        Settings::from_toml(base)
+            .unwrap()
+            .validate_all()
+            .expect("an ARN and no uri is a complete s3tables section");
+
+        // And the ARN is still required, with a message that says what shape it
+        // takes rather than listing URI schemes it does not accept.
+        let mut broken = Settings::from_toml(base).unwrap();
+        broken.cold.warehouse.clear();
+        let err = broken.validate_all().unwrap_err().to_string();
+        assert!(err.contains("ARN"), "{err}");
+    }
+
+    #[test]
     fn the_cold_section_never_prints_its_password() {
         // The SQL form of `uri` is a PostgreSQL connection URL — usually the hot
         // tier's own — and configuration is what a service dumps at startup.
@@ -1533,7 +1633,7 @@ extra_columns = [{ name = "subject_ref", values = ["A", "B"] }]
 
     #[test]
     fn a_checked_column_is_declarable_from_a_file() {
-        // §14's claim for this format is that it is a front end over the same
+        // This format's claim is that it is a front end over the same
         // validated types, with no setting reachable from Rust and not from
         // here.
         let toml = r#"
@@ -1594,7 +1694,7 @@ extra_columns = [{ name = "bilanzkreis", check = "EIC:Q" }]
     #[test]
     fn every_value_check_the_crate_knows_is_declarable_from_a_file() {
         // The two lists are the same list. A scheme added to `ValueCheck` and
-        // not reachable from TOML would break §14's claim silently — the file
+        // not reachable from TOML would break that claim silently — the file
         // would report it as unsupported, which is indistinguishable from a
         // typo.
         for scheme in crate::config::ValueCheck::ALL {
@@ -2015,9 +2115,9 @@ settlment_lag = "7d"
 
     #[test]
     fn a_coded_column_is_declarable_from_a_file() {
-        // §14's claim for this file is that it is a front end over the *same*
+        // This file's claim is that it is a front end over the *same*
         // validated types, with no setting reachable from one and not the other.
-        // §14: no setting is reachable from the builder and not from here.
+        // no setting is reachable from the builder and not from here.
         let toml = r#"
 [[tables]]
 name = "readings"

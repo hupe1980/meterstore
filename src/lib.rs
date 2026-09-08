@@ -163,7 +163,7 @@
 //!
 //! And a command line, behind `cli`: [`cli`] is the `meterstore` binary over the
 //! same public API — `check`, `create`, `status`, `archive`, `maintain`,
-//! `query`, `completeness` and `serve` among its verbs — for the questions an
+//! `query`, `completeness`, `audit` and `serve` among its verbs — for the questions an
 //! operator asks during an incident and the archival loop a deployment has to
 //! run somewhere.
 //!
@@ -218,12 +218,11 @@
 //! [`collect_by_channel`]: crate::session::SeriesQuery::collect_by_channel
 //! [`seen_since`]: crate::session::CompletenessQuery::seen_since
 
-// Doc comments throughout cite `§N`. Those are cross-references between the
-// design notes this crate's maintainers keep, not links a reader needs to
-// follow: everything required to *use* the crate is in the documentation here,
-// and the reasoning behind each decision is written out at
-// <https://hupe1980.github.io/meterstore>. The markers exist so that changing a
-// behaviour is traceable to the argument it rested on.
+// A `§` in a doc comment is always a clause of a *named external* document — a
+// statute, a BDEW Anwendungshilfe, the ENTSO-E EIC Reference Manual — and the
+// surrounding sentence names it. Nothing here cites this crate's own notes by
+// number: the reasoning is written out beside the code and at
+// <https://hupe1980.github.io/meterstore>.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
@@ -258,9 +257,11 @@ pub mod watermark;
 
 #[cfg(feature = "rest-catalog")]
 pub use cold::IcebergRestCatalog;
+#[cfg(feature = "sql-catalog")]
+pub use cold::IcebergSqlCatalog;
 #[cfg(feature = "s3tables")]
 pub use cold::S3TablesCatalog;
-pub use cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
+pub use cold::{ColdTier, IcebergCold, WarehouseAuth};
 pub use config::{
     CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
     ValueCheck, checked_column, coded_column, declared_value_check,
@@ -280,10 +281,10 @@ pub use planner::{
     balancing_month_bounds, bilanzierungsmonat, day_boundary, expected_intervals_in_balancing_day,
 };
 pub use session::{
-    AUTHORITATIVE_ATTEMPTS, Completeness, CompletenessQuery, HotWriter, Maintenance,
-    MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
-    QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery, ResolvedSeries, SeriesQuery,
-    SqlSurface, TableMaintenance,
+    AUTHORITATIVE_ATTEMPTS, AttributeAudit, Completeness, CompletenessQuery, HotWriter,
+    Maintenance, MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore,
+    MeterStoreBuilder, QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery,
+    ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
 };
 pub use settings::{Deployment, PrivacySettings, Settings};
 pub use tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
@@ -300,9 +301,11 @@ pub use watermark::{Tier, TieringWatermark};
 pub mod prelude {
     #[cfg(feature = "rest-catalog")]
     pub use crate::cold::IcebergRestCatalog;
+    #[cfg(feature = "sql-catalog")]
+    pub use crate::cold::IcebergSqlCatalog;
     #[cfg(feature = "s3tables")]
     pub use crate::cold::S3TablesCatalog;
-    pub use crate::cold::{ColdTier, IcebergCold, IcebergSqlCatalog, WarehouseAuth};
+    pub use crate::cold::{ColdTier, IcebergCold, WarehouseAuth};
     pub use crate::config::{
         EicType, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck, checked_column,
         coded_column,
@@ -322,9 +325,10 @@ pub mod prelude {
         expected_intervals_in_balancing_day,
     };
     pub use crate::session::{
-        Completeness, CompletenessQuery, HotWriter, Maintenance, MaintenanceOutcome, MeterCatalog,
-        MeterCatalogBuilder, MeterStore, MeterStoreBuilder, QueryDescription, QueryResult,
-        ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
+        AttributeAudit, Completeness, CompletenessQuery, HotWriter, Maintenance,
+        MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
+        QueryDescription, QueryResult, ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface,
+        TableMaintenance,
     };
     pub use crate::settings::{Deployment, PrivacySettings, Settings};
     pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};

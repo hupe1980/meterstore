@@ -6,7 +6,7 @@
 //! [`FlightSqlServer`](crate::serve::FlightSqlServer) serves one table or every
 //! table without knowing which it has.
 //!
-//! That matters because §15.3's ordinary deployment holds authoritative readings
+//! That matters because the ordinary deployment holds authoritative readings
 //! *beside* a non-authoritative second stream, and the statement a BI tool wants
 //! is frequently the one that mentions both — which only a catalog can express.
 //!

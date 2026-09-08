@@ -347,7 +347,8 @@ mod tests {
 
 /// The split's two properties, over generated inputs rather than chosen ones.
 ///
-/// §6.3 is the whole correctness argument of the design, and it reduces to two
+/// The tiering invariant is the whole correctness argument of the design, and it
+/// reduces to two
 /// statements about this function. Both are silent when broken: too inclusive
 /// and a row is counted twice, too exclusive and it vanishes. Neither shows up as
 /// an error anywhere downstream, so the case nobody wrote is the case that ships.
@@ -403,7 +404,7 @@ mod properties {
         }
 
         /// **The halves agree with the routing rule.** `tier_for` is the single
-        /// place a row's tier is decided (§6.1); a split that disagreed with it
+        /// place a row's tier is decided; a split that disagreed with it
         /// would send a query to the tier that does not hold the row.
         #[test]
         fn each_half_holds_only_what_the_routing_rule_assigns_it(

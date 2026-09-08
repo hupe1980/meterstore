@@ -19,7 +19,9 @@ pub use maintenance::{Maintenance, MaintenanceOutcome, RETENTION_LABEL, TableMai
 pub use query::{QueryDescription, QueryResult};
 pub use readings::ReadingsQuery;
 pub use series::{ResolvedSeries, SeriesQuery};
-pub use store::{AUTHORITATIVE_ATTEMPTS, AppendOutcome, HotWriter, MeterStore, MeterStoreBuilder};
+pub use store::{
+    AUTHORITATIVE_ATTEMPTS, AppendOutcome, AttributeAudit, HotWriter, MeterStore, MeterStoreBuilder,
+};
 pub use surface::SqlSurface;
 pub use system::{ConfigEntry, SystemTables, TableStatus, register_all as register_system_tables};
 /// Every SQL function this crate registers — the calendar, OBIS and EIC ones —

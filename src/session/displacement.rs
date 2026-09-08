@@ -7,7 +7,7 @@
 //!
 //! # Why storage reports this at all
 //!
-//! MeterStore does not compute with readings (§3), and this is not a computation:
+//! MeterStore does not compute with readings, and this is not a computation:
 //! it is the store saying what its own write did. The alternative is for a caller
 //! to read the prior state in a separate query and hope nothing landed in
 //! between — which is a race, and an audit trail built on a race is worse than
@@ -40,7 +40,7 @@ pub struct StoredValue {
     /// What the quantity is measured in.
     ///
     /// Carried because a value without it is dimensionless: water settles in m³
-    /// and gas may sit on either side of the Brennwert conversion (§4.1.2). An
+    /// and gas may sit on either side of the Brennwert conversion. An
     /// audit row recording a changed number without its unit records half a fact.
     pub unit: MeasurementUnit,
     /// The reading's quality.
@@ -54,7 +54,7 @@ pub struct StoredValue {
     ///
     /// A [`ScopedVersion`] rather than a bare number, because ordering two
     /// versions is only defined inside one scope — comparing across scopes is
-    /// the mistake §4.2 exists to prevent, and the type refuses it.
+    /// the mistake append-only storage exists to prevent, and the type refuses it.
     pub version: ScopedVersion,
     /// Transaction time — when the store learned this value.
     pub recorded_at: OffsetDateTime,

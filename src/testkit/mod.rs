@@ -1,7 +1,7 @@
 //! A harness, a workload generator, and the assertions that matter.
 //!
 //! Behind the `testkit` feature, and part of the public API on purpose: the
-//! properties in §17.3 are what a *deployment* needs to be able to check, not
+//! properties the oracle checks are what a *deployment* needs to be able to check, not
 //! only what this crate needs to check about itself. A utility integrating
 //! MeterStore should be able to run the same oracle against its own
 //! configuration and its own volumes.
@@ -106,7 +106,7 @@ pub struct MeteringWorkload {
 }
 
 impl MeteringWorkload {
-    /// A workload starting at `start`, with defaults matching §17.3.
+    /// A workload starting at `start`, with the oracle's own defaults.
     pub fn new(start: OffsetDateTime) -> Self {
         Self {
             seed: 0x5EED,
@@ -178,7 +178,7 @@ impl MeteringWorkload {
 
     /// Report at an interval other than 15 minutes.
     ///
-    /// Sub-quarter-hourly data is what iMSys can already deliver and what §14a
+    /// Sub-quarter-hourly data is what iMSys can already deliver and what § 14a
     /// steering will need, and the interval count per day is not 96 — so a
     /// workload that only ever generated quarter-hours would leave every
     /// resolution-dependent path (completeness, the DST calendar, the expected
@@ -232,7 +232,7 @@ impl MeteringWorkload {
     /// The share of intervals that are later corrected.
     ///
     /// Rare by default because they are rare in practice, and because that is
-    /// the property merge elision depends on (§9.2).
+    /// the property merge elision depends on.
     pub fn with_corrections(mut self, rate: f64) -> Self {
         self.correction_rate = rate.clamp(0.0, 1.0);
         self
@@ -241,7 +241,7 @@ impl MeteringWorkload {
     /// The share of intervals that never arrive.
     ///
     /// A gap is ordinary — a meter can simply not report — and completeness
-    /// exists to say so (§9.6). A workload with none of them never exercises it.
+    /// exists to say so. A workload with none of them never exercises it.
     pub fn with_gaps(mut self, rate: f64) -> Self {
         self.gap_rate = rate.clamp(0.0, 1.0);
         self
@@ -303,7 +303,7 @@ impl MeteringWorkload {
                     // A delivery is split per version scope, not per day. A UTC
                     // day is not inside one local month: 2026-07-31T22:00Z is
                     // already August in Berlin, so a day-aligned batch at a month
-                    // end spans two scopes and encoding rejects it (§4.2). Real
+                    // end spans two scopes and encoding rejects it. Real
                     // ingestion has the same constraint, which is the point of
                     // generating it.
                     for (_, group) in group_by_scope(intervals, self.sparte) {
@@ -327,7 +327,7 @@ impl MeteringWorkload {
             intervals.sort_by_key(|i| i.from);
             // A version scope covers one local month, so a correction batch
             // spanning a month boundary has to be split — encoding rejects a
-            // scope that does not cover its intervals (§4.2).
+            // scope that does not cover its intervals.
             for (_, group) in group_by_scope(intervals, self.sparte) {
                 let anchor = group[0].from;
                 out.push(self.stored(malo, meter, group, self.version + 1, anchor)?);
@@ -608,7 +608,7 @@ fn melo_id(malo: usize, meter: usize) -> MeloId {
 /// deployment declared as identity.
 type OracleKey = (String, String, OffsetDateTime, Vec<String>);
 
-/// The reference implementation the store is checked against (§17.3).
+/// The reference implementation the store is checked against.
 ///
 /// Holds every row the workload ever produced and resolves them independently:
 /// a fold over a map in Rust, rather than the window function the store plans.
@@ -723,7 +723,7 @@ impl Oracle {
 
     /// Record everything a delivery asserted, applying latest-version-wins.
     ///
-    /// Versions are compared **within a scope only** (§4.2). Two versions in
+    /// Versions are compared **within a scope only**. Two versions in
     /// different scopes are not ordered, so neither supersedes the other and
     /// both would survive resolution — which is exactly the inflation
     /// `VersionScope::for_interval` exists to prevent, so the oracle has to

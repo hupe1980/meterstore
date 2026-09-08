@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! §17 draws the line at storage fidelity: the properties worth testing here —
+//! The line is drawn at storage fidelity: the properties worth testing here —
 //! catalog compare-and-swap, advisory-lock scope, partition detach visibility,
 //! `Decimal128` through Parquet — are exactly the ones a mock agrees with
 //! whatever the code does. So the fixtures are real, and the cost is a
@@ -48,12 +48,12 @@ use crate::error::{Error, Result};
 /// The PostgreSQL image every suite runs against.
 ///
 /// **Pinned, and not at the library default.** `testcontainers-modules` defaults
-/// to `11-alpine`, one major below the floor this design requires (§3.1) — so
+/// to `11-alpine`, one major below the floor this design requires — so
 /// every suite would have been proving the store works on a version it does not
 /// claim to support, and `ATTACH PARTITION` would still have taken
 /// `ACCESS EXCLUSIVE` on the parent there, so the lock properties the tests
 /// assert would have been asserted against the one server where they do not
-/// hold. 16 matches the §18 reference deployment.
+/// hold. 16 matches the reference deployment.
 pub const IMAGE_TAG: &str = "16-alpine";
 
 /// A running PostgreSQL, kept for the life of the process.
@@ -133,7 +133,7 @@ async fn connect_ready(url: &str) -> Result<PgConnection> {
 /// The container is shared and started once; the database is created per call
 /// and is as isolated as a separate server for everything these suites do — its
 /// own tables, its own Iceberg SQL catalog, its own advisory-lock namespace is
-/// the only thing it shares, and that is keyed by table name (§5.2).
+/// the only thing it shares, and that is keyed by table name.
 pub async fn fresh_database() -> Result<String> {
     let shared = SHARED
         .get_or_try_init(|| async {

@@ -1072,7 +1072,7 @@ impl SubjectRegistry {
     ///
     /// **Cold-tier exclusion is not part of this transaction and cannot be.** It
     /// is not a write at all: erasure destroys the *mapping*, which leaves every
-    /// archived row unattributable wherever it sits (§12.4). There is nothing in
+    /// archived row unattributable wherever it sits. There is nothing in
     /// object storage to roll back, so sequencing is not a concern.
     pub async fn erase_in(
         &self,
@@ -1741,8 +1741,40 @@ pub enum Retention {
     /// 2 January 2028, because the clock starts at the *Schluss des
     /// Kalenderjahres*. The year is Berlin's, because the statute is.
     CalendarYears(u32),
-    /// A rolling window — the earlier "no longer necessary" trigger, where a
-    /// deployment has decided what that means.
+    /// A rolling window — the earlier *"nicht mehr erforderlich"* trigger, where
+    /// a deployment has decided what that means.
+    ///
+    /// # It expires whole years, and a window shorter than one is not what it looks like
+    ///
+    /// The sweep deletes mapping rows by `epoch`, and an epoch is a **year** —
+    /// that is [`retention_epoch`], and it is a year on purpose, because § 60
+    /// Abs. 6's clock starts at the *Schluss des Kalenderjahres*. So this window
+    /// does not select values by age; it selects the **calendar years that ended
+    /// more than `window` ago**, and everything inside the current year and the
+    /// most recent complete one stays whatever the window says:
+    ///
+    /// ```rust
+    /// use meterstore::Retention;
+    /// use time::{Duration, macros::datetime};
+    ///
+    /// // Thirty days, swept on 15 January 2028. Only epochs before 2027 go:
+    /// // a value collected on 2 January 2027 is a year old and is kept.
+    /// let cutoff = Retention::Rolling(Duration::days(30)).cutoff(datetime!(2028-01-15 00:00 UTC));
+    /// assert_eq!(cutoff, datetime!(2027-12-16 00:00 UTC));
+    /// ```
+    ///
+    /// The error is always in the direction that **keeps** data — nothing is ever
+    /// erased before `window` has elapsed, which is the half that matters for an
+    /// irreversible operation. But a deployment that sets `Rolling(30 days)`
+    /// expecting a thirty-day linkage lifetime does not get one, and nothing at
+    /// runtime will say so.
+    ///
+    /// Reaching below the year needs a finer column on the mapping row than the
+    /// one § 60 Abs. 6 is written in. For a genuine sub-year policy, erase by
+    /// request ([`SubjectRegistry::erase`]) on the deployment's own schedule
+    /// instead.
+    ///
+    /// [`SubjectRegistry::erase`]: crate::erasure::SubjectRegistry::erase
     Rolling(time::Duration),
 }
 
@@ -2191,6 +2223,42 @@ mod tests {
         let later = datetime!(2026-01-01 6:00 UTC); // 07:00 Berlin
         assert_eq!(retention_epoch(later, Sparte::Gas), 2026);
         assert_eq!(retention_epoch(later, Sparte::Strom), 2026);
+    }
+
+    #[test]
+    fn a_rolling_window_expires_whole_years_and_never_erases_early() {
+        use time::macros::datetime;
+
+        // `Rolling` reads as "delete anything older than this"; what it can do is
+        // expire the calendar years that ended more than the window ago, because
+        // the mapping row carries a year and nothing finer.
+        for (now, window_days, due_before) in [
+            (datetime!(2028-06-01 00:00 UTC), 90i64, 2028),
+            (datetime!(2028-02-01 00:00 UTC), 90, 2027),
+            (datetime!(2028-01-15 00:00 UTC), 30, 2027),
+            (datetime!(2028-06-01 00:00 UTC), 400, 2027),
+        ] {
+            let cutoff = Retention::Rolling(time::Duration::days(window_days)).cutoff(now);
+            assert_eq!(
+                sweep_boundary(cutoff),
+                due_before,
+                "Rolling({window_days}d) at {now}"
+            );
+        }
+
+        // The half that must hold: an epoch is only ever swept once every value
+        // it could hold is older than the window. The newest value in the newest
+        // swept epoch is 31 December of `due_before - 1`, which must precede the
+        // cutoff.
+        for window_days in [1i64, 30, 90, 365, 400, 1_000] {
+            let now = datetime!(2028-06-15 12:00 UTC);
+            let cutoff = Retention::Rolling(time::Duration::days(window_days)).cutoff(now);
+            let newest_swept = metering::calendar::year_start_utc(sweep_boundary(cutoff));
+            assert!(
+                newest_swept <= cutoff,
+                "Rolling({window_days}d) would erase a value newer than the window"
+            );
+        }
     }
 
     #[test]

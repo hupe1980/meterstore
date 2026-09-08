@@ -184,7 +184,7 @@ impl MeterStore {
     /// [`query`](Self::query) with positional parameters.
     ///
     /// Values reach the engine as bound parameters and are never concatenated
-    /// into the SQL text (§19.7), so a caller may pass a `malo_id` straight from
+    /// into the SQL text, so a caller may pass a `malo_id` straight from
     /// a market message.
     pub async fn query_with_params(
         &self,
@@ -404,7 +404,7 @@ impl MeterStore {
 
     /// Read one measuring point as the domain type.
     ///
-    /// The typed path (§13.4): rows come back version-resolved and tier-split, as
+    /// The typed path: rows come back version-resolved and tier-split, as
     /// a [`MeasurementSeries`] the `metering` crate computes with directly.
     ///
     /// # The identifier is parsed, not taken on trust
@@ -490,7 +490,7 @@ impl MeterStore {
         ))
     }
 
-    /// Completeness of every channel over a range (§9.6).
+    /// Completeness of every channel over a range.
     ///
     /// A missing interval is information, not an empty set. The expected count
     /// comes from each series' declared resolution and `metering`'s DST-aware
@@ -595,7 +595,8 @@ impl MeterStore {
         //
         // Walked back from the pinned snapshot rather than read off it, for the
         // same reason the cold tier's own lookup walks: a snapshot written out of
-        // band — the compaction §10.3.1 recommends, run with Spark or PyIceberg —
+        // band — the compaction operators are told to run, with Spark or
+        // PyIceberg —
         // is a valid Iceberg commit that carries no watermark. Reading only the
         // pinned one would report the epoch for a settlement rerun that ran
         // against a real boundary. The list is newest-first, so the suffix from
@@ -924,7 +925,7 @@ impl MeterStore {
         self.archiver().verify_invariant().await
     }
 
-    /// Compare the configured schema against the cold table's (§11).
+    /// Compare the configured schema against the cold table's.
     ///
     /// Reports every difference, whether or not it is safe. Callers that want the
     /// table to *stop* on an unsafe one use
@@ -995,7 +996,7 @@ impl MeterStore {
 
     /// The cold tier, for callers that need it directly.
     ///
-    /// Exposed because the tier traits are the extension point (§5.1): a
+    /// Exposed because the tier traits are the extension point: a
     /// deployment may want to list snapshots, seed a watermark, or drive the
     /// store's own maintenance from outside the handle.
     pub fn cold_store(&self) -> &Arc<dyn ColdStore> {
@@ -1311,8 +1312,8 @@ impl MeterStore {
     ///
     /// Routing reads the boundary before the write; archival advances it by
     /// committing to Iceberg, a different system sharing no transaction with the
-    /// insert. Detaching a partition before archiving it closes most of the gap
-    /// (§8.2), since an insert into one being archived fails outright. What is
+    /// insert. Detaching a partition before archiving it closes most of the gap,
+    /// since an insert into one being archived fails outright. What is
     /// left is the moment after the drop, when `ensure_partitions` recreates the
     /// relation and the row lands below the boundary, where no query looks — not
     /// lost, invisible, and reported by nothing but `verify_invariant`.
@@ -1551,7 +1552,7 @@ impl MeterStore {
     /// looks; refusing cannot. The refusal names the interval and points at
     /// [`append`](Self::append).
     ///
-    /// The watermark is monotonic (§6.3), so the risk is a row accepted here that
+    /// The watermark is monotonic, so the risk is a row accepted here that
     /// the true boundary has since passed. The margin is the **settlement lag** —
     /// archival never closes a window newer than `now - settlement_lag`, a week
     /// by default, while current data has `from` near now. Reopen per ingest run
@@ -1585,19 +1586,19 @@ impl MeterStore {
     /// Irreversibly destroy this table and every reading in it, in both tiers.
     ///
     /// **The only operation in this crate that deletes stored readings.**
-    /// Everything else is append-only (§4.2): a correction is a new version, a
+    /// Everything else is append-only: a correction is a new version, a
     /// hot partition drop reclaims space for rows already durable in Iceberg, and
-    /// erasure (§12.4) destroys a *mapping* rather than rows. That asymmetry is
+    /// erasure destroys a *mapping* rather than rows. That asymmetry is
     /// deliberate — a settlement must stay reproducible — and it means this is the
     /// operation to reach for when the answer really is "none of this data should
     /// exist any more".
     ///
     /// The two cases that need it:
     ///
-    /// - **Decommissioning a tenant.** With a table per tenant (§15.2.1), this is
+    /// - **Decommissioning a tenant.** With a table per tenant, this is
     ///   how their data leaves. Within a shared table there is no equivalent, and
     ///   there cannot be: removing one tenant's rows from an Iceberg table means
-    ///   rewriting files, which `iceberg-rust` cannot do (§10.3.1).
+    ///   rewriting files, which `iceberg-rust` cannot do.
     /// - **A statutory maximum retention.** Same constraint: expiry is
     ///   whole-table, so a period that differs per tenant needs a table per
     ///   tenant.
@@ -1810,7 +1811,7 @@ impl MeterStore {
     /// Regulation by Recital 26 — while the settlement record stays reproducible,
     /// which is what the Eichrecht documentation duties and every later audit
     /// need. It is also `O(1)` per subject against a lake that cannot rewrite
-    /// files at all (§10.3.1), so the branch MeterStore can take is also the one
+    /// files at all, so the branch MeterStore can take is also the one
     /// that costs nothing.
     ///
     /// # The unit is a collection year, not a subject
@@ -2090,7 +2091,7 @@ impl MeterStore {
         // which is what separates a replay from a backfill.
         //
         // Parameterised throughout — a `malo_id` reaching here came off a market
-        // message (§19.7).
+        // message.
         let mut params: Vec<ScalarValue> = vec![
             crate::encode::schema::timestamp_scalar(lo),
             crate::encode::schema::timestamp_scalar(hi),
@@ -2364,6 +2365,109 @@ impl MeterStore {
         )
     }
 
+    /// Check a declared **attribute** column against the rows already stored.
+    ///
+    /// The one schema mistake this crate cannot refuse at declaration time.
+    /// Declaring a tenant discriminator as an attribute rather than an identity
+    /// column means two tenants share a merge key: one silently supersedes the
+    /// other under version resolution, and no error is raised anywhere. The
+    /// declaration is legal, the writes succeed, and the symptom is a number.
+    ///
+    /// So it is asked of the data instead: for how many merge keys does this
+    /// column take more than one value? A genuine attribute is a fact *about* a
+    /// reading, so a handful is ordinary — a correction may legitimately restate
+    /// a Bilanzkreis. A mis-declared identity column shows up as a large fraction
+    /// of keys, because every key a second tenant also reports is one of them.
+    ///
+    /// A **report, not a verdict**: the two cases differ in degree, and only the
+    /// deployment knows which its column is. Read against the raw versions
+    /// relation, so a correction's own history is visible rather than resolved
+    /// away, and across both tiers — and through this session, so a scoped or
+    /// pinned one reports on the rows it can see.
+    ///
+    /// Nulls do not count as a value, so a key holding `NULL` and one other value
+    /// is not flagged. That under-reports rather than over-reports, which is the
+    /// right direction for a figure an operator acts on.
+    ///
+    /// A full group-by over the table: a deliberate run, not a scheduled one.
+    ///
+    /// # Errors
+    ///
+    /// The column must be a declared attribute column of this table. An identity
+    /// column has nothing to answer — it is *in* the merge key, so the count is
+    /// one by construction — and an unknown name is a typo that would otherwise
+    /// report a clean bill for a column nobody checked.
+    pub async fn audit_attribute_column(&self, column: &str) -> Result<AttributeAudit> {
+        if !self
+            .config
+            .attribute_columns()
+            .iter()
+            .any(|f| f.name() == column)
+        {
+            return Err(Error::config(format!(
+                "{column:?} is not a declared attribute column of {:?}. Identity columns \
+                 are in the merge key and cannot repeat by construction; a name that is \
+                 neither would report a clean bill for a column that was never checked",
+                self.config.name()
+            )));
+        }
+
+        let key = self.config.merge_key();
+        let grouped = key
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"SELECT count(*) AS keys, count(*) FILTER (WHERE n > 1) AS repeated,
+                      coalesce(max(n), 0) AS widest
+                 FROM (SELECT {grouped}, count(DISTINCT "{column}") AS n
+                         FROM "{raw}" GROUP BY {grouped}) k"#,
+            raw = self.raw_table(),
+        );
+
+        let batches = self.sql(&sql).await?.collect().await.map_err(Error::from)?;
+        let read = |name: &str| -> Result<i64> {
+            let batch = batches
+                .first()
+                .ok_or_else(|| Error::decode(name, "the audit returned no row"))?;
+            batch
+                .column_by_name(name)
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .ok_or_else(|| Error::decode(name, "expected a count"))
+        };
+
+        Ok(AttributeAudit {
+            column: column.to_string(),
+            merge_keys: read("keys")? as u64,
+            merge_keys_with_several_values: read("repeated")? as u64,
+            widest: read("widest")?.max(0) as u64,
+        })
+    }
+
+    /// [`audit_attribute_column`] for every attribute column this table declares.
+    ///
+    /// In declaration order, and empty when the table declares none.
+    ///
+    /// [`audit_attribute_column`]: Self::audit_attribute_column
+    pub async fn audit_attribute_columns(&self) -> Result<Vec<AttributeAudit>> {
+        let names: Vec<String> = self
+            .config
+            .attribute_columns()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            out.push(self.audit_attribute_column(&name).await?);
+        }
+        Ok(out)
+    }
+
     /// The column an external engine must group a daily aggregate by.
     ///
     /// The second rule that has to leave this crate for the open-format claim to
@@ -2380,6 +2484,43 @@ impl MeterStore {
     /// [`encode::schema`]: crate::encode::schema
     pub const fn balancing_day_column(&self) -> &'static str {
         crate::encode::schema::col::BALANCING_DAY
+    }
+}
+
+/// What [`MeterStore::audit_attribute_column`] found.
+///
+/// A declared attribute column measured against the rows already stored, for the
+/// one schema mistake that has no error: an identity column declared as an
+/// attribute, which lets two identities share a merge key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeAudit {
+    /// The column asked about.
+    pub column: String,
+    /// Distinct merge keys the table holds.
+    pub merge_keys: u64,
+    /// Merge keys carrying more than one value of the column.
+    pub merge_keys_with_several_values: u64,
+    /// The most values any single merge key carries.
+    pub widest: u64,
+}
+
+impl AttributeAudit {
+    /// The share of merge keys carrying more than one value, in `0.0..=1.0`.
+    ///
+    /// Zero when the table is empty: nothing was found because there was nothing
+    /// to look at, which must not read as a clean bill.
+    #[must_use]
+    pub fn repetition_ratio(&self) -> f64 {
+        if self.merge_keys == 0 {
+            return 0.0;
+        }
+        self.merge_keys_with_several_values as f64 / self.merge_keys as f64
+    }
+
+    /// Whether the table held anything to judge the column against.
+    #[must_use]
+    pub const fn is_measurable(&self) -> bool {
+        self.merge_keys > 0
     }
 }
 
@@ -3258,7 +3399,7 @@ impl MeterStoreBuilder {
     /// resolved one.
     ///
     /// **Not the same thing as the configured name**, and the difference is what
-    /// makes a naive uniqueness check wrong. §13.7.2 derives both from the
+    /// makes a naive uniqueness check wrong. Both are derived from the
     /// physical name by adding or stripping `_versions`, so `readings` and
     /// `readings_versions` are two configurations that register exactly the same
     /// pair. `register_as` overrides the second, which is a third way for two
@@ -3294,7 +3435,7 @@ impl MeterStoreBuilder {
     /// This is what lets several tables share a catalog, and therefore what
     /// makes a join across them expressible — see [`MeterCatalog`], which is the
     /// supported way to reach it. Each table keeps its own watermark, archiver
-    /// and lease (§15.3); only the query surface is shared.
+    /// and lease; only the query surface is shared.
     ///
     /// [`MeterCatalog`]: crate::session::MeterCatalog
     pub fn session(mut self, ctx: SessionContext) -> Self {
@@ -3351,8 +3492,8 @@ impl MeterStoreBuilder {
         // hold has to be caught here. Left to the resolution planner it surfaces
         // as "No field named tenant" against a list of fourteen columns, which
         // says nothing about the actual mistake — declaring an identity column on
-        // a table that already holds rows changes what "the same reading" means
-        // (§11), and the operator needs to be told that, not shown a schema dump.
+        // a table that already holds rows changes what "the same reading" means,
+        // and the operator needs to be told that, not shown a schema dump.
         if let Some(stored) = cold.stored_schema(config.name()).await? {
             let configured = crate::encode::schema::storage_schema(&config.extra_columns());
             crate::evolution::compare(&configured, &stored).require_safe(config.name())?;
@@ -3361,10 +3502,10 @@ impl MeterStoreBuilder {
         // `information_schema` is off by default in DataFusion, and without it a
         // client cannot discover what tables exist — it can only query names it
         // was told out of band. That matters most for the surfaces where there
-        // is nobody to tell: a BI tool over Flight SQL (§13.7.3) lists the
+        // is nobody to tell: a BI tool over Flight SQL lists the
         // catalog before it queries anything, and an operator at a SQL prompt
         // does the same. It also makes the distinction between `readings` and
-        // `readings_versions` (§13.7.2) discoverable rather than folklore.
+        // `readings_versions` discoverable rather than folklore.
         let ctx = match self.session {
             Some(existing) => existing,
             None => SessionContext::new_with_config(

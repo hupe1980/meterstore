@@ -668,3 +668,67 @@ async fn count(store: &MeterStore, sql: &str) -> i64 {
         .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
         .value(0)
 }
+
+/// The audit that finds the mistake this whole suite exists to prevent, *after*
+/// it has been made.
+///
+/// Declaring a tenant discriminator as an attribute is legal, writes succeed, and
+/// nothing raises an error — so the only way to detect it is to ask the stored
+/// rows whether the column behaves like identity. Here `tenant` is correctly an
+/// identity column and `bilanzkreis` an attribute, so the report is the clean
+/// one; the counts are what an operator compares against.
+#[tokio::test]
+async fn the_attribute_audit_reads_the_declaration_back_off_the_data() {
+    let (store, _w) = store_with_tenant_identity().await;
+
+    // Two tenants, one measuring point and interval. `tenant` is in the merge
+    // key, so these are two keys rather than one.
+    store
+        .append(&[reading("a", 10, 20_260_720_000_001)])
+        .await
+        .unwrap();
+    store
+        .append(&[reading("b", 40, 20_260_725_000_002)])
+        .await
+        .unwrap();
+
+    let audit = store.audit_attribute_column("bilanzkreis").await.unwrap();
+    assert_eq!(audit.merge_keys, 2);
+    assert_eq!(audit.merge_keys_with_several_values, 0);
+    assert_eq!(audit.widest, 1);
+    assert!(audit.is_measurable());
+    assert_eq!(audit.repetition_ratio(), 0.0);
+
+    // A correction restating the attribute is the ordinary case a real attribute
+    // column produces, and it must not read as a mis-declaration on its own.
+    let mut restated = reading("a", 11, 20_260_726_000_003);
+    restated = restated.with_extra("bilanzkreis", ScalarValue::Utf8(Some("BK-2".to_string())));
+    store.append(&[restated]).await.unwrap();
+
+    let audit = store.audit_attribute_column("bilanzkreis").await.unwrap();
+    assert_eq!(
+        audit.merge_keys, 2,
+        "still two keys — a correction is not one"
+    );
+    assert_eq!(
+        audit.merge_keys_with_several_values, 1,
+        "tenant a's key now carries both Bilanzkreise across its versions"
+    );
+    assert_eq!(audit.widest, 2);
+    assert_eq!(audit.repetition_ratio(), 0.5);
+
+    // An identity column has nothing to answer, and a typo must not come back
+    // clean: both are refused rather than reported.
+    for name in ["tenant", "malo_id", "no_such_column"] {
+        assert!(
+            store.audit_attribute_column(name).await.is_err(),
+            "{name} is not a declared attribute column"
+        );
+    }
+
+    // And the sweep over every declared attribute column reaches the same answer.
+    let all = store.audit_attribute_columns().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].column, "bilanzkreis");
+    assert_eq!(all[0].merge_keys_with_several_values, 1);
+}

@@ -46,13 +46,13 @@ const PAGE_ROW_LIMIT: usize = 20_000;
 ///
 /// **Set explicitly because it bounds memory, not only pruning granularity.**
 /// A Parquet writer buffers a whole row group before it can flush one, so this
-/// is the per-writer memory floor — and §10.1's cold layout runs a *fanout*
+/// is the per-writer memory floor — and the cold layout runs a *fanout*
 /// writer, holding one open writer per partition the archival window touches.
 /// Peak is therefore `open partitions × this buffer`, where open partitions is
 /// the number of distinct identity tuples (typically tenants) reporting that
 /// day. Left at the `parquet` crate's default of 1 048 576 rows, that product is
-/// an unstated dependency on a library constant, in the one place §18 gives a
-/// memory budget.
+/// an unstated dependency on a library constant, in the one place this crate
+/// states a memory budget.
 ///
 /// 256k rows is ~2 700 meter-days of quarter-hour readings. It also sharpens
 /// pruning: row-group `malo_id` min/max spans a quarter as many meters, so the
@@ -79,7 +79,7 @@ pub fn writer_properties(expected_malo_ids: u64) -> WriterProperties {
     // Sized per column, not from one number. A bloom filter's size is driven by
     // its declared cardinality — at 1 % false positives, roughly 9.6 bits per
     // distinct value — so giving `obis_code` the *measuring point* count builds a
-    // ~120 KiB filter for a column that holds a few dozen values. §10.2 has
+    // ~120 KiB filter for a column that holds a few dozen values. The layout has
     // always described it as low-ndv; the code sized both alike.
     for (name, ndv) in [
         (col::MALO_ID, expected_malo_ids.max(1)),
@@ -161,9 +161,9 @@ mod tests {
 
     #[test]
     fn the_row_group_size_is_ours_rather_than_the_library_default() {
-        // It bounds the per-writer buffer, and §10.1's fanout writer holds one
+        // It bounds the per-writer buffer, and the fanout writer holds one
         // per partition — so inheriting a library constant here would leave
-        // §18's memory budget resting on a number this crate never chose.
+        // the memory budget resting on a number this crate never chose.
         let props = writer_properties(1_000);
         assert_eq!(props.max_row_group_row_count(), Some(ROW_GROUP_ROW_LIMIT));
         // Compared against the default the writer would otherwise take, so this
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn the_footer_declares_the_sort_order() {
-        // §10.2: readers are entitled to trust this, so it has to be present
+        // Readers are entitled to trust this, so it has to be present
         // *and* has to match the order the archival scan actually produces.
         let props = writer_properties(100);
         let declared = props.sorting_columns().expect("a declared sort order");

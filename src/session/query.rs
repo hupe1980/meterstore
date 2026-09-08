@@ -43,7 +43,7 @@ pub struct QueryResult {
     ///
     /// A single-table query has exactly one and [`watermark`](Self::watermark)
     /// is it. A query across a [`MeterCatalog`] has several, because two tables
-    /// genuinely have two boundaries (§15.3) — collapsing them to one number
+    /// genuinely have two boundaries — collapsing them to one number
     /// would be the fiction that carrying provenance exists to prevent.
     ///
     /// [`MeterCatalog`]: crate::session::MeterCatalog

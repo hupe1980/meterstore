@@ -17,7 +17,7 @@
 //! number no query can safely sum.
 //!
 //! [`metering`] names the field the same way, so the mapping stays a rename-free
-//! one (§4.1.1).
+//! one.
 //!
 //! [`Sparte::billing_unit`]: metering::Sparte::billing_unit
 //!

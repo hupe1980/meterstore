@@ -9,9 +9,9 @@
 //! # Read-only, structurally
 //!
 //! A write here would bypass [`MeterStore::append`] and with it the two things
-//! that make a write safe — routing each interval to the tier that owns it (§8.3)
+//! that make a write safe — routing each interval to the tier that owns it
 //! and the subject-reference check that stops a replay re-linking an erased
-//! subject (§19.4). Neither is recoverable afterwards, so every mutating call is
+//! subject. Neither is recoverable afterwards, so every mutating call is
 //! refused with that reason.
 //!
 //! Refusing the mutating *calls* is not the whole of it: Flight SQL's statement
@@ -39,8 +39,8 @@
 //! # Authentication is the deployment's
 //!
 //! `into_service` returns a tonic service rather than a bound port, so a
-//! deployment wraps it in its own interceptor, TLS and tracing. §19.7 requires
-//! authentication before this leaves a trusted network, and this crate has no
+//! deployment wraps it in its own interceptor, TLS and tracing. Authentication
+//! is required before this leaves a trusted network, and this crate has no
 //! business deciding what kind.
 
 use std::pin::Pin;
@@ -118,7 +118,7 @@ impl FlightSqlServer {
     /// The tonic service, ready to be added to a server or wrapped in layers.
     ///
     /// Returned rather than bound, so a deployment supplies its own
-    /// authentication interceptor and TLS — §19.7 requires both before this
+    /// authentication interceptor and TLS — both are required before this
     /// leaves a trusted network.
     pub fn into_service(self) -> FlightServiceServer<Self> {
         FlightServiceServer::new(self)
@@ -285,7 +285,7 @@ impl FlightSqlService for FlightSqlServer {
     ///
     /// Deliberately not an authentication decision: this crate does not know what
     /// a deployment's identities are, and inventing a scheme here would be a
-    /// second, weaker one beside whatever the estate already runs. §19.7 puts
+    /// second, weaker one beside whatever the estate already runs. That puts
     /// authentication in the layer around `into_service`.
     async fn do_handshake(
         &self,
@@ -497,7 +497,7 @@ const SCHEMAS_SQL: &str = "SELECT DISTINCT table_catalog AS catalog_name, \
 ///
 /// Note what this exposes: `readings` (version-resolved, spanning both tiers),
 /// `readings_versions` (the raw audit trail), and the `system` tables. A client
-/// that picks the wrong one gets the §13.7.2 trap, which is why the names differ
+/// that picks the wrong one gets the resolution trap, which is why the names differ
 /// as loudly as they do.
 const TABLES_SQL: &str = "SELECT table_catalog AS catalog_name, \
                           table_schema AS db_schema_name, \

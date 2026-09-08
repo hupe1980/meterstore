@@ -183,7 +183,7 @@ struct DailyRow {
     not_billable: u64,
 }
 
-/// The result schema, in the order §9.6 documents.
+/// The result schema, in its documented order.
 ///
 /// `discriminators` are the table's merge-key columns beyond
 /// `(malo_id, obis_code, from)`. They sit next to the identifiers they extend,
@@ -333,7 +333,8 @@ fn is_billable(quality: &str) -> bool {
 /// Grouped by the **balancing** day, because that is the unit the expectation is
 /// defined over. Grouping by UTC day would put 22:00–24:00 local in the wrong
 /// bucket every day of the year, and the resulting counts would be short by two
-/// hours at one end and long at the other — the exact error §9.5 exists to stop.
+/// hours at one end and long at the other — the exact error the balancing-day
+/// functions exist to stop.
 /// Grouping gas by the *calendar* day is the same error six hours wide, so the
 /// bucket follows the row's Sparte.
 fn daily_plan(
@@ -993,7 +994,7 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
                 // Both directions are summed **per day** and neither is derived
                 // from the channel totals. Over the totals a surplus on one day
                 // would net against a shortfall on another and the channel would
-                // report as complete — which is exactly the answer §9.6 says
+                // report as complete — which is exactly the answer completeness says
                 // surplus must never be able to produce, since the two are
                 // different conditions rather than opposite signs of one.
                 slot.missing += expected.saturating_sub(actual);
@@ -1066,18 +1067,30 @@ fn expected_in_day(
         return full;
     }
 
-    // Partly outside: expect only the covered fraction. A range that is not
-    // day-aligned — a billing period starting mid-day — must not report the
-    // uncovered half as missing.
-    let covered = end.min(to) - start.max(from);
-    if covered <= time::Duration::ZERO {
+    // Partly outside: expect only what the range covers. A range that is not
+    // day-aligned — a billing period starting mid-day, a report run against
+    // `now()` — must not report the uncovered part as missing.
+    let lo = start.max(from);
+    let hi = end.min(to);
+    if hi <= lo {
         return 0;
     }
     let step = length / full as i32;
-    if step <= time::Duration::ZERO {
+    let step_s = step.whole_seconds();
+    if step_s <= 0 {
         return 0;
     }
-    (covered.whole_seconds() / step.whole_seconds()).max(0) as u64
+
+    // Interval *starts* in `[lo, hi)`, not `covered / step`: a reading is in the
+    // range when its own `from` is, which is what the scan filters on. The two
+    // part whenever `hi` is off the grid — over `[00:00, 00:07)` the division
+    // expects nothing while the interval at 00:00 is counted in `actual`, and the
+    // day reports a surplus that did not happen.
+    let grid_points_before = |t: OffsetDateTime| -> i64 {
+        let d = (t - start).whole_seconds();
+        d.div_euclid(step_s) + i64::from(d.rem_euclid(step_s) != 0)
+    };
+    (grid_points_before(hi) - grid_points_before(lo)).clamp(0, full as i64) as u64
 }
 
 /// A completeness report waiting to be run.
@@ -1298,7 +1311,7 @@ impl<'a> std::future::IntoFuture for CompletenessQuery<'a> {
 /// `meter_completeness(from, to)` — completeness as a queryable table.
 ///
 /// Registered by [`MeterStore`], so the table it reports on is the store's own.
-/// The optional leading argument names it, matching §9.6's spelling; passing a
+/// The optional leading argument names it, matching the report's spelling; passing a
 /// different name is an error rather than a silent report on the wrong table.
 ///
 /// [`MeterStore`]: crate::session::MeterStore
@@ -2057,6 +2070,64 @@ mod tests {
                 datetime!(2026-11-01 00:00 UTC)
             ),
             100
+        );
+    }
+
+    #[test]
+    fn a_ragged_range_end_expects_the_intervals_that_start_inside_it() {
+        // The expectation is a count of interval *starts* in the range, because
+        // that is what the scan underneath selects on. Dividing the covered
+        // duration by the step instead loses the interval that starts exactly at
+        // `lo` whenever `hi` is off the grid — and `actual` still counts it, so
+        // the day comes back with a **surplus** that never happened. Any report
+        // whose range ends at `now()` rather than on an interval boundary hits it.
+        let day = date!(2026 - 03 - 02);
+        let start = datetime!(2026-03-01 23:00 UTC); // Berlin midnight on that day
+        let minutes = |n| start + time::Duration::minutes(n);
+
+        for (end_minutes, want) in [(0i64, 0u64), (1, 1), (7, 1), (15, 1), (16, 2), (30, 2)] {
+            assert_eq!(
+                expected_in_day(
+                    day,
+                    Some("PT15M"),
+                    Sparte::Strom,
+                    start,
+                    minutes(end_minutes)
+                ),
+                want,
+                "[00:00, 00:{end_minutes:02}) holds {want} interval start(s)"
+            );
+        }
+
+        // A ragged *start* was always right, and stays right: the first grid
+        // point at or after 00:07 is 00:15, so 95 of the day's 96 remain.
+        assert_eq!(
+            expected_in_day(
+                day,
+                Some("PT15M"),
+                Sparte::Strom,
+                minutes(7),
+                start + time::Duration::DAY
+            ),
+            95
+        );
+
+        // Ragged at both ends, and never more than the day itself holds.
+        assert_eq!(
+            expected_in_day(day, Some("PT15M"), Sparte::Strom, minutes(7), minutes(46)),
+            3,
+            "00:15, 00:30 and 00:45 start inside [00:07, 00:46)"
+        );
+        assert_eq!(
+            expected_in_day(
+                day,
+                Some("PT15M"),
+                Sparte::Strom,
+                start - time::Duration::DAY,
+                start + time::Duration::days(2),
+            ),
+            96,
+            "a range overhanging both ends still expects exactly the day"
         );
     }
 

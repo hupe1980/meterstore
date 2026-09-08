@@ -93,6 +93,34 @@ async fn the_commands_drive_a_real_deployment() {
         .await
         .expect("the archival committed a snapshot to list");
 
+    // Nothing declared, so nothing to check — and that is a clean run rather
+    // than an error, since `audit` is what a deployment puts in a script.
+    cli(
+        path,
+        Command::Audit {
+            table: None,
+            column: None,
+        },
+    )
+    .run()
+    .await
+    .expect("audit over a table with no attribute columns");
+
+    // A column that is not a declared attribute is refused, because a clean bill
+    // for a column nobody checked is the worst answer available.
+    for column in ["malo_id", "no_such_column"] {
+        cli(
+            path,
+            Command::Audit {
+                table: None,
+                column: Some(column.to_string()),
+            },
+        )
+        .run()
+        .await
+        .expect_err("only a declared attribute column can be audited");
+    }
+
     cli(
         path,
         Command::Query {

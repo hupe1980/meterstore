@@ -7,7 +7,7 @@
 //!
 //! # Why the fixtures are real
 //!
-//! §17 draws the line at storage fidelity: the things worth testing here are the
+//! The line is drawn at storage fidelity: the things worth testing here are the
 //! ones a fake cannot fail at. Catalog compare-and-swap, advisory-lock scope,
 //! partition detach visibility, Parquet round-tripping of a `Decimal128` — a
 //! mock agrees with whatever the code does. So the harness starts the real
@@ -63,7 +63,7 @@ impl TestHarness {
     ///
     /// Carries the `_versions` suffix, because that is the physical name: the
     /// table holds every version of every reading, and the resolved view is what
-    /// queries should use (§13.7.2).
+    /// queries should use.
     pub const TABLE: &'static str = "readings_versions";
 
     /// Start both tiers with the default table configuration.
@@ -113,7 +113,7 @@ impl TestHarness {
             _warehouse: warehouse,
         };
 
-        // One entry point, exactly as a deployment should use (§7.3): the hot
+        // One entry point, exactly as a deployment should use: the hot
         // table's primary key, the cold schema and the resolution `PARTITION BY`
         // all have to agree, and creating them separately is where they drift.
         harness
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn the_table_name_announces_that_it_holds_versions() {
-        // The name is load-bearing (§13.7.2): the relation that looks like the
+        // The name is load-bearing: the relation that looks like the
         // obvious thing to query must not be the one that double-counts.
         assert!(TestHarness::TABLE.ends_with("_versions"));
     }

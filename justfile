@@ -7,7 +7,7 @@ set shell := ["bash", "-uc"]
 # Single-sourced crates: two versions of any of these in one graph means
 # mutually incompatible types (a second `arrow` breaks `RecordBatch`, a second
 # `datafusion` breaks `TableProvider`). Checked by `just deps`.
-SINGLE_SOURCED := "datafusion|arrow|iceberg|parquet|metering|time|rust_decimal|sqlx"
+SINGLE_SOURCED := "datafusion|arrow|iceberg|parquet|metering|time|rust_decimal|sqlx|sqlx-postgres"
 
 _default:
     @just --list --unsorted

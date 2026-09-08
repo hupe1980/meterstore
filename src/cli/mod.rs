@@ -269,6 +269,29 @@ pub enum Command {
         table: Option<String>,
     },
 
+    /// Check declared attribute columns against the rows already stored.
+    ///
+    /// The one schema mistake that raises no error: an identity column declared
+    /// as an *attribute* lets two identities share a merge key, so one silently
+    /// supersedes the other and the only symptom is a number. Nothing at write
+    /// time can tell the two apart, so this asks the data — for how many merge
+    /// keys does the column take more than one value?
+    ///
+    /// A report, not a verdict. A correction may legitimately restate an
+    /// attribute, so a few are ordinary; a large share means the column is
+    /// identity in everything but the declaration. It exits zero either way.
+    ///
+    /// A full group-by over the table, so it is a deliberate run rather than
+    /// something to put on a schedule.
+    Audit {
+        /// Only this table.
+        #[arg(long, value_name = "NAME")]
+        table: Option<String>,
+        /// Only this column.
+        #[arg(long, value_name = "NAME")]
+        column: Option<String>,
+    },
+
     /// Serve the store to external clients.
     ///
     /// Two surfaces, answering different questions. **Flight SQL** carries the
@@ -467,6 +490,7 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         Command::Explain { sql } => explain(cli, sql).await,
         Command::Snapshots { table } => snapshots(cli, table.as_deref()).await,
+        Command::Audit { table, column } => audit(cli, table.as_deref(), column.as_deref()).await,
         Command::Serve { addr, catalog_addr } => serve(cli, addr, catalog_addr.as_deref()).await,
         Command::Erasures {
             limit,
@@ -822,6 +846,19 @@ async fn snapshots(cli: &Cli, only: Option<&str>) -> Result<()> {
         }
     }
     render::snapshots(&rows, cli.format)
+}
+
+async fn audit(cli: &Cli, only: Option<&str>, column: Option<&str>) -> Result<()> {
+    let catalog = load(cli).await?;
+    let mut rows = Vec::new();
+    for store in selected(&catalog, only)? {
+        let found = match column {
+            Some(name) => vec![store.audit_attribute_column(name).await?],
+            None => store.audit_attribute_columns().await?,
+        };
+        rows.extend(found.into_iter().map(|a| (store.table().to_string(), a)));
+    }
+    render::audit(&rows, cli.format)
 }
 
 /// The tables a `--table` flag selects, or all of them.

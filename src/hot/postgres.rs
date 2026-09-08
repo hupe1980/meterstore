@@ -103,7 +103,7 @@ impl PostgresHot {
     ///    higher version covering the same span and has to stay legal.
     ///
     /// 2. **A second network operator for one interval.** A version is
-    ///    comparable only within its `(operator, month)` scope (§4.2). The month
+    ///    comparable only within its `(operator, month)` scope. The month
     ///    half is guarded at encode time; the operator half is whatever the
     ///    caller passed. Two operators for one `(malo_id, obis_code, from)`
     ///    therefore give two incomparable scopes, resolution picks a winner in
@@ -118,14 +118,14 @@ impl PostgresHot {
     /// — reconciling what a grid operator and a supplier each reported — is a
     /// legitimate shape that constraint 2 refuses. Say so in the schema instead:
     /// an `identity_column` for the reporting party makes them two readings no
-    /// aggregate can conflate (§7.3), which states the intent rather than resting
+    /// aggregate can conflate, which states the intent rather than resting
     /// on a constraint being off.
     ///
     /// Turning this off trades both guarantees for insert throughput — two GiST
     /// indexes per partition on the busiest table in the schema — and wants a
     /// measurement in hand. What is left is *detection* rather than refusal:
     ///
-    /// * An **overlap** shows up in completeness (§9.6) as `surplus`.
+    /// * An **overlap** shows up in completeness as `surplus`.
     /// * A **duplicated scope** reaches the typed reads, which refuse to fold two
     ///   values at one instant and raise [`Error::InvariantViolated`].
     /// * Neither covers a `SUM` written in SQL, which will simply be twice the
@@ -415,7 +415,7 @@ impl PostgresHot {
 /// and the partition key is `from` — which appears here inside a range, not as an
 /// equality. An interval crossing a partition boundary is already impossible,
 /// because a row lives in the partition of its `from` and every archival window
-/// is one partition (§7.2).
+/// is one partition.
 ///
 /// The equality columns are read from the parent's **primary key**, minus `from`,
 /// so a deployment that extends the merge key with identity columns gets an
@@ -1214,7 +1214,7 @@ impl PostgresHot {
     ///
     /// Every writer ensures the partitions for the range it is about to write, so
     /// the **first batch of a new day has every ingest worker creating the same
-    /// partition at the same moment** — the ordinary topology (§5.2), not an
+    /// partition at the same moment** — the ordinary topology, not an
     /// unusual one. Check-then-create loses that race: the losers get `relation
     /// "readings_2026_08_20_0000" already exists`, and even suppressed they would
     /// go on to `ADD CONSTRAINT` a constraint that now exists.
@@ -1462,7 +1462,7 @@ impl crate::tiering::store::TableLease for PgTableLease {
 fn decimal_to_version(value: Decimal) -> Result<crate::version::Version> {
     // Via the decimal's own text form rather than `to_u128`: the column is
     // `NUMERIC(20,0)`, three orders of magnitude past `u64::MAX`, and a lossy
-    // hop through a narrower integer is exactly the bug §20.2 already records
+    // hop through a narrower integer is exactly the bug already recorded
     // for this column once.
     let digits = value.trunc().to_string();
     crate::version::Version::new(
@@ -1560,8 +1560,7 @@ impl CursorValue {
     /// Read the value at a projected position, choosing the type by column.
     ///
     /// Positions are fixed by [`scan_columns`] for the core columns; anything
-    /// beyond them is a deployment column, which configuration restricts to text
-    /// (§7.3).
+    /// beyond them is a deployment column, which configuration restricts to text.
     ///
     /// The type is taken from the storage schema rather than from a literal
     /// position: a hardcoded index goes silently wrong the moment a column is
@@ -1581,7 +1580,7 @@ impl CursorValue {
                 Self::Numeric(row.try_get::<Decimal, _>(index).map_err(pg)?)
             }
             // Core text columns, and every deployment column: configuration
-            // restricts those to `Utf8` (§7.3), so past the core they are text.
+            // restricts those to `Utf8`, so past the core they are text.
             _ => Self::Text(row.try_get::<String, _>(index).map_err(pg)?),
         })
     }
@@ -2232,7 +2231,7 @@ impl HotStore for PostgresHot {
         let name = partition.relation_name()?;
         // Answerable from the `(malo_id, "from")` index as an index-only scan,
         // so it touches no heap pages and evicts nothing the operational
-        // workload is using — which is the same reason §8.1 prefers a closed
+        // workload is using — which is the same reason archival prefers a closed
         // partition for the archival read itself.
         let count = sqlx::query_scalar::<_, i64>(&format!(
             r#"SELECT count(DISTINCT malo_id) FROM "{name}""#
@@ -2327,7 +2326,7 @@ mod tests {
     fn partitions_are_created_on_the_shared_alignment() {
         // The bound a partition is created at and the bound a window starts at
         // have to come from one function, or a window lands between partitions
-        // and archives as empty (§7.2). This asserts the hot tier uses the
+        // and archives as empty. This asserts the hot tier uses the
         // shared one rather than a private copy.
         assert_eq!(
             crate::watermark::align_to_step(datetime!(2026-07-20 13:47:03 UTC), Duration::DAY)
@@ -2476,7 +2475,8 @@ mod tests {
             (ValueCheck::Eic(None), "11XBK0000000001"), // fifteen characters
             (ValueCheck::Eic(None), "11xbk0000000001a"), // the DDL sees what was stored
             (ValueCheck::Eic(None), "11-BK0000000001A"), // position 3 is the object type
-            (ValueCheck::Eic(None), "11XBK0000000001-"), // §5.2 forbids `-` there
+            // EIC-Vergabe § 5.2 forbids `-` as a check character.
+            (ValueCheck::Eic(None), "11XBK0000000001-"),
             // The refinement's own half, and the whole reason it is worth
             // declaring: both of these are valid EICs, and each is in the wrong
             // column. The database refuses them without the write path.

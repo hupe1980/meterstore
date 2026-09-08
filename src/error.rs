@@ -72,7 +72,7 @@ pub enum Error {
     /// A table is halted because its schema changed in a way that cannot be
     /// applied safely.
     ///
-    /// The honest response to an incompatible change (§11). Rows already written
+    /// The honest response to an incompatible change. Rows already written
     /// would mean something different from rows about to be written, and no care
     /// downstream recovers that — so the table stops, its watermark freezes, and
     /// an operator resolves it. Other tables keep running.

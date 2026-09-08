@@ -44,12 +44,22 @@ Optional features, all off unless you need them:
 | Feature | What it adds |
 |---|---|
 | `rest-catalog` *(default)* | `IcebergRestCatalog` — the cold tier on a REST catalogue |
+| `sql-catalog` *(default)* | `IcebergSqlCatalog` — the cold tier's metadata in the hot tier's own PostgreSQL |
 | `object-store-s3` / `-gcs` / `-azure` / `-all` | Cloud object stores. `file://` and `memory://` are always available |
 | `catalog-facade` | A read-only Iceberg REST endpoint, for deployments on the SQL catalog |
 | `s3tables` | AWS S3 Tables as the cold-tier catalogue (implies `object-store-s3`) |
 | `flight` | Arrow Flight SQL over the unified hot + cold view |
 | `cli` | The `meterstore` command-line tool (implies `flight` and `catalog-facade`) |
 | `testkit` | The real-infrastructure harness, workload generator and correctness oracle |
+
+Both catalogue features are on by default and both can be turned off. Dropping
+`sql-catalog` matters in a workspace that also links an embedded SQLite: it is
+what reaches `sqlx`'s optional SQLite driver, and `libsqlite3-sys` declares
+`links = "sqlite3"`, which cargo enforces across the whole resolve graph.
+
+```bash
+cargo add meterstore --no-default-features --features rest-catalog
+```
 
 ## The shortest path: no Rust at all
 
@@ -147,7 +157,7 @@ test suite against a catalogue MeterStore did not build, not merely asserted.
 
 | Catalogue | Status |
 |---|---|
-| **SQL** (PostgreSQL-backed) | Built for you by `IcebergSqlCatalog`. Serve the [façade](@/docs/interop.md) for external engines |
+| **SQL** (PostgreSQL-backed) | Built for you by `IcebergSqlCatalog`, behind the `sql-catalog` feature *(default)*. Serve the [façade](@/docs/interop.md) for external engines |
 | **REST** (Polaris, Lakekeeper, Nessie, Gravitino) | Built for you by `IcebergRestCatalog`, behind the `rest-catalog` feature *(default)*. Engines point at the same endpoint, so no façade is needed |
 | **AWS S3 Tables** | Built for you by `S3TablesCatalog`, behind the `s3tables` feature — see below |
 | Glue, Hive, anything else | Any `Arc<dyn Catalog>` works |

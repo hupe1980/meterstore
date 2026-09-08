@@ -185,6 +185,39 @@ a check on `channels_incomplete` alone passes a month nobody could judge.
 More on what the numbers mean, and why `missing` is not `expected - actual`, in
 [Completeness](@/docs/completeness.md).
 
+## Checking a declaration against the data
+
+Declaring a tenant discriminator as an *attribute* rather than an identity column
+is legal, writes succeed, and nothing raises an error — but two tenants then share
+a merge key, so one silently supersedes the other. It is the one schema mistake
+this crate cannot refuse, because nothing at write time can tell it from a column
+that genuinely is a fact about a reading.
+
+So it is asked of the rows instead:
+
+```bash
+meterstore audit
+```
+
+```text
+TABLE                        COLUMN                       KEYS     REPEATED   WIDEST    SHARE
+readings_versions            bilanzkreis                 84_112          37        2     0.0%
+readings_versions            ingest_source               84_112      41_930        2    49.9%
+```
+
+`REPEATED` is how many merge keys carry more than one value of the column. A
+correction may legitimately restate an attribute, so a few are ordinary — the
+first row. Half of them is not: `ingest_source` is identity in everything but the
+declaration, and every key two sources both report is one of them.
+
+A **report, not a verdict**: the two cases differ in degree, and only the
+deployment knows which its column is. It exits zero either way. `--column` and
+`--table` narrow it; an identity column and an unknown name are both refused,
+because a clean bill for a column nobody checked is the worst answer available.
+
+It is a full group-by over the table, so run it deliberately rather than on a
+schedule — after a schema change, or when a number looks wrong.
+
 ## Machine output
 
 `--format json` renders one document per invocation, with the provenance beside

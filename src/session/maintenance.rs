@@ -20,7 +20,7 @@
 //!
 //! # Nothing here holds state
 //!
-//! Every job is idempotent and recovers from an interruption on its own (§6.2),
+//! Every job is idempotent and recovers from an interruption on its own,
 //! so the scheduler is a loop and a clock. It keeps no checkpoint, because the
 //! checkpoint is the Iceberg snapshot summary. Restarting the process loses
 //! nothing.
@@ -98,7 +98,7 @@ impl TableMaintenance {
 
 /// What one maintenance cycle did.
 ///
-/// **Per table**, because §15.3 makes every table its own unit. A cycle that only
+/// **Per table**, because every table is its own unit. A cycle that only
 /// summed would report a deployment healthy while one of its tables was
 /// quarantined, and would give an operator no name to act on. The aggregate
 /// accessors fold the rows rather than replacing them, because "did anything
@@ -205,7 +205,7 @@ pub const RETENTION_LABEL: &str = "<retention>";
 /// Upkeep for one store or a whole catalog, run on demand or on a schedule.
 ///
 /// **One loop over N tables**, not N loops. Each table keeps its own watermark,
-/// archiver and lease (§15.3); only the *scheduling* is shared, which is what
+/// archiver and lease; only the *scheduling* is shared, which is what
 /// gives a deployment one place to ask whether upkeep is keeping up.
 #[derive(Debug, Clone)]
 pub struct Maintenance {
@@ -486,7 +486,7 @@ impl Maintenance {
     /// archiving against a store nobody is watching.
     ///
     /// A failing cycle is logged and retried on the next tick rather than ending
-    /// the loop: every failure mode in §15.2 is either transient or needs an
+    /// the loop: every failure mode here is either transient or needs an
     /// operator, and neither is helped by the scheduler giving up silently.
     pub fn spawn(self) -> MaintenanceHandle {
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();

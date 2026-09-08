@@ -73,7 +73,7 @@ impl IcebergCold {
     /// Exposed because the catalogue *is* the extension point: `new` takes any
     /// `Arc<dyn Catalog>`, and a deployment that handed one in may need it back —
     /// to serve the read-only façade over it, or to run an operation this crate
-    /// does not implement (§10.3.1) against the same tables.
+    /// does not implement against the same tables.
     pub fn catalog(&self) -> std::sync::Arc<dyn Catalog> {
         std::sync::Arc::clone(&self.catalog)
     }
@@ -107,7 +107,7 @@ impl IcebergCold {
     /// **leading partition fields**, ahead of `month(from)`, because an identity
     /// column is by definition something every query filters on — so a scan
     /// scoped to one of them prunes at the manifest rather than by row filter.
-    /// See §10.1.
+    /// See the cold-tier layout.
     pub async fn create_table_with(
         &self,
         table: &str,
@@ -183,7 +183,7 @@ impl IcebergCold {
     /// correctness requirement rather than freshness for its own sake. The
     /// obvious construction — build a static provider once and register it —
     /// freezes the snapshot at the moment the store was built. In the embedded
-    /// topology (§5.2) one process both archives and serves queries, so after
+    /// topology one process both archives and serves queries, so after
     /// the first archival run the rows are gone from PostgreSQL (the partition
     /// was dropped) and invisible in Iceberg (the provider still points at the
     /// snapshot from before the commit). They would reappear only when the
@@ -195,7 +195,7 @@ impl IcebergCold {
         table: &str,
     ) -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
         // Loaded once here for the schema, which is stable between archival
-        // commits — a change to it is a schema evolution, and §11 halts the
+        // commits — a change to it is a schema evolution, and the check halts the
         // table rather than letting the shape drift under a running query.
         let loaded = self.load(table).await?;
         let schema = std::sync::Arc::new(
@@ -250,7 +250,7 @@ impl IcebergCold {
 
         // **The path from the current snapshot back to the boundary.**
         //
-        // §10.3.1 has no native compaction and recommends running it out of band
+        // There is no native compaction, and the documented answer is out of band
         // with Spark or PyIceberg. Such a commit is a valid Iceberg snapshot that
         // knows nothing about tiering, so it carries no watermark and the lookup
         // walks back the *parent chain* to find one.
@@ -340,10 +340,10 @@ impl IcebergCold {
 
     /// Put the tiering boundary back on the **current** snapshot.
     ///
-    /// Every MeterStore commit stamps the boundary into its own snapshot summary
-    /// (§6.2). A commit from anything else does not — and this design explicitly
+    /// Every MeterStore commit stamps the boundary into its own snapshot summary.
+    /// A commit from anything else does not — and this design explicitly
     /// recommends such commits, because compaction and orphan cleanup are blocked
-    /// upstream (§10.3.1, §10.5.1) and the documented answer is to run them out of
+    /// upstream, and the documented answer is to run them out of
     /// band with Spark or PyIceberg.
     ///
     /// After one, the boundary is still *findable*: the lookup walks back the
@@ -583,7 +583,7 @@ impl IcebergCold {
     /// Streaming rather than taking a slice, because the caller's input is a
     /// day of a partition: at 100 k measuring points that is ~9.6 M rows, and
     /// materialising it to hand over would make archival's peak memory
-    /// proportional to the window rather than to a chunk (§18).
+    /// proportional to the window rather than to a chunk.
     ///
     /// Returns the row count alongside the files, since a streaming caller has
     /// no other way to learn it.
@@ -696,7 +696,7 @@ impl IcebergCold {
 
         // A window with no rows is ordinary — a meter can simply not report —
         // and still has to advance the watermark, so it commits with no data
-        // files rather than not committing (§8.2). Closing a writer that never
+        // files rather than not committing. Closing a writer that never
         // saw a batch would produce an empty Parquet file for every such day;
         // both arms above return early instead.
         Ok((data_files, rows))
@@ -746,7 +746,8 @@ impl IcebergCold {
     /// lands first, and the correction's retry then republishes the older value.
     /// Intervals PostgreSQL has already purged are claimed by the hot tier, which
     /// does not hold them, and they vanish from every unified query with nothing
-    /// reporting a failure. That is the single failure §6.2 exists to make
+    /// reporting a failure. That is the single failure the in-snapshot watermark
+    /// exists to make
     /// impossible, reintroduced by a dependency being helpful.
     ///
     /// So library retry is off (`commit.retry.num-retries = 0`) and the loop is
@@ -1092,7 +1093,7 @@ fn align(
 
 /// Bloom-filter sizing when the caller cannot say how many meters are involved.
 ///
-/// The §18 reference workload is 100 k measuring points, so a whole-day window
+/// The reference workload is 100 k measuring points, so a whole-day window
 /// at that scale is the case worth sizing for. Over-sizing costs metadata bytes
 /// and under-sizing costs false positives; neither is a correctness matter.
 const DEFAULT_BLOOM_FILTER_NDV: u64 = 100_000;
@@ -1107,7 +1108,8 @@ const DEFAULT_BLOOM_FILTER_NDV: u64 = 100_000;
 /// silent data loss in the tier whose entire job is to be durable.
 ///
 /// 64 bits from the OS CSPRNG puts a collision beyond reach at any commit rate
-/// this store will see, and it is the same entropy source §19.4 already requires
+/// this store will see, and it is the same entropy source a subject reference
+/// already requires
 /// for subject references.
 fn file_suffix() -> String {
     let mut bytes = [0u8; 8];
@@ -1125,7 +1127,7 @@ fn file_suffix() -> String {
 /// Parquet footer is opened. Without it, every scan reads every operator's files
 /// and prunes by row filter — correct, and linear in the number of tenants.
 ///
-/// It also gives erasure a bounded set of files to rewrite. §12.4 pseudonymises
+/// It also gives erasure a bounded set of files to rewrite. Erasure pseudonymises
 /// rather than rewriting, so this is not on the critical path, but a
 /// tenant-scoped rewrite is the difference between touching one operator's data
 /// and touching the warehouse.
@@ -1141,7 +1143,7 @@ fn file_suffix() -> String {
 /// # Why not `bucket(malo_id)`
 ///
 /// Earlier drafts specified it. Rows are written sorted by `(malo_id, from)` and
-/// carry a bloom filter on `malo_id` (§10.2), which is what actually answers the
+/// carry a bloom filter on `malo_id`, which is what actually answers the
 /// single-meter read; hashing into buckets would scatter that sort order across
 /// files and add nothing a bloom filter does not already do.
 fn partition_spec(
@@ -1183,7 +1185,7 @@ fn partition_spec(
 /// manifests — correct answers, silently linear in the number of tenants, with
 /// nothing anywhere to indicate it.
 ///
-/// This is §11's posture applied to layout rather than to schema: a table that
+/// This is the schema check's posture applied to layout: a table that
 /// does not match its configuration halts and says why, instead of degrading
 /// invisibly.
 ///
@@ -1363,7 +1365,7 @@ impl ColdStore for IcebergCold {
 ///
 /// The current snapshot normally carries it, because every MeterStore commit
 /// re-states it. It may not, though, and the reason is one this design actively
-/// recommends: §10.3 has no native compaction, and the documented workaround is
+/// recommends: there is no native compaction, and the documented workaround is
 /// to run it out of band with Spark or PyIceberg against the same standard
 /// table. Such a snapshot is a perfectly valid Iceberg commit that simply knows
 /// nothing about tiering.

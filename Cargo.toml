@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -73,12 +73,17 @@ arrow = { version = "58.4", default-features = false, features = ["json"] }
 # --- Cold Tier: Apache Iceberg ---
 iceberg = "0.10"
 iceberg-datafusion = "0.10"
-iceberg-catalog-sql = "0.10"
+# The catalogue behind `IcebergSqlCatalog`. Optional but in `default`, so only a
+# deployment that opts out notices: it reaches `sqlx`'s optional SQLite driver,
+# and `libsqlite3-sys` declares `links = "sqlite3"`, which cargo enforces over the
+# whole resolve graph — feature on or not. A workspace that also links an embedded
+# SQLite therefore cannot resolve until this is turned off.
+iceberg-catalog-sql = { version = "0.10", optional = true }
 # `file://` and `memory://` are the always-on baseline (local dev, tests, and a
 # single-node file warehouse). The cloud object stores are opt-in features so a
 # file-only deployment does not compile the AWS/GCS/Azure SDKs — see the
 # `object-store-*` features below.
-iceberg-storage-opendal = { version = "0.10", features = ["opendal-fs", "opendal-memory"] }
+iceberg-storage-opendal = { version = "0.10", default-features = false, features = ["opendal-fs", "opendal-memory"] }
 # The REST catalogue client behind `IcebergRestCatalog`, which is the cold tier on
 # Polaris, Lakekeeper, Nessie or Gravitino. On by default because a REST catalogue
 # is the shape a deployment picks when it has not picked one: it is what every
@@ -94,7 +99,17 @@ iceberg-catalog-rest = { version = "0.10", optional = true }
 iceberg-catalog-s3tables = { version = "0.10", optional = true }
 
 # --- Hot Tier: PostgreSQL ---
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "rust_decimal", "time"] }
+# `default-features = false`: the defaults are `["any", "macros", "migrate",
+# "json"]` and this crate uses none of them — every statement is a runtime
+# `sqlx::query`. They also carry the optional SQLite driver, hence the note on
+# `iceberg-catalog-sql` above.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+# `time` and `rust_decimal` are asked of the driver rather than of the `sqlx`
+# facade. `sqlx/time` names `sqlx-sqlite?/time`, and naming an optional dependency
+# is enough to put it in the resolve graph; `sqlx-postgres/time` is `["dep:time",
+# "sqlx-core/time"]` and mentions no SQLite. Feature unification makes the two
+# identical for this crate's code.
+sqlx-postgres = { version = "0.8", default-features = false, features = ["time", "rust_decimal"] }
 
 # --- Domain Layer ---
 # `metering` owns the domain: MeterInterval, MeasurementSeries, QualityFlag,
@@ -217,7 +232,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [features]
-default = ["rest-catalog"]
+default = ["rest-catalog", "sql-catalog"]
 # Cold-tier object-store backends for `IcebergSqlCatalog`. `file://`/`memory://`
 # are always available; these add the cloud stores (and their SDKs) on demand.
 object-store-s3 = ["iceberg-storage-opendal/opendal-s3"]
@@ -229,6 +244,9 @@ object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 # that says nothing selects, and a default naming a catalogue the crate could not
 # construct is a default nobody can take.
 rest-catalog = ["dep:iceberg-catalog-rest"]
+# The cold tier on a PostgreSQL-backed Iceberg SQL catalogue: one database to
+# operate. Default; turn it off in a workspace that also links SQLite.
+sql-catalog = ["dep:iceberg-catalog-sql"]
 # Read-only Iceberg REST endpoint, for deployments on the SQL catalog (§13.7.1).
 catalog-facade = ["dep:axum"]
 # AWS S3 Tables as the cold-tier catalogue (§12.1). Optional because it pulls the
@@ -243,7 +261,9 @@ s3tables = ["dep:iceberg-catalog-s3tables", "object-store-s3"]
 # Arrow Flight SQL over the unified hot + cold view (§13.7.3). The one surface
 # an external client cannot assemble for itself.
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost"]
-testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+# The reference suite drives a real warehouse through the SQL catalogue, so it
+# names that feature rather than assuming the default set is on.
+testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile", "sql-catalog"]
 # The `meterstore` command-line tool: create tables, archive, query, serve.
 #
 # Off by default because this crate is a library first and a binary second — a

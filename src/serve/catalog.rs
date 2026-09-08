@@ -5,7 +5,7 @@
 //! object storage** with nothing MeterStore-specific installed client-side.
 //! MeterStore stays in the metadata path only — never the data path — so readers
 //! scale in parallel and this process is neither a bottleneck nor a single point
-//! of failure (P2, §13.7).
+//! of failure (P2).
 //!
 //! [REST catalog protocol]: https://iceberg.apache.org/rest-catalog-spec/
 //!
@@ -23,7 +23,7 @@
 //! # Read-only, and not as a default that can be flipped
 //!
 //! There is no write path here at all, and that is a correctness position rather
-//! than an unfinished feature. The §6.3 invariant says PostgreSQL holds exactly
+//! than an unfinished feature. The tiering invariant says PostgreSQL holds exactly
 //! the rows at or above the watermark and Iceberg exactly those below. An
 //! external writer appending through this endpoint would place rows in the cold
 //! tier without MeterStore knowing, and nothing downstream could detect it — the
@@ -136,7 +136,7 @@ impl CatalogFacade {
     /// The router, ready to be served or nested under a larger application.
     ///
     /// Returned rather than bound to a port, so a deployment can put its own
-    /// authentication, TLS termination and tracing layers around it. §19.7 is
+    /// authentication, TLS termination and tracing layers around it. That is
     /// explicit that this needs authentication before it leaves a trusted
     /// network, and a router is the shape that lets a caller add it.
     pub fn router(self) -> Router {
@@ -316,7 +316,7 @@ async fn load_table(
         metadata_location: loaded.metadata_location().map(str::to_string),
         metadata: loaded.metadata().clone(),
         // Deliberately empty: object-store credentials are the client's, which
-        // is what keeps this endpoint out of the data path (§13.7).
+        // is what keeps this endpoint out of the data path.
         config: HashMap::new(),
     })
     .into_response())

@@ -313,6 +313,11 @@ or not the subject is still being metered.
   direction that destroys data still inside its retention period.
   `Retention::Rolling(d)` exists for the earlier "no longer necessary" trigger,
   which is a business decision this crate has no view on.
+- **`Rolling(d)` expires whole years.** An epoch is a year, so a rolling window
+  selects the calendar years that ended more than `d` ago rather than the values
+  older than `d`: `Rolling(30 days)` swept on 15 January 2028 keeps a value
+  collected on 2 January 2027. Never early, but weaker than the name suggests. A
+  genuine sub-year policy is `erase_subject` on your own schedule.
 - **No suppression tombstone.** Suppression exists so an Article 17 erasure
   survives a broker replay; an expiry is not a request to stop processing, and a
   subject whose 2021 epoch expired must still be registrable for 2027.

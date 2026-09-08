@@ -7,6 +7,90 @@ The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
 
+## [0.12.0] — 2026-09-07
+
+An audit pass. Two correctness defects that produced a plausible wrong number
+rather than an error, a retention policy weaker than its name, a catalogue
+backend no configuration file could reach, and a dependency graph that carried
+more than it declared.
+
+### A report ending mid-interval invented a surplus
+
+`expected_in_day` clipped a partly-covered balancing day by dividing the covered
+duration by the interval step. The scan underneath selects rows whose own `from`
+is in the range, so the expectation has to be a count of **interval starts**, and
+the two part whenever the range ends off the grid: over `[00:00, 00:07)` the
+division expects nothing while the interval starting at 00:00 is inside the range
+and counted in `actual`. Every report whose `to` was `now()` rather than a day
+boundary could show a `surplus` of one on its final day — a finding that never
+happened, in the report whose whole value is that its findings did.
+
+The count is now `ceil((hi - day_start)/step) - ceil((lo - day_start)/step)`,
+clamped to the day. Day-aligned ranges are unaffected, which is why this hid.
+
+### Predicate extraction could narrow at the edge of the calendar
+
+`next_stored_instant` fell back to its input when there was no next representable
+instant, which made a `<=` bound exclusive of the value it includes and an `=`
+bound empty. Unreachable in practice, and the wrong direction for a module whose
+stated contract is that it may only ever err by widening. It returns `Option` now
+and the callers turn `None` into *no bound*.
+
+### `Retention::Rolling` expires whole years
+
+Not a behaviour change — a documentation one, for a compliance setting whose
+effect was much weaker than its name. The sweep deletes by `epoch`, and an epoch
+is a year, so `Rolling(30 days)` swept on 15 January 2028 expires epochs before
+2027 and keeps a value collected on 2 January 2027. It never erases early, which
+is the half that matters for an irreversible operation, but nothing said so.
+Documented, and pinned by a test that also asserts the never-early property.
+
+### S3 Tables is reachable from a configuration file
+
+`S3TablesCatalog` was a constructor with no `CatalogKind`, so an S3 Tables
+deployment could be assembled in Rust and not described in TOML — which put every
+CLI verb out of its reach, the CLI having no other way in. `catalog = "s3tables"`
+now exists, taking the table bucket ARN in `warehouse` and no `uri`; the
+warehouse-scheme check is skipped for it, because an ARN has no scheme.
+
+### `meterstore audit` checks a declaration against the data
+
+`MeterStore::audit_attribute_column` and `audit_attribute_columns`, and an `audit`
+verb over them. Declaring a tenant discriminator as an *attribute* rather than an
+identity column is legal, the writes succeed, and nothing raises an error — two
+identities then share a merge key and one silently supersedes the other. Nothing
+at write time can tell that from a column that genuinely is a fact about a
+reading, so the question is asked of the stored rows: for how many merge keys does
+the column take more than one value? A report rather than a verdict, since a
+correction restating an attribute is the same shape at a smaller scale.
+
+### The dependency graph declares what it carries
+
+- **`iceberg-storage-opendal` was taking its default features**, so `opendal-s3`
+  and the `reqsign` AWS stack compiled into every build — while the manifest
+  claimed the cloud object stores were opt-in. They are now.
+- **`sqlx` was taking its defaults** (`any`, `macros`, `migrate`, `json`), none of
+  which this crate uses. Thirteen packages left the graph.
+- **`sqlx/time` moved to `sqlx-postgres/time`.** `sqlx`'s own `time` feature names
+  `sqlx-sqlite?/time`, and naming an optional dependency puts it in the resolve
+  graph, where cargo's `links` uniqueness check runs — enough on its own to stop a
+  workspace that also links an embedded SQLite from resolving.
+  `sqlx-postgres/time` is `["dep:time", "sqlx-core/time"]` and mentions no SQLite;
+  feature unification makes the two identical for this crate's code.
+- **`iceberg-catalog-sql` is behind a `sql-catalog` feature**, in `default`. It
+  reaches the same SQLite driver, so `default-features = false` plus another
+  catalogue is now an escape hatch such a consumer can take.
+- `sqlx-postgres` joins the single-sourced dependency gate.
+
+### The `§N` markers are gone
+
+166 of them across 33 source files cited a single-file predecessor of the design
+notes and resolved to nothing — 120 in user-facing rustdoc, one in an error
+message. Two were indistinguishable at a glance from the BDEW clause references
+beside them. Every internal marker is now the thing it referred to, spelled out;
+every `§` that remains cites a **named external** document, and the surrounding
+sentence names it.
+
 ## [0.11.0] — 2026-09-06
 
 Two defects in the subject registry, reported from an integration of 0.10 — one

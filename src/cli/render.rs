@@ -383,6 +383,48 @@ pub fn describe(described: &QueryDescription, format: Format) -> Result<()> {
 }
 
 /// The cold tier's snapshot list.
+/// Attribute columns measured against the rows already stored.
+pub fn audit(rows: &[(String, crate::AttributeAudit)], format: Format) -> Result<()> {
+    let document = json!({
+        "audit": rows
+            .iter()
+            .map(|(table, a)| json!({
+                "table": table,
+                "column": a.column,
+                "merge_keys": a.merge_keys,
+                "merge_keys_with_several_values": a.merge_keys_with_several_values,
+                "widest": a.widest,
+                "repetition_ratio": a.repetition_ratio(),
+                "measurable": a.is_measurable(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    emit(format, &document, || {
+        println!(
+            "{:<28} {:<20} {:>12} {:>12} {:>8} {:>8}",
+            "TABLE", "COLUMN", "KEYS", "REPEATED", "WIDEST", "SHARE"
+        );
+        for (table, a) in rows {
+            println!(
+                "{:<28} {:<20} {:>12} {:>12} {:>8} {:>8}",
+                table,
+                a.column,
+                a.merge_keys,
+                a.merge_keys_with_several_values,
+                a.widest,
+                // An empty table found nothing because there was nothing to look
+                // at, and that must not print as a clean 0%.
+                if a.is_measurable() {
+                    format!("{:.1}%", a.repetition_ratio() * 100.0)
+                } else {
+                    "—".to_string()
+                },
+            );
+        }
+    })
+}
+
 pub fn snapshots(rows: &[(String, SnapshotInfo)], format: Format) -> Result<()> {
     let document = json!({
         "snapshots": rows

@@ -83,7 +83,7 @@ pub struct ConfigEntry {
     /// The table the setting belongs to.
     ///
     /// Carried per row rather than implied by the relation, because a session
-    /// may host several tables (§15.3) and "which table is this `settlement_lag`
+    /// may host several tables and "which table is this `settlement_lag`
     /// for" is the first question a row raises once there is more than one.
     pub table: String,
     /// Setting name.
@@ -206,7 +206,7 @@ impl<'a> SystemTables<'a> {
 
     /// The SQL an external engine must apply to read the raw table correctly.
     ///
-    /// This is the primary mitigation for the version-resolution trap (§13.7.2),
+    /// This is the primary mitigation for the version-resolution trap,
     /// and it is a correctness matter rather than an ergonomic one: an engine
     /// reading the Iceberg files directly sees **every version** of a corrected
     /// interval, and a naive `SELECT SUM(value)` double-counts each one —
@@ -278,7 +278,7 @@ impl<'a> SystemTables<'a> {
 /// Register the system tables for **every** table a session hosts.
 ///
 /// One relation per concern, one row set per table, discriminated by the
-/// `table` column. A session with several tables (§15.3) otherwise gets either
+/// `table` column. A session with several tables otherwise gets either
 /// four relations per table — which no operator wants to `UNION` by hand — or
 /// one relation whose rows cannot be attributed.
 ///

@@ -104,7 +104,10 @@ fn range_of(filter: &Expr) -> TimeRange {
             match (as_timestamp(low), as_timestamp(high)) {
                 // BETWEEN is inclusive on both sides; our upper bound is
                 // exclusive, so the high value must still be matched.
-                (Some(lo), Some(hi)) => TimeRange::new(Some(lo), Some(next_stored_instant(hi))),
+                (Some(lo), Some(hi)) => match next_stored_instant(hi) {
+                    Some(end) => TimeRange::new(Some(lo), Some(end)),
+                    None => TimeRange::new(Some(lo), None),
+                },
                 _ => TimeRange::unbounded(),
             }
         }
@@ -131,11 +134,11 @@ fn as_from_bound(left: &Expr, op: Operator, right: &Expr) -> Option<TimeRange> {
 fn bound_from(op: Operator, value: OffsetDateTime) -> Option<TimeRange> {
     Some(match op {
         Operator::Lt => TimeRange::new(None, Some(value)),
-        Operator::LtEq => TimeRange::new(None, Some(next_stored_instant(value))),
-        Operator::Gt => TimeRange::new(Some(next_stored_instant(value)), None),
+        Operator::LtEq => TimeRange::new(None, Some(next_stored_instant(value)?)),
+        Operator::Gt => TimeRange::new(Some(next_stored_instant(value)?), None),
         Operator::GtEq => TimeRange::new(Some(value), None),
         // A point lookup is a range of one instant.
-        Operator::Eq => TimeRange::new(Some(value), Some(next_stored_instant(value))),
+        Operator::Eq => TimeRange::new(Some(value), Some(next_stored_instant(value)?)),
         _ => return None,
     })
 }
@@ -160,12 +163,17 @@ fn flip(op: Operator) -> Operator {
 /// a whole microsecond to that lands past the next stored one: `"from" >
 /// TIMESTAMP '2026-07-10 00:00:00.0000005'` would bound at `…0000015` and skip
 /// the row at `…000001`, which satisfies the predicate. Silently, because the row
-/// is simply not read — and §17.1 permits error in the widening direction only.
-fn next_stored_instant(t: OffsetDateTime) -> OffsetDateTime {
+/// is simply not read — and this module may only ever err in the widening direction.
+fn next_stored_instant(t: OffsetDateTime) -> Option<OffsetDateTime> {
     let micros = t.unix_timestamp_nanos().div_euclid(1_000);
     // `div_euclid` floors towards negative infinity, so a pre-epoch instant
     // truncates downwards like every other one rather than towards zero.
-    OffsetDateTime::from_unix_timestamp_nanos((micros + 1) * 1_000).unwrap_or(t)
+    //
+    // `None` where there is no next representable instant, which the callers turn
+    // into *no bound*. Falling back to `t` would make `<=` exclusive of the value
+    // it includes and `=` empty — narrowing, the one direction this module may
+    // not err in.
+    OffsetDateTime::from_unix_timestamp_nanos((micros + 1) * 1_000).ok()
 }
 
 /// Whether an expression is the `from` column, or a **lossless** cast of it.
@@ -180,7 +188,7 @@ fn next_stored_instant(t: OffsetDateTime) -> OffsetDateTime {
 /// truncates: `CAST("from" AS DATE) = …` matches a whole day, and treating it as
 /// a bound on `from` itself would extract a one-microsecond range and drop the
 /// other 95 intervals — silently, since the rows simply are not in the scan. The
-/// module's whole contract (§17.1) is that the analysis may only ever be wrong in
+/// module's whole contract is that the analysis may only ever be wrong in
 /// the widening direction, and an unrestricted cast breaks it.
 ///
 /// So: the column itself, or a cast to a timestamp no coarser than the column's
@@ -216,7 +224,7 @@ fn is_lossless_target(ty: &crate::arrow::datatypes::DataType) -> bool {
 /// truncates one number — and it is not real: `from >= CAST(<nanos> AS
 /// Timestamp(Second))` bounds `from` at the *truncated* second, which is below
 /// the literal, so reading the literal instead narrows the range and drops the
-/// rows in between. §17.1 permits error in the widening direction only, so an
+/// rows in between. Only the widening direction is permitted, so an
 /// unrecognised cast leaves the range unbounded and costs a scan.
 fn as_timestamp(expr: &Expr) -> Option<OffsetDateTime> {
     let scalar = match expr {
@@ -362,15 +370,27 @@ mod tests {
     fn a_bound_on_the_grid_is_unchanged() {
         assert_eq!(
             next_stored_instant(T10),
-            T10 + time::Duration::microseconds(1)
+            Some(T10 + time::Duration::microseconds(1))
         );
         // Pre-epoch instants truncate downwards too, so the successor of a grid
         // instant is still one microsecond on.
         let before = datetime!(1969-12-31 23:59:59 UTC);
         assert_eq!(
             next_stored_instant(before),
-            before + time::Duration::microseconds(1)
+            Some(before + time::Duration::microseconds(1))
         );
+
+        // At the end of the representable calendar there is no successor, and
+        // the answer is *no bound* rather than the value itself. Returning `t`
+        // would make `<=` exclusive of the instant it includes and `=` empty —
+        // narrowing, which is the one direction this module may not err in.
+        let last = datetime!(+9999-12-31 23:59:59.999999 UTC);
+        assert_eq!(next_stored_instant(last), None);
+        assert_eq!(
+            time_range(&[from().lt_eq(ts(last))]),
+            TimeRange::unbounded()
+        );
+        assert_eq!(time_range(&[from().eq(ts(last))]), TimeRange::unbounded());
     }
 
     #[test]
@@ -405,7 +425,7 @@ mod tests {
     #[test]
     fn strictly_greater_than_excludes_the_bound_itself() {
         let r = time_range(&[from().gt(ts(T10))]);
-        assert_eq!(r.start(), Some(next_stored_instant(T10)));
+        assert_eq!(r.start(), next_stored_instant(T10));
         assert!(r.start().unwrap() > T10);
     }
 
@@ -528,7 +548,7 @@ mod tests {
         // are dropped from the scan with nothing to notice it. Same for a cast
         // down to seconds or milliseconds, which collapses sub-unit instants.
         //
-        // Widening is the only legal direction here (§17.1), so an unrecognised
+        // Widening is the only legal direction here, so an unrecognised
         // shape must cost a scan rather than a row.
         for ty in [
             DataType::Date32,
@@ -581,7 +601,7 @@ mod tests {
         // *literal* down to seconds truncates it, so `from >= CAST(t AS
         // TIMESTAMP(0))` admits rows from the start of that second onwards —
         // below the literal. Reading the literal instead narrows the range and
-        // drops them. §17.1 permits widening only.
+        // drops them. Widening only.
         let inner = ts(T10 + time::Duration::microseconds(500_000));
         for ty in [
             timestamp(TimeUnit::Second),
@@ -682,7 +702,7 @@ mod tests {
 /// > if a row satisfies the filter, the extracted range must contain it.
 ///
 /// The reference is an independent evaluator over the same generated tree, for
-/// the same reason the §17.3 oracle is: an evaluator that shared `range_of`'s
+/// the same reason the correctness oracle is: an evaluator that shared `range_of`'s
 /// reasoning would agree with it about its mistakes.
 #[cfg(test)]
 mod properties {

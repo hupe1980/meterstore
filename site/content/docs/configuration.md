@@ -15,7 +15,7 @@ max_connections = 16
 ddl_lock_timeout = "3s"          # how long DDL waits for a lock before giving up
 
 [cold]
-catalog = "rest"                 # or "sql"
+catalog = "rest"                 # or "sql", or "s3tables"
 uri = "https://catalog.internal" # endpoint (rest) or connection URL (sql)
 warehouse = "s3://edm/meterstore"
 namespace = "metering"
@@ -77,6 +77,30 @@ stops a Bilanzierungsgebiet from being stored as a Bilanzkreis — and unlike th
 check character it is a regular expression, so the database enforces it too. A
 letter this build does not list is refused at `meterstore check` rather than
 degrading to a bare `"EIC"`.
+
+## Which catalogue `[cold]` names
+
+Three, and each is a cargo feature as well as a `catalog =` value.
+
+| `catalog =` | Feature | `uri` | `warehouse` |
+|---|---|---|---|
+| `"rest"` *(default)* | `rest-catalog` *(default)* | Catalogue endpoint | Warehouse URI |
+| `"sql"` | `sql-catalog` *(default)* | PostgreSQL URL, normally `[hot] url` | Warehouse URI |
+| `"s3tables"` | `s3tables` | unused | Table bucket **ARN** |
+
+S3 Tables owns the object layout, so it has no warehouse URI and no credentials to
+forward — `warehouse` holds `arn:aws:s3tables:<region>:<account>:bucket/<name>`,
+and anything that is not an ARN is refused at `meterstore check`. Naming a
+catalogue whose feature was not compiled in is an error that says so.
+
+Turn `sql-catalog` off in a workspace that also links an embedded SQLite: it
+reaches `sqlx`'s optional SQLite driver, and `libsqlite3-sys` declares
+`links = "sqlite3"`, which cargo enforces over the whole resolve graph whether or
+not the feature is on.
+
+```bash
+cargo add meterstore --no-default-features --features rest-catalog
+```
 
 ## `[privacy]`
 

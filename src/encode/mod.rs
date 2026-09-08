@@ -417,7 +417,7 @@ fn from_scaled_i128(raw: i128) -> Decimal {
 ///
 /// Taking the tag *from* the serialised form means a variant renamed upstream
 /// moves both columns together and a variant added upstream needs no edit here.
-/// §4.1.1: the domain's vocabulary has one spelling, and it is the domain's.
+/// The domain's vocabulary has one spelling, and it is the domain's.
 fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
     let payload = serde_json::to_value(source)?;
     let kind = match &payload {
@@ -971,7 +971,7 @@ pub fn sorted_for_storage(batch: &RecordBatch) -> Result<RecordBatch> {
 
 /// Distinct `malo_id` values across a set of batches.
 ///
-/// Sizes the Parquet bloom filter on the column §10.2 calls the highest-leverage
+/// Sizes the Parquet bloom filter on the highest-leverage column of the cold
 /// one. Only usable where the rows are already in memory — a streaming write
 /// cannot look ahead, and takes an estimate instead (`WriteHints`).
 pub fn distinct_malo_ids(batches: &[RecordBatch]) -> u64 {
