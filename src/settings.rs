@@ -1511,10 +1511,10 @@ identify_by_melo = false
         assert!(!table.merge_key().contains(&"subject_ref".to_string()));
     }
 
-    // The documented example names `catalog = "rest"`, and validation now refuses
-    // a catalogue this build cannot construct — so the whole-file assertions here
-    // need that backend present. What they check is orthogonal to it.
-    #[cfg(feature = "rest-catalog")]
+    // The documented example names `catalog = "rest"` and an `s3://` warehouse,
+    // and validation refuses either backend when it was not compiled in — so the
+    // whole-file assertions here need both. What they check is orthogonal to both.
+    #[cfg(all(feature = "rest-catalog", feature = "object-store-s3"))]
     #[test]
     fn the_infrastructure_sections_are_validated_too() {
         // They were parsed, exposed and consumed by nothing, so nothing checked
@@ -1604,8 +1604,21 @@ name = "readings"
         // is the lie P6 forbids — and it is reachable, since every backend is a
         // feature and `--no-default-features --features cli` selects none of the
         // three by itself.
+        // `file://` rather than the documented example's `s3://`: the object-store
+        // backends are features of their own, and this is about the catalogue.
+        const MINIMAL: &str = r#"
+[hot]
+url = "postgresql://localhost/edm"
+
+[cold]
+uri = "postgresql://localhost/edm"
+warehouse = "file:///tmp/warehouse"
+
+[[tables]]
+name = "readings"
+"#;
         for kind in [CatalogKind::Rest, CatalogKind::Sql, CatalogKind::S3Tables] {
-            let mut settings = Settings::from_toml(EXAMPLE).unwrap();
+            let mut settings = Settings::from_toml(MINIMAL).unwrap();
             settings.cold.catalog = kind;
             if kind == CatalogKind::S3Tables {
                 "arn:aws:s3tables:eu-central-1:123456789012:bucket/edm"
