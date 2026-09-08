@@ -107,7 +107,12 @@ jobs:
                      "--no-default-features --features testkit" \
                      "--all-features"; do
             printf '%-56s' "$set"
-            if cargo check --quiet --all-targets $set 2>/tmp/out; then
+            # `test --lib`, not `check`: a feature set can compile and still be
+            # wrong. The documented example names both a catalogue and an
+            # object-store scheme, and validating it needs both features present
+            # — a coupling a type check cannot see. Unit tests only; the
+            # integration suite needs Docker and runs once, under `--all-features`.
+            if cargo test --quiet --lib $set 2>/tmp/out; then
               echo ok
             else
               echo FAILED

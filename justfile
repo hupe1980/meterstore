@@ -122,7 +122,12 @@ features:
     check() {
       local label="$1"; shift
       printf '%-24s' "$label"
-      if out=$(cargo check --quiet --all-targets "$@" 2>&1); then
+      # `test --lib`, not `check`: a feature set can compile and still be wrong.
+      # The documented example names both a catalogue and an object-store scheme,
+      # so validating it needs both features present — a coupling a type check
+      # cannot see. Unit tests only; the integration suite needs Docker and runs
+      # once, against `--all-features`.
+      if out=$(cargo test --quiet --lib "$@" 2>&1); then
         echo "ok"
       else
         echo "FAILED"
