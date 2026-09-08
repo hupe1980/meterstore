@@ -102,6 +102,7 @@ jobs:
                      "--no-default-features --features flight" \
                      "--no-default-features --features cli" \
                      "--no-default-features --features catalog-facade" \
+                     "--no-default-features --features sql-catalog" \
                      "--no-default-features --features s3tables" \
                      "--no-default-features --features testkit" \
                      "--all-features"; do

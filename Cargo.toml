@@ -276,7 +276,12 @@ testkit = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile", "
 # finds. The two answer different questions: Flight SQL is the unified hot + cold
 # view, and the façade is what lets an external engine read the history without
 # this process in the data path at all.
-cli = ["dep:clap", "dep:tracing-subscriber", "flight", "catalog-facade"]
+#
+# It names `sql-catalog` too, because a binary has to be able to open a cold tier:
+# a library caller brings its own `Arc<dyn Catalog>`, and the CLI has only the
+# configuration file. Built with `--no-default-features --features cli` it would
+# otherwise compile and then refuse every `catalog =` value at runtime.
+cli = ["dep:clap", "dep:tracing-subscriber", "flight", "catalog-facade", "sql-catalog"]
 
 # The command-line tool. `required-features` rather than a separate crate: it is
 # a thin front end over the same public API, and splitting it into a workspace

@@ -27,10 +27,26 @@
 //! A warehouse whose scheme needs a backend that was not compiled in is a clear
 //! error at construction, not a silent fallback.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+// Every catalogue backend is a feature, so with none of them selected the only
+// thing left in this module is `ColdTier` — which names `Catalog` and nothing
+// else. The rest would be unused imports, and CI builds each feature set with
+// `-D warnings`.
+#[cfg(any(
+    feature = "sql-catalog",
+    feature = "rest-catalog",
+    feature = "s3tables"
+))]
+use std::collections::HashMap;
+
+use iceberg::Catalog;
+#[cfg(any(
+    feature = "sql-catalog",
+    feature = "rest-catalog",
+    feature = "s3tables"
+))]
+use iceberg::{CatalogBuilder, NamespaceIdent};
 #[cfg(feature = "sql-catalog")]
 use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,

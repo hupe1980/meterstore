@@ -114,6 +114,11 @@ features:
     #!/usr/bin/env bash
     set -uo pipefail
     fail=0
+    # `-D warnings`, because CI sets it globally and a feature set that only
+    # *warns* — an import used by every backend but the one selected — fails
+    # there and passes here otherwise. A local gate weaker than the remote one
+    # is a gate that reports success for the run that matters.
+    export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
     check() {
       local label="$1"; shift
       printf '%-24s' "$label"
@@ -130,6 +135,7 @@ features:
     check "flight"         --no-default-features --features flight
     check "cli"            --no-default-features --features cli
     check "catalog-facade" --no-default-features --features catalog-facade
+    check "sql-catalog"    --no-default-features --features sql-catalog
     check "s3tables"       --no-default-features --features s3tables
     check "testkit"        --no-default-features --features testkit
     check "all"            --all-features

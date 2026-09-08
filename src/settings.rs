@@ -570,6 +570,11 @@ impl ColdSettings {
                  connection and every table load would block",
             ));
         }
+        // A catalogue whose feature was not compiled in is a configuration error,
+        // and `meterstore check` is where a deployment expects to be told: it
+        // promises to validate without connecting, so answering "valid" for a
+        // file that cannot open a cold tier is the lie P6 forbids.
+        self.catalog.require_compiled_in()?;
         // The scheme decides the object-store backend, and a backend whose
         // feature was not compiled in is a configuration error rather than a
         // silent fallback to local disk. Asked here so it fails at validation
@@ -619,15 +624,9 @@ impl ColdSettings {
                 .await
             }
             #[cfg(not(feature = "rest-catalog"))]
-            CatalogKind::Rest => Err(Error::config(
-                "[cold] catalog = \"rest\" needs the meterstore `rest-catalog` feature, \
-                 which was not compiled in",
-            )),
+            CatalogKind::Rest => Err(self.catalog.require_compiled_in().unwrap_err()),
             #[cfg(not(feature = "sql-catalog"))]
-            CatalogKind::Sql => Err(Error::config(
-                "[cold] catalog = \"sql\" needs the meterstore `sql-catalog` feature, \
-                 which was not compiled in",
-            )),
+            CatalogKind::Sql => Err(self.catalog.require_compiled_in().unwrap_err()),
             #[cfg(feature = "s3tables")]
             CatalogKind::S3Tables => {
                 crate::cold::S3TablesCatalog {
@@ -641,10 +640,7 @@ impl ColdSettings {
                 .await
             }
             #[cfg(not(feature = "s3tables"))]
-            CatalogKind::S3Tables => Err(Error::config(
-                "[cold] catalog = \"s3tables\" needs the meterstore `s3tables` feature, \
-                 which was not compiled in",
-            )),
+            CatalogKind::S3Tables => Err(self.catalog.require_compiled_in().unwrap_err()),
         }
     }
 }
@@ -806,6 +802,47 @@ pub enum CatalogKind {
     /// its ARN and `uri` is unused — Athena, EMR and Glue already know it.
     #[serde(rename = "s3tables")]
     S3Tables,
+}
+
+impl CatalogKind {
+    /// The cargo feature this kind needs.
+    pub const fn feature(self) -> &'static str {
+        match self {
+            Self::Rest => "rest-catalog",
+            Self::Sql => "sql-catalog",
+            Self::S3Tables => "s3tables",
+        }
+    }
+
+    /// Whether this build can construct this kind.
+    pub const fn is_compiled_in(self) -> bool {
+        match self {
+            Self::Rest => cfg!(feature = "rest-catalog"),
+            Self::Sql => cfg!(feature = "sql-catalog"),
+            Self::S3Tables => cfg!(feature = "s3tables"),
+        }
+    }
+
+    /// Refuse a kind this build cannot construct.
+    ///
+    /// One place, so validation and construction cannot come to different
+    /// answers — the failure that would otherwise let `meterstore check` pass a
+    /// file the first connect refuses.
+    fn require_compiled_in(self) -> Result<()> {
+        if self.is_compiled_in() {
+            return Ok(());
+        }
+        Err(Error::config(format!(
+            "[cold] catalog = \"{}\" needs the meterstore `{}` feature, which was not \
+             compiled in",
+            match self {
+                Self::Rest => "rest",
+                Self::Sql => "sql",
+                Self::S3Tables => "s3tables",
+            },
+            self.feature(),
+        )))
+    }
 }
 
 /// One managed table.
@@ -1474,6 +1511,10 @@ identify_by_melo = false
         assert!(!table.merge_key().contains(&"subject_ref".to_string()));
     }
 
+    // The documented example names `catalog = "rest"`, and validation now refuses
+    // a catalogue this build cannot construct — so the whole-file assertions here
+    // need that backend present. What they check is orthogonal to it.
+    #[cfg(feature = "rest-catalog")]
     #[test]
     fn the_infrastructure_sections_are_validated_too() {
         // They were parsed, exposed and consumed by nothing, so nothing checked
@@ -1555,6 +1596,35 @@ name = "readings"
         }
     }
 
+    #[test]
+    fn a_catalogue_this_build_cannot_construct_fails_validation_not_the_first_connect() {
+        // `meterstore check` promises to validate without connecting, so it is
+        // where a deployment expects to be told that the catalogue it named is
+        // not in this binary. Answering "valid" and failing at the first connect
+        // is the lie P6 forbids — and it is reachable, since every backend is a
+        // feature and `--no-default-features --features cli` selects none of the
+        // three by itself.
+        for kind in [CatalogKind::Rest, CatalogKind::Sql, CatalogKind::S3Tables] {
+            let mut settings = Settings::from_toml(EXAMPLE).unwrap();
+            settings.cold.catalog = kind;
+            if kind == CatalogKind::S3Tables {
+                "arn:aws:s3tables:eu-central-1:123456789012:bucket/edm"
+                    .clone_into(&mut settings.cold.warehouse);
+            }
+
+            let outcome = settings.cold.validate();
+            if kind.is_compiled_in() {
+                assert!(outcome.is_ok(), "{kind:?}: {outcome:?}");
+            } else {
+                let err = outcome
+                    .expect_err("{kind:?} is not compiled in")
+                    .to_string();
+                assert!(err.contains(kind.feature()), "{err}");
+            }
+        }
+    }
+
+    #[cfg(feature = "s3tables")]
     #[test]
     fn s3_tables_is_addressed_by_arn_and_asks_for_no_uri() {
         // The table bucket *is* the warehouse: there is no URI whose scheme picks
