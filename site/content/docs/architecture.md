@@ -142,12 +142,23 @@ across a boundary the plan has already committed to:
 So the purge is **deferred**. The partition stays detached after its commit —
 invisible to writers, excluded by predicate from every plan made after the
 advance, still read by any plan made before it — and a later cycle reclaims it
-once the commit that moved the boundary is older than `reader_grace`:
+once two conditions hold: the commit that moved the boundary is older than
+`reader_grace`, **and** no live plan is registered below the window.
 
 ```toml
 [tables.archival]
-reader_grace = "1h"    # above the longest query this deployment runs
+reader_grace = "1h"    # hysteresis, kept whatever anybody is reading
+max_pin_age  = "6h"    # above the longest query this deployment runs
 ```
+
+The clock alone would be a probability argument: a plan reads the boundary when
+it is *planned* and enumerates hot partitions on *first poll*, which for a query
+drained cold-side-first is however long the cold scan takes. So a plan whose
+split has a hot half registers the boundary it was cut at, in the hot tier's own
+PostgreSQL, and `drop_partition` consults that registry inside the transaction it
+drops in. `max_pin_age` bounds the registration, because a query killed with its
+process never deregisters — past it the floor advances and the over-running query
+fails naming the window rather than returning without it.
 
 The clock is the one MeterStore records in the snapshot summary
 (`meterstore.archived_at`), not Iceberg's own commit timestamp, so the grace is

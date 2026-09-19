@@ -48,11 +48,12 @@ use std::sync::Arc;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetDbSchemas,
-    CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
+    CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
     CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt,
     SqlInfo, TicketStatementQuery,
 };
@@ -66,7 +67,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
 use crate::arrow::array::RecordBatch;
-use crate::arrow::datatypes::SchemaRef;
+use crate::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 // `MeterStore` is imported for the intra-doc links above and below; the
 // server itself holds a `SqlSurface`, which it may equally be a catalog.
 #[allow(unused_imports)]
@@ -265,6 +266,73 @@ impl FlightSqlServer {
         Ok(Response::new(info))
     }
 
+    /// Answer a metadata RPC with the schema **the specification fixes**, not
+    /// the one the SQL behind it happens to produce.
+    ///
+    /// # Why these do not go through `respond`
+    ///
+    /// `respond` stamps the tiering watermark and the tiers scanned onto the
+    /// schema, which is P1 — an answer carries the boundary it was computed
+    /// against — and exactly wrong here. A `GetTables` response is not an answer
+    /// about readings; its schema is part of the wire contract, fixed field for
+    /// field down to nullability, and a client is entitled to reject anything
+    /// else. The ADBC driver does: extra schema metadata and a non-nullable
+    /// `catalog_name` both fail its validation, so a browse that works from a
+    /// client written against this server fails from every client written
+    /// against the specification.
+    ///
+    /// The rows are produced by SQL either way. Only the schema they are shipped
+    /// under changes.
+    async fn metadata(
+        &self,
+        sql: &str,
+        schema: SchemaRef,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        debug!(%sql, "flight sql metadata");
+
+        let (_described, rows) = self
+            .surface
+            .stream_sql(sql, Vec::new())
+            .await
+            .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
+
+        let wire = schema.clone();
+        let batches = rows.map(move |batch| {
+            let batch =
+                batch.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))?;
+            RecordBatch::try_new(wire.clone(), batch.columns().to_vec())
+                .map_err(arrow_flight::error::FlightError::Arrow)
+        });
+
+        let flight = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(batches)
+            .map_err(|e| Status::internal(format!("encoding flight data: {e}")));
+
+        Ok(Response::new(Box::pin(flight)))
+    }
+
+    /// A `FlightInfo` for a metadata RPC, whose ticket carries the **command**.
+    ///
+    /// Not a `TicketStatementQuery` wrapping the SQL: `do_get` dispatches on the
+    /// ticket's message type, so a statement ticket sends the follow-up call to
+    /// `do_get_statement` and the client receives the query path's schema after
+    /// being promised this one. Handing back the command is what makes
+    /// `do_get_tables` and its siblings reachable at all.
+    fn metadata_info(
+        command: impl ProstMessageExt,
+        schema: &Schema,
+        descriptor: FlightDescriptor,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(command.as_any().encode_to_vec());
+        let info = FlightInfo::new()
+            .try_with_schema(schema)
+            .map_err(|e| Status::internal(format!("schema: {e}")))?
+            .with_endpoint(FlightEndpoint::new().with_ticket(ticket))
+            .with_descriptor(descriptor);
+        Ok(Response::new(info))
+    }
+
     /// The refusal every mutating call gives, with the reason.
     fn read_only(operation: &str) -> Status {
         Status::permission_denied(format!(
@@ -382,16 +450,10 @@ impl FlightSqlService for FlightSqlServer {
 
     async fn get_flight_info_catalogs(
         &self,
-        _query: CommandGetCatalogs,
+        query: CommandGetCatalogs,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.info_for(
-            "SELECT DISTINCT table_catalog AS catalog_name FROM information_schema.tables \
-             ORDER BY 1"
-                .to_string(),
-            request.into_inner(),
-        )
-        .await
+        Self::metadata_info(query, &catalogs_schema(), request.into_inner())
     }
 
     async fn do_get_catalogs(
@@ -399,20 +461,15 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetCatalogs,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.respond(
-            "SELECT DISTINCT table_catalog AS catalog_name FROM information_schema.tables \
-             ORDER BY 1",
-        )
-        .await
+        self.metadata(CATALOGS_SQL, catalogs_schema()).await
     }
 
     async fn get_flight_info_schemas(
         &self,
-        _query: CommandGetDbSchemas,
+        query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.info_for(SCHEMAS_SQL.to_string(), request.into_inner())
-            .await
+        Self::metadata_info(query, &db_schemas_schema(), request.into_inner())
     }
 
     async fn do_get_schemas(
@@ -420,16 +477,15 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetDbSchemas,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.respond(SCHEMAS_SQL).await
+        self.metadata(SCHEMAS_SQL, db_schemas_schema()).await
     }
 
     async fn get_flight_info_tables(
         &self,
-        _query: CommandGetTables,
+        query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.info_for(TABLES_SQL.to_string(), request.into_inner())
-            .await
+        Self::metadata_info(query, &tables_schema(), request.into_inner())
     }
 
     async fn do_get_tables(
@@ -437,16 +493,15 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetTables,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.respond(TABLES_SQL).await
+        self.metadata(TABLES_SQL, tables_schema()).await
     }
 
     async fn get_flight_info_table_types(
         &self,
-        _query: CommandGetTableTypes,
+        query: CommandGetTableTypes,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        self.info_for(TABLE_TYPES_SQL.to_string(), request.into_inner())
-            .await
+        Self::metadata_info(query, &table_types_schema(), request.into_inner())
     }
 
     async fn do_get_table_types(
@@ -454,7 +509,7 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandGetTableTypes,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.respond(TABLE_TYPES_SQL).await
+        self.metadata(TABLE_TYPES_SQL, table_types_schema()).await
     }
 
     // --- everything that writes ----------------------------------------------
@@ -485,8 +540,72 @@ impl FlightSqlService for FlightSqlServer {
         Err(Self::read_only("a transaction"))
     }
 
+    async fn get_flight_info_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Self::metadata_info(query, &sql_info().schema(), request.into_inner())
+    }
+
+    async fn do_get_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let batch = sql_info()
+            .record_batch(query.info)
+            .map_err(|e| Status::internal(format!("sql info: {e}")))?;
+        let schema = batch.schema();
+
+        let flight = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async move { Ok(batch) }))
+            .map_err(|e| Status::internal(format!("encoding flight data: {e}")));
+
+        Ok(Response::new(Box::pin(flight)))
+    }
+
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 }
+
+/// What this server says about itself when a client asks.
+///
+/// # Why this is not optional
+///
+/// An ADBC client calls `GetSqlInfo` while opening a connection, before any
+/// query. Answering `Unimplemented` is survivable — the driver falls back — but
+/// what it falls back to is a server with no name, no version and, worst,
+/// **no read-only flag**: the client then believes writes are available and
+/// offers the user an `INSERT`, so the refusal arrives as a permission error at
+/// the end of a session instead of as a menu item that is not there.
+///
+/// Declaring no transaction support is the same argument. The driver otherwise
+/// tries to turn autocommit off, fails, and warns on every connection — about a
+/// capability this server never had and, being read-only, has no use for.
+fn sql_info() -> &'static SqlInfoData {
+    static INFO: std::sync::OnceLock<SqlInfoData> = std::sync::OnceLock::new();
+    INFO.get_or_init(|| {
+        let mut builder = SqlInfoDataBuilder::new();
+        builder.append(SqlInfo::FlightSqlServerName, "MeterStore");
+        builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+        builder.append(SqlInfo::FlightSqlServerArrowVersion, ARROW_VERSION);
+        // The whole surface refuses to write, and says why when asked to. This
+        // is the machine-readable half of that sentence.
+        builder.append(SqlInfo::FlightSqlServerReadOnly, true);
+        // `SQL_TRANSACTION_UNSPECIFIED`: neither transactions nor savepoints.
+        builder.append(SqlInfo::FlightSqlServerTransaction, 0i32);
+        builder.build().expect("a fixed set of literals builds")
+    })
+}
+
+/// The Arrow version this server encodes with, reported to a client that has to
+/// decode it.
+const ARROW_VERSION: &str = "58";
+
+/// The catalogues a client can browse.
+const CATALOGS_SQL: &str = "SELECT DISTINCT table_catalog AS catalog_name \
+                            FROM information_schema.tables ORDER BY 1";
 
 /// The schemas a client can browse.
 const SCHEMAS_SQL: &str = "SELECT DISTINCT table_catalog AS catalog_name, \
@@ -507,6 +626,53 @@ const TABLES_SQL: &str = "SELECT table_catalog AS catalog_name, \
 /// The table types present, as Flight SQL expects them.
 const TABLE_TYPES_SQL: &str =
     "SELECT DISTINCT table_type FROM information_schema.tables ORDER BY 1";
+
+/// The four metadata schemas, **as the Flight SQL specification fixes them**.
+///
+/// Written out here rather than borrowed from `arrow-flight`, whose copies are
+/// private to its own in-memory implementations. They are part of the wire
+/// contract — field order, type and nullability — and a client is entitled to
+/// reject a response that differs in any of them. The ADBC driver does exactly
+/// that, which is how a non-nullable `catalog_name` and a stray watermark in the
+/// schema metadata turned into a browse that failed for every client written
+/// against the specification and worked for every client written against this
+/// server.
+fn catalogs_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "catalog_name",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// See [`catalogs_schema`].
+fn db_schemas_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("catalog_name", DataType::Utf8, true),
+        Field::new("db_schema_name", DataType::Utf8, false),
+    ]))
+}
+
+/// See [`catalogs_schema`]. Without `table_schema`, which this server does not
+/// send: the column is optional in the specification, and a client that wants a
+/// table's schema gets it from `GetFlightInfo` on a query against that table.
+fn tables_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("catalog_name", DataType::Utf8, true),
+        Field::new("db_schema_name", DataType::Utf8, true),
+        Field::new("table_name", DataType::Utf8, false),
+        Field::new("table_type", DataType::Utf8, false),
+    ]))
+}
+
+/// See [`catalogs_schema`].
+fn table_types_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "table_type",
+        DataType::Utf8,
+        false,
+    )]))
+}
 
 /// Convenience: serve until the future completes.
 ///
@@ -540,6 +706,65 @@ mod tests {
         assert!(message.contains("watermark"), "{message}");
         assert!(message.contains("erased subject"), "{message}");
         assert!(message.contains("MeterStore::append"), "{message}");
+    }
+
+    #[test]
+    fn the_metadata_schemas_are_the_specifications() {
+        // Field order, type and nullability are the wire contract for these four
+        // responses, and a client is entitled to reject anything else. An ADBC
+        // one does, so a `catalog_name` declared non-nullable is not a detail —
+        // it is a browse that fails for every client written against the
+        // specification and works for every client written against this server.
+        let tables = tables_schema();
+        assert_eq!(
+            tables
+                .fields()
+                .iter()
+                .map(|f| (f.name().as_str(), f.is_nullable()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("catalog_name", true),
+                ("db_schema_name", true),
+                ("table_name", false),
+                ("table_type", false),
+            ]
+        );
+        assert!(db_schemas_schema().field(0).is_nullable());
+        assert!(!db_schemas_schema().field(1).is_nullable());
+        assert!(!catalogs_schema().field(0).is_nullable());
+        assert!(!table_types_schema().field(0).is_nullable());
+
+        // And none of them carries the provenance a query response does. The
+        // watermark belongs on an answer about readings; a list of table names
+        // is not one.
+        for schema in [
+            catalogs_schema(),
+            db_schemas_schema(),
+            tables_schema(),
+            table_types_schema(),
+        ] {
+            assert!(
+                schema.metadata().is_empty(),
+                "a metadata response's schema is fixed: {:?}",
+                schema.metadata()
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_declares_itself_read_only_where_a_client_reads_it() {
+        // The machine-readable half of `read_only`'s sentence. A client that
+        // does not see this flag offers the user an INSERT and delivers the
+        // refusal at the end of a session instead of not offering it.
+        let batch = sql_info()
+            .record_batch([SqlInfo::FlightSqlServerReadOnly as u32])
+            .expect("one info code");
+        assert_eq!(batch.num_rows(), 1, "the flag has to be sent at all");
+
+        let named = sql_info()
+            .record_batch([SqlInfo::FlightSqlServerName as u32])
+            .expect("one info code");
+        assert_eq!(named.num_rows(), 1, "and the server has to name itself");
     }
 
     #[test]

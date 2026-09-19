@@ -66,6 +66,7 @@ async fn archived(workload: MeteringWorkload) -> (TestHarness, meterstore::Meter
 
     // One day past the end, so every window closes and the hot tier empties.
     store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");

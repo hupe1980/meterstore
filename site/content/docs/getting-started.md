@@ -9,8 +9,8 @@ weight = 1
 | | Version | Why |
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
-| PostgreSQL | **12 or later** | See below. The test suite pins 16 |
-| `metering` | **0.23 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
+| PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18, and whole again on 15 |
+| `metering` | **0.24 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs only `SELECT` plus ownership of its own tables. No server
@@ -18,20 +18,41 @@ configuration, no restart, no `CREATE EXTENSION` for the core path — which is 
 makes it deployable on RDS, Cloud SQL and Azure Postgres, where an
 extension-based approach is not.
 
-### Why 12 and not 10
+### Why 15, when the SQL runs on 12
 
-Range partitioning arrived in 10 and a partitioned primary key in 11; neither is
-the floor. **12 is, because of a lock.** `CREATE TABLE … PARTITION OF` takes
-`ACCESS EXCLUSIVE` on the parent, and PostgreSQL grants locks in arrival order —
-so a statement waiting for it blocks every reader and writer behind it. Partition
-creation runs on the **write path**, so that spelling lets one long query stall
-every subsequent insert. MeterStore builds the relation standalone and *attaches*
-it, which from 12 takes only `SHARE UPDATE EXCLUSIVE` — a lock that conflicts with
-no read and no write.
+Two different claims, and they are worth keeping apart.
 
-Older servers still work; they just do not have the property documented here.
+**What the design needs is 12**, because of a lock. `CREATE TABLE … PARTITION OF`
+takes `ACCESS EXCLUSIVE` on the parent, and PostgreSQL grants locks in arrival
+order — so a statement waiting for it blocks every reader and writer behind it.
+Partition creation runs on the **write path**, so that spelling lets one long
+query stall every subsequent insert. MeterStore builds the relation standalone and
+*attaches* it, which from 12 takes only `SHARE UPDATE EXCLUSIVE`, conflicting with
+no read and no write. (Range partitioning arrived in 10 and a partitioned primary
+key in 11; neither is the constraint.)
 [Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) covers the other half —
 the detach that does need the strong lock.
+
+**What is supported is 15**, because a floor is a promise and a promise has to be
+about versions somebody still patches. 12 went end-of-life in November 2024 and 13
+in November 2025; RDS ended standard support for 12 in February 2025 and for 13 in
+February 2026; 14 goes in November 2026. 15 is the oldest release still receiving
+fixes into 2027 and the oldest offered under standard support by RDS, Cloud SQL
+and Azure Database.
+
+It is checked rather than promised: CI runs the entire integration suite against
+15 as well as against 18. An older server will very likely work — nothing here
+needs anything past 12 — but nothing demonstrates it and no security fix is coming
+for it.
+
+### Why the suite runs on 18
+
+Three changes land there that the design's own arguments rest on: fast-path lock
+slots are sized from `max_locks_per_transaction` instead of being sixteen per
+backend, a prepared statement no longer locks every partition while its plan is
+validated, and `btree_gist` gained sortsupport — the index behind the
+`EXCLUDE USING gist` integrity constraints. A suite on an older server would be
+demonstrating the design on the last version with none of them.
 
 ## Install
 
@@ -144,7 +165,7 @@ let store = MeterStore::builder()
 // entry point: the hot table's primary key, the cold schema and the resolution
 // view all have to agree on what identifies a reading, and creating them
 // separately is where they drift.
-store.create_tables().await?;
+store.admin().create_tables().await?;
 ```
 
 ### Catalogues and warehouses

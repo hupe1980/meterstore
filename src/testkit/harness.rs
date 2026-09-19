@@ -59,6 +59,13 @@ impl TestHarness {
     /// is chosen; re-exported here because that is where suites look for it.
     pub const POSTGRES_IMAGE_TAG: &'static str = super::postgres::IMAGE_TAG;
 
+    /// The server this process is actually running against, default or
+    /// overridden.
+    #[must_use]
+    pub fn postgres_image_tag() -> String {
+        super::postgres::image_tag()
+    }
+
     /// The table name the harness creates.
     ///
     /// Carries the `_versions` suffix, because that is the physical name: the
@@ -131,6 +138,7 @@ impl TestHarness {
                 harness.config.name(),
                 &harness.config.identity_column_names(),
                 &harness.config.extra_columns(),
+                &harness.config.maintenance_policy(),
             )
             .await?;
 
@@ -205,7 +213,8 @@ impl TestHarness {
     /// [`MeterCatalog`](crate::MeterCatalog) to get them in one session.
     ///
     /// The table's storage is not created here; call
-    /// [`MeterStore::create_tables`] or the catalog's equivalent.
+    /// [`StoreAdmin::create_tables`](crate::StoreAdmin::create_tables) or the
+    /// catalog's equivalent.
     pub async fn builder_for(
         &self,
         config: ValidatedTableConfig,
@@ -216,6 +225,7 @@ impl TestHarness {
                 config.name(),
                 &config.extra_columns(),
                 &config.identity_column_names(),
+                &config.maintenance_policy(),
             )
             .await?;
 
@@ -261,6 +271,7 @@ impl TestHarness {
                 crate::tiering::store::stream_of(Vec::new()),
                 crate::tiering::store::WriteHints::default(),
                 ArchivalWindow::new(at - step, at)?,
+                step,
                 at,
             )
             .await
@@ -305,24 +316,43 @@ impl TestHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::postgres::FLOOR;
 
     #[test]
-    fn the_pinned_image_meets_the_documented_minimum() {
-        // The documented floor is **12**, where `ATTACH PARTITION` stopped taking
-        // `ACCESS EXCLUSIVE` on the parent — which is what keeps partition
-        // creation off the ingest path's critical lock. The container library's
-        // own default is 11-alpine, below that, so the tag has to be set rather
-        // than inherited.
-        //
-        // The suite pins a much newer one on purpose: the floor is what the
-        // design *needs*, and what the tests run against should be what a
-        // deployment plausibly runs.
+    fn the_server_under_test_is_at_or_above_the_documented_floor() {
+        // The container library's own default is `11-alpine`, below anything this
+        // crate claims, so the tag has to be set rather than inherited — and the
+        // override exists so the floor can be *run*, which means it can also be
+        // pointed somewhere the floor does not reach.
+        let tag = TestHarness::postgres_image_tag();
+        let major: u32 = tag
+            .split('-')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .expect("the tag must start with a major version");
+        assert!(
+            major >= FLOOR,
+            "this run is on PostgreSQL {major}, below the documented floor of {FLOOR}"
+        );
+    }
+
+    #[test]
+    fn the_default_is_the_newest_release_rather_than_the_floor() {
+        // Two different claims. The floor says where this crate may be deployed;
+        // the default says what the evidence was gathered on, and the evidence
+        // should come from the version a deployment plausibly runs — the one
+        // carrying the lock and index behaviour the performance argument rests
+        // on.
         let major: u32 = TestHarness::POSTGRES_IMAGE_TAG
             .split('-')
             .next()
             .and_then(|m| m.parse().ok())
             .expect("the tag must start with a major version");
-        assert!(major >= 12, "the documented floor is PostgreSQL 12");
+        assert!(
+            major > FLOOR,
+            "the suite's default server is the floor, so nothing demonstrates the \
+             design on a version anybody would deploy today"
+        );
     }
 
     #[test]

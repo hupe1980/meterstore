@@ -153,6 +153,24 @@ pub enum Command {
         anonymise_actor: String,
     },
 
+    /// Put the tiering boundary back on the cold table's current snapshot.
+    ///
+    /// **Run this after any out-of-band maintenance** — the compaction or orphan
+    /// cleanup this crate does not perform itself, done with Spark, PyIceberg or
+    /// a catalogue that maintains the table unasked. Those produce valid Iceberg
+    /// commits carrying no boundary, and the boundary is then findable only by
+    /// walking back the parent chain — which snapshot expiry can punch a hole in,
+    /// and a hole there fails *every* query on the table at once.
+    ///
+    /// It republishes what the history already says, so it **cannot move the
+    /// boundary**, and it does nothing when the current snapshot already carries
+    /// one. Both make it safe on a schedule and safe to run twice.
+    ReassertWatermark {
+        /// Only this table.
+        #[arg(long, value_name = "NAME")]
+        table: Option<String>,
+    },
+
     /// Run a query across both tiers.
     ///
     /// The result carries the boundary it was computed against, which is printed
@@ -452,6 +470,7 @@ async fn run(cli: &Cli) -> Result<()> {
             )
             .await
         }
+        Command::ReassertWatermark { table } => reassert_watermark(cli, table.as_deref()).await,
         Command::Query {
             sql,
             historical,
@@ -562,7 +581,7 @@ async fn status(cli: &Cli) -> Result<()> {
 
     let mut rows = Vec::with_capacity(catalog.len());
     for store in catalog.tables() {
-        rows.push(store.status(now).await?);
+        rows.push(store.admin().status(now).await?);
     }
     render::status(&rows, cli.format)?;
 
@@ -609,7 +628,7 @@ async fn archive(cli: &Cli, only: Option<&str>, max_windows: usize) -> Result<()
 
     let mut lines = Vec::new();
     for store in selected(&catalog, only)? {
-        let outcomes = store.archive(now, max_windows).await?;
+        let outcomes = store.admin().archive(now, max_windows).await?;
         lines.push(render::ArchiveLine::of(store.table(), &outcomes));
     }
     render::archive(&lines, cli.format)
@@ -655,6 +674,25 @@ async fn maintain(
     tracing::info!("stopping after the cycle in flight");
     handle.shutdown().await;
     Ok(())
+}
+
+async fn reassert_watermark(cli: &Cli, only: Option<&str>) -> Result<()> {
+    let catalog = load(cli).await?;
+
+    let mut lines = Vec::new();
+    for store in selected(&catalog, only)? {
+        // The boundary is read after the call, not before: on a table that
+        // needed re-stamping the two are the same value by construction, and
+        // reporting the one the table now states is what an operator came for.
+        let restated = store.admin().reassert_watermark().await?;
+        let watermark = store.watermark().await?;
+        lines.push(render::ReassertLine {
+            table: store.table().to_string(),
+            restated,
+            watermark,
+        });
+    }
+    render::reassert_watermark(&lines, cli.format)
 }
 
 async fn query(cli: &Cli, sql: &str, historical: bool, operational: bool) -> Result<()> {
@@ -841,7 +879,7 @@ async fn snapshots(cli: &Cli, only: Option<&str>) -> Result<()> {
     let catalog = load(cli).await?;
     let mut rows = Vec::new();
     for store in selected(&catalog, only)? {
-        for snapshot in store.snapshots().await? {
+        for snapshot in store.admin().snapshots().await? {
             rows.push((store.table().to_string(), snapshot));
         }
     }
@@ -853,8 +891,8 @@ async fn audit(cli: &Cli, only: Option<&str>, column: Option<&str>) -> Result<()
     let mut rows = Vec::new();
     for store in selected(&catalog, only)? {
         let found = match column {
-            Some(name) => vec![store.audit_attribute_column(name).await?],
-            None => store.audit_attribute_columns().await?,
+            Some(name) => vec![store.admin().audit_attribute_column(name).await?],
+            None => store.admin().audit_attribute_columns().await?,
         };
         rows.extend(found.into_iter().map(|a| (store.table().to_string(), a)));
     }
@@ -1007,7 +1045,7 @@ async fn purge(cli: &Cli, table: &str, confirm: &str) -> Result<()> {
     let [store] = selected(&catalog, Some(table))?[..] else {
         unreachable!("a named selection is exactly one table")
     };
-    store.purge_table(confirm).await?;
+    store.admin().purge_table(confirm).await?;
     println!("{table}: destroyed");
     Ok(())
 }

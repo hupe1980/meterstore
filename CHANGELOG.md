@@ -1,11 +1,582 @@
 # Changelog
 
-All notable changes to `meterstore` are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+All notable changes to `meterstore` are documented here, newest first, under
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)'s headings from 0.14.0
+onward. Releases before that group their entries by subject instead; they are
+left as written.
 
 The crate is **unpublished** and pre-1.0. Until the first release every version
 is a hard cut: breaking changes carry no deprecation shim, and the SQL schema
 changes in place rather than through a migration.
+
+This is the only file in the repository that carries history. Reference
+documentation says what is true now; a test enforces it.
+
+## [Unreleased]
+
+### Fixed
+
+- **The suite demonstrated the design on the last PostgreSQL without the fix for
+  its own bottleneck.** The hot scan takes one lock per partition by
+  construction, and through 17 a backend had exactly sixteen fast-path lock slots
+  before contention starts. The integration suite ran on **16**. It now runs on
+  **18**, where the slots are sized from `max_locks_per_transaction`, a prepared
+  statement no longer locks every partition while its plan is validated, and
+  `btree_gist` has sortsupport — the index behind the `EXCLUDE USING gist`
+  integrity constraints.
+
+- **Every catalogue browse over Flight SQL failed for a conforming client.**
+  `GetCatalogs`, `GetDbSchemas`, `GetTables` and `GetTableTypes` were answered
+  through the query path, so their responses arrived under whatever schema the
+  SQL behind them produced — carrying the tiering watermark in the schema
+  metadata and a non-nullable `catalog_name`. Those four schemas are a wire
+  contract, fixed field for field down to nullability, and a client is entitled
+  to reject anything else. An ADBC client does, with
+  `INTERNAL: Invalid schema returned`, on the first call a BI tool makes.
+
+  They now answer with the specification's schemas and no provenance metadata.
+  The boundary belongs on an answer about readings; a list of table names is not
+  one. Their `GetFlightInfo` also hands back a ticket carrying the **command**
+  rather than a statement query, which is what makes `do_get_tables` and its
+  siblings reachable at all — a statement ticket routed the follow-up call to the
+  query handler, so the client was promised one schema and sent another.
+
+- **The server would not say what it was.** `GetSqlInfo` was unimplemented, which
+  is survivable and therefore worse than fatal: a driver falls back rather than
+  failing, and what it falls back to is a server with no name, no version and —
+  the one that matters — no `FLIGHT_SQL_SERVER_READ_ONLY`. A client that cannot
+  see that flag offers the user an `INSERT` and delivers the refusal as a
+  permission error at the end of a session instead of not offering it. The
+  response now carries the name, the version, the Arrow version it encodes with,
+  the read-only flag, and no transaction support.
+
+- **A maintenance tool run at defaults rewrote the cold table and disabled merge
+  elision for good.** Compaction and expiry are out of band by design, and a
+  scheduled job runs at *its* defaults — on a catalogue that maintains the table
+  unasked, S3 Tables or Lakekeeper, there is no operator to read a runbook at
+  all.
+
+  The table now states its maintenance contract in **Iceberg's own property
+  names**: `history.expire.max-snapshot-age-ms` and `.min-snapshots-to-keep` from
+  the deployment's retention, in place of the tool's five-day default;
+  `write.metadata.delete-after-commit.enabled` and `.previous-versions-max` to
+  bound the metadata files. Written at creation and restated on every
+  `create_tables`.
+
+  And `write.target-file-size-bytes` from the new **`declared_file_size`** —
+  which is not `file_target_bytes`, whose 512 MiB default is exactly what a tool
+  assumes when the property is absent. The number that changes a compactor's
+  answer is the size the writer actually produces, which the window and the
+  portfolio decide. So the crate measures rather than guesses: an archival commit
+  reports the bytes and file count it wrote, and says so on every commit until
+  something is declared. Unset publishes no target, because one set too low makes
+  every ordinary file oversized.
+
+- **A key dropped from the erasure ring un-suppressed every subject it covered,
+  and nothing could say so.** A tombstone is `HMAC(key, identifier)` and the
+  identifier died in the transaction that wrote it, so a tag whose key is gone
+  stays in the table and stops matching — indistinguishable from a tag for a
+  different subject.
+
+  Unreportable about the **tag**, not about the **row**. Each tombstone now
+  records the name of the key that wrote it, eight domain-separated bytes derived
+  from the key itself, so `create_tables` warns per missing key with the count of
+  live suppressions it orphans and `orphaned_suppressions` answers on demand.
+  Derived rather than operator-chosen, because the check exists for operators who
+  mismanage the ring: a relabelled key would report a false orphan and a reused
+  label a false all-clear. A lift clears tag and key name together, so an alarm
+  is always one an operator can clear.
+
+  **It reports; it does not repair.** Putting the key back is the only repair,
+  and the warning says so. A warning rather than a refusal because the trail is a
+  historical fact, and the only way to make a refusal pass would be to drop the
+  audit trail.
+
+- **An archived partition was reclaimed on a clock, with nothing asking whether
+  anybody was reading it.** A query fixes its tier split at *plan* time and
+  enumerates hot partitions on first poll — for a `UNION ALL` drained
+  cold-side-first, however long the cold scan takes. `reader_grace` sized a fixed
+  hour against that and hoped, while every other correctness property here is
+  structural.
+
+  A plan with a hot half now registers the boundary it was cut at, and
+  `drop_partition` reads that registry *inside the transaction it drops in*.
+  Three conditions, a conjunction: durable, past the grace, unheld. Registrations
+  expire after the new **`max_pin_age`**, swept inside the same transaction,
+  because one query killed with its process must not hold a partition forever;
+  release rides on the plan tree's `Drop`, there being no end-of-query hook.
+
+  **What is left.** A query outliving `max_pin_age` still loses its window, with
+  an error naming it, and one transaction-wide race can push the failure from
+  plan time to scan time. Both ends are loud; neither returns a short answer.
+
+- **A query whose plan outlived `reader_grace` came back a window short, with no
+  error.** A plan fixes its hot range from the watermark it reads; archival then
+  advances the boundary and takes the reclaimed partition's space back. The hot
+  scan enumerates partitions lazily, so the partition is simply *absent* by then
+  and the gap widens its predecessor's assumed reach — the cold half stopped at
+  the old boundary, the hot half started there, and nothing held the range
+  between.
+
+  The hot tier now **records what it drops**, monotonically and in the same
+  transaction as the `DROP TABLE`, and a scan whose range starts below that mark
+  refuses instead of returning. Absence alone could not have said it: a window
+  nothing was ever written to is missing in exactly the same way, so a guard
+  keying on absence would refuse healthy deployments.
+
+- **`latest()` scanned the whole history to answer "what does this meter read
+  now".** Without a range it carried no bound on `from`, so the tier split kept
+  both halves, the cold half was every row ever archived, and a hot half in range
+  forced version resolution over all of it — and the limit cannot be pushed below
+  the sort, so nothing pruned it. Four registers cost four full scans of a table
+  that grows without bound and that `[AO § 146 Abs. 4]` forbids discarding.
+
+  A rangeless `latest` now probes the hot tier first, bounded at the watermark.
+  The tiering invariant is what makes one probe enough: the hot tier holds exactly
+  the rows with `from >= watermark`, so if it holds any row for the channel the
+  newest is there, and every version of a corrected reading lives in the same tier
+  as the reading — so resolving within the hot half cannot be superseded from the
+  cold one. A channel that has stopped reporting falls through to the unbounded
+  query, which is what finding a dead meter's last reading costs.
+
+  Only for `ReadMode::Unified`. The other three read one tier by construction —
+  `AsOf` and `Historical` are cold-only, `Operational` hot-only — so there is
+  nothing to narrow.
+
+- **A commit failure that said nothing deleted its data files anyway.** When a
+  commit failed for any reason other than a lost race, the files it wrote were
+  removed — after re-reading the table and keeping anything the current snapshot
+  referenced. That re-read closes the common case, not the one that matters: a
+  catalogue behind a cache, or one whose read lands on a replica, can answer from
+  before the commit it just applied. The files then look unreferenced, are
+  deleted, and a live snapshot points at objects that no longer exist.
+
+  Failures are now split. A catalogue that **refused** — `DataInvalid`,
+  `FeatureUnsupported`, `TableNotFound`, `NamespaceNotFound`,
+  `PreconditionFailed`, or a compare-and-swap lost on every attempt — positively
+  did not apply the commit, so its files go. Anything else, including
+  `Unexpected`, where a timeout and a 5xx both arrive, leaves them in place; so
+  does an unknown kind, `ErrorKind` being `#[non_exhaustive]`. The two mistakes
+  are not comparable: a kept file costs storage that orphan removal reclaims, a
+  deleted one destroys settled history.
+
+  **This makes out-of-band orphan removal load-bearing rather than tidy.** A
+  deployment whose catalogue is occasionally slow accumulates orphans on purpose,
+  and this crate cannot reclaim them — `FileIO` has no listing operation.
+
+- **The commit retry's exhaustion diagnostic was unreachable.** The loop ran
+  `0..=COMMIT_ATTEMPTS` — five attempts for a constant named four — while the
+  conflict arm carried its own `attempt < COMMIT_ATTEMPTS` guard, so the final
+  conflict fell through to the generic arm and returned a raw Iceberg error. The
+  message naming the real cause, *another writer is committing continuously*,
+  could never be reached. The loop bound is now the only guard and the count it
+  reports is the count it makes.
+
+- **The commit backoff had no jitter**, so two writers that collided once
+  collided again at every step of `50 << attempt`. That matters for exactly the
+  conflicts the archive lease does not cover — an archival commit racing a late
+  correction's cold append, or a second deployment on the same warehouse. Now
+  full jitter: uniform over `[0, base)`, which is the variant that decorrelates
+  on the first retry rather than merely spreading.
+
+- **A leaked lease wedged archival permanently, and reported it as benign.** A
+  lease is a session advisory lock on a connection it owns; a future dropped at an
+  await point returns that connection to the pool still holding it. Advisory locks
+  nest per session, so handing it out again let `pg_try_advisory_lock` succeed —
+  count two — and the single unlock on release left it at one. The lock was then
+  held by a connection nobody was using, every other session was refused, and it
+  surfaced as `lease_contended`: the one outcome operators are told not to alert
+  on.
+
+  Both lease paths now clear leaked locks on the connection they check out, which
+  is sound because a live lease *owns* its connection — a lock found on one
+  sitting in the pool is by definition leaked. This is the half that works for a
+  pool the deployment built itself, which P3 says is the normal case; `Settings`
+  keeps its `after_release` hook, which frees the lock sooner.
+
+- **Changing `archival_step` under a table that had already archived stranded a
+  whole partition below the watermark.** The step was never recorded, so the only
+  guard was `next_window` refusing a watermark off the configured grid — and that
+  checks a single instant. Doubling a daily step lands on an even epoch-day about
+  half the time, and the window then spans two partitions while
+  `PartitionId::for_window` names only the one at its lower bound: exactly one is
+  archived, the boundary advances past both, and the second partition's rows sit
+  below the watermark in a relation no plan will scan again.
+
+  The step is now written into the snapshot summary beside the watermark it is
+  the grid for, and a run configured differently is refused. **Absent is not a
+  mismatch** — a table with no history establishes it. Recorded rather than
+  inferred from the window, because `widen_over_empty` collapses an idle stretch
+  into one commit, so a window is legitimately wider than the step.
+
+- **The PostgreSQL floor is 15**, from 12. Not a syntax change — the SQL here
+  still runs on 12 — but a floor is a promise about where this crate may be
+  deployed, and the promise has to name versions somebody still patches. The
+  justification for 12 was that the managed services run it, and they do not: the
+  community dropped 12 in November 2024 and 13 in November 2025, RDS ended
+  standard support for 12 in February 2025 and for 13 in February 2026, and 14
+  goes in November 2026. 15 is the oldest still patched into 2027 and the oldest
+  under standard support at all three.
+
+  And it is **run** rather than promised. CI executes the whole integration suite
+  against the floor as well as the default, reading the version out of
+  `testkit::postgres::FLOOR` so the workflow and the documentation cannot drift
+  apart. `METERSTORE_POSTGRES_IMAGE_TAG` points any local run at another server.
+
+- **`MeterStore` is half the type it was: 57 public methods down to 32.** One
+  type carried six unrelated jobs — reading, writing, deriving a pinned view,
+  naming its relations, administering a deployment, and erasing subjects — so the
+  surface a caller read and wrote through was twice the size of that job, and
+  `purge_table` sat a keystroke from `query`.
+
+  **`store.admin()`** now carries the operational sixteen: `create_tables`,
+  `archive`, `archiver`, `maintenance`, `expire_snapshots`,
+  `reassert_watermark`, `verify_invariant`, `check_schema`,
+  `refresh_system_tables`, `status`, `snapshots`, `purge_table`, `cold_store`,
+  `hot_store` and the two `audit_attribute_column*`. `StoreAdmin` borrows the
+  store and is `Copy`, so it is written inline —
+  `store.admin().archive(now, 8).await?` — and costs nothing to make.
+
+- **The subject and erasure API is on `MeterCatalog` and nowhere else.** Ten
+  methods hung off the per-table `MeterStore` for a registry that is per
+  *deployment*: one `meterstore_subject_map`, one erasure unlinking every table
+  that registered the same identifier. A per-table form names a scope the data
+  does not have, and that was not theoretical — the guard on it was table-scoped
+  while its effect was not, so the same statutory sweep succeeded through one
+  handle and was refused through another (D40).
+
+  `MeterCatalog` gains `register_subject`, `erase_subject` and
+  `orphaned_suppressions`, which it was missing, and keeps the seven it had. A
+  table handle keeps `subject_registry()` and nothing else — one accessor for a
+  deployment that builds a single store and never a catalog, in place of eleven
+  methods that implied a scope.
+
+- **The prelude is the names a caller has to write**: roughly 60 down to 33. Out
+  go eight calendar functions, three planner internals, two builders you get from
+  `X::builder()`, and every type that only ever comes back from a method — a
+  `QueryResult` needs no import, because methods are called on it and its name is
+  inferred. Everything removed is still at its own path, which is one line on the
+  rare occasion it is needed against sixty names in scope on every occasion it is
+  not.
+
+- **`ColdStore::append_and_commit` takes the archival step**, and
+  `ColdStore::archival_step` is new with a default returning `None`. The step is a
+  property of the run rather than of the window, and the two differ whenever a
+  commit is widened over a gap.
+- **`HotStore::drop_partition` takes the reclaimed upper bound**, and
+  `HotStore::reclaimed_below` is new with a default returning `None`. The bound is
+  the caller's to supply because it is `partition.end(step)` and the step belongs
+  to the table's configuration rather than to the partition. A store that cannot
+  remember loses the detection, not the data.
+- **`HotStore::drop_partition` returns `Reclamation`** rather than `()`. The
+  store decides whether a window is free, because it is the only place the
+  question can be asked in the same transaction as the drop, and
+  `Reclamation::HeldByReader` is an ordinary outcome rather than a failure.
+- **Four dev-dependencies dropped**: `testcontainers`, `testcontainers-modules`,
+  `tempfile` and `serde_json` were declared twice. Test targets see
+  `[dependencies]` too, so the first three arrive with `testkit` — which every
+  test using them is gated on — and the fourth is unconditional. `futures-util`
+  went with them; nothing referenced it.
+- **`ColdStore::create_tables` takes a `MaintenancePolicy`**, and
+  `IcebergCold::create_table_with` with it. The contract has to reach the table,
+  and the cold store is where a table's properties are written. A store with
+  nowhere to put it ignores it, and the contract is a paragraph again.
+- **`ArchivalOutcome` and `CommitInfo` gain `added`**, the bytes and file count a
+  commit wrote. `None` for a commit that added no data files.
+- **`HotStore` gains `pin_reader` and `release_pin`**, both defaulted. A store
+  with no registry grants none and says so with `None`, exactly as
+  `try_archive_lease` does — it must not pretend to hold a floor it cannot.
+- **`meterstore_erasures` gains `hmac_key_id`** and a constraint pairing it with
+  `natural_id_hmac`. A registry created by an earlier version is refused at
+  `create_tables` naming the tables to drop, which is what an unpublished crate
+  offers instead of a migration.
+
+### Added
+
+- **`meterstore_reclaimed`**, one row per table, created alongside the hot table.
+- Two tests behind Docker, where this lives: one asserting a scan below the
+  reclaimed boundary refuses, and its counterexample asserting a scan at or above
+  it is untouched — because a guard that refuses everything would pass the first
+  on its own.
+- **`max_pin_age`**, six hours, and `meterstore_pins` alongside the hot table.
+- Seven tests. Two against the archiver: a registration below the window holds it
+  past the grace, and one at the window's upper bound does not — the second is
+  what stops a registry that simply defers whenever anything is registered from
+  passing the first. Five behind Docker: the same pair against real PostgreSQL
+  plus a refused drop recording no reclamation, an expired registration being
+  swept rather than merely ignored, and the whole path end to end — a plan held
+  across an archival run keeps the window that moved, reads its 288 rows, and
+  stops holding it once the plan is dropped.
+- The concurrency suite runs at the **default** one-hour grace instead of a year.
+  It drives `now` a day per cycle, so the grace is exhausted by the first jump
+  and reclamation is live for the whole run, with an assertion that a partition
+  really was taken — a suite that widened the grace to stay clear of reclamation
+  never met the interleaving it exists to test. It does not prove the registry:
+  its readers plan and execute in one step.
+- **`declared_file_size`** on `TableConfig` and in `[tables.archival]`, and
+  `MaintenancePolicy` carrying it to the cold tier. `system.config` shows it,
+  reading `unset: a maintenance tool assumes 512 MiB` rather than a dash, because
+  absent here is the status quo and not a safe default.
+- **`meterstore reassert-watermark [--table NAME]`.** The one step of the
+  maintenance contract whose omission fails *every query on a table at once* —
+  and, until now, the one reachable only by writing a Rust binary whose body is a
+  single call. Compaction and orphan cleanup are out of band by design, they
+  commit valid Iceberg that says nothing about tiering, and the boundary is then
+  findable only by walking back the parent chain; expiring any ancestor on that
+  walk strands it. The person doing that maintenance is holding a cron entry.
+
+  A thin wrapper over the existing call, and it inherits both of its properties:
+  it republishes what the history already says, so it cannot move the boundary,
+  and it does nothing when the current snapshot already carries one. It exits
+  clean on a table that has never archived, saying so rather than reporting the
+  absent boundary as current. `maintain --expire-snapshots` already re-stamps
+  before expiring, so a deployment on that schedule needs nothing new.
+- **`meterstore_erasures.hmac_key_id`**, and `OrphanedSuppressions` alongside it.
+  The registry schema changes in place rather than through a migration — the
+  crate is unpublished — so `create_tables` refuses a table created by an earlier
+  version and names the two tables to drop.
+- Four tests behind Docker. The one that pinned this as an unreportable hazard now
+  asserts it is reported, and that restoring the key clears it; a lifted
+  suppression is not counted, because an alarm nobody can clear is worse than
+  none; a registry that lost its only key reports every live suppression, which is
+  the same failure by a shorter road; and the database refuses a tag written
+  without its key's name.
+- One test driving `reassert-watermark` through the CLI against a real warehouse:
+  a foreign commit leaves the current snapshot stating no boundary, the verb puts
+  the same boundary back, and a second run commits nothing. A fresh deployment
+  runs it clean in the smoke test, because a verb that failed on a quiet table
+  could not be scheduled.
+- **A third documentation convention, enforced**: a published page may not carry
+  a plan. The sibling of the changelog rule, pointed forward — a page that says
+  what somebody means to write is stale the moment the plan changes, and nobody
+  editing the plan goes looking for the page. Scoped to `site/content`, because
+  a pre-1.0 README names its gaps on purpose.
+- **`tests/it/claims.rs`**: the sentences this repository writes about itself,
+  checked against whatever would make them true. Two now — that a CI job actually
+  runs the integration suite against the floor and derives the version from the
+  code, and that no document promises a floor the code does not declare. These
+  are the claims that rot in silence, because nothing fails when they stop being
+  true.
+- **`tests/it/interop_adbc.rs`**: the Flight SQL surface driven from **ADBC**, the
+  API a non-Rust consumer actually holds, by a driver written in another language
+  that validates responses against the specification. A connection opened, a query
+  spanning the watermark, and a catalogue browse. Both defects above were
+  invisible to the Rust client, which accepts whatever schema it is handed — so
+  the suite that said this surface worked was reporting on itself.
+- **`tests/it/api_surface.rs`**, two checks with no database behind them: the
+  public method count of `MeterStore`, `StoreAdmin` and `MeterCatalog`, and the
+  size of the prelude. Snapshots rather than caps — a cap is a number somebody
+  guessed, and it fires on the first honest addition while saying nothing about
+  the twentieth. These fail on *change*, so adding a method costs one line here,
+  which is the moment to ask whether it belongs on that type. `MeterStore`
+  reached fifty-seven across six jobs before anybody counted.
+- Three tests against a real warehouse: the table carries every contract property
+  and carries **no** file-size target while none is declared; a size declared
+  after the table exists still reaches it, and a re-measured one replaces it; and
+  an archival commit reports the bytes and file count it wrote, which is the
+  figure the setting is meant to be copied from. 1000 tests.
+
+### Documentation
+
+- **`DETACH PARTITION CONCURRENTLY` is not adopted, and the notes that said it
+  would be are corrected.** PostgreSQL 14's `inhdetachpending` governs what a
+  planner walking the *parent's* partition list sees. The hot scan never walks
+  it: it enumerates the partitions once and reads each by name, which is a
+  correctness decision and the reason a detach is invisible to a scan here at
+  all. The feature's visibility semantics therefore answer a question this
+  design does not ask. What remains on offer is lock strength on a detach that
+  runs once per cycle, takes milliseconds, and already gives up rather than
+  queueing — against a floor at 14, a session GUC to hand-manage outside a
+  transaction, and a fourth crash state needing `DETACH … FINALIZE`. The plain
+  `DETACH PARTITION` stays, with its timeout and its `deferred` outcome.
+
+- **The PostgreSQL floor's justification no longer holds.** The floor is 12 and
+  the stated reason is that the managed services run it. They no longer do: RDS
+  ended standard support for 12 in February 2025 and for 13 in February 2026,
+  and the community dropped 12 in November 2024 and 13 in November 2025. The
+  floor is unchanged for now and where it should land is recorded as open,
+  alongside moving the integration suite off PostgreSQL 16.
+
+## [0.14.0] — 2026-09-18
+
+A hostile audit of the whole crate — the planner, the tiering and cold-tier paths,
+erasure and the public surface — read against the documentation that describes
+them. Save for the dependency advisory below, the defects are all of one kind:
+**a stated property the code did not hold.** Eleven are fixed here; the rest are
+tracked, and the ones that change a correctness argument rather than a line of
+code are written up rather than quietly patched.
+
+### Changed — breaking
+
+- **`metering` 0.24 or later**, raised from 0.23. A caret pin on a `0.x` excludes
+  the previous minor, so a consumer holding `metering` 0.23 will not resolve —
+  and that exclusion is the point rather than a side effect. The stored form of
+  both JSON columns is upstream's `serde` output, asserted here byte for byte, so
+  pinning to one minor series is what keeps those literals describing a single
+  spelling instead of whatever a consumer happens to resolve.
+
+  Nothing needed porting. Every breaking change in 0.24 — `classify_messtyp`,
+  `warm_water_heat_kwh`, `ImbalanceSaldo::contracted_kwh`, `IMBALANCE_PCT_DP`,
+  `ZustandszahlParams::niederdruck`, `Dynamization::factor`,
+  `classify_rollout_obligation` — is a *computation*, and this crate calls none of
+  them. A domain release that reprices Ausfallarbeit and adds two modules is, at
+  this seam, a version number.
+
+
+- **`SubjectRegistry::expire_epochs_before` returns `SweepOutcome`**, not
+  `Vec<ErasureRecord>`, and so do `MeterStore::anonymise_before` and
+  `MeterCatalog::anonymise_before`. The durable trail is in `meterstore_erasures`
+  before the call returns, so a row per erasure duplicated durable state into an
+  unbounded `Vec` the caller almost always only counted.
+  `SubjectRegistry::erasures` reads the trail.
+- **`MaintenanceOutcome::anonymised` is `Option<SweepOutcome>`**, not
+  `Vec<ErasureRecord>` — the cycle's own result is `Clone` and was the largest
+  allocation in the process. `subjects_anonymised()` returns `u64`; `None` and
+  `Some` now distinguish "no policy configured" from "nothing was due".
+- **`SubjectRef::new` refuses market identifiers, non-canonical epochs, and tokens
+  past `MAX_REFERENCE_TOKEN_CHARS`.** A deployment minting its own references may
+  need to change what it mints.
+
+### Removed
+
+- **`ScanSpec::partition_step`**, with its builder, its getter and the config call
+  that set it. Declared, documented at length and **never read**: `scan_range`
+  derives a partition's exclusive end from the next partition's start instead, and
+  explains why that is better. A field, a rationale and a configuration path for
+  behaviour that did not exist.
+
+### Fixed
+
+- **A crash between the detach and the cold commit stopped archival for that
+  table permanently.** `reclaim_orphans` runs at step 1 of the cycle, before the
+  window is even picked, and refused any detached partition the watermark did not
+  cover — which is exactly what an interrupted run leaves. Every later cycle then
+  aborted at step 1, and because `Maintenance::run_once` reports a table's failure
+  and carries on, the deployment read healthy while one hot tier grew without
+  bound until somebody re-attached by hand. The module's own header promised
+  "every job is idempotent and recovers from an interruption on its own".
+
+  Nothing was ever lost and nothing needed an operator: the partition still held
+  every row, the watermark had not moved, and the window it names is the one
+  archival is about to take. That orphan is now archived again rather than
+  refused, and `HotStore::detach_partition` is **idempotent** — a contract, not a
+  convenience, since the resumed run's first step is to detach what is already
+  detached. An orphan that is *not* the window now due is still refused: no
+  archival run produces one, so it really is operator territory.
+
+
+- **A column reorder transposed values in the cold tier, silently.** `align`
+  paired a batch's columns with the table's fields **by position** while
+  `evolution::compare` gates schema changes **by name** — so permuting two
+  same-typed attribute columns (an alphabetised TOML, a second deployment, a
+  reordered builder chain) passed the compatibility check, the `Utf8 → Utf8` cast
+  succeeded, and every row archived from then on carried each value under the
+  other's name. Under field ids Iceberg resolves by, in the tier whose purpose is
+  to be read by engines that trust the schema. Columns are now matched by name and
+  a missing field is an error. Two independent audits found the same shape in
+  three places; the general rule is now written down: **where a schema is compared
+  by name, the data must be moved by name.**
+
+- **The retention sweep was the one unbounded operation in the crate.** One
+  `DELETE … RETURNING` with no `LIMIT`, in one transaction, materialising every
+  reference and rebuilding it as a record with `reason` and `actor` cloned per
+  row — against a memory budget the crate holds *by construction*, inside a
+  maintenance cycle documented as *bounded*. The code's own comment named the
+  scale ("a deployment's whole 2021 is due on one January morning") and
+  materialised it anyway, while `ErasureQuery` — which only **reads** the audit
+  trail — had a mandatory validated limit. It now deletes in batches, each its own
+  transaction, and is **resumable**: an interrupted sweep is finished by running it
+  again.
+
+- **`anonymise_before` refused to discharge a statutory duty after a schema
+  change.** The guard checked *this table's* subject column; the effect is
+  deployment-wide. So the identical sweep succeeded through one handle and was
+  refused through another, and — the reachable case — a deployment that stopped
+  declaring a subject column could no longer sweep the mapping rows it had already
+  written, leaving personal data attributable past the `[MsbG § 60 Abs. 6]`
+  ceiling. Neither form is gated on a column declaration now.
+
+- **`SubjectRef` admitted the identifiers it exists to keep out.** The length floor
+  ruled out the short ones (MaLo 11, BDEW 13) and admitted the long ones, which are
+  more identifying: a Zählpunktbezeichnung is 33 uppercase alphanumerics and
+  cleared both the floor and the alphabet. A token that **parses** as a MaLo-ID,
+  Messlokation, EIC or BDEW code is now refused — they carry check digits, so
+  recognising one is arithmetic. An epoch must also be spelled canonically:
+  `i32::from_str` accepted `+2026` and `02026`, which passed the Rust check and
+  were then refused by the table's textual `CHECK`.
+
+- **A refused write now names the rule, whichever tier refused it.** The two
+  exclusion constraints are created per partition, so `constraint` carried the
+  window — `readings_2026_07_20_0000_one_operator` — and a caller branching on it
+  saw a different string every day, while the cold path reported stable names for
+  the same rules. Normalised to `one_operator_per_reading` and
+  `spans_do_not_overlap`; the reported table is the parent rather than the window.
+
+- **Archiving a window already at the boundary appended a second copy of it.**
+  The monotonicity assertion is `next >= current` and equality passed — asserted
+  deliberately, as "idempotent re-advance is legal", which is right for a
+  correction append that republishes the boundary unchanged and wrong for an
+  archival commit. Two archivers targeting one window: the first commits, the
+  second loses the compare-and-swap, refreshes, re-derives the same `next`, and
+  equality let it append the same rows again. Nothing reported it — the archiver
+  reconciles the count it wrote against the count it read, and the invariant check
+  looks at PostgreSQL, where the rows are correctly absent. `Summary::Advance` now
+  requires a **strict** advance and names the case: another writer committed this
+  window, abort rather than duplicate it.
+
+- **A partition reclaimed mid-scan now says so.** The hot scan enumerates
+  partitions and then reads each by name, and those are two moments; a plan that
+  outlives `reader_grace` finds a relation that was there when it was enumerated
+  and gone when it is read. That surfaced as a raw `42P01` inside `Error::Storage`
+  — a message about a missing relation, which reads as a schema problem. It is now
+  an `InvariantViolated` naming the partition and saying to raise `reader_grace`.
+  This is the **loud** half of R18; the silent half — a partition reclaimed
+  *before* the enumeration, which is simply absent from it — needs a boundary this
+  layer does not have and is tracked.
+
+- **A leaked archive lease wedged archival and reported it as benign.** The lease
+  holds a *pooled* connection and releases by unlocking before dropping it, so a
+  future cancelled at an await point — a task abort, a `timeout`, shutdown —
+  returned the connection to the pool still holding the session lock. Every later
+  attempt on a different connection then refused, archival stopped, and it
+  surfaced as `lease_contended`, the one outcome operators are told **not** to
+  alert on. `Settings` now installs an `after_release` hook running
+  `pg_advisory_unlock_all()`, which makes the RAII claim true rather than
+  asserted. The boolean `pg_advisory_unlock` returns is also checked — a release
+  that did nothing was previously indistinguishable from one that worked — and the
+  log line that said the lock "dies with this session" no longer says so, because
+  it does not. A deployment that builds its own pool needs the same hook.
+
+### Security
+
+- **`rustls` 0.23.44 → 0.23.45** — RUSTSEC-2026-0285: TLS 1.3 handshake messages
+  were accepted at the wrong encryption level when they followed a key-changing
+  message in the same record. Reached transitively through the AWS SDK under the
+  `s3tables` feature. The transcript stays authenticated, so this is not a path to
+  altering a handshake; `just deny` fails on it regardless, which is the point of
+  having the advisory check in the gate.
+
+### Documentation
+
+- **`latest()` is not a point lookup unless you bound it.** Three doc comments
+  promised "an `ORDER BY … DESC LIMIT 1` the index answers" and "four point
+  lookups". Without a `range` the query carries no bound on `from`, so the split
+  keeps both tiers, the cold half is the whole archive, a hot half forces version
+  resolution over all of it, and the limit cannot be pushed below the sort. On the
+  table these modules exist for — unbounded, and undiscardable under
+  `[AO § 146 Abs. 4]` — that is a full history scan per call. The claims now say
+  what makes them true.
+
+
+- `SubjectRef::new` now states **what the check cannot do**: it cannot tell a keyed
+  hash from an unkeyed one, since both are 64 hex characters. The old wording
+  implied the shape check certified unlinkability.
+- The reader-grace mechanism is written up as what it is — a wall-clock guess
+  protecting a correctness property — with the literature's answer beside it:
+  epoch-based reclamation, where the epoch is the watermark. The concurrency
+  fixture raises the grace to 365 days, so the property has no test.
+- The tiering pattern has a name: Apache Pinot's **`timeBoundary`**, and Apache
+  Fluss independently puts its boundary in the Iceberg snapshot summary too.
 
 ## [0.13.0] — 2026-09-08
 

@@ -554,15 +554,6 @@ impl MeterStore {
         Ok((resolved, name, self.config.discriminator_columns()))
     }
 
-    /// Every committed state of the cold table, newest first.
-    ///
-    /// The list an auditor's question resolves against: "which snapshot did the
-    /// settlement run against" is answered by an id from here, and
-    /// [`as_of`](Self::as_of) then reproduces it exactly.
-    pub async fn snapshots(&self) -> Result<Vec<crate::tiering::store::SnapshotInfo>> {
-        self.cold.snapshots(self.config.name()).await
-    }
-
     /// A session pinned to a past state, for a reproducible read.
     ///
     /// This is the regulatory feature. MaBiS settlement must be reproducible, and
@@ -601,7 +592,7 @@ impl MeterStore {
         // pinned one would report the epoch for a settlement rerun that ran
         // against a real boundary. The list is newest-first, so the suffix from
         // the pinned snapshot is its own history.
-        let snapshots = self.snapshots().await?;
+        let snapshots = self.admin().snapshots().await?;
         let pinned_watermark = snapshots
             .iter()
             .position(|s| match snapshot {
@@ -852,160 +843,6 @@ impl MeterStore {
     /// The current tier boundary.
     pub async fn watermark(&self) -> Result<TieringWatermark> {
         self.cold.watermark(self.config.name()).await
-    }
-
-    /// An archiver for this store's table.
-    pub fn archiver(&self) -> Archiver<Arc<dyn HotStore>, Arc<dyn ColdStore>> {
-        Archiver::new(
-            Arc::clone(&self.hot),
-            Arc::clone(&self.cold),
-            self.config.clone(),
-        )
-    }
-
-    /// Scheduled upkeep for this store: archival, expiry, and the health check.
-    ///
-    /// Nothing runs until [`Maintenance::run_once`] or
-    /// [`Maintenance::spawn`] is called. A store that started a background loop
-    /// on construction would surprise a process that only wanted to read.
-    ///
-    /// [`Maintenance::run_once`]: crate::session::Maintenance::run_once
-    /// [`Maintenance::spawn`]: crate::session::Maintenance::spawn
-    pub fn maintenance(&self) -> super::Maintenance {
-        super::Maintenance::new(self.clone())
-    }
-
-    /// Archive every window that is due, up to `max_windows`.
-    pub async fn archive(
-        &self,
-        now: time::OffsetDateTime,
-        max_windows: usize,
-    ) -> Result<Vec<ArchivalOutcome>> {
-        self.archiver().catch_up(now, max_windows).await
-    }
-
-    /// Expire cold-tier snapshots past the configured retention window.
-    ///
-    /// Returns how many were removed. Not called automatically: the retention
-    /// window is a compliance decision, and a store that quietly expired
-    /// snapshots would be deciding how far back a settlement can be reproduced.
-    pub async fn expire_snapshots(&self, now: time::OffsetDateTime) -> Result<usize> {
-        self.cold
-            .expire_snapshots(
-                self.config.name(),
-                self.config.snapshot_retention(),
-                self.config.min_snapshots_to_keep(),
-                now,
-            )
-            .await
-    }
-
-    /// Put the tiering boundary back on the cold table's current snapshot.
-    ///
-    /// Run this after any out-of-band maintenance — the compaction or orphan
-    /// cleanup this crate cannot perform itself, done with Spark or PyIceberg
-    /// against the same table. Those produce valid Iceberg commits that carry no
-    /// watermark, and the boundary is then only findable by walking back the
-    /// parent chain, which snapshot expiry can punch a hole in.
-    ///
-    /// It republishes what the history already says, so it cannot move the
-    /// boundary, and it is a no-op when the current snapshot already carries one.
-    /// [`expire_snapshots`](Self::expire_snapshots) calls it first for that
-    /// reason, so a deployment on the maintenance schedule need not.
-    pub async fn reassert_watermark(&self) -> Result<bool> {
-        Ok(self
-            .cold
-            .reassert_watermark(self.config.name())
-            .await?
-            .is_some())
-    }
-
-    /// Assert that no row sits in the wrong tier.
-    pub async fn verify_invariant(&self) -> Result<()> {
-        self.archiver().verify_invariant().await
-    }
-
-    /// Compare the configured schema against the cold table's.
-    ///
-    /// Reports every difference, whether or not it is safe. Callers that want the
-    /// table to *stop* on an unsafe one use
-    /// [`Compatibility::require_safe`](crate::evolution::Compatibility::require_safe),
-    /// which the archiver already does before every run.
-    ///
-    /// `None` when the cold store cannot report a schema. That is deliberately
-    /// not "compatible": a check that cannot run has proved nothing, and saying so
-    /// beats implying it passed.
-    pub async fn check_schema(&self) -> Result<Option<crate::evolution::Compatibility>> {
-        let Some(stored) = self.cold.stored_schema(self.config.name()).await? else {
-            return Ok(None);
-        };
-        let configured = crate::encode::schema::storage_schema(&self.config.extra_columns());
-        Ok(Some(crate::evolution::compare(&configured, &stored)))
-    }
-
-    /// Create both tiers' tables with this store's configuration.
-    ///
-    /// The single entry point on purpose. The hot table's primary key, the cold
-    /// table's schema and the resolution view's `PARTITION BY` all have to agree
-    /// on what identifies a reading; creating them separately means three places
-    /// to keep in step, and a mismatch shows up as readings that fail to
-    /// supersede rather than as an error.
-    pub async fn create_tables(&self) -> Result<()> {
-        let extra = self.config.extra_columns();
-        self.hot
-            .create_tables(
-                self.config.name(),
-                &self.config.merge_key(),
-                &extra,
-                self.config.time_model(),
-            )
-            .await?;
-        self.cold
-            .create_tables(
-                self.config.name(),
-                &self.config.identity_column_names(),
-                &extra,
-            )
-            .await?;
-        // The registry's tables belong to the same creation step: a subject
-        // column whose registry has no tables accepts writes and fails the first
-        // erasure request, which is exactly when failing is least useful.
-        if let Some(registry) = &self.registry {
-            registry.create_tables().await?;
-        }
-        info!(table = self.config.name(), "tables ready");
-        Ok(())
-    }
-
-    /// Refresh `system.tables` and `system.config` in this session.
-    ///
-    /// Explicit rather than automatic: gathering the status reads the watermark
-    /// and counts stranded rows, and a query should never silently pay for that.
-    pub async fn refresh_system_tables(&self, now: time::OffsetDateTime) -> Result<()> {
-        super::system::SystemTables::new(&self.hot, &self.cold, &self.config)
-            .register(&self.ctx, now)
-            .await
-    }
-
-    /// Current operational status, without going through SQL.
-    pub async fn status(&self, now: time::OffsetDateTime) -> Result<super::system::TableStatus> {
-        super::system::SystemTables::new(&self.hot, &self.cold, &self.config)
-            .status(now)
-            .await
-    }
-
-    /// The cold tier, for callers that need it directly.
-    ///
-    /// Exposed because the tier traits are the extension point: a
-    /// deployment may want to list snapshots, seed a watermark, or drive the
-    /// store's own maintenance from outside the handle.
-    pub fn cold_store(&self) -> &Arc<dyn ColdStore> {
-        &self.cold
-    }
-
-    /// The hot tier, for callers that need it directly.
-    pub fn hot_store(&self) -> &Arc<dyn HotStore> {
-        &self.hot
     }
 
     /// The deployment's declared extra columns.
@@ -1557,7 +1394,7 @@ impl MeterStore {
     /// archival never closes a window newer than `now - settlement_lag`, a week
     /// by default, while current data has `from` near now. Reopen per ingest run
     /// rather than caching a writer for the process lifetime;
-    /// [`verify_invariant`](Self::verify_invariant) is the backstop.
+    /// [`verify_invariant`](StoreAdmin::verify_invariant) is the backstop.
     ///
     /// That margin is thinnest in a **backfill**, whose `from` is old, and a
     /// **catch-up**, where archival advances several windows at once. Neither is
@@ -1583,288 +1420,39 @@ impl MeterStore {
         })
     }
 
-    /// Irreversibly destroy this table and every reading in it, in both tiers.
+    /// This store's operational surface: setup, archival, maintenance, teardown.
     ///
-    /// **The only operation in this crate that deletes stored readings.**
-    /// Everything else is append-only: a correction is a new version, a
-    /// hot partition drop reclaims space for rows already durable in Iceberg, and
-    /// erasure destroys a *mapping* rather than rows. That asymmetry is
-    /// deliberate — a settlement must stay reproducible — and it means this is the
-    /// operation to reach for when the answer really is "none of this data should
-    /// exist any more".
+    /// Everything a *deployment* does to a table rather than what an application
+    /// does with its readings — `create_tables`, `archive`, `expire_snapshots`,
+    /// `status`, `purge_table` and the rest. Kept behind one call so the surface
+    /// a caller reads and writes through stays the size of that job, and so the
+    /// operation that destroys a table is not adjacent to the one that queries
+    /// it.
     ///
-    /// The two cases that need it:
-    ///
-    /// - **Decommissioning a tenant.** With a table per tenant, this is
-    ///   how their data leaves. Within a shared table there is no equivalent, and
-    ///   there cannot be: removing one tenant's rows from an Iceberg table means
-    ///   rewriting files, which `iceberg-rust` cannot do.
-    /// - **A statutory maximum retention.** Same constraint: expiry is
-    ///   whole-table, so a period that differs per tenant needs a table per
-    ///   tenant.
-    ///
-    /// # The name must be repeated
-    ///
-    /// `confirm` must equal this store's table name. A handle carries no visual
-    /// indication of which table it points at, and this destroys data with no
-    /// recovery path — so the caller states the name and the store checks it,
-    /// rather than trusting that the right handle was reached for.
-    ///
-    /// # What is destroyed
-    ///
-    /// The PostgreSQL table with every partition, attached or detached; the
-    /// Iceberg catalog entry; and the Parquet data files, manifests and metadata
-    /// in object storage. Snapshots do not survive it, so `as_of` against this
-    /// table stops working — that is the point.
-    ///
-    /// The subject registry is **not** touched: it is shared across tables, and
-    /// destroying one table's readings says nothing about whether a subject's
-    /// mapping should go. Use [`erase_subject`](Self::erase_subject) for that.
-    pub async fn purge_table(&self, confirm: &str) -> Result<()> {
-        let table = self.config.name();
-        if confirm != table {
-            return Err(Error::config(format!(
-                "refusing to purge: this store manages {table:?} but the confirmation \
-                 named {confirm:?}. The name is repeated because a purge destroys \
-                 every reading in the table with no recovery path"
-            )));
-        }
-
-        // Cold first. If this succeeds and the hot drop then fails, what remains
-        // is a PostgreSQL table holding only the unarchived window — visible,
-        // countable, and re-purgeable. The other order would leave archived data
-        // in object storage with nothing in PostgreSQL to name it, which is the
-        // state that looks like success and is not.
-        self.cold.purge_table(table).await?;
-        self.hot.drop_table(table).await?;
-
-        warn!(table, "table purged: every reading destroyed in both tiers");
-        Ok(())
+    /// Free to make and borrows this store, so it is written inline:
+    /// `store.admin().archive(now, 8).await?`.
+    #[must_use]
+    pub const fn admin(&self) -> StoreAdmin<'_> {
+        StoreAdmin { store: self }
     }
 
-    /// The registry backing this table's subject column, if configured.
+    /// The registry this table's subject column resolves against.
+    ///
+    /// **The only subject operation on a table handle**, and deliberately so:
+    /// the registry is one `meterstore_subject_map` for the whole deployment
+    /// (D20), so every erasure it performs reaches every table that registered
+    /// the same identifier. A per-table `erase_subject` would name a scope the
+    /// data does not have, and one did — the guard on it was table-scoped while
+    /// its effect was not, so the same sweep succeeded through one handle and
+    /// was refused through another.
+    ///
+    /// [`MeterCatalog`](crate::MeterCatalog) is the deployment handle and
+    /// carries the operations. This is here for a deployment that builds one
+    /// store and never a catalog, which cannot otherwise reach the registry it
+    /// handed to the builder — or never held, having come from a configuration
+    /// file.
     pub fn subject_registry(&self) -> Option<&crate::erasure::SubjectRegistry> {
         self.registry.as_ref()
-    }
-
-    /// Register a natural identifier for the retention epoch containing `at`,
-    /// and get the reference to store on that period's readings.
-    ///
-    /// `at` is an instant *from the data* — any interval in the period being
-    /// written — not a wall clock. A reference belongs to one collection year
-    /// because § 60 Abs. 6 comes due per value, so a backfill of 2024 must carry
-    /// 2024's reference however long after the fact it arrives, and a write path
-    /// that passed `now()` here would attach this year's reference to it and
-    /// keep it attributable four years too long.
-    ///
-    /// `sparte` is the commodity of those readings, because the epoch is the
-    /// year of the day they are **balanced** on and for gas that day runs 06:00
-    /// to 06:00. It is the same [`retention_epoch`] the write path checks the
-    /// reference with, so what this mints is by construction what that accepts —
-    /// see [`retention_epoch`] for the six hours a year it matters over.
-    ///
-    /// The store checks that: a reference whose epoch does not match the year a
-    /// reading is balanced on is refused at the write.
-    ///
-    /// [`retention_epoch`]: crate::erasure::retention_epoch
-    /// [`SubjectRegistry::register`]: crate::erasure::SubjectRegistry::register
-    pub async fn register_subject(
-        &self,
-        natural_id: &str,
-        at: time::OffsetDateTime,
-        sparte: metering::interval::Sparte,
-    ) -> Result<crate::erasure::SubjectRef> {
-        self.require_registry()?
-            .register(natural_id, at, sparte)
-            .await
-    }
-
-    /// Every retention epoch this deployment still links `natural_id` to.
-    ///
-    /// The question [`register_subject`](Self::register_subject) cannot answer:
-    /// a reference names one collection year, so *"what do we still hold on this
-    /// person?"* needs the mapping enumerated rather than probed year by year.
-    /// Ascending, and empty once every epoch has been erased or has expired.
-    ///
-    /// The registry is deployment-wide, so this is the same answer through any
-    /// table's handle.
-    pub async fn subject_epochs(&self, natural_id: &str) -> Result<Vec<i32>> {
-        self.require_registry()?.epochs(natural_id).await
-    }
-
-    /// [`subject_epochs`](Self::subject_epochs) with the reference and the
-    /// registration time as well.
-    pub async fn subject_registrations(
-        &self,
-        natural_id: &str,
-    ) -> Result<Vec<crate::erasure::SubjectRegistration>> {
-        self.require_registry()?.registrations(natural_id).await
-    }
-
-    /// Whether an identifier is on the suppression list.
-    ///
-    /// The answer to *"why is this registration failing?"*, which is otherwise
-    /// indistinguishable from a configuration fault. `false` where no suppression
-    /// key is configured, because there is then nothing to check against — not
-    /// because the identifier was never erased.
-    pub async fn is_subject_suppressed(&self, natural_id: &str) -> Result<bool> {
-        self.require_registry()?.is_suppressed(natural_id).await
-    }
-
-    /// Let an identifier be registered again after an erasure carried out
-    /// against the wrong subject.
-    ///
-    /// It does not restore the old link — the mapping is gone and the readings
-    /// stay unattributable — and it is itself audited, because it reverses a
-    /// compliance decision. See
-    /// [`SubjectRegistry::lift_suppression`](crate::erasure::SubjectRegistry::lift_suppression).
-    pub async fn lift_subject_suppression(
-        &self,
-        natural_id: &str,
-        reason: &str,
-        actor: &str,
-        now: time::OffsetDateTime,
-    ) -> Result<bool> {
-        self.require_registry()?
-            .lift_suppression(natural_id, reason, actor, now)
-            .await
-    }
-
-    /// The erasure audit trail, deployment-wide.
-    ///
-    /// One list rather than one per table: the registry is shared, so a subject's
-    /// linkage is destroyed everywhere at once and concatenating per table would
-    /// report every row as many times as the deployment has tables.
-    pub async fn erasures(
-        &self,
-        query: &crate::erasure::ErasureQuery,
-    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-        self.require_registry()?.erasures(query).await
-    }
-
-    /// Destroy a subject's linkage, leaving the readings anonymous.
-    ///
-    /// The lake keeps every row. What disappears is the mapping that says whose
-    /// they are, which is what Article 17 asks for over storage that cannot
-    /// rewrite history.
-    pub async fn erase_subject(
-        &self,
-        subject: &crate::erasure::SubjectRef,
-        reason: &str,
-        actor: &str,
-        now: time::OffsetDateTime,
-    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-        self.require_registry()?
-            .erase(subject, reason, actor, now)
-            .await
-    }
-
-    /// Destroy a subject's linkage, named the way a request names it.
-    ///
-    /// An Article 17 request arrives with a customer number, a contract, an
-    /// occupancy — never with the opaque token the lake stores. This takes that
-    /// identifier and unlinks **every** retention epoch behind it, returning one
-    /// record per epoch.
-    ///
-    /// With a suppression key configured, an identifier this deployment holds no
-    /// mapping for is still recorded and refused thereafter — a request that
-    /// arrived before the ingest did is honoured rather than lost. See
-    /// [`SubjectRegistry::erase_all`](crate::erasure::SubjectRegistry::erase_all).
-    ///
-    /// The registry is deployment-wide, so this reaches every table that
-    /// registered the same identifier — the authoritative Lastgang and the
-    /// non-authoritative second stream together.
-    pub async fn erase_subject_by_id(
-        &self,
-        natural_id: &str,
-        reason: &str,
-        actor: &str,
-        now: time::OffsetDateTime,
-    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-        self.require_registry()?
-            .erase_all(natural_id, reason, actor, now)
-            .await
-    }
-
-    /// Anonymise every subject whose readings all predate `cutoff`.
-    ///
-    /// # This is a duty on a clock, not a request to wait for
-    ///
-    /// § 60 Abs. 6 MsbG obliges the Messstellenbetreiber to **erase or
-    /// anonymise** personenbezogene Messwerte as soon as storing them is no
-    /// longer necessary, *"spätestens jedoch nach drei Jahren ab dem Schluss des
-    /// Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*.
-    ///
-    /// Three years is a **ceiling**, and the operative trigger is earlier — the
-    /// opposite of a retention mandate. A store built to keep personal metering
-    /// values for three years *because the law says so* has it inverted.
-    ///
-    /// [`erase_subject`](Self::erase_subject) answers an Article 17 request, one
-    /// subject at a time, when someone asks. This is the standing obligation:
-    /// nobody asks, and it comes due anyway.
-    ///
-    /// # Why anonymising is the whole of it
-    ///
-    /// The statute says *löschen **oder** anonymisieren*, and the second branch
-    /// is the one an immutable lake can take. Destroying the mapping leaves
-    /// quantities against an opaque token — anonymous data, outside the
-    /// Regulation by Recital 26 — while the settlement record stays reproducible,
-    /// which is what the Eichrecht documentation duties and every later audit
-    /// need. It is also `O(1)` per subject against a lake that cannot rewrite
-    /// files at all, so the branch MeterStore can take is also the one
-    /// that costs nothing.
-    ///
-    /// # The unit is a collection year, not a subject
-    ///
-    /// § 60 Abs. 6 runs on *"der jeweilige Messwert"*, so what comes due is a
-    /// `(subject, year)` pair rather than a subject. A reference is minted for
-    /// one collection year ([`register_subject`](Self::register_subject)) and
-    /// this deletes the mapping rows whose year has passed the ceiling — so an
-    /// active customer's 2021 values stop being attributable on schedule while
-    /// their 2026 values are untouched.
-    ///
-    /// Keyed instead to a subject's *latest* reading, as this once was, neither
-    /// half worked: a customer who stayed connected kept a decade of values
-    /// linked, and the due-date came from a query, so a sweep run through a
-    /// session that could not see the hot window would find a live customer's
-    /// last reading years old and erase it. This reads no table at all.
-    ///
-    /// `cutoff` is the caller's: the statutory ceiling is a calendar computation
-    /// over the year a value was *erhoben*, and the earlier "no longer necessary"
-    /// trigger is a business decision this crate has no view on.
-    ///
-    /// References the registry no longer resolves are skipped, so the sweep is
-    /// idempotent and a re-run writes no second audit row.
-    ///
-    /// # One registry, however many tables
-    ///
-    /// The subject map is deployment-wide, so this and
-    /// [`MeterCatalog::anonymise_before`] do the same work: they delete mapping
-    /// rows whose collection year has passed the ceiling. Neither reads a
-    /// reading — the epoch is on the mapping row — so a table that is quiet, a
-    /// table that is quarantined and a session that cannot see the hot window
-    /// all make no difference to what comes due.
-    ///
-    /// [`MeterCatalog::anonymise_before`]: crate::MeterCatalog::anonymise_before
-    pub async fn anonymise_before(
-        &self,
-        cutoff: time::OffsetDateTime,
-        reason: &str,
-        actor: &str,
-        now: time::OffsetDateTime,
-    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
-        let registry = self.require_registry()?;
-        if self.config.subject_column().is_none() {
-            return Err(Error::config(
-                "no subject column is declared, so there is no linkage to destroy: \
-                 without one the stored readings carry no reference to a person and \
-                 § 60 Abs. 6 has nothing to act on here",
-            ));
-        }
-
-        registry
-            .expire_epochs_before(cutoff, reason, actor, now)
-            .await
     }
 
     /// Refuse an operation whose *decision* is a query against this session,
@@ -1906,15 +1494,6 @@ impl MeterStore {
              derived from",
             self.mode,
         )))
-    }
-
-    fn require_registry(&self) -> Result<&crate::erasure::SubjectRegistry> {
-        self.registry.as_ref().ok_or_else(|| {
-            Error::config(
-                "no subject registry is configured: declare a subject column and \
-                 pass a registry to the builder",
-            )
-        })
     }
 
     /// [`append_cold`](Self::append_cold) for a point delivery.
@@ -2365,109 +1944,6 @@ impl MeterStore {
         )
     }
 
-    /// Check a declared **attribute** column against the rows already stored.
-    ///
-    /// The one schema mistake this crate cannot refuse at declaration time.
-    /// Declaring a tenant discriminator as an attribute rather than an identity
-    /// column means two tenants share a merge key: one silently supersedes the
-    /// other under version resolution, and no error is raised anywhere. The
-    /// declaration is legal, the writes succeed, and the symptom is a number.
-    ///
-    /// So it is asked of the data instead: for how many merge keys does this
-    /// column take more than one value? A genuine attribute is a fact *about* a
-    /// reading, so a handful is ordinary — a correction may legitimately restate
-    /// a Bilanzkreis. A mis-declared identity column shows up as a large fraction
-    /// of keys, because every key a second tenant also reports is one of them.
-    ///
-    /// A **report, not a verdict**: the two cases differ in degree, and only the
-    /// deployment knows which its column is. Read against the raw versions
-    /// relation, so a correction's own history is visible rather than resolved
-    /// away, and across both tiers — and through this session, so a scoped or
-    /// pinned one reports on the rows it can see.
-    ///
-    /// Nulls do not count as a value, so a key holding `NULL` and one other value
-    /// is not flagged. That under-reports rather than over-reports, which is the
-    /// right direction for a figure an operator acts on.
-    ///
-    /// A full group-by over the table: a deliberate run, not a scheduled one.
-    ///
-    /// # Errors
-    ///
-    /// The column must be a declared attribute column of this table. An identity
-    /// column has nothing to answer — it is *in* the merge key, so the count is
-    /// one by construction — and an unknown name is a typo that would otherwise
-    /// report a clean bill for a column nobody checked.
-    pub async fn audit_attribute_column(&self, column: &str) -> Result<AttributeAudit> {
-        if !self
-            .config
-            .attribute_columns()
-            .iter()
-            .any(|f| f.name() == column)
-        {
-            return Err(Error::config(format!(
-                "{column:?} is not a declared attribute column of {:?}. Identity columns \
-                 are in the merge key and cannot repeat by construction; a name that is \
-                 neither would report a clean bill for a column that was never checked",
-                self.config.name()
-            )));
-        }
-
-        let key = self.config.merge_key();
-        let grouped = key
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"SELECT count(*) AS keys, count(*) FILTER (WHERE n > 1) AS repeated,
-                      coalesce(max(n), 0) AS widest
-                 FROM (SELECT {grouped}, count(DISTINCT "{column}") AS n
-                         FROM "{raw}" GROUP BY {grouped}) k"#,
-            raw = self.raw_table(),
-        );
-
-        let batches = self.sql(&sql).await?.collect().await.map_err(Error::from)?;
-        let read = |name: &str| -> Result<i64> {
-            let batch = batches
-                .first()
-                .ok_or_else(|| Error::decode(name, "the audit returned no row"))?;
-            batch
-                .column_by_name(name)
-                .and_then(|c| {
-                    c.as_any()
-                        .downcast_ref::<crate::arrow::array::Int64Array>()
-                        .map(|a| a.value(0))
-                })
-                .ok_or_else(|| Error::decode(name, "expected a count"))
-        };
-
-        Ok(AttributeAudit {
-            column: column.to_string(),
-            merge_keys: read("keys")? as u64,
-            merge_keys_with_several_values: read("repeated")? as u64,
-            widest: read("widest")?.max(0) as u64,
-        })
-    }
-
-    /// [`audit_attribute_column`] for every attribute column this table declares.
-    ///
-    /// In declaration order, and empty when the table declares none.
-    ///
-    /// [`audit_attribute_column`]: Self::audit_attribute_column
-    pub async fn audit_attribute_columns(&self) -> Result<Vec<AttributeAudit>> {
-        let names: Vec<String> = self
-            .config
-            .attribute_columns()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            out.push(self.audit_attribute_column(&name).await?);
-        }
-        Ok(out)
-    }
-
     /// The column an external engine must group a daily aggregate by.
     ///
     /// The second rule that has to leave this crate for the open-format claim to
@@ -2487,7 +1963,7 @@ impl MeterStore {
     }
 }
 
-/// What [`MeterStore::audit_attribute_column`] found.
+/// What [`StoreAdmin::audit_attribute_column`] found.
 ///
 /// A declared attribute column measured against the rows already stored, for the
 /// one schema mistake that has no error: an identity column declared as an
@@ -3358,6 +2834,375 @@ pub struct MeterStoreBuilder {
     session: Option<SessionContext>,
 }
 
+/// A store's operational surface: setup, archival, maintenance and teardown.
+///
+/// Reached through [`MeterStore::admin`], and separate from it on purpose. A
+/// `MeterStore` is what an application holds to read and write readings, and
+/// those are the methods that should be in reach when it does. Creating tables,
+/// moving the tier boundary, expiring snapshots and destroying a table are a
+/// deployment's operations, run from a scheduler or a shell, and mixing the two
+/// on one type made the common surface twice the size of what a caller needed
+/// and put `purge_table` a keystroke from `query`.
+///
+/// Borrowed rather than owned, so `store.admin().archive(now, 8)` reads as one
+/// call and the handle costs nothing to make.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreAdmin<'a> {
+    store: &'a MeterStore,
+}
+
+impl<'a> StoreAdmin<'a> {
+    /// The store this administers.
+    #[must_use]
+    pub const fn store(self) -> &'a MeterStore {
+        self.store
+    }
+
+    /// Every committed state of the cold table, newest first.
+    ///
+    /// The list an auditor's question resolves against: "which snapshot did the
+    /// settlement run against" is answered by an id from here, and
+    /// [`as_of`](MeterStore::as_of) then reproduces it exactly.
+    pub async fn snapshots(&self) -> Result<Vec<crate::tiering::store::SnapshotInfo>> {
+        self.store.cold.snapshots(self.store.config.name()).await
+    }
+
+    /// An archiver for this store's table.
+    pub fn archiver(&self) -> Archiver<Arc<dyn HotStore>, Arc<dyn ColdStore>> {
+        Archiver::new(
+            Arc::clone(&self.store.hot),
+            Arc::clone(&self.store.cold),
+            self.store.config.clone(),
+        )
+    }
+
+    /// Scheduled upkeep for this store: archival, expiry, and the health check.
+    ///
+    /// Nothing runs until [`Maintenance::run_once`] or
+    /// [`Maintenance::spawn`] is called. A store that started a background loop
+    /// on construction would surprise a process that only wanted to read.
+    ///
+    /// [`Maintenance::run_once`]: crate::session::Maintenance::run_once
+    /// [`Maintenance::spawn`]: crate::session::Maintenance::spawn
+    pub fn maintenance(&self) -> super::Maintenance {
+        super::Maintenance::new(self.store.clone())
+    }
+
+    /// Archive every window that is due, up to `max_windows`.
+    pub async fn archive(
+        &self,
+        now: time::OffsetDateTime,
+        max_windows: usize,
+    ) -> Result<Vec<ArchivalOutcome>> {
+        self.archiver().catch_up(now, max_windows).await
+    }
+
+    /// Expire cold-tier snapshots past the configured retention window.
+    ///
+    /// Returns how many were removed. Not called automatically: the retention
+    /// window is a compliance decision, and a store that quietly expired
+    /// snapshots would be deciding how far back a settlement can be reproduced.
+    pub async fn expire_snapshots(&self, now: time::OffsetDateTime) -> Result<usize> {
+        self.store
+            .cold
+            .expire_snapshots(
+                self.store.config.name(),
+                self.store.config.snapshot_retention(),
+                self.store.config.min_snapshots_to_keep(),
+                now,
+            )
+            .await
+    }
+
+    /// Put the tiering boundary back on the cold table's current snapshot.
+    ///
+    /// Run this after any out-of-band maintenance — the compaction or orphan
+    /// cleanup this crate cannot perform itself, done with Spark or PyIceberg
+    /// against the same table. Those produce valid Iceberg commits that carry no
+    /// watermark, and the boundary is then only findable by walking back the
+    /// parent chain, which snapshot expiry can punch a hole in.
+    ///
+    /// It republishes what the history already says, so it cannot move the
+    /// boundary, and it is a no-op when the current snapshot already carries one.
+    /// [`expire_snapshots`](Self::expire_snapshots) calls it first for that
+    /// reason, so a deployment on the maintenance schedule need not.
+    pub async fn reassert_watermark(&self) -> Result<bool> {
+        Ok(self
+            .store
+            .cold
+            .reassert_watermark(self.store.config.name())
+            .await?
+            .is_some())
+    }
+
+    /// Assert that no row sits in the wrong tier.
+    pub async fn verify_invariant(&self) -> Result<()> {
+        self.archiver().verify_invariant().await
+    }
+
+    /// Compare the configured schema against the cold table's.
+    ///
+    /// Reports every difference, whether or not it is safe. Callers that want the
+    /// table to *stop* on an unsafe one use
+    /// [`Compatibility::require_safe`](crate::evolution::Compatibility::require_safe),
+    /// which the archiver already does before every run.
+    ///
+    /// `None` when the cold store cannot report a schema. That is deliberately
+    /// not "compatible": a check that cannot run has proved nothing, and saying so
+    /// beats implying it passed.
+    pub async fn check_schema(&self) -> Result<Option<crate::evolution::Compatibility>> {
+        let Some(stored) = self
+            .store
+            .cold
+            .stored_schema(self.store.config.name())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let configured = crate::encode::schema::storage_schema(&self.store.config.extra_columns());
+        Ok(Some(crate::evolution::compare(&configured, &stored)))
+    }
+
+    /// Create both tiers' tables with this store's configuration.
+    ///
+    /// The single entry point on purpose. The hot table's primary key, the cold
+    /// table's schema and the resolution view's `PARTITION BY` all have to agree
+    /// on what identifies a reading; creating them separately means three places
+    /// to keep in step, and a mismatch shows up as readings that fail to
+    /// supersede rather than as an error.
+    pub async fn create_tables(&self) -> Result<()> {
+        let extra = self.store.config.extra_columns();
+        self.store
+            .hot
+            .create_tables(
+                self.store.config.name(),
+                &self.store.config.merge_key(),
+                &extra,
+                self.store.config.time_model(),
+            )
+            .await?;
+        self.store
+            .cold
+            .create_tables(
+                self.store.config.name(),
+                &self.store.config.identity_column_names(),
+                &extra,
+                &self.store.config.maintenance_policy(),
+            )
+            .await?;
+        // The registry's tables belong to the same creation step: a subject
+        // column whose registry has no tables accepts writes and fails the first
+        // erasure request, which is exactly when failing is least useful.
+        if let Some(registry) = &self.store.registry {
+            registry.create_tables().await?;
+        }
+        info!(table = self.store.config.name(), "tables ready");
+        Ok(())
+    }
+
+    /// Refresh `system.tables` and `system.config` in this session.
+    ///
+    /// Explicit rather than automatic: gathering the status reads the watermark
+    /// and counts stranded rows, and a query should never silently pay for that.
+    pub async fn refresh_system_tables(&self, now: time::OffsetDateTime) -> Result<()> {
+        super::system::SystemTables::new(&self.store.hot, &self.store.cold, &self.store.config)
+            .register(&self.store.ctx, now)
+            .await
+    }
+
+    /// Current operational status, without going through SQL.
+    pub async fn status(&self, now: time::OffsetDateTime) -> Result<super::system::TableStatus> {
+        super::system::SystemTables::new(&self.store.hot, &self.store.cold, &self.store.config)
+            .status(now)
+            .await
+    }
+
+    /// The cold tier, for callers that need it directly.
+    ///
+    /// Exposed because the tier traits are the extension point: a
+    /// deployment may want to list snapshots, seed a watermark, or drive the
+    /// store's own maintenance from outside the handle.
+    pub fn cold_store(self) -> &'a Arc<dyn ColdStore> {
+        &self.store.cold
+    }
+
+    /// The hot tier, for callers that need it directly.
+    pub fn hot_store(self) -> &'a Arc<dyn HotStore> {
+        &self.store.hot
+    }
+
+    /// Irreversibly destroy this table and every reading in it, in both tiers.
+    ///
+    /// **The only operation in this crate that deletes stored readings.**
+    /// Everything else is append-only: a correction is a new version, a
+    /// hot partition drop reclaims space for rows already durable in Iceberg, and
+    /// erasure destroys a *mapping* rather than rows. That asymmetry is
+    /// deliberate — a settlement must stay reproducible — and it means this is the
+    /// operation to reach for when the answer really is "none of this data should
+    /// exist any more".
+    ///
+    /// The two cases that need it:
+    ///
+    /// - **Decommissioning a tenant.** With a table per tenant, this is
+    ///   how their data leaves. Within a shared table there is no equivalent, and
+    ///   there cannot be: removing one tenant's rows from an Iceberg table means
+    ///   rewriting files, which `iceberg-rust` cannot do.
+    /// - **A statutory maximum retention.** Same constraint: expiry is
+    ///   whole-table, so a period that differs per tenant needs a table per
+    ///   tenant.
+    ///
+    /// # The name must be repeated
+    ///
+    /// `confirm` must equal this store's table name. A handle carries no visual
+    /// indication of which table it points at, and this destroys data with no
+    /// recovery path — so the caller states the name and the store checks it,
+    /// rather than trusting that the right handle was reached for.
+    ///
+    /// # What is destroyed
+    ///
+    /// The PostgreSQL table with every partition, attached or detached; the
+    /// Iceberg catalog entry; and the Parquet data files, manifests and metadata
+    /// in object storage. Snapshots do not survive it, so `as_of` against this
+    /// table stops working — that is the point.
+    ///
+    /// The subject registry is **not** touched: it is shared across tables, and
+    /// destroying one table's readings says nothing about whether a subject's
+    /// mapping should go. Use
+    /// [`MeterCatalog::erase_subject`](crate::MeterCatalog::erase_subject) for that.
+    pub async fn purge_table(&self, confirm: &str) -> Result<()> {
+        let table = self.store.config.name();
+        if confirm != table {
+            return Err(Error::config(format!(
+                "refusing to purge: this store manages {table:?} but the confirmation \
+                 named {confirm:?}. The name is repeated because a purge destroys \
+                 every reading in the table with no recovery path"
+            )));
+        }
+
+        // Cold first. If this succeeds and the hot drop then fails, what remains
+        // is a PostgreSQL table holding only the unarchived window — visible,
+        // countable, and re-purgeable. The other order would leave archived data
+        // in object storage with nothing in PostgreSQL to name it, which is the
+        // state that looks like success and is not.
+        self.store.cold.purge_table(table).await?;
+        self.store.hot.drop_table(table).await?;
+
+        warn!(table, "table purged: every reading destroyed in both tiers");
+        Ok(())
+    }
+
+    /// Check a declared **attribute** column against the rows already stored.
+    ///
+    /// The one schema mistake this crate cannot refuse at declaration time.
+    /// Declaring a tenant discriminator as an attribute rather than an identity
+    /// column means two tenants share a merge key: one silently supersedes the
+    /// other under version resolution, and no error is raised anywhere. The
+    /// declaration is legal, the writes succeed, and the symptom is a number.
+    ///
+    /// So it is asked of the data instead: for how many merge keys does this
+    /// column take more than one value? A genuine attribute is a fact *about* a
+    /// reading, so a handful is ordinary — a correction may legitimately restate
+    /// a Bilanzkreis. A mis-declared identity column shows up as a large fraction
+    /// of keys, because every key a second tenant also reports is one of them.
+    ///
+    /// A **report, not a verdict**: the two cases differ in degree, and only the
+    /// deployment knows which its column is. Read against the raw versions
+    /// relation, so a correction's own history is visible rather than resolved
+    /// away, and across both tiers — and through this session, so a scoped or
+    /// pinned one reports on the rows it can see.
+    ///
+    /// Nulls do not count as a value, so a key holding `NULL` and one other value
+    /// is not flagged. That under-reports rather than over-reports, which is the
+    /// right direction for a figure an operator acts on.
+    ///
+    /// A full group-by over the table: a deliberate run, not a scheduled one.
+    ///
+    /// # Errors
+    ///
+    /// The column must be a declared attribute column of this table. An identity
+    /// column has nothing to answer — it is *in* the merge key, so the count is
+    /// one by construction — and an unknown name is a typo that would otherwise
+    /// report a clean bill for a column nobody checked.
+    pub async fn audit_attribute_column(&self, column: &str) -> Result<AttributeAudit> {
+        if !self
+            .store
+            .config
+            .attribute_columns()
+            .iter()
+            .any(|f| f.name() == column)
+        {
+            return Err(Error::config(format!(
+                "{column:?} is not a declared attribute column of {:?}. Identity columns \
+                 are in the merge key and cannot repeat by construction; a name that is \
+                 neither would report a clean bill for a column that was never checked",
+                self.store.config.name()
+            )));
+        }
+
+        let key = self.store.config.merge_key();
+        let grouped = key
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"SELECT count(*) AS keys, count(*) FILTER (WHERE n > 1) AS repeated,
+                      coalesce(max(n), 0) AS widest
+                 FROM (SELECT {grouped}, count(DISTINCT "{column}") AS n
+                         FROM "{raw}" GROUP BY {grouped}) k"#,
+            raw = self.store.raw_table(),
+        );
+
+        let batches = self
+            .store
+            .sql(&sql)
+            .await?
+            .collect()
+            .await
+            .map_err(Error::from)?;
+        let read = |name: &str| -> Result<i64> {
+            let batch = batches
+                .first()
+                .ok_or_else(|| Error::decode(name, "the audit returned no row"))?;
+            batch
+                .column_by_name(name)
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .ok_or_else(|| Error::decode(name, "expected a count"))
+        };
+
+        Ok(AttributeAudit {
+            column: column.to_string(),
+            merge_keys: read("keys")? as u64,
+            merge_keys_with_several_values: read("repeated")? as u64,
+            widest: read("widest")?.max(0) as u64,
+        })
+    }
+
+    /// [`audit_attribute_column`] for every attribute column this table declares.
+    ///
+    /// In declaration order, and empty when the table declares none.
+    ///
+    /// [`audit_attribute_column`]: Self::audit_attribute_column
+    pub async fn audit_attribute_columns(&self) -> Result<Vec<AttributeAudit>> {
+        let names: Vec<String> = self
+            .store
+            .config
+            .attribute_columns()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            out.push(self.audit_attribute_column(&name).await?);
+        }
+        Ok(out)
+    }
+}
+
 impl MeterStoreBuilder {
     /// The hot tier.
     pub fn hot(mut self, hot: Arc<dyn HotStore>) -> Self {
@@ -3528,7 +3373,8 @@ impl MeterStoreBuilder {
             )
             .with_scan_spec(config.scan_spec())
             .with_row_scope(self.row_scope.clone())
-            .with_mode(self.mode),
+            .with_mode(self.mode)
+            .with_max_pin_age(config.max_pin_age()),
         );
 
         // The raw table holds every version. Registering it under a name that

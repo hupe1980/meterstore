@@ -240,6 +240,7 @@ async fn archives_a_window_end_to_end() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
             D20,
         )
         .await
@@ -267,6 +268,7 @@ async fn the_watermark_survives_being_read_back_from_the_snapshot() {
             stream_of(Vec::new()),
             WriteHints::default(),
             window,
+            Duration::DAY,
             NOW,
         )
         .await
@@ -284,7 +286,14 @@ async fn the_watermark_advances_monotonically_across_commits() {
     for (from, to) in [(D20, D21), (D21, D22)] {
         let w = ArchivalWindow::new(from, to).unwrap();
         h.cold
-            .append_and_commit(TABLE, stream_of(Vec::new()), WriteHints::default(), w, NOW)
+            .append_and_commit(
+                TABLE,
+                stream_of(Vec::new()),
+                WriteHints::default(),
+                w,
+                Duration::DAY,
+                NOW,
+            )
             .await
             .unwrap();
         assert_eq!(h.cold.watermark(TABLE).await.unwrap().get(), to);
@@ -302,6 +311,7 @@ async fn a_correction_append_does_not_move_the_watermark() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            Duration::DAY,
             D21,
         )
         .await
@@ -332,6 +342,7 @@ async fn catch_up_drains_a_backlog_and_then_stops() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
             D20,
         )
         .await
@@ -365,6 +376,7 @@ async fn the_invariant_holds_after_archival() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
             D20,
         )
         .await
@@ -397,6 +409,7 @@ async fn an_orphan_from_an_interrupted_run_is_reclaimed() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            Duration::DAY,
             D21,
         )
         .await
@@ -409,6 +422,144 @@ async fn an_orphan_from_an_interrupted_run_is_reclaimed() {
 
     assert_eq!(outcome.orphans_reclaimed, 1);
     assert!(h.hot.orphaned_partitions(TABLE).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_table_states_its_maintenance_contract_in_icebergs_own_names() {
+    // Every rule in the maintenance contract that a scheduled tool can break is
+    // one it will break, because the tool runs at *its* defaults and a runbook is
+    // not in the loop. These are the same rules written where the tool reads
+    // them — and on S3 Tables or Lakekeeper, where the catalogue maintains the
+    // table unasked, they are the only place a rule can be stated at all.
+    let h = Harness::start().await;
+    let properties = h
+        .cold
+        .load(TABLE)
+        .await
+        .expect("load")
+        .metadata()
+        .properties()
+        .clone();
+
+    // Retention is a compliance decision, so a tool must not apply its own
+    // five-day `max-snapshot-age-ms` on top of it.
+    assert_eq!(
+        properties.get("history.expire.max-snapshot-age-ms"),
+        Some(&(3_653i64 * 24 * 60 * 60 * 1_000).to_string()),
+        "the table has to carry MeterStore's retention, not leave the tool its default"
+    );
+    assert_eq!(
+        properties.get("history.expire.min-snapshots-to-keep"),
+        Some(&"20".to_string())
+    );
+
+    // Metadata files accumulate forever at Iceberg's default, which is the one
+    // piece of upkeep this crate genuinely cannot do itself.
+    assert_eq!(
+        properties.get("write.metadata.delete-after-commit.enabled"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        properties.get("write.metadata.previous-versions-max"),
+        Some(&"100".to_string())
+    );
+
+    // And the one the crate refuses to guess. Unset here because this harness
+    // declares no size, which is the honest state and not a safe one.
+    assert_eq!(
+        properties.get("write.target-file-size-bytes"),
+        None,
+        "a target the deployment did not measure would be a guess, and a guess \
+         that is too low makes every ordinary file a rewrite candidate"
+    );
+
+    // The one that is not a preference: it lets this crate's watermark-preserving
+    // retry run instead of the library's fixed-summary one.
+    assert_eq!(
+        properties.get("commit.retry.num-retries"),
+        Some(&"0".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_declared_file_size_reaches_the_table_and_a_changed_one_restates_it() {
+    // The property is what makes rule 3 self-enforcing, so it has to arrive on
+    // the table — and it has to arrive on a table that already exists, because
+    // a deployment measures the figure *after* it has archived a window.
+    use meterstore::tiering::store::MaintenancePolicy;
+
+    let h = Harness::start().await;
+    let policy = MaintenancePolicy {
+        declared_file_size: Some(41_943_040),
+        ..MaintenancePolicy::default()
+    };
+    h.cold
+        .create_table_with(TABLE, &[], &[], &policy)
+        .await
+        .expect("restate");
+    assert_eq!(
+        h.cold
+            .load(TABLE)
+            .await
+            .expect("load")
+            .metadata()
+            .properties()
+            .get("write.target-file-size-bytes"),
+        Some(&"41943040".to_string()),
+        "a size declared after the table exists must still reach it"
+    );
+
+    // And a deployment that re-measures gets the new figure rather than the
+    // first one it ever declared.
+    h.cold
+        .create_table_with(
+            TABLE,
+            &[],
+            &[],
+            &MaintenancePolicy {
+                declared_file_size: Some(83_886_080),
+                ..MaintenancePolicy::default()
+            },
+        )
+        .await
+        .expect("restate again");
+    assert_eq!(
+        h.cold
+            .load(TABLE)
+            .await
+            .expect("load")
+            .metadata()
+            .properties()
+            .get("write.target-file-size-bytes"),
+        Some(&"83886080".to_string())
+    );
+}
+
+#[tokio::test]
+async fn an_archival_commit_reports_the_size_it_actually_wrote() {
+    // The figure `declared_file_size` has to be set from, which no setting
+    // decides: the window and the portfolio do. The crate refuses to guess it,
+    // so the least it can do is measure it on the one occasion it is measurable.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 96, 20_260_727_000_001).await;
+
+    let outcomes = h.archiver().catch_up(NOW, 32).await.expect("archive");
+    let committed = outcomes
+        .iter()
+        .find(|o| o.rows > 0)
+        .expect("one window held rows");
+    let added = committed
+        .added
+        .expect("a commit that wrote rows added files");
+    assert!(added.files >= 1);
+    assert!(
+        added.bytes > 0 && added.mean_file_bytes() > 0,
+        "a Parquet file with 96 rows in it is not zero bytes: {added:?}"
+    );
 }
 
 #[tokio::test]
@@ -426,6 +577,7 @@ async fn parquet_files_are_actually_written_to_the_warehouse() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
             D20,
         )
         .await
@@ -477,6 +629,7 @@ async fn snapshot_expiry_bounds_metadata_growth() {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(from, to).unwrap(),
+                Duration::DAY,
                 to,
             )
             .await
@@ -519,6 +672,7 @@ async fn expiry_removes_exactly_what_meterstore_selected() {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(from, to).unwrap(),
+                Duration::DAY,
                 to,
             )
             .await
@@ -578,6 +732,7 @@ async fn expiry_never_removes_the_current_snapshot() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            Duration::DAY,
             D21,
         )
         .await
@@ -614,6 +769,7 @@ async fn expiry_cannot_strand_the_boundary_behind_a_foreign_commit() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            Duration::DAY,
             D21,
         )
         .await
@@ -650,6 +806,7 @@ async fn the_boundary_can_be_restamped_onto_a_foreign_snapshot() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D20, D21).unwrap(),
+            Duration::DAY,
             D21,
         )
         .await

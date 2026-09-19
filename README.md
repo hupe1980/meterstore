@@ -12,12 +12,12 @@ both.
 
 > **Pre-alpha, and unpublished on purpose.** Storage, tiering, archival,
 > querying, reproducible reads and completeness work end to end against real
-> PostgreSQL 16 and a real Iceberg warehouse. The API is still settling;
+> PostgreSQL 18 and a real Iceberg warehouse. The API is still settling;
 > integrating against a real workload is what settles it.
 
 ---
 
-## The problem
+## 🧱 The problem
 
 An intelligent measuring system produces one value per measuring point, per OBIS
 code, per interval. Fifteen minutes is the German settlement grain:
@@ -42,7 +42,7 @@ problem.
 are hot and still being corrected; historical intervals are cold and settled. The
 boundary between them is a timestamp.
 
-## How it works
+## ⚙️ How it works
 
 ```
   MeterInterval.from ─────────────────────────────────────▶
@@ -56,24 +56,24 @@ A row's interval start alone decides its tier, so the tiers are disjoint by
 construction — no deduplication, no merge, no double-counting. Four decisions
 carry most of the weight:
 
-- **The watermark lives inside the Iceberg snapshot.** Archival writes the tier
+- 🔒 **The watermark lives inside the Iceberg snapshot.** Archival writes the tier
   boundary into the snapshot summary in the same commit as the data. Iceberg
   commits are a compare-and-swap, so rows and boundary become durable together or
   not at all.
-- **Purge is `DROP TABLE`, never `DELETE` — and deferred.** An archived window
+- 🗑️ **Purge is `DROP TABLE`, never `DELETE` — and deferred.** An archived window
   is exactly one partition: detached when it is read, dropped a cycle later once
   no query planned against the old boundary can still need it. Deleting a day of
   readings for 100 k meters row by row would leave ~9.6 M dead tuples for
   autovacuum.
-- **Corrections are versions, not overwrites.** MSCONS corrects a value by
+- 🧾 **Corrections are versions, not overwrites.** MSCONS corrects a value by
   *versioning* it, so the store needs only Iceberg's `append` — and a past
   settlement stays reproducible.
-- **Nothing on the archival path holds a window.** Peak memory is the chunk size,
+- 🌊 **Nothing on the archival path holds a window.** Peak memory is the chunk size,
   not the ~9.6 M-row window.
 
 [How tiering works →](https://hupe1980.github.io/meterstore/docs/architecture/)
 
-## Quick start
+## 🚀 Quick start
 
 Without writing a program:
 
@@ -90,7 +90,8 @@ meterstore status    # boundary, lag, write runway, health
 was computed against; `meterstore completeness --month 2026-06` reports which
 channels are short before a settlement run trusts a `SUM`; `meterstore erasures`
 prints the audit trail a regulator asks for; `meterstore maintain` is the archival
-loop as a foreground process.
+loop as a foreground process, and `meterstore reassert-watermark` is the one step
+to run after compacting the table with somebody else's tool.
 [The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
 
 As a library:
@@ -129,7 +130,9 @@ let store = MeterStore::builder()
     .build()
     .await?;
 
-store.create_tables().await?;
+// Setup, archival, maintenance and teardown live behind `admin()`, so the
+// surface you read and write through stays the size of that job.
+store.admin().create_tables().await?;
 ```
 
 Then write and read:
@@ -158,20 +161,26 @@ below rather than repeated here.
 
 [Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
-## Requirements
+## 📋 Requirements
 
 | | Version | Why |
 |---|---|---|
 | Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
-| PostgreSQL | **12 or later** | `ATTACH PARTITION` takes only `SHARE UPDATE EXCLUSIVE` on the parent from 12 — see below |
-| `metering` | **0.23 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
+| PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18 and whole again on 15 |
+| `metering` | **0.24 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
-Partition creation runs on the write path, and `CREATE TABLE … PARTITION OF`
-takes `ACCESS EXCLUSIVE` on the parent — which, since PostgreSQL grants locks in
-arrival order, lets one long query stall every subsequent insert. Partitions are
-built standalone and *attached* instead.
+Nothing here needs a server newer than PostgreSQL 12 — partition creation runs on
+the write path, and building a partition standalone and *attaching* it takes only
+`SHARE UPDATE EXCLUSIVE` from 12, where `CREATE TABLE … PARTITION OF` would take
+`ACCESS EXCLUSIVE` on the parent and let one long query stall every subsequent
+insert.
 [Locks →](https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up)
+
+The floor is **15** anyway: it is a promise about where this crate may be
+deployed, and a promise has to name versions somebody still patches. ✅ CI runs
+the whole integration suite against 15 as well as against 18, so the floor is
+checked rather than claimed.
 
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
 Glue — and that seam is driven end to end by the test suite rather than asserted.
@@ -187,7 +196,7 @@ configuration, no restart, and no extension beyond `btree_gist`, which ships in
 contrib and is created on demand. That is what makes it deployable on RDS, Cloud
 SQL and Azure Postgres, where an extension-based approach is not.
 
-## Relationship to `metering`
+## 🔗 Relationship to `metering`
 
 ```
 metering    → what a measurement is, and how to compute with it   (zero I/O, no async)
@@ -204,50 +213,56 @@ That boundary is deliberate. Duplicating a domain rule here — a unit conversio
 DST calendar — would create a second implementation to keep correct, and it would
 drift.
 
-## Documentation
+## 📚 Documentation
 
 | | |
 |---|---|
-| [Getting started](https://hupe1980.github.io/meterstore/docs/getting-started/) | Requirements, install, a store over both tiers |
-| [Architecture](https://hupe1980.github.io/meterstore/docs/architecture/) | The watermark, the invariant, crash-safe archival |
-| [Storage model](https://hupe1980.github.io/meterstore/docs/storage-model/) | Columns, the merge key, identity vs attribute, constraints |
-| [Writing readings](https://hupe1980.github.io/meterstore/docs/writing/) | Routed writes, bulk ingest, idempotent redelivery |
-| [Querying](https://hupe1980.github.io/meterstore/docs/querying/) | SQL across tiers, provenance, the typed series API |
-| [Reproducibility](https://hupe1980.github.io/meterstore/docs/reproducibility/) | Settlement reruns on two independent time axes |
-| [Completeness](https://hupe1980.github.io/meterstore/docs/completeness/) | DST-aware gap detection, including the channel that delivered nothing |
-| [Operations](https://hupe1980.github.io/meterstore/docs/operations/) | Scheduling, locks, system tables, metrics, failure matrix |
-| [The CLI](https://hupe1980.github.io/meterstore/docs/cli/) | `meterstore` — check, create, status, archive, maintain, query, audit, serve |
-| [External engines](https://hupe1980.github.io/meterstore/docs/interop/) | Spark, Trino, DuckDB — and the trap to avoid |
-| [Privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/) | Pseudonymisation, and the three-year duty as a scheduled job |
-| [Configuration](https://hupe1980.github.io/meterstore/docs/configuration/) | TOML over the same validated types |
+| 🚀 [Getting started](https://hupe1980.github.io/meterstore/docs/getting-started/) | Requirements, install, a store over both tiers |
+| ⚙️ [Architecture](https://hupe1980.github.io/meterstore/docs/architecture/) | The watermark, the invariant, crash-safe archival |
+| 🗄️ [Storage model](https://hupe1980.github.io/meterstore/docs/storage-model/) | Columns, the merge key, identity vs attribute, constraints |
+| ✍️ [Writing readings](https://hupe1980.github.io/meterstore/docs/writing/) | Routed writes, bulk ingest, idempotent redelivery |
+| 🔍 [Querying](https://hupe1980.github.io/meterstore/docs/querying/) | SQL across tiers, provenance, the typed series API |
+| ⏱️ [Reproducibility](https://hupe1980.github.io/meterstore/docs/reproducibility/) | Settlement reruns on two independent time axes |
+| 🧩 [Completeness](https://hupe1980.github.io/meterstore/docs/completeness/) | DST-aware gap detection, including the channel that delivered nothing |
+| 🔧 [Operations](https://hupe1980.github.io/meterstore/docs/operations/) | Scheduling, locks, system tables, metrics, failure matrix |
+| 💻 [The CLI](https://hupe1980.github.io/meterstore/docs/cli/) | `meterstore` — check, create, status, archive, maintain, query, serve, and the rest |
+| 🔌 [External engines](https://hupe1980.github.io/meterstore/docs/interop/) | Spark, Trino, DuckDB — and the trap to avoid |
+| 🛡️ [Privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/) | Pseudonymisation, and the three-year duty as a scheduled job |
+| 📝 [Configuration](https://hupe1980.github.io/meterstore/docs/configuration/) | TOML over the same validated types |
 
-## Status
+## 📊 Status
 
 Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**953 tests**: unit, property, doc and integration against real PostgreSQL 16 and
-a real Iceberg warehouse, plus an independently implemented correctness oracle over
-generated workloads, covering both record shapes. Ingest, archival and reads also
-run **against one table at once**, which is the only way to reach the states that
-exist between two steps rather than inside one — and two replicas over separate
-connection pools race to archive one table, which is the shape the archive lease
-exists for. **DuckDB** and **PyIceberg** read
-the output and agree with it, down to the audit trail's timestamps. The lock
-behaviour is asserted against a real server holding a real conflicting lock, not
-argued. Compression against PostgreSQL row storage is
-**measured** rather than targeted — ~109× (457 B/row against 4.2 B/row; the
-measurement suite carries the caveats).
+**1000 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+a real Iceberg warehouse, plus an independently implemented correctness oracle
+over generated workloads:
 
-Missing: query-latency benchmarks on reference hardware, so the p99 targets remain
-aspirational; Spark and Trino interop; a long-horizon soak, and two replicas as
-two *processes* rather than two pools — so a crash mid-lease is argued rather than
-run. Compaction and general orphan-file cleanup
+| ✅ Checked, not asserted | |
+|---|---|
+| **Concurrency** | Ingest, archival and reads run against one table at once — the only way to reach the states between two steps rather than inside one — and two replicas over separate pools race to archive it |
+| **Foreign readers** | DuckDB and PyIceberg read the output and agree with it, down to the audit trail's timestamps |
+| **Foreign clients** | An ADBC driver drives Flight SQL from the API a non-Rust consumer actually holds |
+| **Locks** | Asserted against a real server holding a real conflicting lock |
+| **The version floor** | The whole integration suite runs again on PostgreSQL 15 |
+| **Compression** | Measured rather than targeted: ~109× (457 B/row against 4.2 B/row; the measurement suite carries the caveats) |
+
+⛔ **Argued rather than measured**, and named here for that reason: query latency
+on reference hardware, so the p99 targets remain aspirational; Spark and Trino
+interop; a long-horizon soak; and two replicas as two *processes* rather than two
+pools, so a crash mid-lease is reasoned about rather than run. Compaction and
+general orphan-file cleanup
 [run out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
 because `iceberg-rust` exposes neither.
 
-## Development
+> ⚠️ **One caveat worth knowing before you deploy.** A query holds the archived
+> partitions its plan is entitled to for up to `max_pin_age` — six hours by
+> default — and one that runs longer loses its window, with an error naming it
+> and never a short answer. Raise the setting past the longest query you run.
+
+## 🛠️ Development
 
 Requires a Rust toolchain and, for integration tests, a running Docker daemon.
 
@@ -273,7 +288,7 @@ wall clock of a database per test, for the same isolation.
 `RecordBatch` types, and two of `sqlx` mean two incompatible `PgPool` types —
 neither fails obviously.
 
-## License
+## ⚖️ License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
 option. Part of the [mako](https://github.com/hupe1980/mako) platform.

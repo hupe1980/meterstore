@@ -20,7 +20,8 @@ pub use query::{QueryDescription, QueryResult};
 pub use readings::ReadingsQuery;
 pub use series::{ResolvedSeries, SeriesQuery};
 pub use store::{
-    AUTHORITATIVE_ATTEMPTS, AppendOutcome, AttributeAudit, HotWriter, MeterStore, MeterStoreBuilder,
+    AUTHORITATIVE_ATTEMPTS, AppendOutcome, AttributeAudit, HotWriter, MeterStore,
+    MeterStoreBuilder, StoreAdmin,
 };
 pub use surface::SqlSurface;
 pub use system::{ConfigEntry, SystemTables, TableStatus, register_all as register_system_tables};

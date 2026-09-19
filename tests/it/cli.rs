@@ -10,6 +10,17 @@
 
 use meterstore::cli::{Cli, Command, Format};
 
+/// The deployment's subject registry, reached through the one table handle these
+/// tests hold.
+///
+/// There is no per-table erasure API: the map is deployment-wide, so a scope
+/// narrower than the deployment would be a scope the data does not have.
+fn subjects(store: &meterstore::MeterStore) -> &meterstore::SubjectRegistry {
+    store
+        .subject_registry()
+        .expect("this store was built with a registry")
+}
+
 /// A configuration file describing a real database and a real warehouse.
 fn config_file(url: &str, warehouse: &std::path::Path) -> tempfile::NamedTempFile {
     use std::io::Write;
@@ -66,6 +77,14 @@ async fn the_commands_drive_a_real_deployment() {
     cli(path, Command::Check).run().await.expect("check");
 
     cli(path, Command::Create).run().await.expect("create");
+
+    // Before anything is archived, so there is no boundary to restate. That is a
+    // clean run and not an error: an operator scheduling this beside their
+    // maintenance must not have it fail on a table that has simply been quiet.
+    cli(path, Command::ReassertWatermark { table: None })
+        .run()
+        .await
+        .expect("a table with no boundary yet has nothing to restate");
 
     // A table created a moment ago has no partitions and no frontier to run out
     // of. Reporting that as degraded would make the very first status of every
@@ -186,6 +205,136 @@ async fn the_commands_drive_a_real_deployment() {
     .run()
     .await
     .expect("completeness over an explicit range");
+}
+
+/// The same warehouse the configuration file points at, opened directly.
+///
+/// The CLI is the thing under test, so the assertions have to come from
+/// somewhere it does not control.
+async fn cold_tier(url: &str, warehouse: &std::path::Path) -> meterstore::cold::IcebergCold {
+    use iceberg::{CatalogBuilder, NamespaceIdent};
+    use iceberg_catalog_sql::{
+        SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
+        SqlBindStyle, SqlCatalogBuilder,
+    };
+
+    let catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(std::sync::Arc::new(iceberg::io::LocalFsStorageFactory))
+        .load(
+            "meterstore",
+            std::collections::HashMap::from([
+                (SQL_CATALOG_PROP_URI.to_string(), url.to_string()),
+                (
+                    SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                    format!("file://{}", warehouse.display()),
+                ),
+                (
+                    SQL_CATALOG_PROP_BIND_STYLE.to_string(),
+                    SqlBindStyle::DollarNumeric.to_string(),
+                ),
+            ]),
+        )
+        .await
+        .expect("sql catalog");
+
+    meterstore::cold::IcebergCold::new(
+        std::sync::Arc::new(catalog),
+        NamespaceIdent::new("metering".to_string()),
+        8 * 1024 * 1024,
+    )
+}
+
+/// Commit the way an out-of-band compaction does: valid Iceberg, saying nothing
+/// about tiering.
+async fn foreign_commit(cold: &meterstore::cold::IcebergCold, table: &str) {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+    let loaded = cold.load(table).await.expect("load");
+    let txn = Transaction::new(&loaded);
+    txn.fast_append()
+        .add_data_files(Vec::new())
+        .set_snapshot_properties(std::collections::HashMap::from([(
+            "engine".to_string(),
+            "out-of-band-compaction".to_string(),
+        )]))
+        .apply(txn)
+        .expect("apply")
+        .commit(cold.catalog().as_ref())
+        .await
+        .expect("a foreign commit is a perfectly valid Iceberg commit");
+}
+
+#[tokio::test]
+async fn reassert_watermark_puts_the_boundary_back_after_a_foreign_commit() {
+    // R15's whole point: this is the one step of the maintenance contract whose
+    // omission fails *every* query on the table at once, and until now it was
+    // reachable only by writing a Rust binary whose body is one call. The person
+    // running out-of-band compaction is writing a cron entry.
+    use meterstore::tiering::store::ColdStore;
+
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let file = config_file(&url, warehouse.path());
+    let path = file.path();
+    const TABLE: &str = "readings_versions";
+
+    cli(path, Command::Create).run().await.expect("create");
+    cli(
+        path,
+        Command::Archive {
+            table: None,
+            max_windows: 4,
+        },
+    )
+    .run()
+    .await
+    .expect("archive");
+
+    let cold = cold_tier(&url, warehouse.path()).await;
+    let boundary_before = cold.watermark(TABLE).await.expect("watermark");
+
+    foreign_commit(&cold, TABLE).await;
+    // `snapshots` is newest first, and nothing else is committing here, so the
+    // head of the list is the current snapshot.
+    assert!(
+        cold.snapshots(TABLE)
+            .await
+            .expect("snapshots")
+            .first()
+            .expect("at least one")
+            .watermark
+            .is_none(),
+        "the foreign commit has to leave the current snapshot stating no boundary, \
+         or there is nothing here to repair"
+    );
+
+    cli(path, Command::ReassertWatermark { table: None })
+        .run()
+        .await
+        .expect("reassert");
+
+    let after = cold.snapshots(TABLE).await.expect("snapshots");
+    assert_eq!(
+        after.first().expect("at least one").watermark,
+        Some(boundary_before),
+        "the current snapshot must state the boundary again, and the same one — \
+         this republishes what the history already said and cannot move it"
+    );
+
+    // Idempotent, which is what makes it safe in a cron entry beside the
+    // maintenance it follows.
+    let before_count = after.len();
+    cli(path, Command::ReassertWatermark { table: None })
+        .run()
+        .await
+        .expect("reassert again");
+    assert_eq!(
+        cold.snapshots(TABLE).await.expect("snapshots").len(),
+        before_count,
+        "a second run must commit nothing"
+    );
 }
 
 #[tokio::test]
@@ -366,16 +515,16 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
         .expect("connect");
     let catalog = deployment.catalog().await.expect("catalog");
     let store = catalog.table("readings_versions").expect("table");
-    let subject = store
-        .register_subject(
+    let subject = subjects(store)
+        .register(
             "tenant-a:12345678905",
             time::macros::datetime!(2026-07-20 00:00 UTC),
             metering::interval::Sparte::Strom,
         )
         .await
         .expect("register");
-    store
-        .erase_subject(
+    subjects(store)
+        .erase(
             &subject,
             "DSAR-2026-0042",
             "privacy-team",

@@ -269,8 +269,8 @@ pub use config::{
 pub use encode::{StoredReadings, canonical_obis, parse_malo, parse_melo};
 pub use erasure::{
     DEFAULT_ERASURE_LIMIT, ErasureQuery, ErasureRecord, ErasureTrigger, MIN_ERASURE_SECRET_BYTES,
-    MIN_REFERENCE_TOKEN_CHARS, Retention, SubjectRef, SubjectRegistration, SubjectRegistry,
-    SuppressionLift, retention_epoch,
+    MIN_REFERENCE_TOKEN_CHARS, OrphanedSuppressions, Retention, SubjectRef, SubjectRegistration,
+    SubjectRegistry, SuppressionLift, retention_epoch,
 };
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
@@ -284,20 +284,24 @@ pub use session::{
     AUTHORITATIVE_ATTEMPTS, AttributeAudit, Completeness, CompletenessQuery, HotWriter,
     Maintenance, MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore,
     MeterStoreBuilder, QueryDescription, QueryResult, RETENTION_LABEL, ReadingsQuery,
-    ResolvedSeries, SeriesQuery, SqlSurface, TableMaintenance,
+    ResolvedSeries, SeriesQuery, SqlSurface, StoreAdmin, TableMaintenance,
 };
 pub use settings::{Deployment, PrivacySettings, Settings};
 pub use tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
 pub use version::{ScopedVersion, Version, VersionScope};
 pub use watermark::{Tier, TieringWatermark};
 
-/// Common imports for working with MeterStore.
-/// The names a caller actually types.
+/// What a caller has to **write**, and nothing it merely receives.
 ///
-/// Narrower than the crate root on purpose: everything here is something a
-/// deployment writes in its own code. The Arrow metadata keys a declaration
-/// rides in, the retry counts, the label a scheduled sweep records — those are
-/// reachable at their own paths and are not things anyone imports.
+/// A type that only ever comes back from a method needs no import: methods are
+/// called on it and its name is inferred. A type that appears in a `let`
+/// annotation, a struct literal, a builder argument or a trait bound has to be
+/// named, and those are what this carries.
+///
+/// Everything else is reachable at its own path — `meterstore::Archiver`,
+/// `meterstore::planner::balancing_day`, `meterstore::QueryResult` — which is one
+/// line to import on the rare occasion it is needed, against sixty names in scope
+/// on every occasion it is not.
 pub mod prelude {
     #[cfg(feature = "rest-catalog")]
     pub use crate::cold::IcebergRestCatalog;
@@ -311,27 +315,13 @@ pub mod prelude {
         coded_column,
     };
     pub use crate::encode::{StoredReadings, StoredSeries};
-    pub use crate::erasure::{
-        ErasureQuery, ErasureRecord, ErasureTrigger, MIN_ERASURE_SECRET_BYTES, Retention,
-        SubjectRef, SubjectRegistration, SubjectRegistry, SuppressionLift, retention_epoch,
-    };
+    pub use crate::erasure::{ErasureQuery, Retention, SubjectRef, SubjectRegistry};
     pub use crate::error::{Error, Result};
-    pub use crate::evolution::{Compatibility, SchemaChange};
     pub use crate::hot::PostgresHot;
-    pub use crate::planner::{
-        ReadMode, Resolution, SnapshotSelector, TierSplit, TieredTableProvider, TimeRange,
-        balancing_day, balancing_day_bounds, balancing_day_length, balancing_month,
-        balancing_month_bounds, bilanzierungsmonat, day_boundary,
-        expected_intervals_in_balancing_day,
-    };
-    pub use crate::session::{
-        AttributeAudit, Completeness, CompletenessQuery, HotWriter, Maintenance,
-        MaintenanceOutcome, MeterCatalog, MeterCatalogBuilder, MeterStore, MeterStoreBuilder,
-        QueryDescription, QueryResult, ReadingsQuery, ResolvedSeries, SeriesQuery, SqlSurface,
-        TableMaintenance,
-    };
-    pub use crate::settings::{Deployment, PrivacySettings, Settings};
-    pub use crate::tiering::{ArchivalOutcome, Archiver, ColdStore, HotStore, SnapshotInfo};
-    pub use crate::version::{ScopedVersion, Version, VersionScope};
-    pub use crate::watermark::{Tier, TieringWatermark};
+    pub use crate::planner::{ReadMode, SnapshotSelector, TimeRange};
+    pub use crate::session::{MeterCatalog, MeterStore};
+    pub use crate::settings::Settings;
+    pub use crate::tiering::{ColdStore, HotStore};
+    pub use crate::version::{Version, VersionScope};
+    pub use crate::watermark::TieringWatermark;
 }

@@ -48,6 +48,7 @@ async fn split_store(workload: &MeteringWorkload) -> (TestHarness, meterstore::M
     harness.ingest(&store, &series).await.expect("ingest");
 
     store
+        .admin()
         .archive(from + Duration::days(2), 1)
         .await
         .expect("archive");

@@ -45,16 +45,59 @@ use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
 
-/// The PostgreSQL image every suite runs against.
+/// The oldest PostgreSQL this crate claims to run on.
+///
+/// # Why 15, when the SQL would run on 12
+///
+/// Nothing here needs a feature newer than PostgreSQL 12, where `ATTACH
+/// PARTITION` stopped taking `ACCESS EXCLUSIVE` on the parent — which is what
+/// keeps partition creation off the ingest path's critical lock. So the floor is
+/// not a syntax requirement. It is a **support** claim, and a support claim has
+/// to be about versions somebody supports.
+///
+/// The earlier floor of 12 was justified by the managed services running it, and
+/// they no longer do: the community dropped 12 in November 2024 and 13 in
+/// November 2025, RDS ended standard support for 12 in February 2025 and for 13
+/// in February 2026, and 14 goes in November 2026. Naming 14 would be naming a
+/// version with weeks left. **15 is the oldest release still patched into 2027**
+/// and the oldest offered under standard support by RDS, Cloud SQL and Azure
+/// Database.
+///
+/// It is checked rather than stated: the suite runs whole against this version
+/// as well as against [`IMAGE_TAG`], because a floor nobody runs is a claim, and
+/// this crate's other claims are not.
+pub const FLOOR: u32 = 15;
+
+/// The PostgreSQL image every suite runs against by default.
 ///
 /// **Pinned, and not at the library default.** `testcontainers-modules` defaults
-/// to `11-alpine`, one major below the floor this design requires — so
-/// every suite would have been proving the store works on a version it does not
-/// claim to support, and `ATTACH PARTITION` would still have taken
-/// `ACCESS EXCLUSIVE` on the parent there, so the lock properties the tests
-/// assert would have been asserted against the one server where they do not
-/// hold. 16 matches the reference deployment.
-pub const IMAGE_TAG: &str = "16-alpine";
+/// to `11-alpine`, below the floor this design requires — so every suite would
+/// have been proving the store works on a version it does not claim to support,
+/// and `ATTACH PARTITION` would still have taken `ACCESS EXCLUSIVE` on the parent
+/// there, so the lock properties the tests assert would have been asserted
+/// against the one server where they do not hold.
+///
+/// **18, because three things the design's own performance argument rests on
+/// arrived there**: fast-path lock slots are sized from
+/// `max_locks_per_transaction` instead of being sixteen per backend, a prepared
+/// statement no longer locks every partition while its plan is validated, and
+/// `btree_gist` gained sortsupport — which is what the `EXCLUDE USING gist`
+/// integrity constraints are built and checked through. A suite on an older
+/// server demonstrates the design on the last version with none of them.
+pub const IMAGE_TAG: &str = "18-alpine";
+
+/// Override the server every suite runs against.
+///
+/// Set `METERSTORE_POSTGRES_IMAGE_TAG` to run the whole suite somewhere else —
+/// which is how the **floor** is checked rather than asserted. A support floor
+/// nobody runs is a claim, and this crate's other claims are not.
+pub const IMAGE_TAG_VAR: &str = "METERSTORE_POSTGRES_IMAGE_TAG";
+
+/// The tag this process will actually use.
+#[must_use]
+pub fn image_tag() -> String {
+    std::env::var(IMAGE_TAG_VAR).unwrap_or_else(|_| IMAGE_TAG.to_string())
+}
 
 /// A running PostgreSQL, kept for the life of the process.
 struct Shared {
@@ -81,7 +124,7 @@ const MAX_CONNECTIONS: &str = "500";
 /// Start a PostgreSQL container and return its superuser URL.
 async fn start_container() -> Result<(String, testcontainers::ContainerAsync<Postgres>)> {
     let container = Postgres::default()
-        .with_tag(IMAGE_TAG)
+        .with_tag(image_tag())
         .with_cmd([
             "postgres",
             "-c",

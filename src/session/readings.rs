@@ -11,9 +11,18 @@
 //! [`melo`](ReadingsQuery::melo) is how one of them is named.
 //!
 //! And the question a register is asked most often is *what does the meter read
-//! now* — an `ORDER BY … DESC LIMIT 1` at the storage layer rather than a scan of
-//! a decade followed by a maximum in memory, on the table that exists because it
-//! grows without bound.
+//! now*, which [`latest`](ReadingsQuery::latest) answers with an
+//! `ORDER BY … DESC LIMIT 1` rather than a maximum taken in memory.
+//!
+//! **Give it a [`range`](ReadingsQuery::range).** Without one the query carries no
+//! bound on `from`, so the tier split cannot drop either half, the cold half is
+//! the whole archive, and the presence of a hot half forces full version
+//! resolution — a window function over every row of both tiers. DataFusion cannot
+//! push the limit below the sort, so nothing reaches the provider's own `limit`
+//! either. On the table this module exists for — the one that grows without bound
+//! and that `[AO § 146 Abs. 4]` forbids discarding — an unbounded `latest` is a
+//! full scan of the history, not a point lookup. Bounding it to the recent window
+//! is what makes it cheap (R24).
 //!
 //! # It refuses to fold two registers, and says which
 //!
@@ -197,10 +206,17 @@ impl<'a> ReadingsQuery<'a> {
     ///
     /// For the current value of **every** register — which is what a meter
     /// reading actually is — ask [`channels`](Self::channels) and then `latest`
-    /// per register. Deliberately not one call: each `latest` is an
-    /// `ORDER BY … DESC LIMIT 1` the index answers, so a meter's four registers
-    /// cost four point lookups rather than the history scan a single windowed
-    /// query would need on the one table § 146 Abs. 4 AO forbids discarding.
+    /// per register. Deliberately not one call: each is an
+    /// `ORDER BY … DESC LIMIT 1` over its own register rather than the windowed
+    /// query over all of them that a single call would need.
+    ///
+    /// # Bound it, or it scans the history
+    ///
+    /// With no [`range`](Self::range) this emits no lower bound on `from`, and
+    /// the consequences compound: the split keeps both tiers, the cold half is
+    /// every row ever archived, and a hot half in range forces version resolution
+    /// over the lot. Four registers then cost four full scans, not four point
+    /// lookups. `range` is what makes the claim in this sentence true (R24).
     pub async fn latest(mut self) -> Result<Option<MeterReading>> {
         self.latest_only = true;
         Ok(self
@@ -395,7 +411,55 @@ impl<'a> ReadingsQuery<'a> {
     }
 
     /// Run the range query and decode it, without folding.
+    /// Run the query, trying the hot tier alone first when the caller gave no
+    /// range.
+    ///
+    /// # Why one probe answers the common case
+    ///
+    /// `latest` without a range carries no bound on `from`, so the tier split
+    /// keeps both halves, the cold half is every row ever archived, and a hot
+    /// half in range forces version resolution over all of it. The limit cannot
+    /// be pushed below the sort, so nothing prunes it: the newest reading of one
+    /// register costs a scan of the table's whole history.
+    ///
+    /// The tiering invariant makes that unnecessary. The hot tier holds exactly
+    /// the rows with `from >= watermark` and the cold tier exactly those below
+    /// it, so **if the hot tier holds any row for this channel, the newest one is
+    /// there** — no cold row can have a greater `from`. And every version of a
+    /// corrected reading lives in the same tier as the reading, so resolving
+    /// within the hot half cannot be superseded from the cold one.
+    ///
+    /// A live meter is therefore one bounded scan. A channel that has stopped
+    /// reporting falls through to the unbounded query, which is a history scan —
+    /// honestly, because that is what finding the last reading of a dead meter
+    /// costs without an index this crate does not keep.
+    ///
+    /// Only for [`ReadMode::Unified`]: the other three read one tier by
+    /// construction, so there is nothing to narrow and the probe would be a
+    /// wasted round trip.
+    ///
+    /// [`ReadMode::Unified`]: crate::planner::ReadMode::Unified
     async fn scan(&self) -> Result<(Vec<StoredReadings>, super::QueryResult)> {
+        if self.latest_only && self.from.is_none() {
+            let watermark = self.store.watermark().await?;
+            if let Some(bound) = super::series::latest_probe_bound(
+                self.latest_only,
+                self.from,
+                self.store.read_mode(),
+                watermark,
+            ) {
+                let mut hot = self.clone();
+                hot.from = Some(bound);
+                let found = hot.scan_once().await?;
+                if !found.0.is_empty() {
+                    return Ok(found);
+                }
+            }
+        }
+        self.scan_once().await
+    }
+
+    async fn scan_once(&self) -> Result<(Vec<StoredReadings>, super::QueryResult)> {
         let (conditions, params) = self.predicate();
         let merge_key = self.store.config().merge_key();
         // Ordered by the **whole** merge key so decoding sees contiguous runs of

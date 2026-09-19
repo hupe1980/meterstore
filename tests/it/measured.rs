@@ -100,6 +100,7 @@ async fn the_cold_tier_compresses_against_postgres_row_storage() {
 
     // Everything to the cold tier, then measure what it cost.
     store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");
@@ -165,6 +166,7 @@ async fn archival_throughput_does_not_collapse() {
 
     let started = std::time::Instant::now();
     let outcomes = store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");
@@ -247,6 +249,7 @@ async fn archival_memory_does_not_scale_with_the_window() {
     harness.ingest(&store, &series).await.expect("ingest");
 
     let outcomes = store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");
@@ -257,5 +260,5 @@ async fn archival_memory_does_not_scale_with_the_window() {
         "a 64-row chunk over a {expected}-row window dropped rows: the keyset \
          cursor is not unique per row"
     );
-    store.verify_invariant().await.expect("invariant");
+    store.admin().verify_invariant().await.expect("invariant");
 }

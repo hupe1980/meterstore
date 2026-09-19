@@ -1,6 +1,6 @@
 +++
 title = "The CLI"
-description = "meterstore init, check, create, status, archive, maintain, query, completeness and serve — the same library, without a program to write."
+description = "meterstore init, check, create, status, archive, maintain, reassert-watermark, query, completeness and serve — the same library, without a program to write."
 weight = 9
 +++
 
@@ -17,6 +17,7 @@ or two library calls, and nothing here is unreachable from Rust.
 | `create` | Both tiers, every declared table. Idempotent |
 | `status` | Boundary, lag, write runway, health. Non-zero exit when unhealthy |
 | `archive` `maintain` | One-shot for cron; foreground loop for a sidecar |
+| `reassert-watermark` | The step that follows out-of-band maintenance |
 | `query` `explain` | SQL across both tiers, with the boundary it ran against |
 | `completeness` | Which channels are short, and which delivered nothing |
 | `snapshots` | What a settlement rerun can pin to |
@@ -77,6 +78,30 @@ the year of collection, not `now - 3 years`: the statutory clock starts at the
 a year early. Needs a table declaring `subject_column` and a `[privacy]` section
 for the registry it resolves against — see
 [Privacy and retention](@/docs/privacy.md).
+
+## After out-of-band maintenance
+
+Compaction and orphan cleanup are not this crate's to run — you do them with
+Spark, PyIceberg or a catalogue that maintains the table for you. Those write
+valid Iceberg commits that say nothing about tiering, and the tier boundary is
+then findable only by walking back the parent chain. Expiring **any** ancestor on
+that walk strands it, and a stranded boundary fails every query on the table at
+once.
+
+```bash
+# In the same job, right after the tool that rewrote the table.
+meterstore reassert-watermark
+```
+
+It republishes what the history already says, so it **cannot move the boundary**,
+and it does nothing when the current snapshot already carries one. Both properties
+are what make it a scheduled step rather than a judgement call: safe to run
+unconditionally, safe to run twice, and a clean exit on a table that has never
+archived. `--table` narrows it to one.
+
+`maintain --expire-snapshots` re-stamps before expiring, so a deployment already
+on that schedule does not need this separately — see
+[Operations](@/docs/operations.md).
 
 ## Asking what the store holds
 
@@ -270,7 +295,10 @@ Two surfaces, answering different questions.
 
 **Flight SQL** carries the unified hot + cold view — the one surface an external
 client cannot assemble for itself, because the hot tier is not in the Iceberg
-catalogue.
+catalogue. Point an **ADBC** client at it — `grpc://host:port`, no driver-specific
+configuration — and you get a connection, a catalogue browse and queries that
+span the boundary. That is what the interop suite drives it with, so it is
+checked rather than claimed.
 
 **The catalogue façade** is a read-only Iceberg REST endpoint, and it is what a
 **SQL-catalog** deployment needs so Spark, Trino, DuckDB and PyIceberg can read

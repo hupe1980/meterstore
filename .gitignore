@@ -31,19 +31,25 @@ target
 # Custom
 .DS_Store
 
-# Primary sources (see specs/README.md). Third-party publications — statutes,
-# BNetzA Festlegungen, EDI@Energy documents, BDEW Anwendungshilfen, NIST/ENTSO-E
-# publications and the Apache format specifications — redistributed under their
-# own terms, so they are staged rather than committed. `just specs` rebuilds the
-# folder from the index.
-/specs/
-
-# Internal design notes (see concepts/README.md). Working documents: they quote
-# the regulatory and format sources by clause, and record what each design
-# decision cost. `site/` is the public narrative, `CHANGELOG.md` the history and
-# the rustdoc the API contract; `concepts/` is none of the three, and nothing in
-# the build reads it.
+# Internal design notes, and the primary sources they cite. Working documents:
+# they quote the regulatory and format sources by clause, and record what each
+# design decision cost. `site/` is the public narrative, `CHANGELOG.md` the
+# history and the rustdoc the API contract; `concepts/` is none of the three, and
+# nothing in the build reads it.
+#
+# `concepts/references/` holds the sources themselves — statutes, BNetzA
+# Festlegungen, EDI@Energy documents, BDEW Anwendungshilfen, NIST/ENTSO-E
+# publications and the Apache format specifications. Third-party publications
+# under their own terms, so they are staged rather than committed;
+# `just references` rebuilds the folder from the index beside it.
 /concepts/
+
+# Agent skills. The procedure for working this repository, which reads
+# `concepts/` on every phase and is meaningless without it — so it is ignored for
+# the same reason `concepts/` is. `AGENTS.md` is committed, because it is what an
+# agent needs before touching code and that is true whether or not the design
+# notes are present.
+/.claude/
 
 # Built documentation site (see .github/workflows/site.yml).
 site/public/

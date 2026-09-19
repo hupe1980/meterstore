@@ -166,6 +166,7 @@ async fn as_known_at_reads_the_same_after_archival_to_cold() {
 
     // Archive START's day into the cold tier.
     store
+        .admin()
         .archive(START + Duration::days(2), 8)
         .await
         .expect("archive");

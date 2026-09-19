@@ -1018,11 +1018,16 @@ async fn a_retired_key_still_recognises_the_erasures_it_recorded() {
 }
 
 #[tokio::test]
-async fn dropping_the_old_key_on_rotation_silently_re_opens_registration() {
+async fn dropping_the_old_key_on_rotation_re_opens_registration_and_says_so() {
     // Pinning the hazard rather than the feature, because it is the reason the
     // ring exists and the reason a retired key is kept rather than destroyed.
-    // Nothing can report this: the tombstone is still there and simply stops
-    // being recognised.
+    //
+    // The re-opening itself cannot be prevented: the tombstone is
+    // `HMAC(key, identifier)` and the identifier died in the transaction that
+    // wrote it, so without the key there is nothing to match against. What the
+    // key's name buys is that the deployment is **told** — the tombstone is
+    // still there and simply stops matching, which is otherwise
+    // indistinguishable from a tombstone that does not apply.
     const OLD_KEY: &[u8] = b"retired-suppression-key-32-bytes";
     const NEW_KEY: &[u8] = b"current-suppression-key-32-bytes";
 
@@ -1043,7 +1048,16 @@ async fn dropping_the_old_key_on_rotation_silently_re_opens_registration() {
     .await
     .unwrap();
 
-    let replaced = SubjectRegistry::with_erasure_secret(pool, NEW_KEY).expect("secret");
+    let replaced = SubjectRegistry::with_erasure_secret(pool.clone(), NEW_KEY).expect("secret");
+
+    let orphaned = replaced.orphaned_suppressions().await.expect("report");
+    assert_eq!(orphaned.len(), 1, "one missing key: {orphaned:?}");
+    assert_eq!(orphaned[0].suppressions, 1);
+    assert!(
+        !orphaned[0].key_id.is_empty(),
+        "the report has to name the key an operator must put back"
+    );
+
     assert!(!replaced.is_suppressed("customer-4821").await.unwrap());
     assert!(
         replaced
@@ -1052,6 +1066,131 @@ async fn dropping_the_old_key_on_rotation_silently_re_opens_registration() {
             .is_ok(),
         "the outcome a key ring prevents"
     );
+
+    // Putting the key back is the whole repair, and the report is how an
+    // operator knows it worked.
+    let restored = SubjectRegistry::with_erasure_keys(pool, &[NEW_KEY, OLD_KEY]).expect("ring");
+    assert!(
+        restored
+            .orphaned_suppressions()
+            .await
+            .expect("report")
+            .is_empty(),
+        "a ring carrying every key that wrote must report nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_lifted_suppression_is_not_reported_as_orphaned() {
+    // The counterexample that stops the report from being an alarm nobody can
+    // clear. Lifting drops the tag and its key name together, so a key retired
+    // after everything it wrote was lifted leaves nothing behind — and a report
+    // that fired anyway would tell an operator to restore a key that protects
+    // nobody.
+    const OLD_KEY: &[u8] = b"retired-suppression-key-32-bytes";
+    const NEW_KEY: &[u8] = b"current-suppression-key-32-bytes";
+
+    let pool = pool().await;
+    let old = SubjectRegistry::with_erasure_secret(pool.clone(), OLD_KEY).expect("secret");
+    old.create_tables().await.expect("tables");
+
+    let subject = old
+        .register("customer-4821", IN_2026, Sparte::Strom)
+        .await
+        .unwrap();
+    old.erase(
+        &subject,
+        "DSAR-1",
+        "privacy-team",
+        datetime!(2026-07-01 09:00 UTC),
+    )
+    .await
+    .unwrap();
+    assert!(
+        old.lift_suppression(
+            "customer-4821",
+            "OPS-9",
+            "dpo",
+            datetime!(2026-07-02 09:00 UTC)
+        )
+        .await
+        .unwrap()
+    );
+
+    let replaced = SubjectRegistry::with_erasure_secret(pool, NEW_KEY).expect("secret");
+    assert!(
+        replaced
+            .orphaned_suppressions()
+            .await
+            .expect("report")
+            .is_empty(),
+        "a lifted suppression depends on no key and must not be reported"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_that_lost_its_only_key_reports_every_live_suppression() {
+    // R6 by the shortest road: the secret is gone rather than mis-rotated. The
+    // registry has no ring, so it cannot check anything — and that is exactly
+    // when the trail's own record of which key wrote what is the only thing
+    // that can speak.
+    let pool = pool().await;
+    let keyed = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
+    keyed.create_tables().await.expect("tables");
+
+    for id in ["customer-1", "customer-2"] {
+        let subject = keyed.register(id, IN_2026, Sparte::Strom).await.unwrap();
+        keyed
+            .erase(
+                &subject,
+                "DSAR",
+                "privacy-team",
+                datetime!(2026-07-01 09:00 UTC),
+            )
+            .await
+            .unwrap();
+    }
+
+    let keyless = SubjectRegistry::new(pool);
+    let orphaned = keyless.orphaned_suppressions().await.expect("report");
+    assert_eq!(orphaned.len(), 1, "one key wrote them: {orphaned:?}");
+    assert_eq!(orphaned[0].suppressions, 2);
+}
+
+#[tokio::test]
+async fn a_tombstone_cannot_be_written_without_naming_its_key() {
+    // The pair is the unit. A tag with no key name is unreportable — precisely
+    // the state this column exists to remove — so the database refuses the row
+    // rather than leaving a statement that forgot one to be found later by a
+    // report that had quietly stopped being trustworthy.
+    let pool = pool().await;
+    let r = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
+    r.create_tables().await.expect("tables");
+
+    let half = sqlx::query(
+        "INSERT INTO meterstore_erasures \
+             (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac, hmac_key_id) \
+         VALUES ($1, now(), 'r', 'a', 'request', $2, NULL)",
+    )
+    .bind("s2026_0123456789abcdef0123456789abcdef")
+    .bind(vec![1u8; 32])
+    .execute(&pool)
+    .await;
+    assert!(half.is_err(), "a tag with no key name must be refused");
+
+    // And the whole pair goes in, so the constraint has not swallowed the
+    // ordinary case.
+    sqlx::query(
+        "INSERT INTO meterstore_erasures \
+             (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac, hmac_key_id) \
+         VALUES ($1, now(), 'r', 'a', 'request', $2, $3)",
+    )
+    .bind("s2026_0123456789abcdef0123456789abcdef")
+    .bind(vec![1u8; 32])
+    .bind(vec![2u8; 8])
+    .execute(&pool)
+    .await
+    .expect("a whole pair is ordinary");
 }
 
 #[tokio::test]

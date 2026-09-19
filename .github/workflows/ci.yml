@@ -54,6 +54,43 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # A support floor nobody runs is a claim. This crate's other claims are not, so
+  # the whole integration suite runs against the oldest PostgreSQL the
+  # documentation names as well as against the newest — the one the `check` job
+  # uses by default.
+  #
+  # Its own job rather than a matrix dimension on `check`: the format, clippy and
+  # docs steps have nothing to do with the server version, and running them twice
+  # would double the slowest parts of CI to re-prove something that cannot differ.
+  # A separate job runs at the same time instead, so the wall clock does not move.
+  floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The floor is **read from the code**, not repeated here. Two spellings of
+      # one fact can disagree, and this pair would disagree silently: the job
+      # would keep passing against whatever version this file named, while the
+      # documentation claimed another.
+      #
+      # The integration binary only: the unit and doc tests touch no server, so
+      # running them here would say nothing a second time.
+      - name: Integration suite on the documented floor
+        run: |
+          floor=$(grep -oE 'pub const FLOOR: u32 = [0-9]+' src/testkit/postgres.rs \
+                  | grep -oE '[0-9]+$')
+          test -n "$floor" || { echo "::error::no FLOOR in src/testkit/postgres.rs"; exit 1; }
+          echo "running the integration suite against PostgreSQL $floor"
+          METERSTORE_POSTGRES_IMAGE_TAG="$floor-alpine" cargo test --all-features --test it
+
   # Two DataFusion majors in one graph give mutually incompatible
   # `TableProvider` types. This already happened once via
   # `datafusion-table-providers`, so it is a hard gate, not a lint.

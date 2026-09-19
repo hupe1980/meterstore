@@ -1,0 +1,115 @@
+//! Claims this repository makes about itself, checked against whatever would
+//! make them true.
+//!
+//! Not what the code does — the rest of the suite is for that. These are the
+//! sentences in the documentation whose truth lives somewhere no compiler looks:
+//! a workflow file, a constant, an agreement between two of them. They are the
+//! claims that rot silently, because nothing fails when they stop being true.
+//!
+//! Needs no database and no feature flag.
+
+use std::path::PathBuf;
+
+fn repo(relative: &str) -> String {
+    std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
+        .unwrap_or_else(|e| panic!("read {relative}: {e}"))
+}
+
+#[test]
+fn ci_runs_the_integration_suite_on_the_documented_floor() {
+    // The documentation says the floor is *checked rather than promised*. That
+    // sentence is true only while a job exists to check it, and a job is a YAML
+    // file nobody compiles — so deleting it, renaming the variable or pointing it
+    // at the default would leave the claim standing with nothing behind it.
+    let ci = repo(".github/workflows/ci.yml");
+
+    assert!(
+        ci.contains("METERSTORE_POSTGRES_IMAGE_TAG"),
+        "no job overrides the server version, so nothing runs against the floor"
+    );
+
+    // And it reads the version out of the code rather than repeating it. Two
+    // spellings of one fact can disagree, and this pair would disagree in
+    // silence: the job would keep passing against whatever version it named while
+    // the documentation claimed another.
+    assert!(
+        ci.contains("pub const FLOOR: u32")
+            && ci.contains("src/testkit/postgres.rs")
+            && ci.contains(r#"METERSTORE_POSTGRES_IMAGE_TAG="$floor-alpine""#),
+        "the floor job has to derive the version from `testkit::postgres::FLOOR`, \
+         or the workflow and the documentation can drift apart"
+    );
+}
+
+#[test]
+fn no_document_names_a_floor_the_code_does_not_declare() {
+    // Declared once, said in prose in several places. What rots is not the
+    // wording — that can change freely — but the *number*: a floor moves in the
+    // code and a page somewhere keeps promising the version before it, which is
+    // a promise nobody is keeping and nothing else would notice.
+    //
+    // So this reads the number out of every "N or later" and "PostgreSQL N+" in
+    // the documentation and requires each to be the declared one.
+    let source = repo("src/testkit/postgres.rs");
+    let floor: u32 = source
+        .split_once("pub const FLOOR: u32 = ")
+        .expect("a declared floor")
+        .1
+        .split(';')
+        .next()
+        .expect("a value")
+        .trim()
+        .parse()
+        .expect("a major version");
+
+    let mut wrong = Vec::new();
+    for file in [
+        "README.md",
+        "concepts/README.md",
+        "site/content/docs/getting-started.md",
+    ] {
+        let text = repo(file);
+        let mut named = Vec::new();
+
+        // `**N or later**`, the form every requirements table uses, and any
+        // other phrasing that ends in the same three words.
+        for (index, _) in text.match_indices(" or later") {
+            let head = &text[..index];
+            let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+            // `0.24 or later` is `metering`'s minor, not a PostgreSQL major. A
+            // dot in front means the digits are part of a longer version.
+            if digits == 0 || head[..head.len() - digits].ends_with('.') {
+                continue;
+            }
+            if let Ok(version) = head[head.len() - digits..].parse::<u32>() {
+                named.push(version);
+            }
+        }
+        for (index, _) in text.match_indices("PostgreSQL ") {
+            let rest = &text[index + "PostgreSQL ".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if rest[digits.len()..].starts_with('+')
+                && let Ok(version) = digits.parse::<u32>()
+            {
+                named.push(version);
+            }
+        }
+
+        if named.is_empty() {
+            wrong.push(format!("  {file}: names no floor at all"));
+        }
+        for version in named {
+            if version != floor {
+                wrong.push(format!(
+                    "  {file}: promises PostgreSQL {version} or later, code declares {floor}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "a document promises a floor the code does not:\n{}",
+        wrong.join("\n")
+    );
+}

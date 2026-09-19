@@ -9,11 +9,14 @@
 
 use std::path::{Path, PathBuf};
 
-/// Every documentation-bearing file: `src/`, `tests/`, the site pages, and the
-/// two Markdown files at the root that are documentation.
+/// Every documentation-bearing file: `src/`, `tests/`, the site pages, and
+/// `README.md`.
 ///
-/// `CHANGELOG.md` is deliberately absent. It is the one place history belongs,
-/// and the whole point of the second check is that it belongs *only* there.
+/// Two root Markdown files are deliberately absent, for different reasons.
+/// `CHANGELOG.md` is the one place history belongs, and the whole point of the
+/// second check is that it belongs *only* there. `AGENTS.md` teaches the
+/// convention by counter-example — it shows the past-tense phrasing beside the
+/// present-tense one — so the check it exists to explain would fail it.
 fn documented_files() -> Vec<(PathBuf, String)> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -206,6 +209,67 @@ fn reference_docs_are_not_a_changelog() {
         "a reference doc reads like a changelog:\n  {}\n\
          State what is true now. History belongs in CHANGELOG.md, which is the \
          one file this check does not read.",
+        offenders.join("\n  ")
+    );
+}
+
+#[test]
+fn the_published_docs_are_not_a_backlog() {
+    // The sibling of the check above, and the same argument pointed forward. A
+    // reader of `site/content/docs` arrives with a question about the code in
+    // front of them — not about the code somebody means to write. A page that
+    // carries a plan is stale the moment the plan changes, and nobody editing
+    // the plan goes looking for the page.
+    //
+    // **Narrower than the changelog check on purpose.** It reads the published
+    // pages only. The README's status section names its gaps deliberately, which
+    // is what a pre-1.0 README is for, and the design notes are a backlog by
+    // definition.
+    // Spellings that *only* introduce a plan, on the same principle as the list
+    // above. A bare "not yet" is absent because "a deployment that cannot yet
+    // hold a key securely" is a statement about the reader, and a bare "planned"
+    // because a query is planned before it is executed — which is what half of
+    // `querying.md` is about.
+    const PLANS: [&str; 12] = [
+        "not yet implemented",
+        "not yet supported",
+        "not yet exercised",
+        "on the roadmap",
+        "in a future release",
+        "will be added",
+        "is planned for",
+        "are planned for",
+        "we intend to",
+        "todo:",
+        "fixme",
+        "coming soon",
+    ];
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("site/content");
+    let mut offenders = Vec::new();
+    for (path, text) in documented_files() {
+        if !path.starts_with(&root) {
+            continue;
+        }
+        for (i, line) in text.lines().enumerate() {
+            let lower = line.to_lowercase();
+            if let Some(found) = PLANS.iter().find(|p| lower.contains(**p)) {
+                offenders.push(format!(
+                    "{}:{}: {found:?} — {}",
+                    path.display(),
+                    i + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a published page carries a plan:\n  {}\n\
+         Say what the code does. What it does not do yet belongs in the backlog, \
+         which is not published — and a gap worth warning a reader about is a \
+         limitation, stated as one.",
         offenders.join("\n  ")
     );
 }

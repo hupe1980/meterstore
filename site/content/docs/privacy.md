@@ -70,7 +70,7 @@ the link and what remains is quantities attached to an opaque token: anonymous
 data, outside the Regulation's scope by Recital 26.
 
 ```rust
-let store = MeterStore::builder()
+let catalog = MeterCatalog::builder()
     .table(TableConfig::new("readings_versions").subject_column("subject_ref").build()?)
     .subject_registry(SubjectRegistry::with_erasure_secret(pool, &secret)?)
     // … hot, cold
@@ -78,12 +78,18 @@ let store = MeterStore::builder()
     .await?;
 
 // An opaque reference, for the collection year these readings belong to.
-let subject = store.register_subject("customer-4821", interval.from, sparte).await?;
+let subject = catalog.register_subject("customer-4821", interval.from, sparte).await?;
 
 // Later: destroy the link, in every year. The readings stay; nothing can
 // attribute them. A request names a person, so it can be entered as one.
-store.erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", now).await?;
+catalog.erase_subject_by_id("customer-4821", "DSAR-2026-0042", "privacy-team", now).await?;
 ```
+
+**The subject API is on the catalog, not on a table.** One
+`meterstore_subject_map` serves the whole deployment, so an erasure reaches every
+table that registered the same identifier — a per-table form would name a scope
+the data does not have. A deployment that builds a single `MeterStore` and never a
+catalog reaches the same registry through `store.subject_registry()`.
 
 | Property | How it is met |
 |---|---|
@@ -133,6 +139,23 @@ not resolve means either the pipeline invented it — rows unattributable from b
 link erasure destroyed. Neither is visible in the data afterwards, so it fails at
 the write.
 
+**And it refuses references that are identifiers wearing a pseudonym's clothes.**
+`SubjectRef::new` — the door for a deployment minting its own — checks the shape
+`s<year>_<token>`, with the year spelled canonically and the token between 22 and
+128 characters of `A-Z a-z 0-9 . _ -`. A token that **parses** as a MaLo-ID, a
+Messlokation, an EIC or a BDEW code is refused outright: those carry check digits,
+so recognising one is arithmetic rather than a guess, and storing one here would
+preserve exactly the linkage that deleting the mapping row exists to destroy.
+
+What that check *cannot* do is worth knowing before you rely on it. It cannot tell
+a keyed hash from an unkeyed one — `s2026_<sha256 of an email>` and `s2026_<HMAC
+of the same email>` are both 64 hex characters and nothing about the string
+distinguishes them, though the first survives erasure as a re-identification path
+and the second does not. So it validates a shape and refuses what it can
+recognise; it does not certify that a reference you minted is unlinkable.
+`register_subject` is how you avoid needing the assurance: it draws 128 bits from
+the OS CSPRNG, which is unlinkable by construction.
+
 ## The unit of erasure is a collection year
 
 § 60 Abs. 6 runs on *"der jeweilige Messwert"* — **each value**, three years
@@ -146,8 +169,8 @@ So a reference belongs to **one collection year**, and the year is part of it:
 and the sweep expires them independently:
 
 ```rust
-let y2022 = store.register_subject("customer-4821", jan_2022, Sparte::Strom).await?;
-let y2026 = store.register_subject("customer-4821", jan_2026, Sparte::Strom).await?;
+let y2022 = catalog.register_subject("customer-4821", jan_2022, Sparte::Strom).await?;
+let y2026 = catalog.register_subject("customer-4821", jan_2026, Sparte::Strom).await?;
 assert_ne!(y2022, y2026);
 ```
 
@@ -248,7 +271,9 @@ erasure. Refused here, still to be fixed there. Zero is the expected reading.
 ### Rotating the key
 
 The key must outlive every erasure and is not recoverable from the database.
-Losing it exposes nothing; it silently disables suppression.
+Losing it exposes nothing, and it disables suppression — for the subjects the lost
+key covers, permanently, because nothing can recompute a tag without the
+identifier that made it.
 
 **A tombstone can never be re-keyed** — it is `HMAC(key, identifier)` and the
 identifier was destroyed in the same transaction that wrote it. So the key is a
@@ -268,6 +293,23 @@ key, which is what a compromise of it costs. Retired keys meet the same 32-byte
 floor, since it is the older tombstones they cover, and `retired_erasure_secrets`
 without an `erasure_secret` is refused at startup as the half-finished rotation it
 is.
+
+**A ring missing a key says so.** Each tombstone records the name of the key that
+wrote it — derived from the key, not chosen by you — so a deployment that dropped
+one is told at startup which key is missing and how many live suppressions it
+stopped honouring:
+
+```text
+WARN the erasure key ring no longer carries the key these suppressions were
+     written under, so the subjects they cover can be re-registered by a replay;
+     put the key back, or stop the replay upstream
+     key_id=3f1a9c04d7b25e68 suppressions=412
+```
+
+`MeterStore::orphaned_suppressions` answers the same question on demand, for a
+health endpoint. Match the `key_id` by putting a candidate key back in the ring
+and watching the report shrink — it is a check value, not a label you chose.
+Suppressions you have lifted depend on no key and are never counted.
 
 **In memory it is redacted *and* wiped.** `Debug` prints only whether a key is
 configured, so it cannot reach a log line; the buffer holding it is zeroized on
@@ -306,7 +348,11 @@ or not the subject is still being metered.
   it. A due-date taken from `max("from")` over the sweeping session would be —
   under `Historical` a customer metered daily looks last-seen at the final
   archived interval, old enough to erase and still live, irreversibly.
-- **Idempotent**, so it runs on a schedule and a re-run writes no second audit row.
+- **Idempotent and resumable.** It deletes in batches, each its own transaction,
+  so peak memory is a batch rather than the sweep — a metering operator's whole
+  expiring year is millions of linkages — and an interrupted run is finished by
+  running it again: the `DELETE` matches only rows still present, and the audit
+  insert ignores a conflict. A re-run writes no second audit row.
 - **`CalendarYears(3)` is not `now - 3 years`.** The statutory clock starts at the
   *Schluss des Kalenderjahres*, so a value collected on 2 January 2025 comes due on
   31 December 2028. The rolling spelling would erase it a year early — the
@@ -322,10 +368,27 @@ or not the subject is still being metered.
   survives a broker replay; an expiry is not a request to stop processing, and a
   subject whose 2021 epoch expired must still be registrable for 2027.
 
-`store.anonymise_before(cutoff, …)` and `catalog.anonymise_before(cutoff, …)`
-are the same sweep run once, for a deployment that schedules it elsewhere — and
-the same operation as each other, since the registry is deployment-wide and
-neither reads a reading.
+`catalog.anonymise_before(cutoff, …)` is the same sweep run once, for a
+deployment that schedules it elsewhere. It lives on the **catalog** and has no
+per-table form, because the registry is deployment-wide: one
+`meterstore_subject_map`, one erasure unlinking every table that registered the
+same identifier. A per-table sweep would name a scope the data does not have, and
+the one that existed was guarded per table while its effect was not.
+
+It is not gated on any table declaring a subject column, either: the registry
+outlives any one table's configuration, and a deployment that *stops* declaring
+one still holds every mapping row it wrote before — rows still due under
+§ 60 Abs. 6.
+
+It returns a **`SweepOutcome`**: how many linkages were destroyed, which
+collection years they came from, and how many batches it took. Not a record per
+subject — the audit trail is durable in `meterstore_erasures` before the call
+returns, and `erasures()` reads it:
+
+```rust
+let swept = catalog.anonymise_before(cutoff, "§ 60 Abs. 6 MsbG", "retention-job", now).await?;
+println!("{} linkages, epochs {:?}", swept.subjects, swept.epochs);
+```
 
 This is also the answer to "there is no partial data expiry". The statute does not
 require deleting rows; it requires that the values stop being personal, and that
@@ -358,10 +421,11 @@ gets no registry and creates none of its tables.
 
 `erasure_secret` is what turns the suppression list on. It is optional because
 the key must outlive every erasure and is not recoverable from the database:
-losing it exposes nothing and silently disables suppression, which is the one
-failure this crate cannot report — so a deployment that cannot yet hold a key
-securely is better off knowing suppression is off than inventing one it will
-lose.
+losing it exposes nothing and disables suppression for every subject that key
+covered, permanently. The deployment is told how many — each tombstone names the
+key that wrote it — but being told is not being protected, so a deployment that
+cannot yet hold a key securely is better off knowing suppression is off than
+inventing one it will lose.
 
 `meterstore erasures` reads the audit trail from a shell. There is deliberately
 no `meterstore erase`: an Article 17 request usually reaches an application's own

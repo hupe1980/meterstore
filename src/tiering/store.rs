@@ -41,13 +41,6 @@ pub struct ScanSpec {
     extra: Vec<String>,
     /// Rows per round trip, or `None` for the store's own default.
     chunk_rows: Option<usize>,
-    /// The partition granularity, or `None` if the caller did not say.
-    ///
-    /// A scan that knows the step knows a detached partition's exclusive end
-    /// from its start, and can therefore skip one that cannot hold a row in
-    /// range. Without it such a partition is scanned and returns nothing —
-    /// correct, and wasted.
-    partition_step: Option<time::Duration>,
 }
 
 impl ScanSpec {
@@ -57,7 +50,6 @@ impl ScanSpec {
             merge_key,
             extra,
             chunk_rows: None,
-            partition_step: None,
         }
     }
 
@@ -76,17 +68,6 @@ impl ScanSpec {
     /// The configured chunk size, if the caller set one.
     pub fn chunk_rows(&self) -> Option<usize> {
         self.chunk_rows
-    }
-
-    /// Declare the partition granularity of the table being scanned.
-    pub fn with_partition_step(mut self, step: time::Duration) -> Self {
-        self.partition_step = (step > time::Duration::ZERO).then_some(step);
-        self
-    }
-
-    /// The partition granularity, if the caller declared one.
-    pub fn partition_step(&self) -> Option<time::Duration> {
-        self.partition_step
     }
 
     /// A spec for a table with no deployment columns.
@@ -293,6 +274,37 @@ pub trait TableLease: Send + Sync + std::fmt::Debug {
     async fn release(self: Box<Self>) -> Result<()>;
 }
 
+/// What [`HotStore::drop_partition`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reclamation {
+    /// The partition is gone and `reclaimed_below` records it.
+    Dropped,
+    /// A live reader is pinned at or below this window, so the space stays.
+    ///
+    /// Not a failure and not a retry: the next cycle asks again, and the pin is
+    /// either released or expired by then.
+    HeldByReader,
+}
+
+/// A held reclamation floor, returned by [`HotStore::pin_reader`].
+///
+/// Opaque on purpose: the only thing a caller may do with it is hand it back to
+/// [`HotStore::release_pin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderPin(i64);
+
+impl ReaderPin {
+    /// Wrap a store-assigned identifier.
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    /// The store-assigned identifier.
+    pub const fn id(self) -> i64 {
+        self.0
+    }
+}
+
 /// The hot tier: PostgreSQL, time-partitioned, holding `from >= watermark`.
 #[async_trait]
 pub trait HotStore: Send + Sync {
@@ -416,6 +428,12 @@ pub trait HotStore: Send + Sync {
     ///
     /// Detaching before the scan is what stops a row being inserted into a
     /// partition that is mid-archival.
+    ///
+    /// **Idempotent**, and that is a contract rather than a convenience: an
+    /// already-detached partition is the state an interrupted archival leaves
+    /// behind, so a run that could not detach one again could not resume. An
+    /// implementation that refuses instead stalls archival for that table at the
+    /// one crash point in the middle of the operation.
     async fn detach_partition(&self, partition: &PartitionId) -> Result<()>;
 
     /// Stream a detached partition's rows in the declared sort order.
@@ -436,12 +454,87 @@ pub trait HotStore: Send + Sync {
         Ok(None)
     }
 
-    /// Drop a detached partition.
+    /// Drop a detached partition, recording that its window is gone.
     ///
     /// This is the purge, and it must remain `DROP TABLE`: a row-wise `DELETE`
     /// at metering volume produces millions of dead tuples per day and the
     /// vacuum debt that follows.
-    async fn drop_partition(&self, partition: &PartitionId) -> Result<()>;
+    ///
+    /// `reclaimed_below` is the window's exclusive upper bound, and the store
+    /// must remember the highest it has seen, **durably and in the same
+    /// transaction as the drop**. A scan is then able to tell the one state it
+    /// otherwise cannot: a window with no partition because the space was taken
+    /// back, against a window with no partition because nothing was ever written
+    /// there. Both look identical to an enumeration, and only the first means a
+    /// query is about to come back short.
+    ///
+    /// The caller supplies it because the bound is `partition.end(step)` and the
+    /// step is the table's configuration, not this partition's.
+    ///
+    /// **The store decides, not the caller.** A reader that pinned a boundary at
+    /// or below this window is still entitled to it, and the store is the only
+    /// place where that question can be asked in the *same transaction* as the
+    /// drop — so it is asked here and the answer is
+    /// [`Reclamation::HeldByReader`], which is an ordinary outcome and not a
+    /// failure. A store with no pin registry always drops.
+    async fn drop_partition(
+        &self,
+        partition: &PartitionId,
+        reclaimed_below: OffsetDateTime,
+    ) -> Result<Reclamation>;
+
+    /// Hold the reclamation floor at `watermark` until the pin is released or
+    /// `expires_at` passes.
+    ///
+    /// A query plans against a boundary and scans later — lazily, on first poll,
+    /// which for a `UNION ALL` drained cold-side-first is however long the cold
+    /// scan takes. Archival in between can take the partition the plan was
+    /// entitled to. The wall-clock [`reader_grace`] is the *hysteresis* that
+    /// keeps the reclaimer from thrashing; this is the **quiescence** beside it,
+    /// and the two are a conjunction.
+    ///
+    /// Two properties an implementation must have, because they are what the
+    /// systems that ship this get wrong:
+    ///
+    /// * **The pin and the drop must be one transaction's worth of apart.** A
+    ///   pin the reclaimer cannot see while it decides protects nothing.
+    /// * **Pins must expire.** `expires_at` is a cap, not a hint: without it one
+    ///   crashed query holds a partition forever, which is a worse failure than
+    ///   the one being fixed. Past it the floor advances and the over-running
+    ///   query fails naming the window it lost, which is the loud failure this
+    ///   crate prefers.
+    ///
+    /// The default grants **no** pin and says so with `None`, exactly as
+    /// [`try_archive_lease`](Self::try_archive_lease) does: a store that cannot
+    /// hold a floor must not pretend to, and the caller then has the grace alone.
+    ///
+    /// [`reader_grace`]: crate::config::TableConfig::reader_grace
+    async fn pin_reader(
+        &self,
+        _table: &str,
+        _watermark: OffsetDateTime,
+        _expires_at: OffsetDateTime,
+    ) -> Result<Option<ReaderPin>> {
+        Ok(None)
+    }
+
+    /// Release a pin taken by [`pin_reader`](Self::pin_reader).
+    ///
+    /// Best-effort by construction — it runs from a `Drop`, and a query killed
+    /// with its process never reaches it. That is what `expires_at` is for.
+    /// Releasing an already-expired pin is not an error.
+    async fn release_pin(&self, _pin: ReaderPin) -> Result<()> {
+        Ok(())
+    }
+
+    /// The exclusive upper bound of everything this store has reclaimed for
+    /// `table`, or `None` if it has reclaimed nothing.
+    ///
+    /// A store that cannot remember returns `None` and loses the detection, not
+    /// the data.
+    async fn reclaimed_below(&self, _table: &str) -> Result<Option<OffsetDateTime>> {
+        Ok(None)
+    }
 
     /// Insert, and report what each row did to the value that was current.
     ///
@@ -494,11 +587,17 @@ pub trait ColdStore: Send + Sync {
     /// `identity` names the deployment's identity columns. The cold tier makes
     /// them the leading partition fields, so a tenant-scoped scan prunes at the
     /// manifest rather than by row filter.
+    ///
+    /// `policy` is the maintenance contract this table should state in the
+    /// format's own vocabulary, so a tool that never read this crate's
+    /// documentation still honours it. A store with nowhere to put it ignores it
+    /// — the contract is then a paragraph again, which is where it started.
     async fn create_tables(
         &self,
         table: &str,
         identity: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        policy: &MaintenancePolicy,
     ) -> Result<()>;
 
     /// Destroy the table, its metadata and its data files.
@@ -513,6 +612,16 @@ pub trait ColdStore: Send + Sync {
     ///
     /// Returns the epoch watermark when the table has no snapshots yet.
     async fn watermark(&self, table: &str) -> Result<TieringWatermark>;
+
+    /// The archival step this table's committed windows were cut on.
+    ///
+    /// `None` when nothing records one — a table with no history, or a store
+    /// that does not keep it. **Absent is not a mismatch**: the archiver
+    /// establishes the step on the next commit rather than refusing, because a
+    /// check that cannot run must not become a check that fails.
+    async fn archival_step(&self, _table: &str) -> Result<Option<time::Duration>> {
+        Ok(None)
+    }
 
     /// Append `batches` and advance the watermark, atomically.
     ///
@@ -530,6 +639,7 @@ pub trait ColdStore: Send + Sync {
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        step: time::Duration,
         now: OffsetDateTime,
     ) -> Result<CommitInfo>;
 
@@ -750,8 +860,29 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         (**self).distinct_malo_ids(partition).await
     }
 
-    async fn drop_partition(&self, partition: &PartitionId) -> Result<()> {
-        (**self).drop_partition(partition).await
+    async fn drop_partition(
+        &self,
+        partition: &PartitionId,
+        reclaimed_below: OffsetDateTime,
+    ) -> Result<Reclamation> {
+        (**self).drop_partition(partition, reclaimed_below).await
+    }
+
+    async fn reclaimed_below(&self, table: &str) -> Result<Option<OffsetDateTime>> {
+        (**self).reclaimed_below(table).await
+    }
+
+    async fn pin_reader(
+        &self,
+        table: &str,
+        watermark: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<Option<ReaderPin>> {
+        (**self).pin_reader(table, watermark, expires_at).await
+    }
+
+    async fn release_pin(&self, pin: ReaderPin) -> Result<()> {
+        (**self).release_pin(pin).await
     }
 
     async fn orphaned_partitions(&self, table: &str) -> Result<Vec<PartitionId>> {
@@ -772,8 +903,9 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         table: &str,
         identity: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        policy: &MaintenancePolicy,
     ) -> Result<()> {
-        (**self).create_tables(table, identity, extra).await
+        (**self).create_tables(table, identity, extra, policy).await
     }
 
     async fn purge_table(&self, table: &str) -> Result<()> {
@@ -784,16 +916,21 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         (**self).watermark(table).await
     }
 
+    async fn archival_step(&self, table: &str) -> Result<Option<time::Duration>> {
+        (**self).archival_step(table).await
+    }
+
     async fn append_and_commit(
         &self,
         table: &str,
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        step: time::Duration,
         now: OffsetDateTime,
     ) -> Result<CommitInfo> {
         (**self)
-            .append_and_commit(table, batches, hints, window, now)
+            .append_and_commit(table, batches, hints, window, step, now)
             .await
     }
 
@@ -859,6 +996,70 @@ pub struct CommitInfo {
     pub rows: u64,
     /// The watermark after this commit.
     pub watermark: TieringWatermark,
+    /// Bytes of data file this commit added, and over how many files.
+    ///
+    /// `None` for a commit that added none — an empty window, or a re-stamp.
+    /// The **observed** figure behind
+    /// [`declared_file_size`](crate::config::TableConfig::declared_file_size):
+    /// what a maintenance tool's eligibility test will actually be measuring,
+    /// which no setting decides and only a commit can report.
+    pub added: Option<AddedFiles>,
+}
+
+/// What one commit added to the cold tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddedFiles {
+    /// Total bytes across the files added.
+    pub bytes: u64,
+    /// How many files those bytes are spread over.
+    pub files: u64,
+}
+
+impl AddedFiles {
+    /// Mean bytes per file, which is the figure a compactor's threshold is
+    /// compared against.
+    #[must_use]
+    pub const fn mean_file_bytes(self) -> u64 {
+        match self.files {
+            0 => 0,
+            n => self.bytes / n,
+        }
+    }
+}
+
+/// What a foreign maintenance tool must honour, in Iceberg's own property names.
+///
+/// Every rule in `MAINTENANCE.md` that a scheduled job can break is a rule the
+/// job will break, because a runbook is not in the loop when a tool runs at
+/// defaults. These are the same rules written where the tool reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenancePolicy {
+    /// `write.target-file-size-bytes`, or `None` to publish none.
+    ///
+    /// **Not** the writer's roll threshold. That defaults to 512 MiB — the very
+    /// figure a compactor assumes when the property is absent — so publishing it
+    /// would leave every eligibility test coming out exactly as it does now. The
+    /// number that changes the answer is the size the writer *actually produces*,
+    /// which the window and the portfolio decide rather than any setting, so it
+    /// has to be declared by the deployment that measured it.
+    pub declared_file_size: Option<u64>,
+    /// `history.expire.max-snapshot-age-ms`.
+    pub snapshot_retention: time::Duration,
+    /// `history.expire.min-snapshots-to-keep`.
+    pub min_snapshots_to_keep: usize,
+}
+
+impl Default for MaintenancePolicy {
+    /// What a table gets when nobody said otherwise: the crate's own retention
+    /// defaults, and no declared file size, because there is nothing to derive
+    /// one from.
+    fn default() -> Self {
+        Self {
+            declared_file_size: None,
+            snapshot_retention: crate::config::defaults::SNAPSHOT_RETENTION,
+            min_snapshots_to_keep: crate::config::defaults::MIN_SNAPSHOTS_TO_KEEP,
+        }
+    }
 }
 
 #[cfg(test)]

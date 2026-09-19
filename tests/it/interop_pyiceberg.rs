@@ -159,6 +159,7 @@ async fn archived(workload: MeteringWorkload) -> (TestHarness, Oracle) {
     harness.ingest(&store, &series).await.expect("ingest");
 
     store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");

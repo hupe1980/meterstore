@@ -20,6 +20,17 @@ use meterstore::testkit::TestHarness;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
+/// The deployment's subject registry, reached through the one table handle these
+/// tests hold.
+///
+/// There is no per-table erasure API: the map is deployment-wide, so a scope
+/// narrower than the deployment would be a scope the data does not have.
+fn subjects(store: &meterstore::MeterStore) -> &meterstore::SubjectRegistry {
+    store
+        .subject_registry()
+        .expect("this store was built with a registry")
+}
+
 const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 const MALO: &str = "12345678905";
 
@@ -311,16 +322,16 @@ archival_step = "1d"
     // End to end: register, erase, and the trail is what `meterstore erasures`
     // reads. `create_tables` had to have created the registry's own two tables,
     // or none of this reaches a relation.
-    let subject = store
-        .register_subject(
+    let subject = subjects(&store)
+        .register(
             "tenant-a:12345678905",
             START,
             metering::interval::Sparte::Strom,
         )
         .await
         .expect("register");
-    store
-        .erase_subject(&subject, "DSAR-2026-0042", "dpo", START)
+    subjects(&store)
+        .erase(&subject, "DSAR-2026-0042", "dpo", START)
         .await
         .expect("erase");
     let trail = registry
@@ -335,8 +346,8 @@ archival_step = "1d"
 
     // And the suppression list holds: a replaying pipeline does not re-link the
     // subject it just erased.
-    let err = store
-        .register_subject(
+    let err = subjects(&store)
+        .register(
             "tenant-a:12345678905",
             START,
             metering::interval::Sparte::Strom,

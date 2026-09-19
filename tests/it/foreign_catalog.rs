@@ -184,9 +184,15 @@ async fn the_whole_store_runs_on_a_catalog_meterstore_did_not_build() {
         .build()
         .expect("config");
 
-    ColdStore::create_tables(cold.as_ref(), table, &[], &config.extra_columns())
-        .await
-        .expect("the cold table is created through the trait");
+    ColdStore::create_tables(
+        cold.as_ref(),
+        table,
+        &[],
+        &config.extra_columns(),
+        &config.maintenance_policy(),
+    )
+    .await
+    .expect("the cold table is created through the trait");
 
     let store = harness
         .builder_for(config)
@@ -200,7 +206,7 @@ async fn the_whole_store_runs_on_a_catalog_meterstore_did_not_build() {
         .await
         .expect("a store over a foreign catalog");
 
-    store.create_tables().await.expect("both tiers");
+    store.admin().create_tables().await.expect("both tiers");
     harness
         .ensure_partitions(START, START + Duration::days(3))
         .await
@@ -222,6 +228,7 @@ async fn the_whole_store_runs_on_a_catalog_meterstore_did_not_build() {
 
     // Archive half of it, so the read below genuinely crosses the boundary.
     store
+        .admin()
         .archive(START + Duration::days(2), 8)
         .await
         .expect("archive");
@@ -275,15 +282,22 @@ async fn the_boundary_is_readable_through_a_foreign_catalog() {
     );
 
     let table = "foreign_boundary_versions";
-    ColdStore::create_tables(&cold, table, &[], &[])
-        .await
-        .expect("create");
+    ColdStore::create_tables(
+        &cold,
+        table,
+        &[],
+        &[],
+        &meterstore::tiering::store::MaintenancePolicy::default(),
+    )
+    .await
+    .expect("create");
 
     cold.append_and_commit(
         table,
         meterstore::tiering::store::stream_of(Vec::new()),
         Default::default(),
         meterstore::watermark::ArchivalWindow::new(START, START + Duration::DAY).expect("window"),
+        Duration::DAY,
         START + Duration::DAY,
     )
     .await

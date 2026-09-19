@@ -69,6 +69,7 @@ async fn two_tenants() -> TestHarness {
     }
 
     store
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -240,7 +241,12 @@ async fn a_table_whose_stored_layout_disagrees_with_the_configuration_is_refused
     // columns is a different layout, and there is no way to reconcile the two.
     let err = harness
         .cold()
-        .create_table_with(TestHarness::TABLE, &[], &[])
+        .create_table_with(
+            TestHarness::TABLE,
+            &[],
+            &[],
+            &meterstore::tiering::store::MaintenancePolicy::default(),
+        )
         .await
         .expect_err("a layout mismatch must halt rather than degrade");
 

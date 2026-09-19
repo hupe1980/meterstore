@@ -14,10 +14,12 @@
 //! integration test crate instead. Each suite keeps its own `#![cfg]` gates,
 //! fixtures, and test names, while the dependency graph is linked only once.
 
+mod api_surface;
 mod archival_end_to_end;
 mod calendar_delegation;
 mod catalog_facade;
 mod checked_columns;
+mod claims;
 mod cli;
 mod cold_partitioning;
 mod commodities;
@@ -32,6 +34,7 @@ mod foreign_catalog;
 mod hot_postgres;
 mod hot_writer;
 mod interop;
+mod interop_adbc;
 mod interop_duckdb;
 mod interop_pyiceberg;
 mod measured;

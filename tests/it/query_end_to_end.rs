@@ -18,7 +18,9 @@ use meterstore::encode::schema::col;
 use meterstore::hot::PostgresHot;
 use meterstore::planner::ReadMode;
 use meterstore::tiering::Archiver;
-use meterstore::tiering::store::{ColdStore, HotStore, WriteHints, stream_of};
+use meterstore::tiering::store::{
+    ColdStore, HotStore, PartitionId, Reclamation, WriteHints, stream_of,
+};
 use meterstore::watermark::ArchivalWindow;
 
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
@@ -182,6 +184,7 @@ impl Harness {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+                Duration::DAY,
                 D18,
             )
             .await
@@ -301,6 +304,120 @@ async fn a_plan_built_before_archival_still_reads_the_window_archival_moved() {
         "a plan made before the boundary moved must still see every row; \
          got {n} of 288, so archival reclaimed a partition a live plan needed"
     );
+}
+
+#[tokio::test]
+async fn a_live_plan_holds_the_window_archival_is_about_to_reclaim() {
+    // The grace's successor. `reader_grace` is a clock, and a clock cannot know
+    // whether anybody is still reading — so past it the partition goes and a
+    // plan that outran it loses its window, loudly since D41 but still lost.
+    //
+    // A plan now registers the boundary it was cut at, and reclamation asks
+    // that registry in the same transaction as the drop. This test runs the
+    // whole path: plan at one boundary, archive past it, then try to reclaim
+    // the window that moved — with no grace involved, because the drop is
+    // called directly.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
+
+    // One window archived: the boundary is D19 and `[D19, D20)` is still hot.
+    h.archive_through(D20).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let ctx = store.context();
+    let plan = store
+        .sql(&format!(r#"SELECT count(*) AS n FROM "{TABLE}""#))
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+
+    // Archival moves the boundary to D20 while the plan is held, which detaches
+    // exactly the window the plan is still asking PostgreSQL for.
+    let archiver = Archiver::new(
+        Arc::clone(&h.hot),
+        Arc::clone(&h.cold),
+        TableConfig::new(TABLE)
+            .settlement_lag(Duration::days(1))
+            .build()
+            .unwrap(),
+    );
+    archiver.catch_up(D21, 32).await.expect("archive");
+
+    let moved = PartitionId::new(TABLE, D19);
+    assert_eq!(
+        h.hot.drop_partition(&moved, D20).await.unwrap(),
+        Reclamation::HeldByReader,
+        "a plan cut at D19 is entitled to [D19, …), so this window is not free"
+    );
+
+    // And it reads whole, which is what holding it was for.
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("execute");
+    use datafusion::arrow::array::AsArray;
+    let n = batches[0]
+        .column(0)
+        .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+        .value(0);
+    assert_eq!(n, 288, "a held plan must still see every row");
+
+    // The plan and its streams are gone, so the floor is released — spawned,
+    // not awaited, so give it a bounded moment rather than a fixed sleep.
+    let mut outcome = Reclamation::HeldByReader;
+    for _ in 0..50 {
+        outcome = h.hot.drop_partition(&moved, D20).await.unwrap();
+        if outcome == Reclamation::Dropped {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        outcome,
+        Reclamation::Dropped,
+        "a finished plan must stop holding the floor without waiting out max_pin_age"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_only_plan_holds_nothing() {
+    // The counterexample. Pinning on every plan would work for the test above
+    // and stop reclamation on any deployment that reads history, so the rule
+    // has to be the one that follows from the split: a plan with no hot half
+    // asks PostgreSQL for nothing and is entitled to nothing.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D18, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert("11111111115", D18, 96, 1).await;
+    h.insert("11111111115", D19, 96, 1).await;
+    h.insert("11111111115", D20, 96, 1).await;
+    h.archive_through(D20).await;
+
+    let store = h.store(ReadMode::Unified).await;
+    let _plan = store
+        .sql(&format!(
+            r#"SELECT count(*) AS n FROM "{TABLE}" WHERE "from" < TIMESTAMP '2026-07-19 00:00:00'"#
+        ))
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+
+    let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM meterstore_pins")
+        .fetch_one(h.hot.pool())
+        .await
+        .unwrap();
+    assert_eq!(pins, 0, "a cold-only plan registers no reclamation floor");
 }
 
 #[tokio::test]
@@ -619,6 +736,7 @@ async fn the_store_handle_registers_everything_needed_for_a_query() {
     // And the watermark is reachable without touching the cold store directly.
     assert_eq!(store.watermark().await.unwrap().get(), D20);
     store
+        .admin()
         .verify_invariant()
         .await
         .expect("tiers must partition the data");
@@ -1174,7 +1292,11 @@ async fn system_tables_answer_the_questions_an_incident_asks() {
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let store = h.store(ReadMode::Unified).await;
-    store.refresh_system_tables(NOW_FOR_STATUS).await.unwrap();
+    store
+        .admin()
+        .refresh_system_tables(NOW_FOR_STATUS)
+        .await
+        .unwrap();
 
     let batches = store
         .sql(r#"SELECT "table", invariant_violations, healthy FROM system.tables"#)
@@ -1207,7 +1329,7 @@ async fn system_status_reports_watermark_lag() {
     h.archive_through(ARCHIVE_AS_OF).await;
 
     let store = h.store(ReadMode::Unified).await;
-    let status = store.status(NOW_FOR_STATUS).await.unwrap();
+    let status = store.admin().status(NOW_FOR_STATUS).await.unwrap();
 
     assert_eq!(status.watermark, D20, "two windows archived");
     assert!(
@@ -1221,11 +1343,16 @@ async fn system_status_reports_watermark_lag() {
 async fn system_config_shows_the_settings_that_interact() {
     let h = Harness::start().await;
     let store = h.store(ReadMode::Unified).await;
-    store.refresh_system_tables(NOW_FOR_STATUS).await.unwrap();
+    store
+        .admin()
+        .refresh_system_tables(NOW_FOR_STATUS)
+        .await
+        .unwrap();
     // **Twice**, because it is a refresh: `MemorySchemaProvider::register_table`
     // refuses a name it already holds, and the second call is the first one a
     // maintenance loop or an operator dashboard makes.
     store
+        .admin()
         .refresh_system_tables(NOW_FOR_STATUS)
         .await
         .expect("a refresh must be repeatable");
@@ -1499,17 +1626,23 @@ async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
 
     // Seed the watermark and archive through the same handle.
     store
+        .admin()
         .cold_store()
         .append_and_commit(
             TABLE,
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            Duration::DAY,
             D18,
         )
         .await
         .expect("seed watermark");
-    store.archive(ARCHIVE_AS_OF, 8).await.expect("archive");
+    store
+        .admin()
+        .archive(ARCHIVE_AS_OF, 8)
+        .await
+        .expect("archive");
 
     // Rows really did move: the hot tier is now short.
     let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))

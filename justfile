@@ -238,28 +238,27 @@ coverage:
 
 # Gitignored: the files are third-party publications under their own terms.
 # Existing files are kept, so a re-run only fetches what is missing; anything
-# that cannot be fetched is reported at the end and indexed in `specs/README.md`
-# with its source.
+# that cannot be fetched is reported at the end, with its source.
 #
-# 📚 Rebuild `specs/` — the primary sources every citation is checked against
-specs:
+# 📚 Rebuild `concepts/references/` — the primary sources every citation is checked against
+references:
     #!/usr/bin/env bash
     set -uo pipefail
     ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
     missing=""
     # fetch DIR FILE URL [ALT_URL]
     fetch() {
-        mkdir -p "specs/$1"
-        if [ -s "specs/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
+        mkdir -p "concepts/references/$1"
+        if [ -s "concepts/references/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
         for url in "$3" "${4:-}"; do
             [ -n "$url" ] || continue
             if curl -fsSL -A "$ua" --retry 3 --retry-delay 5 --max-time 900 \
-                    -o "specs/$1/$2.part" "$url" \
-                    && [ -s "specs/$1/$2.part" ] \
-                    && { [ "${1}" = "format" ] || [ "$(file -b --mime-type "specs/$1/$2.part")" != "text/html" ]; }; then
-                mv "specs/$1/$2.part" "specs/$1/$2"; echo "fetched  $1/$2"; return 0
+                    -o "concepts/references/$1/$2.part" "$url" \
+                    && [ -s "concepts/references/$1/$2.part" ] \
+                    && { [ "${1}" = "format" ] || [ "$(file -b --mime-type "concepts/references/$1/$2.part")" != "text/html" ]; }; then
+                mv "concepts/references/$1/$2.part" "concepts/references/$1/$2"; echo "fetched  $1/$2"; return 0
             fi
-            rm -f "specs/$1/$2.part"
+            rm -f "concepts/references/$1/$2.part"
         done
         echo "MISSING  $1/$2  <- $3" >&2
         missing="$missing  $1/$2  <- $3"$'\n'
@@ -332,7 +331,7 @@ specs:
         'https://www.bsi.bund.de/SharedDocs/Downloads/DE/BSI/Publikationen/TechnischeRichtlinien/TR03109/TR03109-1.pdf?__blob=publicationFile&v=4'
     if [ -n "$missing" ]; then
         echo >&2
-        echo "⚠️  not fetched (see specs/README.md for the source):" >&2
+        echo "⚠️  not fetched:" >&2
         printf '%s' "$missing" >&2
     fi
-    echo "📚 specs/ rebuilt"
+    echo "📚 concepts/references/ rebuilt"

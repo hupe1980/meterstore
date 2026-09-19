@@ -7,7 +7,7 @@ weight = 8
 ## Scheduling
 
 ```rust
-let handle = store.maintenance()
+let handle = store.admin().maintenance()
     .interval(Duration::minutes(15))
     .expire_snapshots(false)      // snapshot retention is a compliance decision
     .spawn();
@@ -236,7 +236,7 @@ it — a window closes while corrections for it are still arriving, and they lan
 below the watermark where no query looks. Seeing the two side by side is how that
 gets noticed.
 
-All four are snapshots computed when asked. `store.refresh_system_tables(now)`
+All four are snapshots computed when asked. `store.admin().refresh_system_tables(now)`
 recomputes them — deliberately explicit, so an ordinary query never silently pays
 for a round trip to both tiers.
 
@@ -323,8 +323,8 @@ compaction with Spark, or a second deployment on an older configuration.
 
 | Failure | Behaviour | Recovery |
 |---|---|---|
-| Crash mid-archival, pre-commit | Partition detached, not archived; invisible to writers, still **readable** by queries | Next run refuses to drop it and names it for an operator to re-attach |
-| Crash post-commit | Detached partition — data intact, and exactly the state a *successful* run leaves | A later cycle reclaims it, once past the reader grace |
+| Crash mid-archival, pre-commit | Partition detached, not archived; invisible to writers, still **readable** by queries | **Automatic.** The next run archives it again — the partition already holds every row and the watermark never moved, so it is the state archival wants. `detach_partition` is idempotent for this reason |
+| Crash post-commit | Detached partition — data intact, and exactly the state a *successful* run leaves | A later cycle reclaims it, once past the reader grace and unheld by any live plan |
 | Hot partitions exhausted | **Inserts fail** | Alert on `partitions_ahead`; pre-creation is automatic but monitored |
 | Object store unavailable | Archival backpressures; cold queries fail loudly | Automatic |
 | Postgres unavailable | Archival retries; cold queries unaffected | Automatic |
@@ -355,10 +355,37 @@ two versions stored and appears twice however the bytes are arranged. Coarser
 files in fact push elision the wrong way, since a scan reads whole files. The case
 for compaction is the ordinary one — less manifest to plan against.
 
-The one orphan source that is closed needs no listing: a commit that wrote its
-data files and failed to land still holds every path, so it deletes them before
-returning the error. It re-reads the table first, because a commit can fail
-*after* landing.
+So **do not compact the readings table's data files.** Archival writes one file
+per window, each holding a single version over a disjoint interval range, and that
+is precisely the layout that lets a historical scan skip version resolution
+entirely. Collapse a month's thirty files into one and its statistics read
+`version min: 1, max: 30` — a file that contains a correction on its own evidence
+— and every query touching that month pays a window function, a sort and a
+repartition from then on, over data holding no correction at all.
+
+A compactor decides "small" as a fraction of `write.target-file-size-bytes`, so
+**declare yours**:
+
+```toml
+[tables.archival]
+declared_file_size = 41943040   # what this table's files actually come out at
+```
+
+Left out, the tool falls back to Iceberg's 512 MiB default, reads a 40 MB daily
+file as 8 % of target, and rewrites the warehouse. The figure is decided by the
+archival window and the size of the portfolio rather than by any setting — roughly
+40 MB a day at 100 k measuring points — so archive a window and read it off the
+run, which reports the bytes per file it wrote for as long as nothing is declared.
+
+The orphans MeterStore creates itself need no listing: a commit that wrote its
+data files and failed still holds every path. It removes them only when the
+catalogue **refused** the commit. When the catalogue says nothing about whether it
+applied one — a timeout, a reset connection, a 5xx — the files are left in place,
+because deleting one that a landed snapshot references destroys settled history,
+while keeping one it does not costs storage you can reclaim later.
+
+So a deployment whose catalogue is occasionally slow accumulates orphans on
+purpose, and out-of-band orphan removal is what takes that space back.
 
 ## Snapshot expiry
 
@@ -372,19 +399,22 @@ and is parsed on **every** table load. Unreferenced manifest lists and old
 metadata files stay on object storage — removing those needs the listing operation
 above.
 
-### The retention window is meterstore's, not the table's
+### The retention window is the deployment's, and the table says so
 
-`snapshot_retention` and `min_snapshots_to_keep` decide what expiry removes, and
-nothing else does — including `history.expire.*` on the Iceberg table, which
-`iceberg`'s expire action would otherwise apply on top. Its age path runs whether
-or not snapshot ids are named, defaulting to `max-snapshot-age-ms` of **five
-days**, so a store could stop being able to reproduce a settlement older than a
-working week.
+`snapshot_retention` and `min_snapshots_to_keep` decide what MeterStore's own
+expiry removes, and nothing else does. `iceberg`'s expire action would otherwise
+apply `history.expire.*` on top: its age path runs whether or not snapshot ids are
+named, defaulting to `max-snapshot-age-ms` of **five days**, so a store could stop
+being able to reproduce a settlement older than a working week. MeterStore pins
+that cutoff to the epoch **on the action**, which selects nothing, leaving the ids
+computed against the configured retention as the whole of what is expired.
 
-MeterStore pins that cutoff to the epoch, which selects nothing: the ids computed
-against the configured retention are the whole of what is expired. Since
-`history.expire.*` is a *table* property, that also keeps out-of-band compaction
-from deciding a deployment's retention by setting one.
+The table separately **publishes** `history.expire.max-snapshot-age-ms` and
+`history.expire.min-snapshots-to-keep` at this deployment's real figures. That is
+for somebody else to read: a foreign expiry honours the table's properties, and a
+table that carries none hands it the five-day default. The two do not conflict —
+this crate's expiry ignores the properties and a foreign one obeys them, and both
+end up at the same policy.
 
 ### Do not expire snapshots from a foreign tool
 
@@ -395,19 +425,28 @@ the walk stops at a parent id that no longer resolves, and every query fails at
 once on a table that is otherwise healthy.
 
 `expire_snapshots` re-stamps the boundary onto the current snapshot first, so
-there is no chain to punch a hole in. `store.reassert_watermark()` is that step on
-its own — run it after any out-of-band maintenance if you are not also running
-expiry. It republishes what the history already says, cannot move the boundary,
-and is a no-op when the current snapshot carries one:
+there is no chain to punch a hole in. Re-stamping on its own is the step to run
+after any out-of-band maintenance when you are not also running expiry. It
+republishes what the history already says, cannot move the boundary, and is a
+no-op when the current snapshot carries one — so put it in the same job, right
+after the tool that rewrote the table:
+
+```bash
+# After compacting with Spark, PyIceberg or a catalogue that maintains
+# the table for you:
+meterstore reassert-watermark
+```
 
 ```rust
-// After compacting with Spark or PyIceberg:
-store.reassert_watermark().await?;
+store.admin().reassert_watermark().await?;
 ```
+
+Both are safe to run unconditionally and safe to run twice, which is what makes
+this a scheduled step rather than a judgement call.
 
 ## Removing data
 
-`store.purge_table(name)` destroys the PostgreSQL table with every partition, the
+`store.admin().purge_table(name)` destroys the PostgreSQL table with every partition, the
 Iceberg catalogue entry, and the data files in object storage. It is the **only**
 operation in the crate that deletes stored readings — everything else is
 append-only, because a settlement must stay reproducible.

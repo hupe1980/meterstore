@@ -40,6 +40,7 @@ async fn populated() -> (TestHarness, meterstore::MeterStore) {
         .expect("ingest");
     // Archive part of it, so both tiers genuinely hold rows.
     store
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -60,7 +61,11 @@ async fn a_purge_removes_the_data_files_not_only_the_catalog_entry() {
         "the fixture must have archived something, or there is nothing to purge"
     );
 
-    store.purge_table(TestHarness::TABLE).await.expect("purge");
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("purge");
 
     let after = harness.parquet_files();
     assert!(
@@ -80,7 +85,11 @@ async fn a_purge_removes_the_hot_table_and_every_partition() {
             .expect("count relations");
     assert!(partitions_before > 1, "parent plus at least one partition");
 
-    store.purge_table(TestHarness::TABLE).await.expect("purge");
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("purge");
 
     let partitions_after: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_class WHERE relname LIKE 'readings_versions%'")
@@ -118,7 +127,11 @@ async fn a_detached_orphan_does_not_survive_the_purge() {
             .expect("lookup");
     assert!(exists, "the detached partition must exist before the purge");
 
-    store.purge_table(TestHarness::TABLE).await.expect("purge");
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("purge");
 
     let survives: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)")
@@ -137,6 +150,7 @@ async fn the_table_name_must_be_repeated() {
     let (_h, store) = populated().await;
 
     let err = store
+        .admin()
         .purge_table("some_other_table")
         .await
         .expect_err("a mismatched confirmation must be refused");
@@ -179,6 +193,7 @@ async fn purging_one_table_leaves_another_intact() {
 
     for store in catalog.tables() {
         store
+            .admin()
             .hot_store()
             .ensure_partitions(
                 store.config().name(),
@@ -208,6 +223,7 @@ async fn purging_one_table_leaves_another_intact() {
     catalog
         .table("leaving_versions")
         .expect("leaving")
+        .admin()
         .purge_table("leaving_versions")
         .await
         .expect("purge");

@@ -39,7 +39,7 @@
 //!     .await?;
 //!
 //! // And each table still archives on its own schedule.
-//! catalog.table("readings").unwrap().archive(now(), 8).await?;
+//! catalog.table("readings").unwrap().admin().archive(now(), 8).await?;
 //! # Ok(())
 //! # }
 //! # fn now() -> time::OffsetDateTime { time::OffsetDateTime::UNIX_EPOCH }
@@ -469,7 +469,7 @@ impl MeterCatalog {
     /// known order.
     pub async fn create_tables(&self) -> Result<()> {
         for store in self.stores.values() {
-            store.create_tables().await?;
+            store.admin().create_tables().await?;
         }
         Ok(())
     }
@@ -483,7 +483,13 @@ impl MeterCatalog {
         let views: Vec<super::system::SystemTables<'_>> = self
             .stores
             .values()
-            .map(|s| super::system::SystemTables::new(s.hot_store(), s.cold_store(), s.config()))
+            .map(|s| {
+                super::system::SystemTables::new(
+                    s.admin().hot_store(),
+                    s.admin().cold_store(),
+                    s.config(),
+                )
+            })
             .collect();
         super::system::register_all(&self.ctx, &views, now).await
     }
@@ -492,7 +498,7 @@ impl MeterCatalog {
     pub async fn status(&self, now: OffsetDateTime) -> Result<Vec<super::system::TableStatus>> {
         let mut out = Vec::with_capacity(self.stores.len());
         for store in self.stores.values() {
-            out.push(store.status(now).await?);
+            out.push(store.admin().status(now).await?);
         }
         Ok(out)
     }
@@ -515,9 +521,13 @@ impl MeterCatalog {
             // make it retryable: `InvariantViolated` is the one condition this
             // crate is most emphatic must *not* be retried past, and archival is
             // where it surfaces.
-            let outcome = store.archive(now, max_windows).await.inspect_err(|e| {
-                tracing::error!(table = %name, error = %e, "archiving a catalog table failed");
-            })?;
+            let outcome = store
+                .admin()
+                .archive(now, max_windows)
+                .await
+                .inspect_err(|e| {
+                    tracing::error!(table = %name, error = %e, "archiving a catalog table failed");
+                })?;
             out.push((name.clone(), outcome));
         }
         Ok(out)
@@ -530,7 +540,7 @@ impl MeterCatalog {
     pub async fn verify_invariant(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         for (name, store) in &self.stores {
-            if let Err(e) = store.verify_invariant().await {
+            if let Err(e) = store.admin().verify_invariant().await {
                 match e {
                     Error::InvariantViolated { detail, .. } => out.push((name.clone(), detail)),
                     other => return Err(other),
@@ -542,21 +552,52 @@ impl MeterCatalog {
 
     /// Destroy every linkage whose collection year has passed `cutoff`.
     ///
-    /// # Identical to [`MeterStore::anonymise_before`], and that is the point
+    /// # This is a duty on a clock, not a request to wait for
     ///
-    /// The subject registry is deployment-wide: one `meterstore_subject_map`
-    /// keyed by `(natural identifier, collection year)`, so two tables that
-    /// register the same identifier for the same year share one [`SubjectRef`]
-    /// and one expiry unlinks both.
+    /// § 60 Abs. 6 MsbG obliges the Messstellenbetreiber to **erase or
+    /// anonymise** personenbezogene Messwerte as soon as storing them is no
+    /// longer necessary, *"spätestens jedoch nach drei Jahren ab dem Schluss des
+    /// Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*.
     ///
-    /// What comes due is decided by the calendar against the `epoch` column, so
-    /// neither this nor the per-table form reads a reading — which is why they
-    /// cannot disagree. An earlier design applied the cutoff to the *latest
-    /// reading in the deployment*, and needed this method to exist because the
-    /// per-table form would then destroy a linkage another table still depended
-    /// on. That hazard is gone with the rule that created it.
+    /// Three years is a **ceiling**, and the operative trigger is earlier — the
+    /// opposite of a retention mandate. A store built to keep personal metering
+    /// values for three years *because the law says so* has it inverted.
     ///
-    /// Idempotent and safe on a schedule; see
+    /// [`erase_subject_by_id`](Self::erase_subject_by_id) answers an Article 17
+    /// request, one subject at a time, when someone asks. This is the standing
+    /// obligation: nobody asks, and it comes due anyway.
+    ///
+    /// The statute says *löschen **oder** anonymisieren*, and the second branch
+    /// is the one an immutable lake can take: destroying the mapping leaves
+    /// quantities against an opaque token — anonymous data, outside the
+    /// Regulation by Recital 26 — while the settlement record stays reproducible.
+    ///
+    /// # The unit is a collection year, not a subject
+    ///
+    /// § 60 Abs. 6 runs on *"der jeweilige Messwert"*, so what comes due is a
+    /// `(subject, year)` pair. A reference is minted for one collection year
+    /// ([`register_subject`](Self::register_subject)) and this deletes the
+    /// mapping rows whose year has passed the ceiling — so an active customer's
+    /// 2021 values stop being attributable on schedule while their 2026 values
+    /// are untouched. It reads no reading at all, so a quiet table, a
+    /// quarantined one and a session that cannot see the hot window make no
+    /// difference to what is due.
+    ///
+    /// `cutoff` is the caller's: the statutory ceiling is a calendar computation
+    /// over the year a value was *erhoben*, and the earlier "no longer necessary"
+    /// trigger is a business decision this crate has no view on.
+    ///
+    /// # One registry, however many tables
+    ///
+    /// The subject map is deployment-wide: one `meterstore_subject_map` keyed by
+    /// `(natural identifier, collection year)`, so two tables registering the
+    /// same identifier for the same year share one [`SubjectRef`] and one expiry
+    /// unlinks both. That is why this is a **catalog** operation and has no
+    /// per-table form — a sweep scoped to one table would name a scope the data
+    /// does not have.
+    ///
+    /// References the registry no longer resolves are skipped, so the sweep is
+    /// idempotent and a re-run writes no second audit row; see
     /// [`Maintenance::anonymise_after`](super::Maintenance::anonymise_after).
     ///
     /// [`SubjectRef`]: crate::erasure::SubjectRef
@@ -566,7 +607,7 @@ impl MeterCatalog {
         reason: &str,
         actor: &str,
         now: OffsetDateTime,
-    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+    ) -> Result<crate::erasure::SweepOutcome> {
         anonymise_across(self.stores.values(), cutoff, reason, actor, now).await
     }
 
@@ -580,6 +621,62 @@ impl MeterCatalog {
         self.stores.values().find_map(MeterStore::subject_registry)
     }
 
+    /// Register a natural identifier for the retention epoch containing `at`,
+    /// and get the reference to store on that period's readings.
+    ///
+    /// **A pseudonym, not an encryption.** The reference is a random token
+    /// resolvable only through the mapping this writes, so destroying that row
+    /// destroys the linkage while every reading carrying the token stays where
+    /// it is.
+    ///
+    /// `sparte` is the commodity of those readings, because the epoch is the
+    /// year of the day they are **balanced** on and for gas that day runs 06:00
+    /// to 06:00. It is the same [`retention_epoch`] the write path checks the
+    /// reference with, so what this mints is by construction what that accepts.
+    ///
+    /// Idempotent: the same identifier and epoch return the same reference, so an
+    /// ingest path may call it per batch.
+    ///
+    /// [`retention_epoch`]: crate::erasure::retention_epoch
+    pub async fn register_subject(
+        &self,
+        natural_id: &str,
+        at: OffsetDateTime,
+        sparte: metering::interval::Sparte,
+    ) -> Result<crate::erasure::SubjectRef> {
+        self.require_registry()?
+            .register(natural_id, at, sparte)
+            .await
+    }
+
+    /// Destroy one reference's linkage, leaving its readings anonymous.
+    ///
+    /// One collection year of one subject.
+    /// [`erase_subject_by_id`](Self::erase_subject_by_id) is what an Article 17
+    /// request needs, because a request names a person and a person has as many
+    /// references as years on record.
+    pub async fn erase_subject(
+        &self,
+        subject: &crate::erasure::SubjectRef,
+        reason: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<crate::erasure::ErasureRecord>> {
+        self.require_registry()?
+            .erase(subject, reason, actor, now)
+            .await
+    }
+
+    /// Suppressions this deployment's key ring can no longer recognise.
+    ///
+    /// Empty is healthy. Non-empty means a key was dropped from the ring while
+    /// live tombstones still depended on it, so the subjects those cover are no
+    /// longer kept out and a replay re-registers them. See
+    /// [`SubjectRegistry::orphaned_suppressions`](crate::erasure::SubjectRegistry::orphaned_suppressions).
+    pub async fn orphaned_suppressions(&self) -> Result<Vec<crate::erasure::OrphanedSuppressions>> {
+        self.require_registry()?.orphaned_suppressions().await
+    }
+
     /// Destroy a subject's linkage across the whole deployment, named the way an
     /// Article 17 request names it.
     ///
@@ -588,8 +685,9 @@ impl MeterCatalog {
     /// reaches every table that registered it — the authoritative Lastgang and
     /// the non-authoritative second stream together.
     ///
-    /// [`MeterStore::erase_subject_by_id`] is the same operation through one
-    /// table's handle, and cannot disagree with it.
+    /// There is no per-table form, and that is the point: the map is
+    /// deployment-wide, so a handle narrower than the deployment would name a
+    /// scope the data does not have.
     pub async fn erase_subject_by_id(
         &self,
         natural_id: &str,
@@ -688,7 +786,7 @@ pub(crate) async fn anonymise_across<'a>(
     reason: &str,
     actor: &str,
     now: OffsetDateTime,
-) -> Result<Vec<crate::erasure::ErasureRecord>> {
+) -> Result<crate::erasure::SweepOutcome> {
     let mut registry = None;
     let mut subject_tables = 0usize;
 
@@ -700,12 +798,16 @@ pub(crate) async fn anonymise_across<'a>(
         registry = registry.or_else(|| store.subject_registry());
     }
 
+    // Not a refusal. See `MeterStore::anonymise_before`: the sweep is a registry
+    // operation over a deployment-wide map, and a deployment that has *stopped*
+    // declaring subject columns still holds every mapping row it wrote before —
+    // rows still due under `[MsbG § 60 Abs. 6]`. Refusing here would decline to
+    // discharge a statutory deletion duty because of an unrelated schema change.
     if subject_tables == 0 {
-        return Err(Error::config(
-            "no table in this catalog declares a subject column, so there is no \
-             linkage to destroy: without one the stored readings carry no reference \
-             to a person and § 60 Abs. 6 has nothing to act on here",
-        ));
+        tracing::debug!(
+            "retention sweep run over a catalog where no table declares a subject \
+             column; the sweep is deployment-wide and unaffected"
+        );
     }
     let registry = registry.ok_or_else(|| {
         Error::config(

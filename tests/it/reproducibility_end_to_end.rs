@@ -175,6 +175,7 @@ impl Harness {
                 stream_of(Vec::new()),
                 WriteHints::default(),
                 ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+                Duration::DAY,
                 D18,
             )
             .await
@@ -283,7 +284,7 @@ async fn a_pinned_snapshot_reproduces_what_was_known_then() {
     h.archive_through(D20).await;
 
     let store = h.store(ReadMode::Unified).await;
-    let settlement_snapshot = store.snapshots().await.expect("snapshots")[0].snapshot_id;
+    let settlement_snapshot = store.admin().snapshots().await.expect("snapshots")[0].snapshot_id;
 
     // Afterwards a correction restates the day at 40 kWh per interval. It is
     // below the watermark, so it goes straight to Iceberg.
@@ -345,7 +346,7 @@ async fn a_version_ceiling_pins_the_domain_axis_independently() {
 
     // The newest snapshot contains both versions.
     let latest = h.store(ReadMode::Unified).await;
-    let newest = latest.snapshots().await.unwrap()[0].snapshot_id;
+    let newest = latest.admin().snapshots().await.unwrap()[0].snapshot_id;
 
     let unpinned = latest
         .as_of(SnapshotSelector::Id(newest), None)
@@ -396,7 +397,7 @@ async fn a_reproducible_read_never_touches_the_mutable_tier() {
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
-    let snapshot = store.snapshots().await.unwrap()[0].snapshot_id;
+    let snapshot = store.admin().snapshots().await.unwrap()[0].snapshot_id;
     let pinned = store
         .as_of(SnapshotSelector::Id(snapshot), None)
         .await
@@ -412,7 +413,7 @@ async fn a_reproducible_read_never_touches_the_mutable_tier() {
     // And the provenance reports the boundary the *pinned* snapshot published,
     // not today's — attaching a number from one moment to a boundary from
     // another is exactly what carrying provenance exists to prevent.
-    let listed = store.snapshots().await.unwrap();
+    let listed = store.admin().snapshots().await.unwrap();
     let published = listed
         .iter()
         .find(|s| s.snapshot_id == snapshot)
@@ -438,7 +439,7 @@ async fn a_pinned_session_refuses_to_be_written_through() {
     h.archive_through(D21).await;
 
     let store = h.store(ReadMode::Unified).await;
-    let snapshot = store.snapshots().await.unwrap()[0].snapshot_id;
+    let snapshot = store.admin().snapshots().await.unwrap()[0].snapshot_id;
     let pinned = store
         .as_of(SnapshotSelector::Id(snapshot), None)
         .await
@@ -775,6 +776,7 @@ async fn a_contended_archiver_does_nothing_rather_than_racing() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            Duration::DAY,
             D18,
         )
         .await
@@ -820,6 +822,7 @@ async fn the_resolution_sql_is_reachable_from_a_sql_client() {
 
     let store = h.store(ReadMode::Unified).await;
     store
+        .admin()
         .refresh_system_tables(D21)
         .await
         .expect("refresh system tables");
@@ -852,6 +855,7 @@ async fn the_balancing_day_column_is_reachable_from_a_sql_client() {
 
     let store = h.store(ReadMode::Unified).await;
     store
+        .admin()
         .refresh_system_tables(D21)
         .await
         .expect("refresh system tables");
@@ -901,7 +905,11 @@ async fn system_snapshots_lists_what_a_reproducible_read_can_pin() {
     h.archive_through(D19).await;
 
     let store = h.store(ReadMode::Unified).await;
-    store.refresh_system_tables(D21).await.expect("refresh");
+    store
+        .admin()
+        .refresh_system_tables(D21)
+        .await
+        .expect("refresh");
 
     let result = store
         .query("SELECT COUNT(*) FROM system.snapshots WHERE written_by_meterstore")
@@ -909,7 +917,7 @@ async fn system_snapshots_lists_what_a_reproducible_read_can_pin() {
         .expect("query");
     assert!(scalar(&result) >= 1);
 
-    let listed = store.snapshots().await.unwrap();
+    let listed = store.admin().snapshots().await.unwrap();
     assert!(listed.iter().all(|s| s.watermark.is_some()));
     assert!(
         listed
@@ -927,6 +935,7 @@ async fn a_matching_schema_reports_no_changes() {
     let compatibility = h
         .store(ReadMode::Unified)
         .await
+        .admin()
         .check_schema()
         .await
         .expect("check")
@@ -1029,8 +1038,16 @@ async fn a_store_can_be_built_before_its_tables_exist() {
         .await
         .expect("a store must build before create_tables runs");
 
-    store.create_tables().await.expect("create tables");
-    assert!(store.check_schema().await.unwrap().unwrap().is_safe());
+    store.admin().create_tables().await.expect("create tables");
+    assert!(
+        store
+            .admin()
+            .check_schema()
+            .await
+            .unwrap()
+            .unwrap()
+            .is_safe()
+    );
 }
 
 #[tokio::test]
@@ -1048,6 +1065,7 @@ async fn a_safe_schema_difference_does_not_halt_the_table() {
                 true,
             )],
             &[],
+            &meterstore::tiering::store::MaintenancePolicy::default(),
         )
         .await
         .expect("cold table already exists; this is a no-op load");
@@ -1055,6 +1073,7 @@ async fn a_safe_schema_difference_does_not_halt_the_table() {
     let compatibility = h
         .store(ReadMode::Unified)
         .await
+        .admin()
         .check_schema()
         .await
         .unwrap()
@@ -1135,6 +1154,7 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            Duration::DAY,
             D18,
         )
         .await
@@ -1167,7 +1187,7 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
 
     // And nothing was lost or duplicated in the process.
     let store = h.store(ReadMode::Unified).await;
-    store.verify_invariant().await.expect("invariant");
+    store.admin().verify_invariant().await.expect("invariant");
     assert_eq!(
         scalar(&store.query("SELECT COUNT(*) FROM readings").await.unwrap()),
         192,
@@ -1198,13 +1218,14 @@ async fn writes_during_archival_are_never_stranded_below_the_watermark() {
             stream_of(Vec::new()),
             WriteHints::default(),
             ArchivalWindow::new(D18 - Duration::DAY, D18).unwrap(),
+            Duration::DAY,
             D18,
         )
         .await
         .unwrap();
 
     let store = h.store(ReadMode::Unified).await;
-    store.archive(D20, 4).await.expect("archive D18");
+    store.admin().archive(D20, 4).await.expect("archive D18");
     assert_eq!(store.watermark().await.unwrap().get(), D19);
 
     // A correction for the now-archived day. It must not reach PostgreSQL.
@@ -1221,7 +1242,7 @@ async fn writes_during_archival_are_never_stranded_below_the_watermark() {
         "nothing may be written below the boundary"
     );
 
-    store.verify_invariant().await.expect("invariant");
+    store.admin().verify_invariant().await.expect("invariant");
 
     let total = h
         .store(ReadMode::Unified)

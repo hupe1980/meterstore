@@ -54,25 +54,29 @@ const EXPECTED_ROWS: u64 = (DAYS as u64) * 96 * (METERS as u64);
 
 /// A store, its harness, and the range it holds.
 ///
-/// # The reader grace is set in the units of the clock the test drives
+/// # The grace runs out here on purpose
 ///
-/// Archival takes `now` as a parameter, and this suite advances it a **day per
-/// cycle** so that a window closes between reads instead of all at once. The
-/// reader grace is measured on that same clock — deliberately, so that nothing
-/// depends on a second one — which means the default hour is exhausted by the
-/// first jump, and a reclamation would then be free to take a partition a reader
-/// planned against.
+/// Archival takes `now` as a parameter and this suite advances it a **day per
+/// cycle**, so the default hour of `reader_grace` is exhausted by the first
+/// jump. Reclamation is therefore live throughout: every cycle is free to take
+/// the partition it just archived, while three readers plan and execute against
+/// the boundary it is moving.
 ///
-/// That is not an artefact to work around; it is the contract, stated in the one
-/// place it can be observed. A deployment that drives `now` faster than wall
-/// clock — a catch-up after an outage, a backfill — gets exactly as much grace as
-/// the clock it supplies. So the grace here is set wider than the span the test
-/// covers, which is what a deployment doing the same thing has to do.
+/// That is the point. The grace is measured on the clock the caller drives —
+/// deliberately, so nothing depends on a second one — and a deployment catching
+/// up after an outage drives it just as fast. Widening the grace instead — to a
+/// year, say — keeps reclamation out of the way, and then the interleaving this
+/// suite exists to test never meets a partition being taken.
+///
+/// **What this does not prove.** These readers plan and execute in one step, so
+/// the window between the two is microseconds and the reclamation floor each
+/// plan registers is never what saves them. The floor is proved where it can be:
+/// a plan held across an archival run, in `query_end_to_end`.
 async fn seeded() -> (TestHarness, Arc<MeterStore>) {
     let harness = TestHarness::with_config(
         TableConfig::new(TestHarness::TABLE)
             .settlement_lag(Duration::DAY)
-            .reader_grace(Duration::days(365))
+            .reader_grace(Duration::HOUR)
             .build()
             .expect("config"),
     )
@@ -112,7 +116,7 @@ async fn resolved_count(store: &MeterStore) -> u64 {
 async fn a_count_is_exact_while_archival_moves_the_data_under_it() {
     // The property the tiering design exists to make true, asserted while the
     // boundary is actually moving rather than after it has stopped.
-    let (_h, store) = seeded().await;
+    let (h, store) = seeded().await;
     assert_eq!(resolved_count(&store).await, EXPECTED_ROWS, "seeded");
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -149,7 +153,7 @@ async fn a_count_is_exact_while_archival_moves_the_data_under_it() {
             // A one-day settlement lag, so `START + n + 1` closes the nth window.
             for day in 1..=DAYS {
                 let now = START + Duration::days(day + 1);
-                store.archive(now, 4).await.expect("archive");
+                store.admin().archive(now, 4).await.expect("archive");
                 tokio::task::yield_now().await;
             }
             stop.store(true, Ordering::Relaxed);
@@ -174,6 +178,19 @@ async fn a_count_is_exact_while_archival_moves_the_data_under_it() {
         resolved_count(&store).await,
         EXPECTED_ROWS,
         "and the count is still exact once everything has settled"
+    );
+
+    // And reclamation was **live** for all of it. Without this the suite would
+    // keep passing if the grace were widened back out, which is the state it
+    // spent its life in: every count exact because no partition was ever taken.
+    use meterstore::tiering::store::HotStore;
+    assert!(
+        h.hot()
+            .reclaimed_below(TestHarness::TABLE)
+            .await
+            .expect("reclaimed_below")
+            .is_some(),
+        "no partition was reclaimed, so nothing here was tested against reclamation"
     );
 }
 
@@ -259,6 +276,7 @@ async fn ingest_archival_and_reads_together_leave_the_written_range_exact() {
         tokio::spawn(async move {
             for day in 1..=DAYS {
                 store
+                    .admin()
                     .archive(START + Duration::days(day + 1), 4)
                     .await
                     .expect("archive");
@@ -300,6 +318,7 @@ async fn corrections_landing_during_a_scan_are_never_double_counted() {
     // Archive the whole range, so every correction below is a cold append and
     // every read is a cold-only scan — the elision path.
     store
+        .admin()
         .archive(START + Duration::days(DAYS + 2), 16)
         .await
         .expect("archive");
@@ -407,6 +426,73 @@ async fn second_replica(harness: &TestHarness) -> Arc<meterstore::PostgresHot> {
         .await
         .expect("second replica pool");
     Arc::new(meterstore::PostgresHot::new(pool))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leaked_lease_is_cleared_when_its_connection_is_next_used() {
+    // A lease is a *session* advisory lock on a connection the lease owns. A
+    // future dropped at an await point — a task abort, a `timeout`, shutdown —
+    // skips the release, and the connection goes back to the pool still holding
+    // it. Every other session is then refused, and it is reported as
+    // `lease_contended`: the one outcome operators are told not to alert on.
+    //
+    // The re-entrancy is what made it permanent. Advisory locks nest per session,
+    // so handing the connection back out let `pg_try_advisory_lock` succeed —
+    // count two — and the single unlock on release left it at one. The lock was
+    // then held forever by a connection nobody was using.
+    //
+    // Asserted from a **second session**, because that is the only place the
+    // difference shows: on the leaking connection itself the re-entrancy makes
+    // every attempt succeed whether or not anything was cleared.
+    use meterstore::tiering::HotStore;
+
+    let (harness, _store) = seeded().await;
+    let table = harness.config().name();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(harness.url())
+        .await
+        .expect("single-connection pool");
+    let leaky = meterstore::PostgresHot::new(pool);
+    let observer = second_replica(&harness).await;
+
+    // Leak it: take the lease and drop it without releasing.
+    drop(
+        leaky
+            .try_archive_lease(table)
+            .await
+            .expect("lease query")
+            .expect("an uncontended lease is granted"),
+    );
+    assert!(
+        observer
+            .try_archive_lease(table)
+            .await
+            .expect("lease query")
+            .is_none(),
+        "the leaked lock really is still held, or this test proves nothing"
+    );
+
+    // The leaking pool has one connection, so the next lease gets it back —
+    // clears what was leaked, takes the lock cleanly, and releases it.
+    leaky
+        .try_archive_lease(table)
+        .await
+        .expect("lease query")
+        .expect("the leaking pool must be able to lease its own table")
+        .release()
+        .await
+        .expect("release");
+
+    assert!(
+        observer
+            .try_archive_lease(table)
+            .await
+            .expect("lease query")
+            .is_some(),
+        "the lock is still held after a clean acquire-and-release: the leaked \
+         count was decremented rather than cleared, so archival stays wedged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

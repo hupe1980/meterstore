@@ -81,6 +81,49 @@ async fn store() -> (TestHarness, meterstore::MeterStore) {
 }
 
 #[tokio::test]
+async fn latest_finds_the_newest_reading_in_either_tier() {
+    // `latest` answers from the hot tier alone when it can, because the tiering
+    // invariant says the newest row is there whenever the hot tier holds any.
+    // The branch a probe could silently break is the other one: a channel whose
+    // readings are *all* archived, where the hot tier has nothing and the answer
+    // is only in the cold tier.
+    let (h, store) = store().await;
+    store
+        .append(&[reading(
+            &[(10, QualityFlag::Measured), (20, QualityFlag::Measured)],
+            20_260_720_000_001,
+        )])
+        .await
+        .expect("append");
+
+    // Archive it, leaving the hot tier empty for this channel.
+    h.ensure_partitions(START, START + Duration::days(10))
+        .await
+        .expect("partitions");
+    let archived = store
+        .admin()
+        .archiver()
+        .catch_up(START + Duration::days(9), 8)
+        .await
+        .expect("archive");
+    let rows: u64 = archived.iter().map(|o| o.rows).sum();
+    assert!(rows > 0, "the fixture must actually archive something");
+
+    let found = store
+        .series("12345678905")
+        .unwrap()
+        .latest()
+        .await
+        .expect("latest over an archived channel")
+        .expect("the reading is in the cold tier, not gone");
+    assert_eq!(
+        found.from,
+        START + Duration::minutes(15),
+        "the fallback must find the newest archived reading"
+    );
+}
+
+#[tokio::test]
 async fn latest_returns_the_newest_interval() {
     let (_h, store) = store().await;
     store

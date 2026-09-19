@@ -93,9 +93,14 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
 
     // The provider is built from the cold table, so it has to exist first — the
     // same order every other suite's harness uses.
-    cold.create_tables(TABLE, &[], &config.extra_columns())
-        .await
-        .expect("cold table");
+    cold.create_tables(
+        TABLE,
+        &[],
+        &config.extra_columns(),
+        &config.maintenance_policy(),
+    )
+    .await
+    .expect("cold table");
 
     let store = meterstore::MeterStore::builder()
         .hot(Arc::clone(&hot) as Arc<dyn HotStore>)
@@ -108,7 +113,7 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
         .await
         .expect("store");
 
-    store.create_tables().await.expect("tables");
+    store.admin().create_tables().await.expect("tables");
     hot.ensure_partitions(TABLE, START, START + Duration::days(3), Duration::DAY)
         .await
         .expect("partitions");
@@ -249,6 +254,7 @@ async fn a_zaehlerstandsgang_tiers_like_everything_else() {
     // Archive the first day. `settlement_lag` is one day, so a clock two days on
     // closes exactly the first window.
     store
+        .admin()
         .archive(START + Duration::days(2), 4)
         .await
         .expect("archive");
@@ -281,7 +287,7 @@ async fn a_zaehlerstandsgang_tiers_like_everything_else() {
     let total: usize = all.iter().map(|d| d.readings.len()).sum();
     assert_eq!(total, 192, "both days, one from each tier");
 
-    store.verify_invariant().await.expect("invariant");
+    store.admin().verify_invariant().await.expect("invariant");
 }
 
 #[tokio::test]
@@ -519,6 +525,7 @@ async fn a_late_correction_reconciles_per_messlokation() {
         .expect("second meter");
 
     store
+        .admin()
         .archive(START + Duration::days(2), 4)
         .await
         .expect("archive");

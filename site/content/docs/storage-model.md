@@ -282,7 +282,7 @@ other's reading — a cross-tenant leak with no error anywhere.
 
 **And the choice can be checked afterwards.** It is the one schema mistake that
 raises no error — the declaration is legal and the writes succeed — so
-`store.audit_attribute_column("tenant")` asks the stored rows instead: for how
+`store.admin().audit_attribute_column("tenant")` asks the stored rows instead: for how
 many merge keys does the column take more than one value? A correction restating
 an attribute gives a handful; an identity column declared as an attribute gives a
 large share, because every key a second identity also reports is one of them.

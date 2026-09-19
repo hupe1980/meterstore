@@ -100,6 +100,7 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
             TABLE,
             &config.identity_column_names(),
             &config.extra_columns(),
+            &config.maintenance_policy(),
         )
         .await
         .expect("cold table");
@@ -437,18 +438,21 @@ async fn identity_columns_survive_archival_into_the_cold_tier() {
     // is D20 itself. Without this the archiver starts at the epoch and spends
     // its window budget on empty 1970 days, and the test proves nothing.
     store
+        .admin()
         .cold_store()
         .append_and_commit(
             TABLE,
             stream_of(Vec::new()),
             WriteHints::default(),
             meterstore::watermark::ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
             D20,
         )
         .await
         .expect("seed watermark");
 
     store
+        .admin()
         .archive(D21 + Duration::DAY, 4)
         .await
         .expect("archive");
@@ -691,7 +695,11 @@ async fn the_attribute_audit_reads_the_declaration_back_off_the_data() {
         .await
         .unwrap();
 
-    let audit = store.audit_attribute_column("bilanzkreis").await.unwrap();
+    let audit = store
+        .admin()
+        .audit_attribute_column("bilanzkreis")
+        .await
+        .unwrap();
     assert_eq!(audit.merge_keys, 2);
     assert_eq!(audit.merge_keys_with_several_values, 0);
     assert_eq!(audit.widest, 1);
@@ -704,7 +712,11 @@ async fn the_attribute_audit_reads_the_declaration_back_off_the_data() {
     restated = restated.with_extra("bilanzkreis", ScalarValue::Utf8(Some("BK-2".to_string())));
     store.append(&[restated]).await.unwrap();
 
-    let audit = store.audit_attribute_column("bilanzkreis").await.unwrap();
+    let audit = store
+        .admin()
+        .audit_attribute_column("bilanzkreis")
+        .await
+        .unwrap();
     assert_eq!(
         audit.merge_keys, 2,
         "still two keys — a correction is not one"
@@ -720,13 +732,13 @@ async fn the_attribute_audit_reads_the_declaration_back_off_the_data() {
     // clean: both are refused rather than reported.
     for name in ["tenant", "malo_id", "no_such_column"] {
         assert!(
-            store.audit_attribute_column(name).await.is_err(),
+            store.admin().audit_attribute_column(name).await.is_err(),
             "{name} is not a declared attribute column"
         );
     }
 
     // And the sweep over every declared attribute column reaches the same answer.
-    let all = store.audit_attribute_columns().await.unwrap();
+    let all = store.admin().audit_attribute_columns().await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].column, "bilanzkreis");
     assert_eq!(all[0].merge_keys_with_several_values, 1);

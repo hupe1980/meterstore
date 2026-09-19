@@ -104,14 +104,40 @@ settlement_lag = "7d"
 # grid, and a window off that grid names a partition relation nothing creates.
 archival_step = "1d"
 
-# How long an archived partition is kept before its space is reclaimed.
+# How long an archived partition is kept whatever anybody is reading.
+#
+# Hysteresis: it keeps reclamation from chasing every commit. Safety is the line
+# below. The cost of raising it is a fraction of one partition's disk.
+reader_grace = "1h"
+
+# The cap on how long one query holds an archived partition.
 #
 # A query reads the tier boundary when it is *planned* and reads the tiers when
 # it *executes*. Archival between the two moves a window across the boundary the
-# plan already decided against, so the partition stays readable for this long
-# afterwards. Set it above the longest query this deployment runs; the cost is a
-# fraction of one partition's disk.
-reader_grace = "1h"
+# plan already decided against, so a plan registers the boundary it was cut at
+# and archival keeps what that plan is entitled to. Past this age the floor
+# advances anyway — a query killed with its process never deregisters, and one
+# such death must not hold a partition forever — and the over-running query
+# fails naming the window rather than returning without it.
+#
+# Set it above the longest query this deployment runs.
+max_pin_age = "6h"
+
+# The size this table's Iceberg data files actually come out at, in bytes.
+#
+# Published on the table as `write.target-file-size-bytes`, which is what every
+# compactor's "is this file small?" test is a fraction of. Leave it out and a
+# maintenance tool measures against Iceberg's 512 MiB default instead: a 40 MB
+# daily file reads as 8 % of target, the tool rewrites it, and collapsing thirty
+# single-version files into one that spans thirty versions disables merge
+# elision for that month permanently — over data holding no correction at all.
+#
+# No other setting decides it. The archival window and the size of the portfolio
+# do: roughly 40 MB a day at 100 k measuring points, 4 MB at 10 k, 400 MB at 1 M.
+# So archive a window and read the figure off the run — it is reported on every
+# commit while this is unset — and put it here.
+#
+# declared_file_size = 41943040
 
 [tables.maintenance]
 # A snapshot is what makes a past settlement reproducible, so this is a

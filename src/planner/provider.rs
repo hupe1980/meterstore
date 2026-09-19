@@ -216,6 +216,9 @@ pub struct TieredTableProvider {
     /// Empty for an unscoped provider. See
     /// [`with_row_scope`](Self::with_row_scope).
     row_scope: Vec<(String, datafusion::scalar::ScalarValue)>,
+    /// How long a cross-tier plan holds the reclamation floor, or `None` to
+    /// leave reclamation to the wall-clock grace alone.
+    max_pin_age: Option<time::Duration>,
 }
 
 impl fmt::Debug for TieredTableProvider {
@@ -272,7 +275,25 @@ impl TieredTableProvider {
                 extra,
             ),
             row_scope: Vec::new(),
+            max_pin_age: None,
         }
+    }
+
+    /// Hold the reclamation floor for as long as a cross-tier plan may live.
+    ///
+    /// A plan is cut at a boundary and scanned later, and the hot half is
+    /// enumerated lazily — on first poll, which for a `UNION ALL` drained
+    /// cold-side-first is however long the cold scan takes. Registering the
+    /// boundary makes archival keep what the plan is entitled to, instead of the
+    /// plan finding it gone and refusing.
+    ///
+    /// Unset means no registration and the wall-clock
+    /// [`reader_grace`](crate::config::TableConfig::reader_grace) alone, which
+    /// is also what a store with no pin registry gets.
+    #[must_use]
+    pub fn with_max_pin_age(mut self, age: time::Duration) -> Self {
+        self.max_pin_age = Some(age);
+        self
     }
 
     /// Confine every scan to rows matching these identity-column equalities.
@@ -388,6 +409,7 @@ impl TieredTableProvider {
         range: TimeRange,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
+        pin: Option<Arc<HeldPin>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(HotScanExec::new(
             self.schema.clone(),
@@ -397,6 +419,7 @@ impl TieredTableProvider {
             self.spec.clone(),
             projection.cloned(),
             limit,
+            pin,
         )?))
     }
 
@@ -520,6 +543,59 @@ impl TieredTableProvider {
         let mut tier_filters = filters.to_vec();
         tier_filters.extend(enforced.iter().cloned());
 
+        // **The reclamation floor this plan needs held.**
+        //
+        // Whenever there is a hot half, which is the exact condition rather
+        // than a heuristic: the hot range starts at the boundary this plan was
+        // cut at, so every partition archival is about to take is one this plan
+        // still asks for. A cold-only plan touches no partition and needs
+        // nothing held.
+        //
+        // Not narrowed to cross-tier plans, though those are where the exposure
+        // is longest — the hot child is enumerated on first poll and a
+        // `UNION ALL` drains cold-side-first, so the wait is the cold scan. A
+        // hot-only plan is exposed for however long its consumer takes to read
+        // it, which is not this layer's to bound.
+        //
+        // Two statements against a database the plan has not otherwise touched,
+        // against a watermark read that has already been to the Iceberg
+        // catalogue. The pin lives on the hot scan and dies with it, so a plan
+        // built and discarded releases it without executing.
+        let pin = match (self.max_pin_age, split.hot.is_some()) {
+            (Some(age), true) => {
+                let now = OffsetDateTime::now_utc();
+                let held = self
+                    .hot
+                    .pin_reader(&self.table, watermark.get(), now + age)
+                    .await
+                    .map_err(external)?
+                    .map(|pin| Arc::new(HeldPin::new(Arc::clone(&self.hot), pin)));
+
+                // **Pin, then verify** — CockroachDB's rule for protected
+                // timestamps, because "the mere existence of a record does not
+                // itself prove that the data has been protected". A pin written
+                // after the reclaimer read the registry protects nothing, and
+                // the drop that raced it is recorded in the same transaction it
+                // happened in, so re-reading that record settles the question
+                // exactly rather than probably.
+                if held.is_some()
+                    && let Some(reclaimed_below) = self
+                        .hot
+                        .reclaimed_below(&self.table)
+                        .await
+                        .map_err(external)?
+                    && reclaimed_below > watermark.get()
+                {
+                    return Err(DataFusionError::Plan(format!(
+                        "the hot tier reclaimed {} up to {reclaimed_below} while this plan was                          being made at boundary {watermark}, so the plan is already short a                          window. Retry: a fresh plan reads the new boundary and is whole",
+                        self.table,
+                    )));
+                }
+                held
+            }
+            _ => None,
+        };
+
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if let Some(range) = split.cold {
             plans.push(
@@ -528,7 +604,7 @@ impl TieredTableProvider {
             );
         }
         if let Some(range) = split.hot {
-            plans.push(self.scan_hot(range, tier_projection, tier_limit)?);
+            plans.push(self.scan_hot(range, tier_projection, tier_limit, pin)?);
         }
 
         // Planning latency, not scan latency: at this point nothing has been
@@ -620,6 +696,46 @@ impl TieredTableProvider {
     }
 }
 
+/// A reclamation floor held for one plan's lifetime.
+///
+/// # Why `Drop` and not an explicit release
+///
+/// There is no end-of-query hook to hang one on. A plan may be built and never
+/// executed, executed and abandoned half-drained, or dropped when a client
+/// disconnects — and the only thing all three have in common is that the plan
+/// tree goes away. So the release rides on that, and because `Drop` cannot
+/// await, it is spawned.
+///
+/// Spawning makes it **best-effort**, which is why the pin also carries an
+/// expiry: a release that never runs — no runtime, a process killed outright —
+/// costs the floor nothing beyond
+/// [`max_pin_age`](crate::config::TableConfig::max_pin_age).
+struct HeldPin {
+    hot: Arc<dyn HotStore>,
+    pin: crate::tiering::store::ReaderPin,
+}
+
+impl HeldPin {
+    fn new(hot: Arc<dyn HotStore>, pin: crate::tiering::store::ReaderPin) -> Self {
+        Self { hot, pin }
+    }
+}
+
+impl Drop for HeldPin {
+    fn drop(&mut self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let hot = Arc::clone(&self.hot);
+        let pin = self.pin;
+        handle.spawn(async move {
+            if let Err(e) = hot.release_pin(pin).await {
+                tracing::debug!(error = %e, "could not release a reader pin; it will expire");
+            }
+        });
+    }
+}
+
 /// Streams the hot tier into the engine.
 ///
 /// A `MemTable` would be simpler, but it holds every batch in memory before the
@@ -643,6 +759,9 @@ pub(crate) struct HotScanExec {
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     properties: Arc<datafusion::physical_plan::PlanProperties>,
+    /// The reclamation floor this scan's plan is entitled to, held until the
+    /// plan and every stream it produced are gone.
+    pin: Option<Arc<HeldPin>>,
 }
 
 impl HotScanExec {
@@ -655,6 +774,7 @@ impl HotScanExec {
         spec: crate::tiering::store::ScanSpec,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        pin: Option<Arc<HeldPin>>,
     ) -> DfResult<Self> {
         use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
         use datafusion::physical_plan::PlanProperties;
@@ -683,6 +803,7 @@ impl HotScanExec {
             projection,
             limit,
             properties,
+            pin,
         })
     }
 }
@@ -749,8 +870,13 @@ impl ExecutionPlan for HotScanExec {
         let source_schema = self.source_schema.clone();
         let projection = self.projection.clone();
         let mut remaining = self.limit.unwrap_or(usize::MAX);
+        // Moved into the stream as well as held by the plan: a consumer that
+        // drops the plan and keeps draining the stream must not have the floor
+        // released out from under it.
+        let pin = self.pin.clone();
 
         let batches = async_stream::stream! {
+            let _pin = pin;
             let started = std::time::Instant::now();
             let mut inner = match hot.scan_range(&table, range, &spec).await {
                 Ok(stream) => stream,
@@ -961,8 +1087,12 @@ mod tests {
         ) -> crate::Result<crate::tiering::store::BatchStream> {
             Ok(crate::tiering::store::stream_of(Vec::new()))
         }
-        async fn drop_partition(&self, _p: &PartitionId) -> crate::Result<()> {
-            Ok(())
+        async fn drop_partition(
+            &self,
+            _p: &PartitionId,
+            _below: time::OffsetDateTime,
+        ) -> crate::Result<crate::tiering::store::Reclamation> {
+            Ok(crate::tiering::store::Reclamation::Dropped)
         }
         async fn orphaned_partitions(&self, _t: &str) -> crate::Result<Vec<PartitionId>> {
             Ok(vec![])
@@ -987,6 +1117,7 @@ mod tests {
             _table: &str,
             _identity: &[String],
             _extra: &[crate::arrow::datatypes::Field],
+            _policy: &crate::tiering::store::MaintenancePolicy,
         ) -> crate::Result<()> {
             Ok(())
         }
@@ -1000,12 +1131,14 @@ mod tests {
             _b: crate::tiering::store::BatchStream,
             _h: crate::tiering::store::WriteHints,
             w: ArchivalWindow,
+            _step: time::Duration,
             _now: OffsetDateTime,
         ) -> crate::Result<CommitInfo> {
             Ok(CommitInfo {
                 snapshot_id: 1,
                 rows: 0,
                 watermark: w.resulting_watermark(),
+                added: None,
             })
         }
         async fn expire_snapshots(
@@ -1028,6 +1161,7 @@ mod tests {
                 snapshot_id: 1,
                 rows: 0,
                 watermark: self.watermark,
+                added: None,
             })
         }
     }

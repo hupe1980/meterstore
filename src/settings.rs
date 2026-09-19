@@ -210,8 +210,9 @@ pub struct PrivacySettings {
     /// erasure** and is not recoverable from the database. A deployment that
     /// cannot yet hold one securely is better off knowing suppression is off
     /// than inventing a key it will lose — losing it exposes nothing and
-    /// silently disables suppression, which is the failure this crate cannot
-    /// report.
+    /// disables suppression for every subject it covered, permanently. The
+    /// trail can say how many, since each tombstone names its key, but being
+    /// told is not being protected.
     ///
     /// See [`SubjectRegistry::with_erasure_secret`](crate::SubjectRegistry::with_erasure_secret).
     #[serde(default)]
@@ -394,6 +395,26 @@ impl HotSettings {
         self.validate()?;
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(self.max_connections)
+            // The archive lease is a **session** advisory lock held on a pooled
+            // connection as an RAII claim. That claim is only true if the lock
+            // cannot outlive the checkout: a future cancelled at an await point —
+            // a task abort, a `timeout` around maintenance, shutdown — drops the
+            // lease without running its release, and the connection goes back to
+            // the pool still holding the lock. Archival is then wedged, reported
+            // as the one outcome operators are told not to alert on, until
+            // `max_lifetime` recycles the connection.
+            //
+            // One statement per checkin closes it. A deployment that builds its
+            // own pool — which P3 says is the normal case — needs the same hook
+            // (R22).
+            .after_release(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SELECT pg_advisory_unlock_all()")
+                        .execute(conn)
+                        .await?;
+                    Ok(true)
+                })
+            })
             .connect(&self.url)
             .await
             .map_err(|e| {
@@ -699,6 +720,7 @@ impl Deployment {
             config.name(),
             &config.identity_column_names(),
             &config.extra_columns(),
+            &config.maintenance_policy(),
         )
         .await?;
         let provider = cold.table_provider(config.name()).await?;
@@ -724,7 +746,7 @@ impl Deployment {
     /// to mention both.
     ///
     /// Creates the hot and cold tables as a side effect, exactly as
-    /// [`MeterStore::create_tables`](crate::MeterStore::create_tables) does, so
+    /// [`StoreAdmin::create_tables`](crate::StoreAdmin::create_tables) does, so
     /// a fresh deployment is one call from usable.
     pub async fn store(&self) -> Result<crate::MeterStore> {
         let config = match self.tables.as_slice() {
@@ -744,7 +766,7 @@ impl Deployment {
             }
         };
         let store = self.table(config).await?.build().await?;
-        store.create_tables().await?;
+        store.admin().create_tables().await?;
         Ok(store)
     }
 
@@ -900,9 +922,14 @@ impl TableSettings {
             .archival_step(self.archival.archival_step.0)
             .settlement_lag(self.archival.settlement_lag.0)
             .reader_grace(self.archival.reader_grace.0)
+            .max_pin_age(self.archival.max_pin_age.0)
             .scan_chunk_rows(self.archival.scan_chunk_rows)
             .snapshot_retention(self.maintenance.snapshot_retention.0)
             .min_snapshots_to_keep(self.maintenance.min_snapshots_to_keep);
+
+        if let Some(bytes) = self.archival.declared_file_size {
+            config = config.declared_file_size(bytes);
+        }
 
         if let Some(yes) = self.identify_by_melo {
             config = config.identify_by_melo(yes);
@@ -992,6 +1019,28 @@ pub struct ArchivalSettings {
     /// PostgreSQL for a range that has just left it.
     #[serde(default = "default_reader_grace")]
     pub reader_grace: HumanDuration,
+    /// How long one query may hold reclamation back.
+    ///
+    /// A plan spanning both tiers registers the boundary it was cut at, and
+    /// archival keeps what it is entitled to for as long as the registration
+    /// lives. This is the cap on that: a query killed with its process never
+    /// deregisters, and past this age the floor advances anyway and the
+    /// over-running query fails naming the window it lost.
+    #[serde(default = "default_max_pin_age")]
+    pub max_pin_age: HumanDuration,
+    /// The size this table's cold data files actually come out at.
+    ///
+    /// Published on the Iceberg table as `write.target-file-size-bytes`, which
+    /// is what every compactor's "is this file small?" test is a fraction of.
+    /// Unset, the tool uses Iceberg's 512 MiB default and rewrites files that
+    /// are exactly the size they should be — destroying the per-file statistics
+    /// merge elision is proved from.
+    ///
+    /// Not derivable from any other setting: it is decided by the archival
+    /// window and the size of the portfolio. Archive a window and read the
+    /// figure off the run, which reports it while this is unset.
+    #[serde(default)]
+    pub declared_file_size: Option<u64>,
 }
 
 impl Default for ArchivalSettings {
@@ -1001,6 +1050,8 @@ impl Default for ArchivalSettings {
             archival_step: default_archival_step(),
             scan_chunk_rows: default_chunk(),
             reader_grace: default_reader_grace(),
+            max_pin_age: default_max_pin_age(),
+            declared_file_size: None,
         }
     }
 }
@@ -1016,6 +1067,9 @@ const fn default_chunk() -> usize {
 }
 fn default_reader_grace() -> HumanDuration {
     HumanDuration(crate::config::defaults::READER_GRACE)
+}
+fn default_max_pin_age() -> HumanDuration {
+    HumanDuration(crate::config::defaults::MAX_PIN_AGE)
 }
 
 /// Snapshot retention.
@@ -1911,9 +1965,9 @@ subject_column = "subject_ref"
     async fn rotating_the_erasure_key_keeps_the_outgoing_one_reading() {
         // A tombstone is `HMAC(key, identifier)` and the identifier was
         // destroyed with it, so it can never be re-keyed. Replacing the key
-        // without retiring the old one silently stops every earlier erasure from
-        // being recognised — the one failure this crate cannot report — so the
-        // file has to be able to say both.
+        // without retiring the old one stops every earlier erasure from being
+        // recognised, and no ring can undo that — only report it — so the file
+        // has to be able to say both.
         let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
         let settings = Settings::from_toml(
             r#"

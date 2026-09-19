@@ -54,7 +54,7 @@ async fn run(
         // The horizon is `now - settlement_lag`, and the harness uses a one-day
         // lag, so this archives exactly `archive_days` windows.
         let now = from + Duration::days(archive_days + 1);
-        store.archive(now, 64).await.expect("archive");
+        store.admin().archive(now, 64).await.expect("archive");
         assert_eq!(
             store.watermark().await.unwrap().get(),
             from + Duration::days(archive_days),
@@ -327,6 +327,7 @@ async fn archiving_window_by_window_never_changes_the_answer() {
 
     for day in 1..=4 {
         store
+            .admin()
             .archive(from + Duration::days(day + 1), 1)
             .await
             .expect("archive");
@@ -335,7 +336,7 @@ async fn archiving_window_by_window_never_changes_the_answer() {
             expected,
             "after archiving day {day}"
         );
-        store.verify_invariant().await.expect("invariant");
+        store.admin().verify_invariant().await.expect("invariant");
     }
 }
 
@@ -551,7 +552,7 @@ async fn run_readings(
 
     if archive_days > 0 {
         let now = from + Duration::days(archive_days + 1);
-        store.archive(now, 64).await.expect("archive");
+        store.admin().archive(now, 64).await.expect("archive");
         assert_eq!(
             store.watermark().await.unwrap().get(),
             from + Duration::days(archive_days),

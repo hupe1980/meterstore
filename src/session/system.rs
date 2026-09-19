@@ -182,11 +182,30 @@ impl<'a> SystemTables<'a> {
                 "reader_grace",
                 format!("{}s", c.reader_grace().whole_seconds()),
             ),
+            // And beside `reader_grace` for the same reason again: the grace is
+            // the hysteresis, this is the cap on the quiescence, and a value
+            // below the longest query turns a held window into a refused one.
+            entry(
+                "max_pin_age",
+                format!("{}s", c.max_pin_age().whole_seconds()),
+            ),
             entry(
                 "expected_hot_partitions",
                 c.expected_hot_partitions().to_string(),
             ),
             entry("scan_chunk_rows", c.scan_chunk_rows().to_string()),
+            // Published on the cold table as `write.target-file-size-bytes`, so
+            // a compactor's eligibility test measures against the size this
+            // table really writes instead of Iceberg's 512 MiB default. Unset is
+            // the status quo and not a safe default, which is why it reads as a
+            // sentence rather than as a dash.
+            entry(
+                "declared_file_size",
+                c.declared_file_size().map_or_else(
+                    || "unset: a maintenance tool assumes 512 MiB".to_string(),
+                    |bytes| bytes.to_string(),
+                ),
+            ),
             // What `to` and `value` mean on this table, which an external engine
             // cannot infer from a single row: `to IS NULL` is the signal, and a
             // table whose window happens to hold no readings shows nothing.
@@ -608,6 +627,7 @@ mod tests {
             "partition_headroom",
             "settlement_lag",
             "reader_grace",
+            "max_pin_age",
             "merge_key",
             "expected_hot_partitions",
         ] {
@@ -702,7 +722,11 @@ mod tests {
         ) -> Result<crate::tiering::store::BatchStream> {
             unreachable!()
         }
-        async fn drop_partition(&self, _: &crate::tiering::store::PartitionId) -> Result<()> {
+        async fn drop_partition(
+            &self,
+            _: &crate::tiering::store::PartitionId,
+            _: time::OffsetDateTime,
+        ) -> Result<crate::tiering::store::Reclamation> {
             unreachable!()
         }
         async fn orphaned_partitions(
@@ -726,7 +750,13 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(&self, _: &str, _: &[String], _: &[Field]) -> Result<()> {
+        async fn create_tables(
+            &self,
+            _: &str,
+            _: &[String],
+            _: &[Field],
+            _: &crate::tiering::store::MaintenancePolicy,
+        ) -> Result<()> {
             unreachable!()
         }
         async fn watermark(&self, _: &str) -> Result<crate::watermark::TieringWatermark> {
@@ -738,6 +768,7 @@ mod tests {
             _: crate::tiering::store::BatchStream,
             _: crate::tiering::store::WriteHints,
             _: crate::watermark::ArchivalWindow,
+            _: time::Duration,
             _: time::OffsetDateTime,
         ) -> Result<crate::tiering::store::CommitInfo> {
             unreachable!()

@@ -53,7 +53,9 @@ partition_headroom = "14d"       # pre-created ahead of the write frontier
 [tables.archival]
 settlement_lag = "7d"
 archival_step = "1d"             # and the partition granularity — the same number
-reader_grace = "1h"              # above the longest query this deployment runs
+reader_grace = "1h"              # hysteresis: kept whatever anybody is reading
+max_pin_age = "6h"               # above the longest query this deployment runs
+# declared_file_size = 41943040  # what your cold files actually come out at
 scan_chunk_rows = 50_000
 
 [tables.maintenance]
@@ -192,10 +194,21 @@ Below one minute it is refused at construction: a partition relation is named
 
 ## Settings that must agree
 
-`reader_grace` must exceed the longest query the deployment runs. Nothing can
-validate that — the store cannot know — so it is stated here: too short and a
-plan made before an archival commit comes back a window short, silently. The cost
-of a generous value is disk, and it is a fraction of one partition.
+`declared_file_size` has no default and cannot be derived from one. It is the size
+this table's cold data files actually come out at, which the archival window and
+the portfolio decide; archive a window and read the figure off the run, which
+reports it on every commit until you set it. Left unset, a maintenance tool
+measures against Iceberg's 512 MiB default and rewrites files that are exactly the
+size they should be.
+
+`max_pin_age` must exceed the longest query the deployment runs. Nothing can
+validate that — the store cannot know — so it is stated here. A plan registers the
+tier boundary it was cut at and archival keeps what that plan is entitled to,
+which is what makes a query safe against a boundary moving under it. Past
+`max_pin_age` the floor advances anyway, because a query killed with its process
+never deregisters and one such death must not hold a partition forever; a query
+that outlives the cap fails naming the window it lost. The cost of a generous
+value is disk, and only while a query is actually running.
 
 `settlement_lag` must cover at least one `archival_step`. It is validated at
 construction because getting it wrong degrades **silently**: a window can be
@@ -266,7 +279,14 @@ from `IcebergSqlCatalog` directly, where `WarehouseAuth` has fields for them.
 
 **No compaction or orphan-cleanup settings**, for a different reason: neither is
 implementable against the published `iceberg` crate. Both run out of band — see
-[Operations](@/docs/operations.md#compaction).
+[Operations](@/docs/operations.md#compaction). What the table does carry is the
+policy those tools must honour, in Iceberg's own property names:
+`write.target-file-size-bytes` from `declared_file_size`,
+`history.expire.max-snapshot-age-ms` and `history.expire.min-snapshots-to-keep`
+from the retention settings, and `write.metadata.delete-after-commit.enabled` with
+`write.metadata.previous-versions-max` so superseded metadata does not accumulate
+forever. A scheduled job runs at *its* defaults and never reads this page; the
+table is the only place a rule reaches it.
 
 ## Defaults
 
@@ -275,7 +295,9 @@ implementable against the published `iceberg` crate. Both run out of band — se
 | `archival_step` | 1 day | One window per commit, and one partition per window |
 | `settlement_lag` | 7 days | Must exceed the market's correction window |
 | `partition_headroom` | 14 days | Pre-created ahead of the write frontier |
-| `reader_grace` | 1 hour | How long an archived partition stays readable after its cold commit. A query picks its tier split at *plan* time and reads the tiers at *execute* time, so a plan made before the boundary moved still needs the rows PostgreSQL has just archived |
+| `reader_grace` | 1 hour | How long an archived partition stays readable after its cold commit, whatever anybody is reading. Hysteresis: it keeps reclamation from chasing every commit |
+| `max_pin_age` | 6 hours | The cap on how long one query holds an archived partition. A query picks its tier split at *plan* time and reads the tiers at *execute* time, so a plan made before the boundary moved still needs rows PostgreSQL has just archived — it registers that boundary, and this bounds the registration |
 | `scan_chunk_rows` | 50 000 | The bound on a scan's peak memory. **Rows, not measuring points** — meters differ by orders of magnitude in how much they report, so a fixed number of *them* is a variable amount of memory |
+| `declared_file_size` | unset | What this table's Iceberg data files actually come out at, published as `write.target-file-size-bytes`. Unset, a compactor measures against Iceberg's 512 MiB default and rewrites files that are the size they should be — which destroys the statistics merge elision is proved from. No other setting decides it; archive a window and read it off the run |
 | `snapshot_retention` | 10 years | Reproducibility is a compliance requirement, not a lakehouse default |
 | `min_snapshots_to_keep` | 20 | So expiry can never leave the table unreadable |

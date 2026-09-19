@@ -48,6 +48,52 @@ pub struct ResolvedSeries {
     pub series: MeasurementSeries,
 }
 
+/// The lower bound a rangeless `latest` read should try first, if any.
+///
+/// # Why a bound makes the difference
+///
+/// `latest` without a range carries no bound on `from`, so the tier split keeps
+/// both halves, the cold half is every row ever archived, and a hot half in
+/// range forces version resolution over all of it. The limit cannot be pushed
+/// below the sort, so nothing prunes it: the newest reading of one register
+/// costs a scan of the table's whole history.
+///
+/// The tiering invariant makes that unnecessary. The hot tier holds exactly the
+/// rows with `from >= watermark` and the cold tier exactly those below it, so
+/// **if the hot tier holds any row for the channel, the newest one is there** —
+/// no cold row can have a greater `from`. Every version of a corrected reading
+/// lives in the same tier as the reading, so resolving within the hot half
+/// cannot be superseded from the cold one.
+///
+/// Returning `None` means "ask the unbounded question", which is what finding
+/// the last reading of a meter that stopped reporting actually costs.
+///
+/// Four things each suppress it, and each for its own reason:
+///
+/// - **not a `latest` read** — a range read is already bounded by its range;
+/// - **the caller gave a bound** — theirs is the question, not this one;
+/// - **the watermark is the epoch** — nothing is archived, so the unbounded read
+///   is already hot-only and the probe would be a wasted round trip;
+/// - **any read mode but [`ReadMode::Unified`]** — the other three read one tier
+///   by construction, so there is nothing to narrow.
+///
+/// [`ReadMode::Unified`]: crate::planner::ReadMode::Unified
+pub(crate) fn latest_probe_bound(
+    latest_only: bool,
+    caller_bound: Option<time::OffsetDateTime>,
+    mode: crate::planner::ReadMode,
+    watermark: crate::watermark::TieringWatermark,
+) -> Option<time::OffsetDateTime> {
+    if !latest_only
+        || caller_bound.is_some()
+        || mode != crate::planner::ReadMode::Unified
+        || watermark == crate::watermark::TieringWatermark::empty()
+    {
+        return None;
+    }
+    Some(watermark.get())
+}
+
 /// A read of one channel, built up and then collected.
 ///
 /// Obtained from [`MeterStore::series`](crate::session::MeterStore::series).
@@ -278,11 +324,19 @@ impl<'a> SeriesQuery<'a> {
     ///
     /// For the newest value of **each** channel, ask
     /// [`channels`](Self::channels) and then `latest` per channel. That is
-    /// deliberately not one call: each `latest` is an `ORDER BY … DESC LIMIT 1`
-    /// the index answers, so the cost is a handful of point lookups rather than
-    /// the whole-history scan a single windowed query would need — which is the
-    /// opposite trade from [`collect_by_channel`](Self::collect_by_channel),
-    /// where reading each channel in turn means scanning the range N times.
+    /// deliberately not one call: each is an `ORDER BY … DESC LIMIT 1` over its
+    /// own channel rather than the windowed query over all of them a single call
+    /// would need — the opposite trade from
+    /// [`collect_by_channel`](Self::collect_by_channel), where reading each
+    /// channel in turn means scanning the range N times.
+    ///
+    /// # Bound it with [`range`](Self::range)
+    ///
+    /// Unbounded, this carries no lower bound on `from`: the tier split keeps
+    /// both halves, the cold half is the entire archive, and a hot half in range
+    /// forces version resolution over all of it. The limit cannot be pushed below
+    /// the sort, so nothing prunes it. Each `latest` is then a full history scan
+    /// rather than a point lookup, and N channels are N of them (R24).
     pub async fn latest(self) -> Result<Option<metering::interval::MeterInterval>> {
         Ok(self
             .latest_resolved()
@@ -473,7 +527,55 @@ impl<'a> SeriesQuery<'a> {
     }
 
     /// Run the read and decode it, without folding.
+    /// Run the query, trying the hot tier alone first when the caller gave no
+    /// range.
+    ///
+    /// # Why one probe answers the common case
+    ///
+    /// `latest` without a range carries no bound on `from`, so the tier split
+    /// keeps both halves, the cold half is every row ever archived, and a hot
+    /// half in range forces version resolution over all of it. The limit cannot
+    /// be pushed below the sort, so nothing prunes it: the newest reading of one
+    /// register costs a scan of the table's whole history.
+    ///
+    /// The tiering invariant makes that unnecessary. The hot tier holds exactly
+    /// the rows with `from >= watermark` and the cold tier exactly those below
+    /// it, so **if the hot tier holds any row for this channel, the newest one is
+    /// there** — no cold row can have a greater `from`. And every version of a
+    /// corrected reading lives in the same tier as the reading, so resolving
+    /// within the hot half cannot be superseded from the cold one.
+    ///
+    /// A live meter is therefore one bounded scan. A channel that has stopped
+    /// reporting falls through to the unbounded query, which is a history scan —
+    /// honestly, because that is what finding the last reading of a dead meter
+    /// costs without an index this crate does not keep.
+    ///
+    /// Only for [`ReadMode::Unified`]: the other three read one tier by
+    /// construction, so there is nothing to narrow and the probe would be a
+    /// wasted round trip.
+    ///
+    /// [`ReadMode::Unified`]: crate::planner::ReadMode::Unified
     async fn scan(&self) -> Result<(Vec<crate::encode::StoredSeries>, super::QueryResult)> {
+        if self.latest_only && self.from.is_none() {
+            let watermark = self.store.watermark().await?;
+            if let Some(bound) = super::series::latest_probe_bound(
+                self.latest_only,
+                self.from,
+                self.store.read_mode(),
+                watermark,
+            ) {
+                let mut hot = self.clone();
+                hot.from = Some(bound);
+                let found = hot.scan_once().await?;
+                if !found.0.is_empty() {
+                    return Ok(found);
+                }
+            }
+        }
+        self.scan_once().await
+    }
+
+    async fn scan_once(&self) -> Result<(Vec<crate::encode::StoredSeries>, super::QueryResult)> {
         let (conditions, params) = self.predicate();
 
         // Ordered by the **whole** merge key so decoding sees contiguous runs of
@@ -484,9 +586,10 @@ impl<'a> SeriesQuery<'a> {
         // at every row, so a day comes back as ninety-six one-interval groups.
         // Correct, and useless.
         //
-        // A `latest` read inverts to newest-first and takes a single interval,
-        // so the whole history need not be scanned to answer "what is the
-        // current reading".
+        // A `latest` read inverts to newest-first and takes a single interval.
+        // That shape alone does not bound the scan — the limit cannot be pushed
+        // below the sort — so what keeps it cheap is the bound `scan` puts on
+        // `from` before calling here.
         let tail = if self.latest_only {
             // Newest first, then the rest of the merge key — a **total** order,
             // for the same reason the published resolution SQL breaks its ties:
@@ -854,6 +957,45 @@ fn single_channel(intervals: &[metering::interval::MeterInterval]) -> Option<Obi
 
 #[cfg(test)]
 mod tests {
+    use crate::planner::ReadMode;
+    use crate::watermark::TieringWatermark;
+
+    const W: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
+
+    #[test]
+    fn a_rangeless_latest_read_is_probed_against_the_watermark() {
+        // The bound is what stops `latest` scanning the whole history: without
+        // it the split keeps both tiers, the cold half is every archived row, and
+        // the limit cannot be pushed below the sort.
+        assert_eq!(
+            latest_probe_bound(true, None, ReadMode::Unified, TieringWatermark::new(W)),
+            Some(W)
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_probed() {
+        let w = TieringWatermark::new(W);
+        // A range read is bounded by its own range.
+        assert_eq!(latest_probe_bound(false, None, ReadMode::Unified, w), None);
+        // The caller's bound is the question; this one would narrow it further.
+        assert_eq!(
+            latest_probe_bound(true, Some(W), ReadMode::Unified, w),
+            None
+        );
+        // Nothing archived: the unbounded read is already hot-only.
+        assert_eq!(
+            latest_probe_bound(true, None, ReadMode::Unified, TieringWatermark::empty()),
+            None
+        );
+        // The other modes read one tier by construction — `AsOf` and
+        // `Historical` are cold-only, `Operational` is hot-only — so there is
+        // nothing to narrow and the probe would be a wasted round trip.
+        for mode in [ReadMode::Historical, ReadMode::Operational] {
+            assert_eq!(latest_probe_bound(true, None, mode, w), None, "{mode:?}");
+        }
+    }
+
     use super::*;
     use crate::encode::StoredSeries;
     use crate::version::{ScopedVersion, Version, VersionScope};

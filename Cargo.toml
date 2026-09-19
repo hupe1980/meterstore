@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -21,11 +21,10 @@ rust-version = "1.94"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# Full debug info makes each integration test binary ~420 MB, almost all of it
-# DWARF for dependencies; twenty of those exhaust a CI runner's disk and `rust-lld`
-# reports it as a bus error. `line-tables-only` keeps `file:line` in a backtrace,
-# which is what a failing test needs. Set `debug = true` locally to step through a
-# dependency.
+# Full debug info makes each test binary ~420 MB of dependency DWARF, and twenty
+# of those exhaust a CI runner's disk — reported by `rust-lld` as a bus error.
+# `line-tables-only` keeps `file:line` in a backtrace. Set `debug = true` locally
+# to step through a dependency.
 [profile.dev]
 debug = "line-tables-only"
 
@@ -37,8 +36,7 @@ opt-level = 1
 
 [lints.rust]
 # Test binaries here exceed the 16 MB of unwind tables the macOS linker encodes
-# compactly. The note is about debug-info layout, not this crate's code, and there
-# is nothing to act on — but `-D warnings` would fail the build locally.
+# compactly. Nothing to act on, but `-D warnings` would fail the build locally.
 linker_messages = "allow"
 
 [dependencies]
@@ -55,53 +53,43 @@ arrow = { version = "58.4", default-features = false, features = ["json"] }
 # --- Cold Tier: Apache Iceberg ---
 iceberg = "0.10"
 iceberg-datafusion = "0.10"
-# The catalogue behind `IcebergSqlCatalog`. Optional but in `default`, so only a
-# deployment that opts out notices: it reaches `sqlx`'s optional SQLite driver,
-# and `libsqlite3-sys` declares `links = "sqlite3"`, which cargo enforces over the
-# whole resolve graph — feature on or not. A workspace that also links an embedded
-# SQLite therefore cannot resolve until this is turned off.
+# `IcebergSqlCatalog`. Optional despite being in `default`, because it reaches
+# `sqlx`'s SQLite driver and `libsqlite3-sys` declares `links = "sqlite3"` —
+# enforced over the whole resolve graph, feature on or not. A workspace that also
+# links an embedded SQLite cannot resolve until this is off.
 iceberg-catalog-sql = { version = "0.10", optional = true }
-# The cloud object stores only: `file://` and `memory://` use `iceberg`'s own
-# factories. Optional because `opendal-core` depends on `quick-xml`
-# unconditionally and on a second `reqwest` and rustls — a whole HTTP stack a
-# warehouse on local disk has no use for.
+# The cloud object stores only; `file://` and `memory://` use `iceberg`'s own
+# factories. Optional because `opendal-core` pulls `quick-xml`, a second `reqwest`
+# and a second rustls — an HTTP stack a warehouse on local disk has no use for.
 iceberg-storage-opendal = { version = "0.10", default-features = false, optional = true }
-# `IcebergRestCatalog`: Polaris, Lakekeeper, Nessie, Gravitino. Default, because
-# it is what `CatalogKind::Rest` selects and what every engine already speaks.
-# Unrelated to `catalog-facade`, which serves the REST protocol over whatever
-# catalogue is in use.
+# `IcebergRestCatalog`: Polaris, Lakekeeper, Nessie, Gravitino. Unrelated to
+# `catalog-facade`, which *serves* the REST protocol over whatever catalogue is in
+# use.
 iceberg-catalog-rest = { version = "0.10", optional = true }
 # AWS S3 Tables through its native API. Not the Iceberg REST endpoint, which
 # authenticates with SigV4 that `iceberg-catalog-rest` cannot sign.
 iceberg-catalog-s3tables = { version = "0.10", optional = true }
 
 # --- Hot Tier: PostgreSQL ---
-# The defaults (`any`, `macros`, `migrate`, `json`) are unused here — every
-# statement is a runtime `sqlx::query` — and carry the optional SQLite driver.
+# The defaults (`any`, `macros`, `migrate`, `json`) are unused — every statement
+# is a runtime `sqlx::query` — and carry the optional SQLite driver.
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 # Asked of the driver, not the facade: `sqlx/time` names `sqlx-sqlite?/time`, and
 # naming an optional dependency is enough to put it in the resolve graph.
-# Unification makes the two identical for this crate's code.
 sqlx-postgres = { version = "0.8", default-features = false, features = ["time", "rust_decimal"] }
 
 # --- Domain Layer ---
-# The domain: every quantity, calendar, unit, quality flag and identifier is its
-# type. This crate stores them and computes with none of them. Part of the mako
-# platform (hupe1980/mako).
-#
-# A floor rather than a preference: `ids::{BdewCode, Eic, MaloId, MeloId}` are
-# what a `check =` column parses with and what a `VersionScope` carries, and
-# `wire::rfc3339` fixes the shape the `provenance` column is written in.
-metering = { version = "0.23", features = ["serde"] }
+# The domain layer (hupe1980/mako): every quantity, calendar, unit, quality flag
+# and identifier is its type, and this crate computes with none of them. A floor
+# rather than a preference — `ids::{BdewCode, Eic, MaloId, MeloId}` are what a
+# `check =` column parses with, and `wire::rfc3339` fixes the stored shape of
+# `provenance`.
+metering = { version = "0.24", features = ["serde"] }
 
 # `metering`'s choice, not chrono: mixing the two would convert at every row.
-# Europe/Berlin DST gives 92- and 100-interval days, which every daily aggregate
-# depends on.
-#
-# Deliberately not `serde-human-readable`: `time`'s serde impl is
-# feature-conditional, so enabling it would make the stored shape of the
-# `provenance` column depend on what else is in the binary.
-# `encode::encode_provenance` writes it explicitly instead.
+# Deliberately without `serde-human-readable` — `time`'s serde impl is
+# feature-conditional, so enabling it would make the stored shape of `provenance`
+# depend on what else is in the binary. `encode::encode_provenance` writes it.
 time = { version = "0.3", features = ["macros"] }
 time-tz = "2"
 # Settlement is money — never f64.
@@ -121,46 +109,52 @@ zeroize = "1.9"
 
 # --- Runtime ---
 tokio = { version = "1.0", features = ["full"] }
-futures-util = "0.3"
+futures = "0.3.33"
+async-stream = "0.3.6"
 
-# --- Optional ---
-# The `cli` front end. Optional: a library consumer has no use for an argument
-# parser.
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"], optional = true }
-# For the CLI alone. The library installs no subscriber: capturing the global one
-# takes the decision away from the application embedding it.
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-# The default of each is `["ring"]`, which enables `rustls/ring` through `bollard`.
-# Every other rustls here is `aws-lc-rs`, and two providers with neither installed
-# as the process default is a `rustls` panic.
-testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"], optional = true }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres", "aws-lc-rs"], optional = true }
-tempfile = { version = "3.27", optional = true }
-axum = { version = "0.8", optional = true }
+# --- Everything else, unconditional ---
 thiserror = "2.0.19"
 tracing = "0.1.44"
-serde_json = "1.0.151"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1"
+# Metrics only. The library records; installing an SDK is the application's
+# decision, so nothing here pulls one.
+opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 # Same major as `arrow`; the duplicate gate fails the build if they diverge.
 parquet = { version = "58.4", default-features = false, features = ["arrow", "zstd", "snap"] }
-async-stream = "0.3.6"
-futures = "0.3.33"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
-toml = "1.1"
-# --- Serving: Flight SQL ---
+
+# --- Optional: the `cli` feature ---
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"], optional = true }
+# The library installs no subscriber: capturing the global one takes the decision
+# away from the application embedding it.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# --- Optional: the serving features ---
 # Same major as `arrow`. `tonic` and `prost` follow arrow-flight's own floors.
 arrow-flight = { version = "58.4", features = ["flight-sql"], optional = true }
 tonic = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
+# `catalog-facade`: the read-only Iceberg REST endpoint.
+axum = { version = "0.8", optional = true }
 
+# --- Optional: the `testkit` feature ---
+# `default-features = false` because the default of each is `["ring"]`, which
+# enables `rustls/ring` through `bollard`. Every other rustls here is
+# `aws-lc-rs`, and two providers with neither installed as the process default is
+# a `rustls` panic.
+testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"], optional = true }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres", "aws-lc-rs"], optional = true }
+tempfile = { version = "3.27", optional = true }
+
+# Test, bench and example targets also see everything in `[dependencies]`, so
+# only crates nothing above needs belong here. `testcontainers`, `tempfile` and
+# `serde_json` are not among them: the first two arrive with `testkit`, which
+# every test that uses them is gated on, and the third is unconditional.
 [dev-dependencies]
 # The planner's safety properties: `time_range` may only err by widening, and
 # `split` must be exhaustive and disjoint. Both are silent when broken.
 proptest = "1.11"
-serde_json = "1.0.151"
-tempfile = "3.27.0"
-testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["postgres", "aws-lc-rs"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 # Turns a bound `TcpListener` into the connection stream tonic serves, so the
 # Flight tests can take an ephemeral port instead of racing on a fixed one.

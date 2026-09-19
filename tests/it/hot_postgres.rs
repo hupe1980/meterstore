@@ -13,7 +13,7 @@
 use meterstore::arrow::array::RecordBatch;
 use meterstore::encode::schema::col;
 use meterstore::hot::PostgresHot;
-use meterstore::tiering::store::{BatchStream, HotStore, PartitionId, ScanSpec};
+use meterstore::tiering::store::{BatchStream, HotStore, PartitionId, Reclamation, ScanSpec};
 
 /// Drain a scan stream, which is what a cold store does on the way to Parquet.
 async fn collect_stream(stream: BatchStream) -> Vec<datafusion::arrow::array::RecordBatch> {
@@ -246,6 +246,113 @@ async fn detach_hides_rows_from_the_parent_but_keeps_them_readable() {
     .await;
     let scanned: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(scanned, 8, "archiver must still be able to read it");
+}
+
+#[tokio::test]
+async fn a_scan_reaching_below_what_was_reclaimed_says_so() {
+    // The silent half of the reader-grace gap. A plan fixes its hot range from
+    // the watermark it read; archival then advances the boundary and, once the
+    // grace has passed, takes the partition's space back. The scan runs later and
+    // the partition is simply *absent* from the enumeration — so the query comes
+    // back one window short, with the cold half stopping at the old boundary and
+    // nothing holding the range between.
+    //
+    // An enumeration cannot see that on its own, because a window nothing was
+    // ever written to is absent in exactly the same way. What tells them apart is
+    // that the store remembers dropping this one.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 8).await;
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+    h.hot.drop_partition(&partition, D21).await.unwrap();
+
+    // The scan is entitled to `[D20, ...)` and the tier gave `[D20, D21)` away.
+    let err = h
+        .hot
+        .scan_range(
+            TABLE,
+            meterstore::planner::TimeRange::between(D20, D22),
+            &ScanSpec::core(),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("a scan below the reclaimed boundary must not return silently");
+    assert!(
+        matches!(err, meterstore::Error::InvariantViolated { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_scan_above_what_was_reclaimed_is_untouched() {
+    // The counterexample the guard needs: reclaiming an old window must not make
+    // every later query fail. A scan starting at or above the boundary is asking
+    // for nothing the tier gave away.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D22, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D21, 8).await;
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+    h.hot.drop_partition(&partition, D21).await.unwrap();
+
+    let batches = collect_stream(
+        h.hot
+            .scan_range(
+                TABLE,
+                meterstore::planner::TimeRange::between(D21, D22),
+                &ScanSpec::core(),
+            )
+            .await
+            .expect("a scan at the boundary is unaffected"),
+    )
+    .await;
+    let scanned: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(scanned, 8);
+}
+
+#[tokio::test]
+async fn detaching_an_already_detached_partition_is_a_no_op() {
+    // The trait says `detach_partition` is idempotent, and archival depends on
+    // it: a crash between the detach and the cold commit leaves the partition
+    // standalone, and the run that resumes detaches it again. Without this,
+    // PostgreSQL answers "is not a partition of" and the table can never finish
+    // the window it started.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 8).await;
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+    h.hot
+        .detach_partition(&partition)
+        .await
+        .expect("a second detach is the resumed run's first step");
+
+    assert!(
+        h.relation_exists("readings_2026_07_20_0000").await,
+        "and it must not have disturbed the relation"
+    );
+    let batches = collect_stream(
+        h.hot
+            .scan_detached(&partition, &ScanSpec::core())
+            .await
+            .unwrap(),
+    )
+    .await;
+    let scanned: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(scanned, 8, "every row is still there to be archived");
 }
 
 #[tokio::test]
@@ -706,7 +813,7 @@ async fn purge_creates_no_dead_tuples() {
 
     let partition = PartitionId::new(TABLE, D20);
     h.hot.detach_partition(&partition).await.unwrap();
-    h.hot.drop_partition(&partition).await.unwrap();
+    h.hot.drop_partition(&partition, D21).await.unwrap();
 
     sqlx::query("ANALYZE").execute(h.pool()).await.unwrap();
     let after = h.dead_tuples().await;
@@ -729,8 +836,112 @@ async fn drop_is_idempotent() {
 
     let partition = PartitionId::new(TABLE, D20);
     h.hot.detach_partition(&partition).await.unwrap();
-    h.hot.drop_partition(&partition).await.unwrap();
-    h.hot.drop_partition(&partition).await.unwrap();
+    h.hot.drop_partition(&partition, D21).await.unwrap();
+    h.hot.drop_partition(&partition, D21).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pinned_reader_keeps_its_partition_and_the_boundary_stays_put() {
+    // The quiescence half of reclamation. A plan cut at D20 is entitled to
+    // `[D20, …)`, and `[D20, D21)` is exactly what dropping this partition
+    // takes — so while the pin lives the space stays, and because the drop is
+    // refused rather than recorded, the boundary a later scan checks itself
+    // against must not move either.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    h.insert_readings(D20, 96).await;
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+
+    let pin = h
+        .hot
+        .pin_reader(TABLE, D20, OffsetDateTime::now_utc() + Duration::HOUR)
+        .await
+        .unwrap()
+        .expect("PostgreSQL pins");
+
+    assert_eq!(
+        h.hot.drop_partition(&partition, D21).await.unwrap(),
+        Reclamation::HeldByReader
+    );
+    assert!(h.relation_exists("readings_2026_07_20_0000").await);
+    assert_eq!(
+        h.hot.reclaimed_below(TABLE).await.unwrap(),
+        None,
+        "a refused drop must not claim a window was reclaimed"
+    );
+
+    // Released, and the same call now takes it.
+    h.hot.release_pin(pin).await.unwrap();
+    assert_eq!(
+        h.hot.drop_partition(&partition, D21).await.unwrap(),
+        Reclamation::Dropped
+    );
+    assert!(!h.relation_exists("readings_2026_07_20_0000").await);
+    assert_eq!(h.hot.reclaimed_below(TABLE).await.unwrap(), Some(D21));
+}
+
+#[tokio::test]
+async fn a_pin_at_or_above_the_window_does_not_keep_it() {
+    // The counterexample. A registry that deferred whenever any pin existed
+    // would pass the test above while stopping reclamation for good on any
+    // deployment that runs queries — which is the failure mode the cap exists
+    // for, reached by a different road.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+    h.hot
+        .pin_reader(TABLE, D21, OffsetDateTime::now_utc() + Duration::HOUR)
+        .await
+        .unwrap()
+        .expect("PostgreSQL pins");
+
+    assert_eq!(
+        h.hot.drop_partition(&partition, D21).await.unwrap(),
+        Reclamation::Dropped,
+        "a plan whose hot half starts where the window ends never reads it"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_pin_stops_holding_the_floor() {
+    // The cap, and the reason it is not optional: a query killed with its
+    // process never releases its pin. Without an expiry one such death holds a
+    // partition forever, which is a worse failure than the shortfall the
+    // registry prevents. The sweep is the reclaimer's own work, so it happens
+    // in the transaction that needs the answer.
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+
+    let partition = PartitionId::new(TABLE, D20);
+    h.hot.detach_partition(&partition).await.unwrap();
+    h.hot
+        .pin_reader(TABLE, D20, OffsetDateTime::now_utc() - Duration::seconds(1))
+        .await
+        .unwrap()
+        .expect("PostgreSQL pins");
+
+    assert_eq!(
+        h.hot.drop_partition(&partition, D21).await.unwrap(),
+        Reclamation::Dropped
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM meterstore_pins")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the expired pin is swept, not merely ignored");
 }
 
 #[tokio::test]

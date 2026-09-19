@@ -62,6 +62,7 @@ async fn two_tables() -> (TestHarness, MeterCatalog) {
 
     for store in catalog.tables() {
         store
+            .admin()
             .hot_store()
             .ensure_partitions(
                 store.config().name(),
@@ -233,6 +234,7 @@ async fn a_result_carries_every_table_boundary_not_one() {
     catalog
         .table(TestHarness::TABLE)
         .expect("primary")
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -275,6 +277,7 @@ async fn a_result_is_attributed_only_to_the_tables_it_read() {
     catalog
         .table(TestHarness::TABLE)
         .expect("primary")
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -402,6 +405,7 @@ async fn each_table_keeps_its_own_watermark_and_archiver() {
     catalog
         .table(TestHarness::TABLE)
         .expect("primary")
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -780,6 +784,7 @@ async fn two_tenanted_tables() -> (TestHarness, MeterCatalog) {
 
     for store in catalog.tables() {
         store
+            .admin()
             .hot_store()
             .ensure_partitions(
                 store.config().name(),
@@ -975,12 +980,14 @@ async fn a_failing_table_reaches_the_caller_as_the_error_it_raised() {
     // doors. Which variant it raises does not matter: what is asserted is that
     // the catalog hands back what the store raised.
     store
+        .admin()
         .hot_store()
         .drop_table(SECOND)
         .await
         .expect("drop the hot half");
 
     let direct = store
+        .admin()
         .archive(START + Duration::days(30), 4)
         .await
         .expect_err("the hot table is gone");

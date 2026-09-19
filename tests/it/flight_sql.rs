@@ -5,10 +5,12 @@
 //! is the one thing an external client cannot assemble for itself**. Everything
 //! else it might want is better served by reading the catalog directly.
 //!
-//! So the test that matters is the one that shows a non-Rust-shaped client — here
-//! `FlightSqlServiceClient`, the same client a JDBC/ODBC driver wraps — getting
-//! rows that span the watermark, which no amount of object-store access would
-//! give it.
+//! So the test that matters is the one that shows a client getting rows that span
+//! the watermark, which no amount of object-store access would give it. This one
+//! drives it with `FlightSqlServiceClient`, which is fast and in-process and
+//! accepts whatever schema it is handed — so it says what the server *does*, not
+//! what a conforming client will accept. That is `interop_adbc.rs`, with a driver
+//! written in another language that validates against the specification.
 //!
 //! The rest checks the two properties that make the surface safe rather than
 //! merely present: it refuses to write, and results carry the boundary they were
@@ -119,6 +121,7 @@ async fn split_store() -> (TestHarness, meterstore::MeterStore, Oracle) {
 
     // Two days cold, one still hot — so a query has to span the boundary.
     store
+        .admin()
         .archive(from + Duration::days(3), 2)
         .await
         .expect("archive");
@@ -499,6 +502,7 @@ async fn two_table_catalog() -> (TestHarness, meterstore::MeterCatalog) {
 
     for store in catalog.tables() {
         store
+            .admin()
             .hot_store()
             .ensure_partitions(
                 store.config().name(),
@@ -539,6 +543,7 @@ async fn two_table_catalog() -> (TestHarness, meterstore::MeterCatalog) {
     catalog
         .table(TestHarness::TABLE)
         .expect("primary")
+        .admin()
         .archive(START + Duration::days(3), 2)
         .await
         .expect("archive");

@@ -204,6 +204,21 @@ let service = FlightSqlServer::new(store).into_service();     // feature = "flig
 let service = FlightSqlServer::new(catalog).into_service();   // …or every table
 ```
 
+Any Flight SQL client reaches it. From Python, that is ADBC and no
+driver-specific configuration:
+
+```python
+import adbc_driver_flightsql.dbapi as flight_sql
+
+with flight_sql.connect("grpc://meterstore:50051") as conn, conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM readings")   # both tiers, one answer
+    print(cur.fetchone()[0])
+```
+
+The interop suite drives exactly that — a driver written in another language,
+which validates the server's responses against the specification rather than
+accepting what it is handed.
+
 - **A store or a whole catalogue.** The server takes any `SqlSurface` — the pair
   of methods serving needs: plan a statement without running it, and run it as a
   stream. A statement spanning two
@@ -214,8 +229,12 @@ let service = FlightSqlServer::new(catalog).into_service();   // …or every tab
   reference check, neither of which is recoverable afterwards, so every mutating
   call answers `PermissionDenied` naming both.
 - **Results carry their boundary over the wire.** The watermark, the tiers scanned
-  and the read mode travel as **Arrow schema metadata** on every response, so a BI
-  tool that keeps the schema keeps the provenance. Over a catalogue,
+  and the read mode travel as **Arrow schema metadata** on every *query* response,
+  so a BI tool that keeps the schema keeps the provenance. Not on the catalogue
+  RPCs: `GetCatalogs`, `GetDbSchemas`, `GetTables` and `GetTableTypes` answer with
+  the schemas the specification fixes, field for field down to nullability,
+  because those are a wire contract rather than an answer about readings — and a
+  conforming client rejects anything else. Over a catalogue,
   `meterstore.watermarks` names *each* table the statement touched and its
   boundary, beside the conservative minimum — two tables have two boundaries, and
   one number would claim a figure was settled to a point only half its inputs had
@@ -225,6 +244,11 @@ let service = FlightSqlServer::new(catalog).into_service();   // …or every tab
   the result to send it would make the server's peak memory the size of whatever
   a client asked for, over a socket the client controls. The provenance is
   available before the first batch, which is what lets the schema go out first.
+- **The server says what it is.** `GetSqlInfo` carries the name, the version, the
+  Arrow version it encodes with, and `FLIGHT_SQL_SERVER_READ_ONLY` — the
+  machine-readable half of the refusal above. A client that cannot see that flag
+  offers the user an `INSERT` and delivers the permission error at the end of a
+  session rather than not offering it.
 - **The statement handle *is* the SQL.** A server-side cache would need eviction
   and would leak on a disconnected client, and at metering result sizes it buys
   nothing — the cost is the scan, not the parse.

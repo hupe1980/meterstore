@@ -32,10 +32,12 @@ use crate::arrow::array::RecordBatch;
 use crate::encode::schema;
 use crate::error::{Error, Result};
 use crate::planner::SnapshotSelector;
-use crate::tiering::store::{BatchStream, ColdStore, CommitInfo, SnapshotInfo, WriteHints};
+use crate::tiering::store::{
+    AddedFiles, BatchStream, ColdStore, CommitInfo, MaintenancePolicy, SnapshotInfo, WriteHints,
+};
 use crate::watermark::{
-    ARCHIVED_AT_PROPERTY, ARCHIVED_RANGE_PROPERTY, ArchivalWindow, ROW_COUNT_PROPERTY,
-    TieringWatermark, WATERMARK_PROPERTY,
+    ARCHIVAL_STEP_PROPERTY, ARCHIVED_AT_PROPERTY, ARCHIVED_RANGE_PROPERTY, ArchivalWindow,
+    ROW_COUNT_PROPERTY, TieringWatermark, WATERMARK_PROPERTY,
 };
 
 /// An Iceberg-backed cold tier.
@@ -95,7 +97,8 @@ impl IcebergCold {
     /// and sums `value` double-counts corrected intervals, so the name must
     /// not be the one that looks like the obvious thing to query.
     pub async fn create_table(&self, table: &str) -> Result<Table> {
-        self.create_table_with(table, &[], &[]).await
+        self.create_table_with(table, &[], &[], &MaintenancePolicy::default())
+            .await
     }
 
     /// Create the table with the deployment's declared extra columns.
@@ -113,6 +116,7 @@ impl IcebergCold {
         table: &str,
         extra: &[crate::arrow::datatypes::Field],
         identity: &[String],
+        policy: &MaintenancePolicy,
     ) -> Result<Table> {
         if !self
             .catalog
@@ -130,7 +134,7 @@ impl IcebergCold {
         if self.catalog.table_exists(&ident).await.map_err(ice)? {
             let existing = self.catalog.load_table(&ident).await.map_err(ice)?;
             check_partition_spec(table, &existing, identity)?;
-            return self.disable_library_commit_retry(existing).await;
+            return self.reconcile_properties(existing, policy).await;
         }
 
         let arrow_schema = schema::storage_schema(extra);
@@ -142,10 +146,7 @@ impl IcebergCold {
             .name(table.to_string())
             .partition_spec(partition_spec(&iceberg_schema, identity)?)
             .schema(iceberg_schema)
-            .properties(HashMap::from([(
-                COMMIT_RETRIES_PROPERTY.to_string(),
-                "0".to_string(),
-            )]))
+            .properties(policy_properties(policy))
             .build();
 
         let created = self
@@ -314,8 +315,10 @@ impl IcebergCold {
         //
         // The epoch selects nothing by age, so the ids computed here are the
         // whole of what is expired — the library's own documented way to expire
-        // by id alone. Since `history.expire.*` is a *table* property, it also
-        // keeps an out-of-band tool from deciding this deployment's retention.
+        // by id alone. Set on the **action**, so it holds whatever the table
+        // says; the table separately publishes `history.expire.*` at this
+        // deployment's real retention, which is for a *foreign* tool to read and
+        // is deliberately not what this path consults.
         let action = txn
             .expire_snapshots()
             .expire_older_than_ms(0)
@@ -702,20 +705,44 @@ impl IcebergCold {
         Ok((data_files, rows))
     }
 
-    /// Turn off the library's own commit retry, so ours can run instead.
+    /// Bring an existing table's properties up to the contract it should state.
     ///
-    /// See [`IcebergCold::append_with_summary`] for why re-applying a *fixed*
-    /// snapshot summary against a refreshed base is wrong for this crate. Set at
-    /// creation for new tables; this handles one created before the property
-    /// existed, or by another tool.
-    async fn disable_library_commit_retry(&self, table: Table) -> Result<Table> {
-        if table.metadata().properties().get(COMMIT_RETRIES_PROPERTY) == Some(&"0".to_string()) {
+    /// A new table gets them at creation, so this is for a table that already
+    /// exists and whose properties differ — whatever put it in that state, and
+    /// including the ordinary case of a deployment that has just measured its
+    /// file size or moved its retention. It runs on every `create_tables`, which
+    /// is idempotent, so restating is a matter of calling it again.
+    ///
+    /// One of these is not a preference. `commit.retry.num-retries = 0` turns off
+    /// the library's own retry so this crate's can run instead — see
+    /// [`IcebergCold::append_with_summary`] for why re-applying a *fixed*
+    /// snapshot summary against a refreshed base is wrong here.
+    ///
+    /// **Nothing is removed.** A property the deployment no longer declares —
+    /// `declared_file_size` unset after being set — is left as it stands rather
+    /// than deleted, because this cannot tell a deployment that withdrew a
+    /// declaration from one whose configuration simply does not mention it, and
+    /// silently restoring a compactor's 512 MiB assumption is the failure the
+    /// property exists to stop.
+    async fn reconcile_properties(
+        &self,
+        table: Table,
+        policy: &MaintenancePolicy,
+    ) -> Result<Table> {
+        let current = table.metadata().properties();
+        let wanted: Vec<(String, String)> = policy_properties(policy)
+            .into_iter()
+            .filter(|(key, value)| current.get(key) != Some(value))
+            .collect();
+        if wanted.is_empty() {
             return Ok(table);
         }
+
         let txn = Transaction::new(&table);
-        let action = txn
-            .update_table_properties()
-            .set(COMMIT_RETRIES_PROPERTY.to_string(), "0".to_string());
+        let mut action = txn.update_table_properties();
+        for (key, value) in &wanted {
+            action = action.set(key.clone(), value.clone());
+        }
         let updated = action
             .apply(txn)
             .map_err(ice)?
@@ -724,7 +751,8 @@ impl IcebergCold {
             .map_err(ice)?;
         debug!(
             table = table.identifier().name(),
-            "library commit retry disabled; the watermark-preserving retry is ours"
+            restated = wanted.len(),
+            "table properties restated"
         );
         Ok(updated)
     }
@@ -765,14 +793,22 @@ impl IcebergCold {
         let mut base = self.load(table).await?;
         let (data_files, rows) = self.write_data_files(&base, batches, hints).await?;
 
-        for attempt in 0..=COMMIT_ATTEMPTS {
+        for attempt in 0..COMMIT_ATTEMPTS {
             let watermark = summary.watermark_for(table, &base)?;
             let mut properties = HashMap::from([
                 (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
                 (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
             ]);
-            if let Summary::Advance(window, archived_at) = summary {
+            if let Summary::Advance(window, step, archived_at) = summary {
                 properties.insert(ARCHIVED_RANGE_PROPERTY.to_string(), window.to_property()?);
+                // The grid the boundary sits on, beside the boundary. Written
+                // only on an advance: a correction append republishes the
+                // watermark it found and cuts no window, so it has no step of
+                // its own to state — and the walk finds the last one that did.
+                properties.insert(
+                    ARCHIVAL_STEP_PROPERTY.to_string(),
+                    crate::watermark::step_to_property(step),
+                );
                 properties.insert(
                     ARCHIVED_AT_PROPERTY.to_string(),
                     archived_at
@@ -806,38 +842,88 @@ impl IcebergCold {
                         snapshot_id,
                         rows,
                         watermark,
+                        // Taken from the files this commit wrote rather than read
+                        // back out of the snapshot summary: it is the same
+                        // number, and the caller wants it in order to compare it
+                        // against a declared target.
+                        added: (!data_files.is_empty()).then(|| AddedFiles {
+                            bytes: data_files.iter().map(|f| f.file_size_in_bytes()).sum(),
+                            files: data_files.len() as u64,
+                        }),
                     });
                 }
-                Err(e)
-                    if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts
-                        && attempt < COMMIT_ATTEMPTS =>
-                {
+                Err(e) if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
                     // Someone else committed first. Reload and rebuild the
                     // summary against what is now current — which is the whole
                     // reason this loop is not the library's.
+                    //
+                    // No guard on `attempt` here: the loop bound is the guard.
+                    // Carrying a second one meant the final conflict fell through
+                    // to the arm below and returned a raw Iceberg error, so the
+                    // exhaustion message naming the real cause was unreachable —
+                    // and an operator saw a catalogue conflict rather than "a
+                    // writer is committing continuously".
                     debug!(
                         table,
                         attempt, "commit conflict; re-deriving against a fresh base"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6)))
-                        .await;
-                    base = self.load(table).await?;
+                    if attempt + 1 < COMMIT_ATTEMPTS {
+                        tokio::time::sleep(backoff(attempt)).await;
+                        base = self.load(table).await?;
+                    }
                 }
                 Err(e) => {
-                    // Not a lost race — a catalog that refused, or one that may
-                    // not have answered. Either way the files this attempt wrote
-                    // will not be committed by anyone.
-                    self.discard(table, &base, &data_files).await;
+                    // Not a lost race — a catalogue that refused, or one that may
+                    // not have answered. The two are not the same: a refusal
+                    // means nobody will ever commit these files, while silence
+                    // means the commit may have landed and a snapshot may already
+                    // reference them.
+                    let refused = Self::commit_was_refused(&e);
+                    self.discard(table, &base, &data_files, refused).await;
                     return Err(ice(e));
                 }
             }
         }
 
-        self.discard(table, &base, &data_files).await;
+        // Every attempt lost the compare-and-swap, which is the one failure that
+        // says positively that nothing landed: a conflict *is* the catalogue
+        // reporting that somebody else's commit is the one in place.
+        self.discard(table, &base, &data_files, true).await;
         Err(Error::Storage(format!(
             "{table}: {COMMIT_ATTEMPTS} commit attempts all lost the compare-and-swap; \
              another writer is committing continuously"
         )))
+    }
+
+    /// Whether a failed commit definitively did not land.
+    ///
+    /// The distinction decides whether the data files it wrote may be deleted,
+    /// and the two mistakes are not comparable: keeping a file the catalogue
+    /// never referenced costs storage that out-of-band orphan removal reclaims,
+    /// while deleting one a landed snapshot *does* reference destroys settled
+    /// history with no recovery path.
+    ///
+    /// So this answers "refused" only for the kinds that say so, and treats
+    /// everything else — including any variant added upstream, since `ErrorKind`
+    /// is `#[non_exhaustive]` — as ambiguous.
+    ///
+    /// `Unexpected` is the ambiguous one that matters, and upstream names it
+    /// exactly that: *"Iceberg don't know what happened here… for example,
+    /// iceberg returns an internal service error."* A timeout, a reset
+    /// connection and a 5xx all arrive as that kind, and none of them says
+    /// whether the catalogue applied the update before the answer was lost.
+    fn commit_was_refused(e: &iceberg::Error) -> bool {
+        use iceberg::ErrorKind;
+        matches!(
+            e.kind(),
+            ErrorKind::DataInvalid
+                | ErrorKind::FeatureUnsupported
+                | ErrorKind::NamespaceNotFound
+                | ErrorKind::TableNotFound
+                | ErrorKind::NamespaceAlreadyExists
+                | ErrorKind::TableAlreadyExists
+                | ErrorKind::PreconditionFailed
+        )
     }
 
     /// Remove data files a commit wrote and never landed.
@@ -848,17 +934,42 @@ impl IcebergCold {
     /// orphan cleanup stays blocked on `FileIO` having no listing operation;
     /// this needs none, because the writer still holds every path.
     ///
-    /// It **re-reads first**: a commit can fail *after* landing — a timeout says
-    /// nothing about whether the catalog applied the update — and deleting then
-    /// would take files out from under a live snapshot. Anything the current
-    /// snapshot references is left alone, and so is everything if the reload
-    /// fails.
+    /// `refused` is the caller's verdict from [`Self::commit_was_refused`]. When
+    /// the commit may have landed, **nothing is deleted**: the files are left for
+    /// out-of-band orphan removal, which is the operation that reclaims them and
+    /// the one this crate does not perform.
+    ///
+    /// It **re-reads first** even when refused: a re-read is one more chance to
+    /// notice a file the current snapshot references, and deleting then would
+    /// take it out from under a live snapshot. Anything referenced is left alone,
+    /// and so is everything if the reload fails. That read is a second belt
+    /// rather than the argument — a catalogue behind a cache, or one whose read
+    /// lands on a replica, can answer from before the commit it just applied,
+    /// which is precisely why an ambiguous outcome deletes nothing at all.
     ///
     /// Best-effort, and silent about its own failures: the caller is already
     /// returning the error that matters, and an orphan costs storage rather than
     /// correctness.
-    async fn discard(&self, table: &str, base: &Table, files: &[iceberg::spec::DataFile]) {
+    async fn discard(
+        &self,
+        table: &str,
+        base: &Table,
+        files: &[iceberg::spec::DataFile],
+        refused: bool,
+    ) {
         if files.is_empty() {
+            return;
+        }
+
+        if !refused {
+            warn!(
+                table,
+                files = files.len(),
+                "the catalogue did not say whether it applied this commit, so its data \
+                 files are left in place: deleting one a landed snapshot references \
+                 would destroy settled history, while keeping one it does not costs \
+                 storage that orphan removal reclaims"
+            );
             return;
         }
 
@@ -937,7 +1048,11 @@ impl IcebergCold {
 enum Summary {
     /// Archival: advance the boundary to the window's exclusive end, recording
     /// the caller's clock so the reader grace is measured on it.
-    Advance(ArchivalWindow, OffsetDateTime),
+    /// The step is carried explicitly rather than taken as `to - from`: a
+    /// window widened over an empty stretch is legitimately wider than the step
+    /// — the first commit of a fresh table spans from the epoch — so the width
+    /// says nothing about the grid.
+    Advance(ArchivalWindow, time::Duration, OffsetDateTime),
     /// A late correction: restate whatever the base already published. The
     /// boundary is about which tier owns a range, and a correction does not
     /// change that.
@@ -950,12 +1065,40 @@ impl Summary {
         let current = watermark_of(base)?;
         match self {
             Self::Preserve => Ok(current),
-            Self::Advance(window, _) => {
+            Self::Advance(window, _, _) => {
                 let next = window.resulting_watermark();
                 // Asserted against the commit base, not only by the caller. An
                 // archiver that read a stale watermark, or a second archiver
                 // racing the first, would otherwise publish a boundary that moves
                 // backwards over rows PostgreSQL has already purged.
+                //
+                // **Strictly** forwards, where `advance_to` permits equality —
+                // deliberately, because a `Preserve` summary republishes the
+                // boundary it found. For an archival commit equality is the one
+                // case the retry loop admits: two archivers target `[W, W+step)`,
+                // the first commits, the second loses the compare-and-swap,
+                // re-derives `next` from its own window — still `W+step` — and
+                // appends a **second copy of the same rows**.
+                //
+                // Nothing downstream reports that. The archiver's row counts
+                // agree, and the invariant check counts rows in PostgreSQL, where
+                // they are correctly absent; the duplicate lives in Iceberg and
+                // doubles every sum over the window. The lease makes it rare
+                // rather than impossible. A window already at the boundary was
+                // archived by somebody, so the answer is to stop.
+                if next.get() <= current.get() {
+                    return Err(Error::InvariantViolated {
+                        table: table.to_string(),
+                        detail: format!(
+                            "the window [{}, {}) is already committed: the boundary is \
+                             at {current} and archiving it again would append a second \
+                             copy of rows the cold tier already holds. Another writer \
+                             committed this window — abort rather than duplicate it",
+                            window.from(),
+                            window.to(),
+                        ),
+                    });
+                }
                 current
                     .advance_to(table, next)
                     .map_err(|_| Error::InvariantViolated {
@@ -974,8 +1117,103 @@ impl Summary {
 /// Table property switching off the library's own commit retry.
 const COMMIT_RETRIES_PROPERTY: &str = "commit.retry.num-retries";
 
-/// How many times a lost compare-and-swap is re-derived and retried.
+/// The size a compactor's "is this file small?" test is a fraction of.
+const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
+/// Iceberg's own age cutoff for a snapshot expiry, in milliseconds.
+const MAX_SNAPSHOT_AGE_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
+/// How many snapshots an expiry must leave behind whatever their age.
+const MIN_SNAPSHOTS_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
+/// Whether superseded metadata files are removed as commits land.
+const METADATA_DELETE_PROPERTY: &str = "write.metadata.delete-after-commit.enabled";
+/// How many superseded metadata files survive that removal.
+const METADATA_VERSIONS_PROPERTY: &str = "write.metadata.previous-versions-max";
+
+/// How many superseded metadata files this crate keeps.
+///
+/// Iceberg's own default, declared rather than inherited: the *removal* is what
+/// this table turns on, and a table that enables it without stating the bound
+/// leaves the bound to whichever tool reads it next.
+const METADATA_VERSIONS_MAX: usize = 100;
+
+/// The table properties that state this table's maintenance contract.
+///
+/// # Why a property and not a runbook
+///
+/// Compaction and expiry are out of band by design, and every rule they can
+/// break is one they will break, because a scheduled job runs at *its* defaults
+/// and a paragraph is not in the loop. Iceberg already has names for three of
+/// the four rules; writing them on the table is the only remedy that reaches a
+/// tool whose operator never read this crate's documentation — including a
+/// catalogue that maintains the table unasked, where there is no operator to
+/// reach at all.
+///
+/// Metadata removal is on and bounded here rather than declared per deployment,
+/// because unlike the other two it has no per-deployment answer: a superseded
+/// metadata file is reachable through no snapshot this crate reads, the boundary
+/// walk runs inside the *current* one, and every catalogue this crate supports
+/// keeps its pointer in the catalogue rather than in the file.
+fn policy_properties(policy: &MaintenancePolicy) -> HashMap<String, String> {
+    let mut properties = HashMap::from([
+        (COMMIT_RETRIES_PROPERTY.to_string(), "0".to_string()),
+        (
+            MAX_SNAPSHOT_AGE_PROPERTY.to_string(),
+            (policy.snapshot_retention.whole_milliseconds().max(0)).to_string(),
+        ),
+        (
+            MIN_SNAPSHOTS_PROPERTY.to_string(),
+            policy.min_snapshots_to_keep.to_string(),
+        ),
+        (METADATA_DELETE_PROPERTY.to_string(), "true".to_string()),
+        (
+            METADATA_VERSIONS_PROPERTY.to_string(),
+            METADATA_VERSIONS_MAX.to_string(),
+        ),
+    ]);
+    // Only when the deployment measured one. A guess here is worse than silence:
+    // too low and every ordinary file reads as oversized, which is the same
+    // rewrite reached from the other side.
+    if let Some(bytes) = policy.declared_file_size {
+        properties.insert(TARGET_FILE_SIZE_PROPERTY.to_string(), bytes.to_string());
+    }
+    properties
+}
+
+/// How many times a commit is attempted before giving up.
+///
+/// Attempts, not retries: the loop runs this many times in total, so the
+/// exhaustion diagnostic below can state the figure a reader will count.
 const COMMIT_ATTEMPTS: u32 = 4;
+
+/// Base backoff between commit attempts.
+const COMMIT_BACKOFF_MS: u64 = 50;
+
+/// Exponential backoff with full jitter, for attempt `n` counting from zero.
+///
+/// # Why jitter, when a lease already serialises archival
+///
+/// The lease stops two *archivers*, and the conflicts this loop exists for are
+/// the ones it does not cover: an archival commit racing a late correction's
+/// cold append, or a second deployment on the same warehouse. Those arrive
+/// unsynchronised and then retry on the same schedule — a deterministic
+/// `50 << attempt` makes two writers that collided once collide again at 100 ms,
+/// and again at 200, which is the shape that turns one lost race into four.
+///
+/// Full jitter — uniform over `[0, base)` rather than `base ± something` —
+/// because it is the variant that actually decorrelates: two writers picking
+/// independently from the same interval separate on the first retry.
+fn backoff(attempt: u32) -> std::time::Duration {
+    let ceiling = COMMIT_BACKOFF_MS << attempt;
+    let mut bytes = [0u8; 8];
+    // A failure here is not worth propagating from a sleep. Falling back to the
+    // full ceiling waits a correct amount of time and merely gives up the
+    // decorrelation, which is a weaker retry rather than a wrong one.
+    let jittered = if getrandom::fill(&mut bytes).is_ok() {
+        u64::from_le_bytes(bytes) % ceiling.max(1)
+    } else {
+        ceiling
+    };
+    std::time::Duration::from_millis(jittered)
+}
 
 /// A cold-tier provider that reads the table's current snapshot on every scan.
 ///
@@ -1056,6 +1294,25 @@ impl datafusion::catalog::TableProvider for RefreshingProvider {
 /// The column *count* is checked rather than zipped: a `zip` silently truncates
 /// to the shorter side, so a batch missing the deployment's columns would have
 /// produced a file with the wrong shape instead of an error naming the problem.
+///
+/// # Columns are matched by name, never by position
+///
+/// Iceberg resolves columns by field id and this function is what decides which
+/// id a given array lands under, so a positional match makes the *order* of the
+/// declaration part of the stored contract — silently.
+///
+/// The failure it caused: `evolution::compare` matches strictly by name, so a
+/// **permutation** of two same-typed attribute columns — `bilanzkreis`,
+/// `netzgebiet` reordered to `netzgebiet`, `bilanzkreis` by an alphabetised TOML
+/// or a second deployment — reports `is_identical()` and passes the compatibility
+/// gate. Both are `Utf8` (config validation admits nothing else), so the
+/// subsequent `cast` is a no-op and succeeds. Every row archived from then on
+/// carries each value under the other's name, in the tier whose whole purpose is
+/// to be read by engines that trust the schema. Nothing errors, ever.
+///
+/// Matching by name cannot express that mistake. The count check stays, because
+/// by-name lookup alone would not notice a batch carrying a column the table does
+/// not have.
 fn align(
     batch: &RecordBatch,
     write_schema: &crate::arrow::datatypes::SchemaRef,
@@ -1082,12 +1339,28 @@ fn align(
         ));
     }
 
-    let columns = batch
-        .columns()
+    let columns = write_schema
+        .fields()
         .iter()
-        .zip(write_schema.fields())
-        .map(|(array, field)| crate::arrow::compute::cast(array, field.data_type()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|field| {
+            let array = batch.column_by_name(field.name()).ok_or_else(|| {
+                Error::encode(
+                    "cold batch",
+                    format!(
+                        "the table's schema has a column {:?} that the batch does not: {:?}",
+                        field.name(),
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+            })?;
+            crate::arrow::compute::cast(array, field.data_type()).map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(write_schema.clone(), columns)?)
 }
 
@@ -1235,8 +1508,9 @@ impl ColdStore for IcebergCold {
         table: &str,
         identity: &[String],
         extra: &[crate::arrow::datatypes::Field],
+        policy: &MaintenancePolicy,
     ) -> Result<()> {
-        self.create_table_with(table, extra, identity)
+        self.create_table_with(table, extra, identity, policy)
             .await
             .map(|_| ())
     }
@@ -1261,18 +1535,24 @@ impl ColdStore for IcebergCold {
         watermark_of(&loaded)
     }
 
+    async fn archival_step(&self, table: &str) -> Result<Option<time::Duration>> {
+        let loaded = self.load(table).await?;
+        archival_step_of(&loaded)
+    }
+
     async fn append_and_commit(
         &self,
         table: &str,
         batches: BatchStream,
         hints: WriteHints,
         window: ArchivalWindow,
+        step: time::Duration,
         now: OffsetDateTime,
     ) -> Result<CommitInfo> {
         // The watermark rides along in the same commit as the data. That is the
         // atomicity that makes recovery trivial — and the reason the summary is
         // derived from the commit base rather than fixed up front.
-        self.append_with_summary(table, batches, hints, Summary::Advance(window, now))
+        self.append_with_summary(table, batches, hints, Summary::Advance(window, step, now))
             .await
     }
 
@@ -1378,32 +1658,52 @@ impl ColdStore for IcebergCold {
 /// Only a table whose entire history carries no watermark is refused: that is
 /// not a MeterStore table, and guessing a boundary for it would either
 /// re-archive everything or strand it.
+/// The nearest value of `key` in a snapshot summary, walking back the parent
+/// chain from the current snapshot.
+///
+/// A foreign commit — an out-of-band compaction, a second deployment — carries
+/// none of this crate's properties, so the current snapshot is not necessarily
+/// the one that set them, and the walk is what makes those commits survivable.
+///
+/// Bounded by the snapshot count: a cycle in the parent chain would otherwise
+/// hang the query path rather than fail it.
+fn summary_property(table: &Table, key: &str) -> Option<String> {
+    let metadata = table.metadata();
+    let mut snapshot = metadata.current_snapshot()?.clone();
+    for _ in 0..=metadata.snapshots().count() {
+        if let Some(value) = snapshot.summary().additional_properties.get(key) {
+            return Some(value.clone());
+        }
+        let parent = snapshot
+            .parent_snapshot_id()
+            .and_then(|id| metadata.snapshot_by_id(id))?;
+        snapshot = parent.clone();
+    }
+    None
+}
+
+/// The archival step this table's windows were cut on, if any snapshot says.
+///
+/// `None` means no snapshot records one — a table with no history, or one whose
+/// history predates the property. **Absent is not a mismatch**: a step that
+/// cannot be read is a check that cannot run, and refusing on it would refuse
+/// every table that ever archived without recording one.
+fn archival_step_of(table: &Table) -> Result<Option<time::Duration>> {
+    summary_property(table, ARCHIVAL_STEP_PROPERTY)
+        .map(|v| crate::watermark::step_from_property(&v))
+        .transpose()
+}
+
 fn watermark_of(table: &Table) -> Result<TieringWatermark> {
     let metadata = table.metadata();
 
     // No snapshot means nothing has been archived, so everything is hot.
-    let Some(current) = metadata.current_snapshot() else {
+    if metadata.current_snapshot().is_none() {
         return Ok(TieringWatermark::empty());
-    };
+    }
 
-    let mut snapshot = current.clone();
-    // Bounded by the snapshot count: a cycle in the parent chain would
-    // otherwise hang the query path rather than fail it.
-    for _ in 0..=metadata.snapshots().count() {
-        if let Some(value) = snapshot
-            .summary()
-            .additional_properties
-            .get(WATERMARK_PROPERTY)
-        {
-            return TieringWatermark::from_property(value);
-        }
-        let Some(parent) = snapshot
-            .parent_snapshot_id()
-            .and_then(|id| metadata.snapshot_by_id(id))
-        else {
-            break;
-        };
-        snapshot = parent.clone();
+    if let Some(value) = summary_property(table, WATERMARK_PROPERTY) {
+        return TieringWatermark::from_property(&value);
     }
 
     Err(Error::InvariantViolated {
@@ -1442,6 +1742,72 @@ fn as_timestamp(datum: &iceberg::spec::Datum) -> Option<OffsetDateTime> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_ambiguous_commit_failure_is_not_a_refusal() {
+        // `Unexpected` is where a timeout, a reset connection and a 5xx arrive,
+        // and upstream documents it as "Iceberg don't know what happened here".
+        // Treating it as a refusal deletes the data files of a commit that may
+        // already be referenced by a live snapshot.
+        let ambiguous = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "gateway timeout");
+        assert!(!IcebergCold::commit_was_refused(&ambiguous));
+
+        // And a lost race is not ambiguous at all — a conflict is the catalogue
+        // saying somebody else's commit is the one in place.
+        let conflict = iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "outdated metadata",
+        );
+        assert!(!IcebergCold::commit_was_refused(&conflict));
+    }
+
+    #[test]
+    fn a_refused_commit_is_one_the_catalogue_said_no_to() {
+        // The counterexample: if nothing counted as refused, the classifier
+        // would be a constant and the files would leak on every failure.
+        for kind in [
+            iceberg::ErrorKind::DataInvalid,
+            iceberg::ErrorKind::FeatureUnsupported,
+            iceberg::ErrorKind::TableNotFound,
+            iceberg::ErrorKind::NamespaceNotFound,
+            iceberg::ErrorKind::PreconditionFailed,
+        ] {
+            let e = iceberg::Error::new(kind, "refused");
+            assert!(
+                IcebergCold::commit_was_refused(&e),
+                "{kind:?} is a definitive refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exhaustion_diagnostic_counts_the_attempts_the_loop_makes() {
+        // `0..=COMMIT_ATTEMPTS` is one more attempt than the constant names, and
+        // the conflict arm's own `attempt < COMMIT_ATTEMPTS` guard then sent the
+        // last conflict to the generic arm — so the message below could never be
+        // reached and an operator saw a raw catalogue error instead.
+        assert_eq!((0..COMMIT_ATTEMPTS).count(), COMMIT_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn backoff_grows_and_stays_inside_its_ceiling() {
+        for attempt in 0..COMMIT_ATTEMPTS {
+            let ceiling = COMMIT_BACKOFF_MS << attempt;
+            for _ in 0..64 {
+                let waited = backoff(attempt).as_millis() as u64;
+                assert!(waited < ceiling, "attempt {attempt}: {waited} >= {ceiling}");
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_is_not_deterministic() {
+        // The point of jitter: two writers that collide once must not collide
+        // again on the same schedule. A fixed delay would make every sample equal.
+        let samples: std::collections::HashSet<u128> =
+            (0..64).map(|_| backoff(3).as_millis()).collect();
+        assert!(samples.len() > 1, "backoff produced one value in 64 draws");
+    }
+
     use super::*;
 
     #[test]

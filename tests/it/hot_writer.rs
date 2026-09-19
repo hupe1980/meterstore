@@ -37,6 +37,7 @@ async fn split_store() -> (TestHarness, meterstore::MeterStore) {
         .await
         .expect("ingest");
     store
+        .admin()
         .archive(START + Duration::days(2), 1)
         .await
         .expect("archive");
@@ -79,6 +80,7 @@ async fn current_data_writes_without_a_catalog_round_trip_per_batch() {
     // The boundary did not move, and nothing was stranded below it.
     assert_eq!(writer.watermark(), boundary);
     store
+        .admin()
         .verify_invariant()
         .await
         .expect("no row may sit below the watermark in PostgreSQL");

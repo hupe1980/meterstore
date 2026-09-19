@@ -28,6 +28,48 @@ pub const WATERMARK_PROPERTY: &str = "meterstore.tiering_watermark";
 /// The snapshot summary property recording the archived interval range.
 pub const ARCHIVED_RANGE_PROPERTY: &str = "meterstore.archived_range";
 
+/// The snapshot summary property recording the **archival step** the window was
+/// cut on, in whole seconds.
+///
+/// The watermark is a point on a grid and this is the grid's spacing, so storing
+/// one without the other describes half a boundary. Every window must correspond
+/// to exactly one hot partition, and partitions are created on `align_to_step`
+/// boundaries — so a step that changes under a table that has already archived
+/// produces windows naming relations nothing ever created, or windows spanning
+/// several.
+///
+/// `next_window` refuses a watermark that is not on the *configured* grid, which
+/// catches most of it and not all: doubling a daily step lands on an even
+/// epoch-day about half the time, and the watermark then looks perfectly aligned
+/// while the window it cuts covers two partitions and archives one. The second
+/// partition's rows end up below the advanced boundary, still in PostgreSQL, in a
+/// relation no plan will scan again.
+///
+/// Recorded so the archiver can compare rather than infer.
+pub const ARCHIVAL_STEP_PROPERTY: &str = "meterstore.archival_step";
+
+/// Render an archival step for [`ARCHIVAL_STEP_PROPERTY`].
+///
+/// Whole seconds: a step is a partition width, and sub-second widths are refused
+/// long before this.
+pub fn step_to_property(step: time::Duration) -> String {
+    step.whole_seconds().to_string()
+}
+
+/// Parse an archival step from [`ARCHIVAL_STEP_PROPERTY`].
+pub fn step_from_property(value: &str) -> Result<time::Duration> {
+    let seconds: i64 = value
+        .parse()
+        .map_err(|_| Error::decode(ARCHIVAL_STEP_PROPERTY, format!("{value:?}")))?;
+    if seconds <= 0 {
+        return Err(Error::decode(
+            ARCHIVAL_STEP_PROPERTY,
+            format!("{value:?}: an archival step must be positive"),
+        ));
+    }
+    Ok(time::Duration::seconds(seconds))
+}
+
 /// The snapshot summary property recording the archived row count.
 pub const ROW_COUNT_PROPERTY: &str = "meterstore.row_count";
 
@@ -81,6 +123,12 @@ impl TieringWatermark {
     ///
     /// The watermark is monotonic: moving it backwards would place
     /// already-archived intervals back in the hot tier, where they do not exist.
+    ///
+    /// **Equality passes**, because republishing the boundary unchanged is what a
+    /// correction append does. An archival commit needs more than this — a window
+    /// already at the boundary was committed by somebody, and appending it again
+    /// duplicates its rows in the cold tier with nothing downstream to report it —
+    /// so `Summary::Advance` requires a *strict* advance on top of this check.
     pub fn can_advance_to(self, next: Self) -> bool {
         next.0 >= self.0
     }
@@ -295,6 +343,11 @@ mod tests {
 
         assert!(!w.can_advance_to(back));
         assert!(w.can_advance_to(fwd));
+        // Legal *here*, and deliberately: a `Preserve` summary republishes the
+        // boundary it found, so the general helper must admit equality. An
+        // **archival** commit is stricter — `Summary::Advance` refuses a window
+        // already at the boundary, because equality there means another writer
+        // committed it and appending would duplicate the rows (R23).
         assert!(w.can_advance_to(w), "idempotent re-advance is legal");
 
         let err = w.advance_to("readings_versions", back).unwrap_err();

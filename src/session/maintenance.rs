@@ -54,7 +54,7 @@ pub struct TableMaintenance {
     /// Rendered rather than typed because it is a *report*: the cycle has already
     /// moved on to the next table, and what is left to do with this is log it and
     /// alert on it. A caller wanting to act on the error programmatically runs
-    /// that table's [`archive`](crate::MeterStore::archive) itself.
+    /// that table's [`archive`](crate::StoreAdmin::archive) itself.
     pub failure: Option<String>,
 }
 
@@ -107,13 +107,22 @@ impl TableMaintenance {
 pub struct MaintenanceOutcome {
     /// One entry per table the cycle ran over, in name order.
     pub tables: Vec<TableMaintenance>,
-    /// Subjects whose linkage this cycle destroyed, when a retention policy is
-    /// configured.
+    /// What the retention sweep destroyed, when a retention policy is
+    /// configured and the sweep ran.
     ///
-    /// **Not per table.** The subject registry is deployment-wide, so a subject
-    /// is due only once every table that names it has passed the ceiling — see
+    /// **Not per table.** The subject registry is deployment-wide, so one expiry
+    /// unlinks every table that registered the identifier — see
     /// [`Maintenance::anonymise_after`].
-    pub anonymised: Vec<crate::erasure::ErasureRecord>,
+    ///
+    /// A **summary**, not a row per subject. This is a background loop's
+    /// per-cycle outcome and it is `Clone`; a sweep clearing a metering
+    /// operator's whole expiring year is millions of linkages, and carrying one
+    /// record each would make the cycle's own result the largest allocation in
+    /// the process. The durable trail is in `meterstore_erasures` before the
+    /// sweep returns, and [`SubjectRegistry::erasures`] reads it.
+    ///
+    /// [`SubjectRegistry::erasures`]: crate::erasure::SubjectRegistry::erasures
+    pub anonymised: Option<crate::erasure::SweepOutcome>,
     /// Why the retention sweep did not run, if it was configured and failed.
     ///
     /// Rendered rather than typed, for the reason
@@ -190,9 +199,12 @@ impl MaintenanceOutcome {
             )
     }
 
-    /// Subjects anonymised this cycle.
-    pub fn subjects_anonymised(&self) -> usize {
-        self.anonymised.len()
+    /// Linkages the retention sweep destroyed this cycle.
+    ///
+    /// Zero both when no policy is configured and when nothing was due — the two
+    /// are told apart by [`anonymised`](Self::anonymised) being `None` or `Some`.
+    pub fn subjects_anonymised(&self) -> u64 {
+        self.anonymised.as_ref().map_or(0, |s| s.subjects)
     }
 }
 
@@ -392,7 +404,7 @@ impl Maintenance {
         // deployment-wide: the stores are consulted to find it and to tell
         // "nothing was due" apart from "this deployment stores no reference".
         let (anonymised, retention_failure) = match &self.retention {
-            None => (Vec::new(), None),
+            None => (None, None),
             Some(sweep) => {
                 let cutoff = sweep.policy.cutoff(now);
                 match super::catalog::anonymise_across(
@@ -404,14 +416,14 @@ impl Maintenance {
                 )
                 .await
                 {
-                    Ok(records) => (records, None),
+                    Ok(swept) => (Some(swept), None),
                     Err(e) => {
                         warn!(
                             error = %e,
                             %cutoff,
                             "retention sweep failed; the cycle continues and the next tick retries"
                         );
-                        (Vec::new(), Some(e.to_string()))
+                        (None, Some(e.to_string()))
                     }
                 }
             }
@@ -441,7 +453,7 @@ impl Maintenance {
         store: &crate::session::MeterStore,
         now: OffsetDateTime,
     ) -> Result<TableMaintenance> {
-        let archival = store.archive(now, self.max_windows).await?;
+        let archival = store.admin().archive(now, self.max_windows).await?;
 
         // Expiry is a **metadata mutation**, so it belongs to the replica that
         // won the archive lease and to no other. Every replica runs the same
@@ -456,11 +468,11 @@ impl Maintenance {
         // it — the invariant is worth checking from wherever it is noticed.
         let contended = archival.iter().all(|o| o.lease_contended);
         let snapshots_expired = match self.expire_snapshots && !contended {
-            true => store.expire_snapshots(now).await?,
+            true => store.admin().expire_snapshots(now).await?,
             false => 0,
         };
 
-        let status = store.status(now).await?;
+        let status = store.admin().status(now).await?;
         let invariant_violations = status.invariant_violations.max(0) as u64;
         if invariant_violations > 0 {
             warn!(
@@ -576,6 +588,7 @@ mod tests {
             partitions_created: 0,
             lease_contended: false,
             deferred: false,
+            added: None,
         }
     }
 
@@ -588,6 +601,7 @@ mod tests {
             partitions_created: 3,
             lease_contended: false,
             deferred: false,
+            added: None,
         }
     }
 

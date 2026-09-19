@@ -189,6 +189,60 @@ pub fn archive(lines: &[ArchiveLine], format: Format) -> Result<()> {
     })
 }
 
+/// What one table's re-stamp did.
+#[derive(Debug, Clone)]
+pub struct ReassertLine {
+    /// The table.
+    pub table: String,
+    /// Whether a commit was needed, or the current snapshot already stated it.
+    pub restated: bool,
+    /// The boundary the table now states.
+    pub watermark: crate::watermark::TieringWatermark,
+}
+
+/// One `reassert-watermark` invocation.
+///
+/// The boundary is printed either way, and that is the point of running it: an
+/// operator who has just let a foreign tool rewrite the table wants to see the
+/// value the table now states, not only whether this command did something.
+pub fn reassert_watermark(lines: &[ReassertLine], format: Format) -> Result<()> {
+    let document = json!({
+        "tables": lines
+            .iter()
+            .map(|l| json!({
+                "table": l.table,
+                "restated": l.restated,
+                "watermark": instant(l.watermark.get()),
+                "empty": l.watermark == crate::watermark::TieringWatermark::empty(),
+            }))
+            .collect::<Vec<_>>(),
+        "restated": lines.iter().filter(|l| l.restated).count(),
+    });
+
+    emit(format, &document, || {
+        println!("{:<28} {:<26}  NOTE", "TABLE", "WATERMARK");
+        for l in lines {
+            println!(
+                "{:<28} {:<26}  {}",
+                l.table,
+                instant(l.watermark.get()),
+                // "already current" on a table that has never archived would
+                // read as a clean bill of health for a boundary that does not
+                // exist yet, which is a different state and not this command's
+                // to fix.
+                match (
+                    l.restated,
+                    l.watermark == crate::watermark::TieringWatermark::empty()
+                ) {
+                    (true, _) => "re-stamped onto the current snapshot",
+                    (_, true) => "nothing archived yet, so there is no boundary to state",
+                    _ => "already on the current snapshot",
+                },
+            );
+        }
+    })
+}
+
 /// A completeness report, over one or more tables.
 ///
 /// The range is carried in both formats, for the reason the watermark is:
@@ -708,6 +762,7 @@ mod tests {
             partitions_created: 0,
             lease_contended: false,
             deferred: false,
+            added: None,
         };
 
         let line = ArchiveLine::of("readings_versions", &[outcome(0, 96), outcome(1, 100)]);
@@ -727,6 +782,7 @@ mod tests {
             partitions_created: 0,
             lease_contended: false,
             deferred: true,
+            added: None,
         };
         let line = ArchiveLine::of("readings_versions", &[idle]);
         assert_eq!(line.windows, 0);

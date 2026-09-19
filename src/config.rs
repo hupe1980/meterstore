@@ -547,6 +547,13 @@ pub mod defaults {
     /// query exactly one cycle of protection, and the query this store exists
     /// for is a settlement scan over a year of a six-figure meter population.
     pub const READER_GRACE: Duration = Duration::hours(1);
+    /// How long a query may hold the reclamation floor before the floor advances
+    /// anyway — see [`TableConfig::max_pin_age`](super::TableConfig::max_pin_age).
+    ///
+    /// Six hours: comfortably above the settlement scan the grace is sized for,
+    /// and well below the daily archival cycle, so a query that died without
+    /// releasing its pin costs at most a fraction of one cycle's reclamation.
+    pub const MAX_PIN_AGE: Duration = Duration::hours(6);
     /// Target Parquet data file size, in bytes.
     ///
     /// **A cold-tier setting, not a table setting**, and here only as the
@@ -581,6 +588,8 @@ pub struct TableConfig {
     settlement_lag: Duration,
     partition_headroom: Duration,
     reader_grace: Duration,
+    max_pin_age: Duration,
+    declared_file_size: Option<u64>,
     scan_chunk_rows: usize,
     snapshot_retention: Duration,
     min_snapshots_to_keep: usize,
@@ -600,6 +609,8 @@ impl TableConfig {
             settlement_lag: defaults::SETTLEMENT_LAG,
             partition_headroom: defaults::PARTITION_HEADROOM,
             reader_grace: defaults::READER_GRACE,
+            max_pin_age: defaults::MAX_PIN_AGE,
+            declared_file_size: None,
             scan_chunk_rows: defaults::SCAN_CHUNK_ROWS,
             snapshot_retention: defaults::SNAPSHOT_RETENTION,
             min_snapshots_to_keep: defaults::MIN_SNAPSHOTS_TO_KEEP,
@@ -677,22 +688,83 @@ impl TableConfig {
     /// A query reads the watermark when it is **planned** and reads the tiers
     /// when it **executes**, so a plan made before an archival commit still asks
     /// PostgreSQL for the window that commit moved. The partition stays detached
-    /// and readable for this long afterwards; without it such a plan comes back
-    /// one window short, silently.
+    /// and readable for this long afterwards.
     ///
-    /// Set it above the longest query the deployment runs. The cost is disk —
-    /// one extra partition per `reader_grace` worth of archival — and nothing
-    /// else: a retained partition sits below every current boundary, so the range
-    /// check skips it before it is scanned.
+    /// **This is hysteresis, not the safety argument.** What keeps a live plan
+    /// whole is the floor it registers, which reclamation consults in the
+    /// transaction that drops — see [`max_pin_age`]. The grace is what stops the
+    /// reclaimer chasing every commit, and it is what a deployment whose store
+    /// cannot register a floor has instead.
+    ///
+    /// The cost of raising it is disk — one extra partition per `reader_grace`
+    /// worth of archival — and nothing else: a retained partition sits below
+    /// every current boundary, so the range check skips it before it is scanned.
     ///
     /// **Not the maintenance interval.** That decides how often reclamation is
-    /// attempted; this decides what is eligible. Equal values leave a query one
-    /// cycle of protection, which is thin for a settlement scan.
+    /// attempted; this decides what is eligible.
+    ///
+    /// [`max_pin_age`]: Self::max_pin_age
     ///
     /// A cold store that cannot report snapshot commit times cannot date an
     /// orphan, and gets no grace.
     pub fn reader_grace(mut self, grace: Duration) -> Self {
         self.reader_grace = grace;
+        self
+    }
+
+    /// Declare the size this table's cold data files actually come out at.
+    ///
+    /// Published as Iceberg's `write.target-file-size-bytes`, which is what
+    /// every compactor's "is this file small?" test is a fraction of. Absent,
+    /// the tool falls back to Iceberg's 512 MiB default: a 40 MB daily file
+    /// reads as 8 % of target, and a run at defaults rewrites the warehouse —
+    /// which collapses thirty single-version files into one spanning thirty
+    /// versions and disables merge elision for that month permanently, over data
+    /// holding no correction at all.
+    ///
+    /// # Why this is not `file_target_bytes`
+    ///
+    /// That is the writer's roll threshold and its default *is* 512 MiB, so
+    /// publishing it would leave the tool's arithmetic unchanged. What decides
+    /// the real size is the archival window and the portfolio: roughly 40 MB a
+    /// day at 100 k measuring points, 4 MB at 10 k, 400 MB at 1 M. No setting
+    /// produces that number, so the crate will not invent one.
+    ///
+    /// # Measuring it
+    ///
+    /// Archive a window and read the figure off the run: a cycle that commits
+    /// data reports the bytes per file it wrote, and says so explicitly while
+    /// nothing is declared here. Set this to that, rounded.
+    ///
+    /// Unset publishes no property, which leaves the tool at its default. That
+    /// is the status quo rather than a safe default, and it is why the archiver
+    /// says so on every commit rather than leaving it to a runbook.
+    pub fn declared_file_size(mut self, bytes: u64) -> Self {
+        self.declared_file_size = Some(bytes);
+        self
+    }
+
+    /// Set how long one query may hold reclamation back.
+    ///
+    /// A plan spanning both tiers registers the boundary it was cut at, and
+    /// reclamation keeps every partition at or above that boundary for as long
+    /// as the registration lives. That is the half [`reader_grace`] cannot
+    /// supply: the grace is a clock, and a clock does not know whether anybody
+    /// is still reading.
+    ///
+    /// This is the cap on it. A query killed with its process never releases its
+    /// registration, so without an expiry one such death would hold a partition
+    /// forever — a worse failure than the shortfall the registry prevents. Past
+    /// this age the floor advances and the over-running query fails naming the
+    /// window it lost.
+    ///
+    /// Set it above the longest query and below the interval at which disk
+    /// matters. The cost of raising it is the same disk `reader_grace` costs,
+    /// and only when a query actually dies mid-flight.
+    ///
+    /// [`reader_grace`]: Self::reader_grace
+    pub fn max_pin_age(mut self, age: Duration) -> Self {
+        self.max_pin_age = age;
         self
     }
 
@@ -865,6 +937,25 @@ impl TableConfig {
                  can still read it",
             ));
         }
+        // Zero is legitimate — it disables pinning and leaves the grace alone,
+        // which is what a deployment whose store cannot pin already gets. What
+        // is not legitimate is negative, which would expire every pin the moment
+        // it is taken while still paying for the registry.
+        // Zero would publish a target of nothing, against which every file is
+        // oversized — the same rewrite this setting exists to prevent, reached
+        // from the other side.
+        if self.declared_file_size == Some(0) {
+            return Err(Error::config(
+                "declared_file_size must not be zero: it is published as Iceberg's \
+                 write.target-file-size-bytes, and a target of zero makes every file \
+                 a rewrite candidate. Leave it unset to publish no target at all",
+            ));
+        }
+        if self.max_pin_age < Duration::ZERO {
+            return Err(Error::config(
+                "max_pin_age must not be negative: it is how long one query may hold                  reclamation back before the floor advances anyway",
+            ));
+        }
 
         if self.partition_headroom < self.archival_step {
             return Err(Error::config(
@@ -990,6 +1081,26 @@ impl ValidatedTableConfig {
     pub fn reader_grace(&self) -> Duration {
         self.0.reader_grace
     }
+
+    /// How long one query may hold reclamation back.
+    pub fn max_pin_age(&self) -> Duration {
+        self.0.max_pin_age
+    }
+
+    /// The declared cold data file size, if the deployment measured one.
+    pub fn declared_file_size(&self) -> Option<u64> {
+        self.0.declared_file_size
+    }
+
+    /// The rules a foreign maintenance tool has to honour, as this table states
+    /// them.
+    pub fn maintenance_policy(&self) -> crate::tiering::store::MaintenancePolicy {
+        crate::tiering::store::MaintenancePolicy {
+            declared_file_size: self.0.declared_file_size,
+            snapshot_retention: self.0.snapshot_retention,
+            min_snapshots_to_keep: self.0.min_snapshots_to_keep,
+        }
+    }
     /// Rows fetched per round trip when streaming a scan.
     pub fn scan_chunk_rows(&self) -> usize {
         self.0.scan_chunk_rows
@@ -1009,7 +1120,6 @@ impl ValidatedTableConfig {
                 .collect(),
         )
         .with_chunk_rows(self.scan_chunk_rows())
-        .with_partition_step(self.archival_step())
     }
     /// How long cold snapshots are kept.
     pub fn snapshot_retention(&self) -> Duration {

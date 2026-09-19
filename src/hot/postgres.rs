@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::{PgPool, Row};
 use time::{Duration, OffsetDateTime};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::arrow::array::{
     Array, ArrayRef, Decimal128Array, RecordBatch, StringArray, TimestampMicrosecondArray,
@@ -22,7 +22,7 @@ use crate::encode::schema::{
 };
 use crate::error::{Error, Result};
 use crate::planner::TimeRange;
-use crate::tiering::store::{BatchStream, HotStore, PartitionId, ScanSpec};
+use crate::tiering::store::{BatchStream, HotStore, PartitionId, ReaderPin, Reclamation, ScanSpec};
 use crate::watermark::TieringWatermark;
 
 /// A PostgreSQL-backed hot tier.
@@ -340,6 +340,58 @@ impl PostgresHot {
             r#"CREATE INDEX IF NOT EXISTS "{table}_malo_from_idx" ON "{table}" (malo_id, "from")"#
         );
         sqlx::query(&idx).execute(&self.pool).await.map_err(pg)?;
+
+        // One row per table, written by `drop_partition` and read by every hot
+        // scan. `IF NOT EXISTS` so the second table created in a deployment
+        // finds it already there.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS meterstore_reclaimed (
+                   "table"         TEXT        PRIMARY KEY,
+                   -- Exclusive: everything strictly below this instant has had
+                   -- its hot partition dropped. A scan reaching below it is
+                   -- asking for rows this tier deliberately gave up, which is
+                   -- the one absence an enumeration cannot tell from a window
+                   -- nothing was ever written to.
+                   reclaimed_below TIMESTAMPTZ NOT NULL
+               )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(pg)?;
+
+        // The reclamation floor live queries hold, one row per plan that spans
+        // both tiers. `pin` is a sequence rather than a uuid because nothing
+        // outside this database ever mints one.
+        //
+        // `expires_at` is the cap, not a hint: a query killed with its process
+        // never reaches `release_pin`, and without an expiry one such death
+        // holds a partition forever — a worse failure than the shortfall the
+        // registry exists to stop.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS meterstore_pins (
+                   pin        BIGSERIAL   PRIMARY KEY,
+                   "table"    TEXT        NOT NULL,
+                   -- The boundary the plan was cut at. Everything at or above it
+                   -- is the hot half this reader is still entitled to.
+                   watermark  TIMESTAMPTZ NOT NULL,
+                   expires_at TIMESTAMPTZ NOT NULL
+               )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(pg)?;
+
+        // The reclaimer's question is `min(watermark) for one table`, asked once
+        // per candidate partition inside a DDL transaction. Answer it from an
+        // index so a deployment with many concurrent readers does not pay a seq
+        // scan while holding `ACCESS EXCLUSIVE`.
+        sqlx::query(
+            r#"CREATE INDEX IF NOT EXISTS meterstore_pins_table_watermark
+                   ON meterstore_pins ("table", watermark)"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(pg)?;
 
         info!(table, "hot table ready");
         Ok(())
@@ -1174,7 +1226,10 @@ impl PostgresHot {
                     }
                 }
 
-                let rows = query.fetch_all(&pool).await.map_err(pg)?;
+                let rows = query
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| scan_err(&relation, e))?;
                 if rows.is_empty() {
                     break;
                 }
@@ -1448,12 +1503,27 @@ impl std::fmt::Debug for PgTableLease {
 #[async_trait]
 impl crate::tiering::store::TableLease for PgTableLease {
     async fn release(mut self: Box<Self>) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
+        // The boolean matters. `pg_advisory_unlock` returns `false` when this
+        // session does not in fact hold the lock, which means either a double
+        // release or — the case worth knowing about — a lock that was taken
+        // re-entrantly on a pooled connection that had leaked an earlier one.
+        // Discarding it made a release that did nothing indistinguishable from
+        // one that worked.
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
-            .execute(&mut *self.connection)
+            .fetch_one(&mut *self.connection)
             .await
             .map_err(pg)?;
-        debug!(table = %self.table, purpose = self.purpose, "lease released");
+        if released {
+            debug!(table = %self.table, purpose = self.purpose, "lease released");
+        } else {
+            warn!(
+                table = %self.table,
+                purpose = self.purpose,
+                "advisory unlock reported the lock was not held by this session; \
+                 a lease was leaked earlier and this connection may still hold one"
+            );
+        }
         Ok(())
     }
 }
@@ -1846,6 +1916,135 @@ impl<'a> RowView<'a> {
     }
 }
 
+/// Release any advisory lock still held on a freshly checked-out connection.
+///
+/// # Why a pooled connection can be holding one at all
+///
+/// A lease is a session advisory lock held on a connection the lease itself
+/// owns, released when the lease is. A future dropped at an await point — a task
+/// abort, a `timeout` around maintenance, shutdown — skips that release, and the
+/// `PoolConnection` goes back to the pool **still holding the lock**.
+///
+/// The damage is worse than one lost lease, because advisory locks are
+/// re-entrant per session: hand that connection out again and
+/// `pg_try_advisory_lock` *succeeds*, taking the count to two, and the single
+/// unlock on release leaves it at one. The lock is then held forever by a
+/// connection nobody is using, every later attempt on a different connection is
+/// refused, and it is reported as `lease_contended` — the one outcome operators
+/// are told not to alert on.
+///
+/// Clearing on acquire is safe precisely because a live lease *owns* its
+/// connection: a lock found on one sitting in the pool is by definition leaked.
+///
+/// `Settings` also installs an `after_release` hook that does this on checkin,
+/// which is better because it frees the lock sooner. This is the half that works
+/// for the pool a deployment built itself — which P3 says is the normal case.
+async fn clear_leaked_locks(connection: &mut sqlx::PgConnection) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_unlock_all()")
+        .execute(connection)
+        .await
+        .map_err(pg)?;
+    Ok(())
+}
+
+/// Strip a `_YYYY_MM_DD_HHMM` partition suffix, if the name carries one.
+///
+/// Returns `None` when it does not, so a caller can tell "this was already a
+/// parent-level name" from "this was a partition".
+fn without_partition_suffix(name: &str) -> Option<&str> {
+    // The shape `PartitionId::relation_name` writes: four groups of digits,
+    // separated by `_`, of widths 4, 2, 2 and 4. Parsed rather than matched on
+    // length alone, so a table legitimately called `meter_2026_01` is untouched.
+    let widths = [4usize, 2, 2, 4];
+    let mut rest = name;
+    for width in widths.into_iter().rev() {
+        let cut = rest.len().checked_sub(width)?;
+        let (head, group) = rest.split_at(cut);
+        if group.len() != width || !group.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest = head.strip_suffix('_')?;
+    }
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// The stable rule name for a constraint PostgreSQL reported.
+///
+/// # Why this is not `db.constraint()` verbatim
+///
+/// [`Error::IntegrityViolation`] documents `constraint` as naming *the rule*, so
+/// that a caller can branch on it without parsing the message. The two
+/// exclusion constraints are created **per partition** and are therefore named
+/// after one — `readings_2026_07_20_0000_one_operator` — so the raw name is a
+/// different string every window, and branching on it means parsing after all.
+///
+/// The cold path already reports stable names for the same rules
+/// (`version_identifies_one_assertion`, `melo_identifies_the_reading`), so
+/// passing the raw name through also meant one rule answering to two
+/// identifiers depending on which tier refused the write. These are the hot
+/// tier's half of that vocabulary.
+///
+/// Constraints declared on the parent — the `CHECK`s — are inherited by name and
+/// are already stable, so they pass through unchanged.
+fn rule_name(constraint: &str) -> String {
+    // The rule suffix comes off first, and only then is what remains required to
+    // be a partition relation. Checking the other way round never matches: the
+    // name ends in the rule, not in the window.
+    const RULES: [(&str, &str); 2] = [
+        ("_one_operator", "one_operator_per_reading"),
+        ("_no_overlap", "spans_do_not_overlap"),
+    ];
+    for (suffix, rule) in RULES {
+        if let Some(head) = constraint.strip_suffix(suffix)
+            && without_partition_suffix(head).is_some()
+        {
+            return rule.to_string();
+        }
+    }
+    constraint.to_string()
+}
+
+/// PostgreSQL's `undefined_table`.
+const UNDEFINED_TABLE: &str = "42P01";
+
+/// [`pg`], for a statement reading a partition the scan enumerated earlier.
+///
+/// # Why this one failure gets a name
+///
+/// The hot scan lists the partitions overlapping its range and then reads each by
+/// name, and those are two moments. Archival reclaims an archived partition once
+/// the grace has passed and no live plan holds the floor, so a plan whose hold
+/// has lapsed finds a relation that was there when it was enumerated and is not
+/// there when it is read.
+///
+/// Raw, that is `42P01` inside `Error::Storage` — a message about a missing
+/// relation, which reads as a schema problem and is not one. Named, it says what
+/// happened and what to change, which is the difference between an operator
+/// raising `max_pin_age` and an operator looking for a dropped table.
+///
+/// Reaching it at all means the plan's registered floor was gone by the time the
+/// read ran — expired, or lost to the one transaction-wide race the registry
+/// does not close. The sibling failure, a partition reclaimed *before* the
+/// enumeration, is caught by `reclaimed_below` instead: absent alone cannot say
+/// it, because a window nothing was ever written to is absent the same way.
+fn scan_err(relation: &str, e: sqlx::Error) -> Error {
+    if let Some(db) = e.as_database_error()
+        && db.code().as_deref() == Some(UNDEFINED_TABLE)
+    {
+        return Error::InvariantViolated {
+            table: relation.to_string(),
+            detail: format!(
+                "the partition {relation:?} was reclaimed while this query was \
+                 reading it: the scan enumerated it and archival dropped it before \
+                 the read reached it. A plan holds the reclamation floor for \
+                 `max_pin_age`, so raise that past the longest query this \
+                 deployment runs"
+            ),
+        };
+    }
+    pg(e)
+}
+
 /// Map a `sqlx` failure into our error type.
 fn pg(e: sqlx::Error) -> Error {
     let Some(db) = e.as_database_error() else {
@@ -1856,8 +2055,15 @@ fn pg(e: sqlx::Error) -> Error {
         // delivery the store refused on purpose, and none of them succeeds on a
         // retry, so they must not read as a transient storage failure.
         Some(code) if code.starts_with("23") => Error::IntegrityViolation {
-            table: db.table().unwrap_or("<unknown>").to_string(),
-            constraint: db.constraint().map(str::to_string),
+            // The parent, not the partition the row happened to route to: which
+            // window a refused delivery landed in is not a property of the rule
+            // it broke, and a caller matching on the table name wants the one it
+            // asked to write.
+            table: db
+                .table()
+                .map(|t| without_partition_suffix(t).unwrap_or(t).to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            constraint: db.constraint().map(rule_name),
             detail: db.message().to_string(),
         },
         _ => Error::Storage(e.to_string()),
@@ -1957,6 +2163,7 @@ impl HotStore for PostgresHot {
     ) -> Result<Option<Box<dyn crate::tiering::store::TableLease>>> {
         let key = lock_key("archive", table);
         let mut connection = self.pool.acquire().await.map_err(pg)?;
+        clear_leaked_locks(&mut connection).await?;
 
         // `try_` rather than the blocking form: a second scheduled archiver
         // should discover it has nothing to do, not queue behind a run that may
@@ -1987,6 +2194,7 @@ impl HotStore for PostgresHot {
     ) -> Result<Box<dyn crate::tiering::store::TableLease>> {
         let key = lock_key("cold-append", table);
         let mut connection = self.pool.acquire().await.map_err(pg)?;
+        clear_leaked_locks(&mut connection).await?;
 
         // Spun rather than taken with the blocking `pg_advisory_lock`, so a
         // caller waits for a bounded time and gets an error naming the contention
@@ -2099,6 +2307,37 @@ impl HotStore for PostgresHot {
         let name = partition.relation_name()?;
         let table = partition.table();
         let mut tx = self.begin_ddl().await?;
+
+        // Already detached is already done.
+        //
+        // The state this admits is the one an interrupted run leaves: a crash
+        // after the detach and before the cold commit leaves the partition
+        // standalone, holding every row, with the watermark unmoved — which is
+        // precisely the state the rest of `archive_window` wants it in. Without
+        // this, resuming raises "is not a partition of", so the one crash point
+        // in the middle of archival could not be retried.
+        //
+        // Inside the DDL transaction, so the answer is the one the `ALTER` would
+        // have acted on.
+        let attached: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS (
+                   SELECT 1
+                     FROM pg_inherits i
+                     JOIN pg_class c ON c.oid = i.inhrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = current_schema()
+                      AND c.relname = $1
+               )"#,
+        )
+        .bind(&name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(pg)?;
+        if !attached {
+            debug!(partition = %name, "already detached; nothing to do");
+            return Ok(());
+        }
+
         sqlx::query(&format!(
             r#"ALTER TABLE "{table}" DETACH PARTITION "{name}""#
         ))
@@ -2163,24 +2402,47 @@ impl HotStore for PostgresHot {
 
         // **Partition by partition, never through the parent.**
         //
-        // Archival detaches a partition before reading it and leaves it detached
-        // until a later cycle reclaims it. Throughout that window the rows still
-        // belong to the hot tier — the watermark is published by the *commit*,
-        // not by the detach — so a query asking for the range must find them.
-        //
-        // A partition relation is stable under a detach: it keeps its name, its
-        // rows and its identity, and only its parentage changes. So enumerating
-        // the partitions and scanning each by name reads the same rows whatever
-        // archival does in between, and reads each exactly once.
+        // A detached partition's rows still belong to the hot tier — the
+        // watermark is published by the *commit*, not by the detach — and a
+        // relation is stable under a detach, keeping its name, rows and identity.
+        // So enumerating once and scanning each by name reads the same rows
+        // whatever archival does in between, and reads each exactly once.
         //
         // Scanning the parent and adding whatever is currently detached is two
         // reads of one catalogue: a detach landing between them puts the
         // partition in neither, and a whole window vanishes with nothing to
-        // report.
-        //
-        // A partition created after the enumeration is not scanned — it can only
-        // hold rows written after a query was entitled to see them.
+        // report. A partition created *after* the enumeration is not scanned,
+        // which is correct — it can only hold rows written after a query was
+        // entitled to see them.
         let partitions = partitions_of(&self.pool, table, Attachment::Any).await?;
+
+        // **The window this scan is entitled to and cannot get.**
+        //
+        // A plan whose hold has lapsed finds its partition simply *absent* from
+        // the enumeration above, and the gap widens its predecessor's assumed
+        // reach: the cold half stopped at the old boundary, the hot half starts
+        // there, and nothing holds the range between. A smaller number, no error.
+        //
+        // Absence alone cannot see it — a window nothing was ever written to is
+        // absent in exactly the same way, and refusing that would break every
+        // deployment that ever went quiet. What tells them apart is the record
+        // `drop_partition` writes in the transaction it drops in.
+        if let Some(from) = range.start()
+            && let Some(reclaimed_below) = self.reclaimed_below(table).await?
+            && from < reclaimed_below
+        {
+            return Err(Error::InvariantViolated {
+                table: table.to_string(),
+                detail: format!(
+                    "this scan asks for rows from {from}, and the hot tier has \
+                     reclaimed everything below {reclaimed_below}: the plan was \
+                     built against a boundary that has since moved and the space \
+                     was taken back before the scan reached it. The rows are \
+                     durable in the cold tier — re-run the query, and raise \
+                     `max_pin_age` past the longest query this deployment runs"
+                ),
+            });
+        }
 
         // Ascending, and each one's exclusive upper bound is the next one's
         // start — the *actual* layout rather than the configured step, so an
@@ -2253,16 +2515,126 @@ impl HotStore for PostgresHot {
     /// Timing out here costs nothing: the rows are already durable in the cold
     /// tier, so the partition is exactly the orphan an interrupted run leaves,
     /// and the next cycle reclaims it.
-    async fn drop_partition(&self, partition: &PartitionId) -> Result<()> {
+    async fn drop_partition(
+        &self,
+        partition: &PartitionId,
+        reclaimed_below: OffsetDateTime,
+    ) -> Result<Reclamation> {
         let name = partition.relation_name()?;
         let mut tx = self.begin_ddl().await?;
+
+        // **Expire first, then ask.** The sweep is the reclaimer's own work
+        // rather than a separate job, because this is the only moment the answer
+        // is used and a pin that outlived its cap must not hold the floor for
+        // the length of one more cycle.
+        sqlx::query("DELETE FROM meterstore_pins WHERE expires_at <= now()")
+            .execute(&mut *tx)
+            .await
+            .map_err(pg)?;
+
+        // **The quiescence check, in the transaction that does the drop.**
+        //
+        // A reader pinned at `W` scans `[W, ∞)`, so it is entitled to every
+        // partition whose exclusive upper bound is above `W` — which for this
+        // one is exactly `reclaimed_below`. Asking here rather than in the
+        // caller is what makes the answer usable: a pin committed after the
+        // question would have to be seen by the drop, and only one transaction
+        // can promise that.
+        //
+        // What it does not close is the mirror race — a pin taken after this
+        // read but before the commit. That one is caught on the reader's side,
+        // which re-reads `reclaimed_below` after pinning, and failing that by
+        // the scan's own guard. Both are loud.
+        let floor = sqlx::query_scalar::<_, Option<OffsetDateTime>>(
+            r#"SELECT min(watermark) FROM meterstore_pins WHERE "table" = $1"#,
+        )
+        .bind(partition.table())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(pg)?;
+
+        if let Some(floor) = floor
+            && floor < reclaimed_below
+        {
+            tx.rollback().await.map_err(pg)?;
+            debug!(
+                partition = %name,
+                pinned_at = %floor,
+                "a live reader is pinned below this window; keeping it"
+            );
+            return Ok(Reclamation::HeldByReader);
+        }
+
         sqlx::query(&format!(r#"DROP TABLE IF EXISTS "{name}""#))
             .execute(&mut *tx)
             .await
             .map_err(|e| pg_ddl(&name, "drop partition", self.ddl_lock_timeout, e))?;
+
+        // In the same transaction as the drop, and monotonic.
+        //
+        // A scan cannot otherwise tell a window whose space was taken back from
+        // one nothing was ever written to: both are simply absent from the
+        // partition enumeration, and only the first means the query is about to
+        // come back a window short. `GREATEST` because reclamation runs oldest
+        // first but a retry or a concurrent cycle must never move it backwards —
+        // the value is a high-water mark, not a cursor.
+        sqlx::query(
+            r#"INSERT INTO meterstore_reclaimed ("table", reclaimed_below)
+                    VALUES ($1, $2)
+               ON CONFLICT ("table") DO UPDATE
+                   SET reclaimed_below = GREATEST(
+                           meterstore_reclaimed.reclaimed_below,
+                           EXCLUDED.reclaimed_below
+                       )"#,
+        )
+        .bind(partition.table())
+        .bind(reclaimed_below)
+        .execute(&mut *tx)
+        .await
+        .map_err(pg)?;
+
         tx.commit().await.map_err(pg)?;
-        debug!(partition = %name, "dropped");
+        debug!(partition = %name, %reclaimed_below, "dropped");
+        Ok(Reclamation::Dropped)
+    }
+
+    async fn pin_reader(
+        &self,
+        table: &str,
+        watermark: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<Option<ReaderPin>> {
+        let id = sqlx::query_scalar::<_, i64>(
+            r#"INSERT INTO meterstore_pins ("table", watermark, expires_at)
+                    VALUES ($1, $2, $3)
+               RETURNING pin"#,
+        )
+        .bind(table)
+        .bind(watermark)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(pg)?;
+        Ok(Some(ReaderPin::new(id)))
+    }
+
+    async fn release_pin(&self, pin: ReaderPin) -> Result<()> {
+        sqlx::query("DELETE FROM meterstore_pins WHERE pin = $1")
+            .bind(pin.id())
+            .execute(&self.pool)
+            .await
+            .map_err(pg)?;
         Ok(())
+    }
+
+    async fn reclaimed_below(&self, table: &str) -> Result<Option<OffsetDateTime>> {
+        sqlx::query_scalar::<_, OffsetDateTime>(
+            r#"SELECT reclaimed_below FROM meterstore_reclaimed WHERE "table" = $1"#,
+        )
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(pg)
     }
 
     async fn orphaned_partitions(&self, table: &str) -> Result<Vec<PartitionId>> {
@@ -2533,5 +2905,57 @@ mod tests {
         let max = 10i128.pow(20) - 1;
         let as_decimal = Decimal::try_from_i128_with_scale(max, 0).unwrap();
         assert_eq!(decimal_to_i128(as_decimal, 0, col::VERSION).unwrap(), max);
+    }
+
+    #[test]
+    fn a_partition_qualified_constraint_reports_its_rule() {
+        // The bug this exists for: the two exclusion constraints are created per
+        // partition, so the raw name carried the window and a caller branching on
+        // it saw a different string every day.
+        assert_eq!(
+            rule_name("readings_2026_07_20_0000_one_operator"),
+            "one_operator_per_reading"
+        );
+        assert_eq!(
+            rule_name("readings_2026_07_20_0000_no_overlap"),
+            "spans_do_not_overlap"
+        );
+        // Two windows, one rule — which is the whole point.
+        assert_eq!(
+            rule_name("readings_2026_07_20_0000_one_operator"),
+            rule_name("readings_2099_01_01_1545_one_operator"),
+        );
+    }
+
+    #[test]
+    fn a_parent_constraint_passes_through_unchanged() {
+        // The `CHECK`s are declared on the parent and inherited by name, so they
+        // are already stable and must not be rewritten.
+        for name in [
+            "interval_forward",
+            "obis_code_canonical",
+            "sparte_known",
+            "unit_known",
+            "quality_known",
+            "version_scope_canonical",
+        ] {
+            assert_eq!(rule_name(name), name);
+        }
+    }
+
+    #[test]
+    fn a_suffix_is_only_stripped_when_it_is_really_one() {
+        assert_eq!(
+            without_partition_suffix("readings_2026_07_20_0000"),
+            Some("readings")
+        );
+        // A table whose own name ends in digits is not a partition of anything.
+        assert_eq!(without_partition_suffix("meter_2026_01"), None);
+        assert_eq!(without_partition_suffix("readings"), None);
+        // All four groups must be present and the right width.
+        assert_eq!(without_partition_suffix("readings_26_07_20_0000"), None);
+        assert_eq!(without_partition_suffix("readings_2026_07_20_000"), None);
+        // Nothing left of the suffix is not a partition name either.
+        assert_eq!(without_partition_suffix("2026_07_20_0000"), None);
     }
 }

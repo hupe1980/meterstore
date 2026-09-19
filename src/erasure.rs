@@ -78,6 +78,29 @@ const EPOCH_PREFIX: char = 's';
 /// is a re-identification path that survives erasure.
 pub const MIN_REFERENCE_TOKEN_CHARS: usize = 22;
 
+/// The longest token a reference may carry.
+///
+/// Not a security boundary — see [`SubjectRef::new`] for what length cannot
+/// decide — but a bound on what reaches the `subject_ref` column, which is
+/// indexed and carried on every stored reading. A UUID is 36 characters and a
+/// SHA-256 in hex is 64; anything past this is a payload rather than a
+/// pseudonym.
+pub const MAX_REFERENCE_TOKEN_CHARS: usize = 128;
+
+/// Whether a token is a market identifier wearing a pseudonym's clothes.
+///
+/// Checked with the domain's own parsers rather than by shape, because that is
+/// the whole of what "is this actually identifying" can be decided by here: a
+/// MaLo-ID has a check digit, an EIC has a check character, and a
+/// Zählpunktbezeichnung has a fixed length and charset. A string that satisfies
+/// one of them is not a random token that happens to look like it.
+fn parses_as_an_identifier(token: &str) -> bool {
+    token.parse::<metering::ids::MaloId>().is_ok()
+        || token.parse::<metering::ids::MeloId>().is_ok()
+        || token.parse::<metering::ids::Eic>().is_ok()
+        || token.parse::<metering::ids::BdewCode>().is_ok()
+}
+
 impl SubjectRef {
     /// Wrap an externally generated reference.
     /// It must carry no personal data — a name, a meter serial or an email
@@ -85,11 +108,31 @@ impl SubjectRef {
     /// path — and it must name the retention epoch it belongs to, which
     /// [`SubjectRegistry::register`] does for you.
     ///
-    /// The shape is checked: `s<year>_<token>`, with a token of at least
-    /// [`MIN_REFERENCE_TOKEN_CHARS`] characters drawn from `A-Z a-z 0-9 . _ -`.
+    /// The shape is checked: `s<year>_<token>`, the year in canonical form, and
+    /// a token between [`MIN_REFERENCE_TOKEN_CHARS`] and
+    /// [`MAX_REFERENCE_TOKEN_CHARS`] characters drawn from `A-Z a-z 0-9 . _ -`.
     /// That admits hex, base64url and a UUID — anything a foreign minter is
-    /// likely to produce — while refusing the short, meaningful string that is
-    /// what a pipeline puts there when it has not been given a reference to use.
+    /// likely to produce — while refusing the short, meaningful string a
+    /// pipeline puts there when it has not been given a reference to use.
+    ///
+    /// A token that **parses as a market identifier** — a MaLo-ID, a
+    /// Messlokation, an EIC or a BDEW code — is refused outright. Those carry
+    /// check digits, so recognising one is not guesswork, and a length floor
+    /// alone let the most identifying of them through: a Zählpunktbezeichnung is
+    /// 33 uppercase alphanumerics and clears both the floor and the alphabet.
+    ///
+    /// # What this check cannot do
+    ///
+    /// It cannot tell a keyed hash from an unkeyed one. `s2026_<sha256 of an
+    /// email>` and `s2026_<HMAC of the same email>` are both 64 hex characters
+    /// and no inspection of the string distinguishes them — the first is a
+    /// re-identification path that survives erasure, the second is not.
+    ///
+    /// So this validates a *shape* and refuses what it can recognise; it does not
+    /// certify that a foreign reference is unlinkable. That remains the minter's
+    /// obligation, and [`SubjectRegistry::register`] is the way to not have it:
+    /// it draws 128 bits from the OS CSPRNG, which is unlinkable by construction
+    /// rather than by assurance.
     pub fn new(reference: impl Into<String>) -> Result<Self> {
         let reference = reference.into();
         if reference.trim().is_empty() {
@@ -155,6 +198,21 @@ impl SubjectRef {
         let (year, token) = rest
             .split_once('_')
             .ok_or_else(|| malformed("does not name a retention epoch"))?;
+        // Canonical spelling only. `i32::from_str` accepts `+2026` and `02026`,
+        // and the table's constraint is textual —
+        // `starts_with(subject_ref, 's' || epoch::text || '_')` — so a
+        // non-canonical year satisfies the Rust check on the write path and is
+        // refused by the database on registration: two spellings of one fact,
+        // disagreeing, which is what that constraint exists to prevent.
+        let digits = year.strip_prefix('-').unwrap_or(year);
+        if digits.is_empty()
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+            || (digits.len() > 1 && digits.starts_with('0'))
+        {
+            return Err(malformed(
+                "does not name a retention epoch in canonical form",
+            ));
+        }
         let year = year
             .parse::<i32>()
             .map_err(|_| malformed("does not name a retention epoch"))?;
@@ -162,11 +220,28 @@ impl SubjectRef {
         if token.chars().count() < MIN_REFERENCE_TOKEN_CHARS {
             return Err(malformed("carries too short a token to be a pseudonym"));
         }
+        if token.chars().count() > MAX_REFERENCE_TOKEN_CHARS {
+            return Err(malformed(
+                "carries a token longer than any pseudonym needs to be",
+            ));
+        }
         if !token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         {
             return Err(malformed("has a token outside the permitted alphabet"));
+        }
+        // The length floor rules out the *short* meaningful strings. It does not
+        // rule out the long ones, which are the more identifying: a
+        // Zählpunktbezeichnung is 33 uppercase alphanumerics and clears both the
+        // floor and the alphabet. So the identifiers this crate can recognise are
+        // recognised and refused, rather than trusted to be too short to matter.
+        if parses_as_an_identifier(token) {
+            return Err(malformed(
+                "is a market identifier rather than a pseudonym — storing one here \
+                 would preserve the linkage that erasing the mapping row exists to \
+                 destroy",
+            ));
         }
         Ok((year, token))
     }
@@ -229,6 +304,22 @@ impl std::str::FromStr for ErasureTrigger {
             ))),
         }
     }
+}
+
+/// Live tombstones written under a key the ring no longer carries.
+///
+/// One per missing key. See
+/// [`orphaned_suppressions`](SubjectRegistry::orphaned_suppressions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedSuppressions {
+    /// The missing key's name, hex, as it appears in the audit trail.
+    ///
+    /// Derived from the key, so an operator matches it by feeding a candidate
+    /// key back to the ring and seeing the report shrink — not by recognising
+    /// the string.
+    pub key_id: String,
+    /// How many live suppressions that key wrote and nothing can now match.
+    pub suppressions: u64,
 }
 
 /// A suppression that was reversed, and by whom.
@@ -473,6 +564,56 @@ impl SubjectRegistry {
         })
     }
 
+    /// Suppressions this registry can no longer recognise, by the key that
+    /// wrote them.
+    ///
+    /// Empty is the healthy answer and the usual one. A non-empty result means
+    /// the ring has lost a key that live tombstones were written under, so every
+    /// subject those cover is **no longer suppressed**: a replayed message
+    /// re-registers them and the link erasure destroyed comes back.
+    ///
+    /// Nothing else can see this. A tombstone whose key is gone is still in the
+    /// table and simply stops matching, which is exactly what a tombstone that
+    /// does not apply looks like — so the failure had no symptom short of the
+    /// subject reappearing (R6, R25). The key's name, stored beside the tag,
+    /// is the whole of what makes it visible.
+    ///
+    /// Lifted suppressions are excluded: lifting clears the tag and its key
+    /// name together, so a key retired after every suppression it wrote was
+    /// lifted is not reported. A registry with **no** ring answers about every
+    /// live tombstone, because a deployment that lost its only key is the same
+    /// failure reached by a shorter road.
+    ///
+    /// # Repairing it
+    ///
+    /// Put the key back. There is no other repair: the tag cannot be recomputed
+    /// under a different key, because the identifier was destroyed in the
+    /// transaction that wrote it. If the key is genuinely gone, the subjects it
+    /// covers cannot be kept out by this crate, and the deployment has to stop
+    /// the replay upstream instead.
+    pub async fn orphaned_suppressions(&self) -> Result<Vec<OrphanedSuppressions>> {
+        sqlx::query_as::<_, (Vec<u8>, i64)>(
+            r#"SELECT hmac_key_id, count(*)
+                 FROM meterstore_erasures
+                WHERE hmac_key_id IS NOT NULL
+                  AND hmac_key_id <> ALL($1)
+             GROUP BY hmac_key_id
+             ORDER BY count(*) DESC"#,
+        )
+        .bind(self.ring_key_ids())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(id, count)| OrphanedSuppressions {
+                    key_id: hex(&id),
+                    suppressions: count.max(0) as u64,
+                })
+                .collect()
+        })
+    }
+
     /// Whether a suppression list is enforced.
     #[must_use]
     pub fn suppresses_reregistration(&self) -> bool {
@@ -493,6 +634,22 @@ impl SubjectRegistry {
     /// What a new tombstone is recorded as. `None` without a configured key.
     fn tombstone(&self, natural_id: &str) -> Option<Vec<u8>> {
         Some(mac(self.erasure_keys.first()?, natural_id))
+    }
+
+    /// The name of the key a new tombstone is written under.
+    ///
+    /// Stored beside the tag, because the tag cannot be recomputed: the
+    /// identifier died in the transaction that wrote it. Without this, a key
+    /// dropped from the ring leaves tombstones that are still there and simply
+    /// stop matching, which is indistinguishable from tombstones that do not
+    /// apply — the one failure this crate could not report.
+    fn writing_key_id(&self) -> Option<Vec<u8>> {
+        Some(key_id(self.erasure_keys.first()?))
+    }
+
+    /// Every key the ring can read a tombstone under, by name.
+    fn ring_key_ids(&self) -> Vec<Vec<u8>> {
+        self.erasure_keys.iter().map(|k| key_id(k)).collect()
     }
 
     /// Keyed hash under **every** key in the ring, for a lookup.
@@ -577,6 +734,14 @@ impl SubjectRegistry {
                    -- replayed message can re-register the subject — and NULL
                    -- again once a suppression has been lifted.
                    natural_id_hmac BYTEA,
+                   -- Which key in the ring wrote that tag. Derived from the key
+                   -- rather than named by the operator, and stored because the
+                   -- tag cannot be recomputed under another one: the identifier
+                   -- died in the transaction that wrote it. A key dropped from
+                   -- the ring otherwise leaves tombstones that are still there
+                   -- and simply stop matching, which looks exactly like
+                   -- tombstones that do not apply.
+                   hmac_key_id     BYTEA,
                    -- Set when the suppression was lifted. Lifting reverses a
                    -- compliance decision, so it is recorded on the row it
                    -- concerns rather than left to a log line that rotates away.
@@ -584,7 +749,14 @@ impl SubjectRegistry {
                    lifted_by       TEXT,
                    lift_reason     TEXT,
                    CONSTRAINT meterstore_erasures_lift_is_whole
-                       CHECK (num_nulls(lifted_at, lifted_by, lift_reason) IN (0, 3))
+                       CHECK (num_nulls(lifted_at, lifted_by, lift_reason) IN (0, 3)),
+                   -- A tag with no key name is unreportable and a key name with
+                   -- no tag names nothing. The pair is the unit, so the database
+                   -- refuses a row where one arrived without the other rather
+                   -- than leaving a statement that forgot one to be found by the
+                   -- report that could no longer be trusted.
+                   CONSTRAINT meterstore_erasures_tombstone_is_whole
+                       CHECK (num_nulls(natural_id_hmac, hmac_key_id) IN (0, 2))
                )"#,
         )
         .execute(&self.pool)
@@ -621,6 +793,22 @@ impl SubjectRegistry {
         .execute(&self.pool)
         .await
         .map_err(pg)?;
+
+        // After the tables exist and before anything uses them, because this is
+        // the one moment a deployment is still in a position to put the key
+        // back. It reports rather than refuses: the trail is a historical fact
+        // that restarting cannot repair, and the only way to make a refusal
+        // pass would be to drop the audit trail — the one thing this table must
+        // not lose.
+        for orphan in self.orphaned_suppressions().await? {
+            warn!(
+                key_id = %orphan.key_id,
+                suppressions = orphan.suppressions,
+                "the erasure key ring no longer carries the key these suppressions \
+                 were written under, so the subjects they cover can be re-registered \
+                 by a replay; put the key back, or stop the replay upstream"
+            );
+        }
 
         info!(
             suppression = self.suppresses_reregistration(),
@@ -661,6 +849,7 @@ impl SubjectRegistry {
                     "actor",
                     "trigger",
                     "natural_id_hmac",
+                    "hmac_key_id",
                     "lifted_at",
                     "lifted_by",
                     "lift_reason",
@@ -1180,6 +1369,9 @@ impl SubjectRegistry {
         // identifier under every key, so a pre-emptive suppression is not
         // written twice for a subject already tombstoned under a retired one.
         let tombstone = natural_id.as_deref().and_then(|id| self.tombstone(id));
+        // Non-`None` exactly when `tombstone` is, which is what the row's
+        // `num_nulls` constraint enforces on the way in.
+        let writing_key = tombstone.is_some().then(|| self.writing_key_id()).flatten();
         let ring = natural_id
             .as_deref()
             .map(|id| self.tombstones(id))
@@ -1236,11 +1428,14 @@ impl SubjectRegistry {
         for target in targets {
             sqlx::query(
                 r#"INSERT INTO meterstore_erasures
-                       (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac)
-                   VALUES ($1, $2, $3, $4, $5, $6)
+                       (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac,
+                        hmac_key_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
                    ON CONFLICT (subject_ref) DO UPDATE
                        SET natural_id_hmac =
-                           COALESCE(meterstore_erasures.natural_id_hmac, EXCLUDED.natural_id_hmac)"#,
+                           COALESCE(meterstore_erasures.natural_id_hmac, EXCLUDED.natural_id_hmac),
+                           hmac_key_id =
+                           COALESCE(meterstore_erasures.hmac_key_id, EXCLUDED.hmac_key_id)"#,
             )
             .bind(target.as_str())
             .bind(now)
@@ -1248,6 +1443,7 @@ impl SubjectRegistry {
             .bind(actor)
             .bind(trigger.as_str())
             .bind(tombstone.as_deref())
+            .bind(writing_key.as_deref())
             .execute(&mut *tx)
             .await
             .map_err(pg)?;
@@ -1272,8 +1468,8 @@ impl SubjectRegistry {
                     sqlx::query(
                         r#"INSERT INTO meterstore_erasures
                                (subject_ref, erased_at, reason, actor, trigger,
-                                natural_id_hmac)
-                           SELECT NULL, $1, $2, $3, $4, $5
+                                natural_id_hmac, hmac_key_id)
+                           SELECT NULL, $1, $2, $3, $4, $5, $7
                             WHERE NOT EXISTS (
                                       SELECT 1 FROM meterstore_erasures
                                        WHERE natural_id_hmac = ANY($6))"#,
@@ -1284,6 +1480,7 @@ impl SubjectRegistry {
                     .bind(trigger.as_str())
                     .bind(hmac.as_slice())
                     .bind(&ring)
+                    .bind(writing_key.as_deref())
                     .execute(&mut *tx)
                     .await
                     .map_err(pg)?;
@@ -1341,15 +1538,38 @@ impl SubjectRegistry {
     /// session that could not see the hot window would find a live customer's
     /// last reading years old and erase it, irreversibly.
     ///
-    /// Idempotent: an epoch already erased has no mapping row left to delete, so
-    /// a re-run writes no second audit row and counts nothing.
+    /// Idempotent and **resumable**: an epoch already erased has no mapping row
+    /// left to delete, so a re-run writes no second audit row and counts
+    /// nothing — and an interrupted sweep is completed by running it again.
+    ///
+    /// # Why this is batched, and why it does not return the references
+    ///
+    /// This is the only operation in the crate whose row count is unbounded by
+    /// construction: a deployment's whole 2021 comes due on one January morning,
+    /// which at a metering operator's scale is millions of mapping rows. It ran
+    /// as a single `DELETE … RETURNING` inside one transaction, materialised
+    /// every reference, and built one [`ErasureRecord`] per row — against a
+    /// memory budget the rest of the crate holds *by construction* rather than by
+    /// tuning, and inside the maintenance cycle that is otherwise bounded so a
+    /// store which has been down for a month catches up over several cycles.
+    ///
+    /// So it deletes in bounded batches, each its own transaction.
+    /// Peak memory is the batch, the lock is held for a batch, and a crash
+    /// leaves the epochs already swept durably swept.
+    ///
+    /// It returns a **summary** rather than the references, because the audit
+    /// trail this sweep writes is durable in `meterstore_erasures` before the
+    /// call returns: handing back a row per erasure duplicated durable state
+    /// into an unbounded `Vec` that the caller almost always only counted.
+    /// [`SubjectRegistry::erasures`] reads the trail, with the limit this
+    /// deliberately no longer needs.
     pub async fn expire_epochs_before(
         &self,
         cutoff: OffsetDateTime,
         reason: &str,
         actor: &str,
         now: OffsetDateTime,
-    ) -> Result<Vec<ErasureRecord>> {
+    ) -> Result<SweepOutcome> {
         if reason.trim().is_empty() {
             return Err(Error::config("erasure needs a reason for the audit trail"));
         }
@@ -1357,25 +1577,50 @@ impl SubjectRegistry {
         // containing the cutoff still holds values inside their period.
         let due_before = sweep_boundary(cutoff);
 
-        // One `DELETE … RETURNING` rather than a select-then-delete loop. The
-        // sweep is the one operation here whose row count is unbounded — a
-        // deployment's whole 2021 is due on one January morning — and a
-        // statement per row would hold a transaction open for the duration.
-        // `DELETE` takes the row locks the loop used `FOR UPDATE` for.
-        let mut tx = self.pool.begin().await.map_err(pg)?;
-        let due = sqlx::query_scalar::<_, String>(
-            "DELETE FROM meterstore_subject_map WHERE epoch < $1 RETURNING subject_ref",
-        )
-        .bind(due_before)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(pg)?;
+        let mut swept = SweepOutcome {
+            subjects: 0,
+            epochs: Vec::new(),
+            batches: 0,
+            swept_at: now,
+        };
+        let mut epochs = std::collections::BTreeSet::new();
 
-        // No tombstone. Suppression exists so an Article 17 erasure survives a
-        // broker replay; a retention expiry is not a request to stop processing,
-        // and a subject whose 2020 epoch expired must still be registrable for
-        // 2027.
-        if !due.is_empty() {
+        loop {
+            // `ctid IN (… LIMIT …)` rather than `DELETE … LIMIT`, which
+            // PostgreSQL does not have. The subquery picks the batch under the
+            // same index the predicate uses; the delete then takes row locks for
+            // exactly those.
+            let mut tx = self.pool.begin().await.map_err(pg)?;
+            let due = sqlx::query_as::<_, (String, i32)>(
+                r#"DELETE FROM meterstore_subject_map
+                    WHERE ctid IN (
+                        SELECT ctid FROM meterstore_subject_map
+                         WHERE epoch < $1
+                         LIMIT $2
+                    )
+                RETURNING subject_ref, epoch"#,
+            )
+            .bind(due_before)
+            .bind(SWEEP_BATCH)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(pg)?;
+
+            if due.is_empty() {
+                // Nothing left. Roll back rather than commit an empty
+                // transaction, and stop.
+                drop(tx);
+                break;
+            }
+
+            // No tombstone. Suppression exists so an Article 17 erasure survives
+            // a broker replay; a retention expiry is not a request to stop
+            // processing, and a subject whose 2020 epoch expired must still be
+            // registrable for 2027.
+            let refs: Vec<&str> = due
+                .iter()
+                .map(|(reference, _)| reference.as_str())
+                .collect();
             sqlx::query(
                 r#"INSERT INTO meterstore_erasures
                        (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac)
@@ -1383,50 +1628,43 @@ impl SubjectRegistry {
                      FROM unnest($1::text[]) AS reference
                    ON CONFLICT (subject_ref) DO NOTHING"#,
             )
-            .bind(due.as_slice())
+            .bind(&refs)
             .bind(now)
             .bind(reason)
             .bind(actor)
             .execute(&mut *tx)
             .await
             .map_err(pg)?;
-        }
-        tx.commit().await.map_err(pg)?;
+            tx.commit().await.map_err(pg)?;
 
-        // Ordered after the fact, because `RETURNING` has no order to give.
-        // Oldest epoch first is what a caller writing the outcome into its own
-        // compliance log wants, and a deterministic order is what makes the
-        // outcome of two runs comparable.
-        let mut records: Vec<ErasureRecord> = due
-            .into_iter()
-            .map(|reference| {
-                Ok(ErasureRecord {
-                    subject: Some(SubjectRef::new(reference)?),
-                    erased_at: now,
-                    reason: reason.to_string(),
-                    actor: actor.to_string(),
-                    trigger: ErasureTrigger::Retention,
-                    lifted: None,
-                })
-            })
-            .collect::<Result<_>>()?;
-        records.sort_by(|a, b| {
-            (a.epoch(), a.subject.as_ref().map(SubjectRef::as_str))
-                .cmp(&(b.epoch(), b.subject.as_ref().map(SubjectRef::as_str)))
-        });
+            let count = due.len();
+            epochs.extend(due.into_iter().map(|(_, epoch)| epoch));
+            swept.subjects += count as u64;
+            swept.batches += 1;
 
-        if !records.is_empty() {
+            // Report per batch rather than once at the end, so an interrupted
+            // sweep still accounts for what it destroyed.
             crate::observe::metrics().subjects_erased.add(
-                records.len() as u64,
+                count as u64,
                 &crate::observe::erasure_trigger(ErasureTrigger::Retention),
             );
+
+            if count < SWEEP_BATCH as usize {
+                break;
+            }
+        }
+
+        swept.epochs = epochs.into_iter().collect();
+        if swept.subjects > 0 {
             warn!(
-                epochs = records.len(),
+                subjects = swept.subjects,
+                batches = swept.batches,
+                epochs = ?swept.epochs,
                 %cutoff,
                 "retention sweep destroyed linkages past the statutory ceiling"
             );
         }
-        Ok(records)
+        Ok(swept)
     }
 
     /// Whether an identifier is on the suppression list.
@@ -1487,6 +1725,7 @@ impl SubjectRegistry {
         let lifted = sqlx::query(
             r#"UPDATE meterstore_erasures
                   SET natural_id_hmac = NULL,
+                      hmac_key_id     = NULL,
                       lifted_at       = $2,
                       lifted_by       = $3,
                       lift_reason     = $4
@@ -1617,6 +1856,52 @@ pub struct ErasureQuery {
     until: Option<OffsetDateTime>,
     trigger: Option<ErasureTrigger>,
     limit: i64,
+}
+
+/// How many mapping rows one retention-sweep transaction destroys.
+///
+/// The sweep is the only operation here whose row count is unbounded by
+/// construction — a deployment's whole 2021 comes due on one January morning —
+/// so it is the only one that needs a batch size at all. Large enough that a
+/// realistic sweep is a handful of round trips, small enough that the lock on
+/// `meterstore_subject_map` is never held long and peak memory is a batch.
+const SWEEP_BATCH: i64 = 10_000;
+
+/// What a retention sweep destroyed.
+///
+/// A summary rather than a row per subject. The sweep writes its audit trail to
+/// `meterstore_erasures` before it returns, so handing back an
+/// [`ErasureRecord`] each would duplicate durable state into an unbounded `Vec`
+/// — and the epochs it names are the *years* swept, of which there are a
+/// handful however many subjects they covered.
+///
+/// [`SubjectRegistry::erasures`] reads the trail itself, which is where a
+/// caller that wants the individual references should look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// How many `(subject, epoch)` linkages were destroyed.
+    pub subjects: u64,
+    /// The collection years swept, ascending. Bounded by the number of calendar
+    /// years past the ceiling, not by the number of subjects.
+    pub epochs: Vec<i32>,
+    /// How many transactions it took.
+    ///
+    /// The batch size is fixed and internal — a caller cannot tune it, and does
+    /// not need to: what matters is that the sweep is bounded, not by how much.
+    ///
+    /// Reported because an interrupted sweep is resumable: a crash leaves the
+    /// batches already committed durably swept, and re-running finishes the job.
+    pub batches: usize,
+    /// The `now` the caller passed, which is what the audit rows carry.
+    pub swept_at: OffsetDateTime,
+}
+
+impl SweepOutcome {
+    /// Whether the sweep found nothing due.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.subjects == 0
+    }
 }
 
 /// How many rows an unnarrowed [`ErasureQuery`] returns.
@@ -1968,6 +2253,36 @@ fn mac(key: &[u8], natural_id: &str) -> Vec<u8> {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(natural_id.as_bytes());
     mac.finalize().into_bytes().to_vec()
+}
+
+/// Domain separator for a key's identifier, so it can never collide with a
+/// tombstone tag written under the same key.
+const KEY_ID_DOMAIN: &str = "meterstore.erasure-key-id.v1";
+
+/// How many bytes of the derived tag identify a key.
+///
+/// Eight, because this only has to tell the keys of one ring apart and be
+/// recognisable in a log line. Collisions between two keys in one ring would
+/// report an orphan as present; at 2^-64 per pair that is not the failure worth
+/// designing against.
+const KEY_ID_BYTES: usize = 8;
+
+/// A stable, public name for a key, derived from the key itself.
+///
+/// Not operator-chosen, and that is the point: the check exists because
+/// operators mismanage the ring, so an identifier they could mislabel would fail
+/// in exactly the cases it is for. Derived, it cannot disagree with the key it
+/// names.
+///
+/// # What it gives away
+///
+/// It is a key check value, so somebody holding a *candidate* key can confirm
+/// it. That is no worse than the tombstones themselves, which fall to the same
+/// guess plus one identifier — and identifiers here are enumerable, an 11-digit
+/// Marktlokations-ID. Both arguments rest on [`MIN_ERASURE_SECRET_BYTES`] of
+/// real entropy, which is what the length floor is there to ask for.
+fn key_id(key: &[u8]) -> Vec<u8> {
+    mac(key, KEY_ID_DOMAIN)[..KEY_ID_BYTES].to_vec()
 }
 
 /// Lowercase hex, without pulling in a dependency for sixteen characters.
@@ -2439,5 +2754,52 @@ mod tests {
         assert!(rendered.contains("s2026_"));
         assert!(rendered.contains("DSAR-2026-0042"));
         assert!(rendered.contains("Request"));
+    }
+
+    #[test]
+    fn a_market_identifier_is_not_a_pseudonym() {
+        // The failure this exists for: the length floor rules out the *short*
+        // identifiers and admitted the long ones, which are the more identifying.
+        // A Zählpunktbezeichnung is 33 uppercase alphanumerics — it cleared both
+        // the floor and the alphabet.
+        let zpb = "DE0001234567890000000000000000123";
+        assert_eq!(zpb.len(), 33);
+        assert!(
+            zpb.parse::<metering::ids::MeloId>().is_ok(),
+            "fixture must be a real MeLo"
+        );
+        assert!(SubjectRef::new(format!("s2026_{zpb}")).is_err());
+
+        // And the short ones stay refused, by the floor.
+        assert!(SubjectRef::new("s2026_41373559241").is_err());
+    }
+
+    #[test]
+    fn a_random_token_of_identifier_length_is_still_accepted() {
+        // The refusal must key on parsing, not on length: a 33-character random
+        // token is a perfectly good pseudonym and must not be caught by the rule
+        // above.
+        let token = "abcdefghijklmnopqrstuvwxyz0123456";
+        assert_eq!(token.len(), 33);
+        assert!(SubjectRef::new(format!("s2026_{token}")).is_ok());
+    }
+
+    #[test]
+    fn an_epoch_must_be_spelled_canonically() {
+        // `i32::from_str` accepts both of these, and the table's constraint is
+        // textual — so they passed the Rust check and were refused by the
+        // database, which is the disagreement that constraint exists to prevent.
+        let token = "abcdefghijklmnopqrstuvwxyz";
+        assert!(SubjectRef::new(format!("s+2026_{token}")).is_err());
+        assert!(SubjectRef::new(format!("s02026_{token}")).is_err());
+        assert!(SubjectRef::new(format!("s2026_{token}")).is_ok());
+    }
+
+    #[test]
+    fn a_token_has_an_upper_bound_too() {
+        let token = "a".repeat(MAX_REFERENCE_TOKEN_CHARS + 1);
+        assert!(SubjectRef::new(format!("s2026_{token}")).is_err());
+        let token = "a".repeat(MAX_REFERENCE_TOKEN_CHARS);
+        assert!(SubjectRef::new(format!("s2026_{token}")).is_ok());
     }
 }

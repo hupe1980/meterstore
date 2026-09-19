@@ -166,6 +166,7 @@ async fn archived(workload: MeteringWorkload) -> (TestHarness, meterstore::Meter
     harness.ingest(&store, &series).await.expect("ingest");
 
     store
+        .admin()
         .archive(to + Duration::days(2), 64)
         .await
         .expect("archive");
@@ -319,7 +320,7 @@ async fn duckdb_sees_the_snapshot_history_a_reproducible_read_pins_to() {
         .days(3);
     let (harness, store, _oracle) = archived(workload).await;
 
-    let ours = store.snapshots().await.expect("snapshots");
+    let ours = store.admin().snapshots().await.expect("snapshots");
     assert!(ours.len() >= 2, "the fixture must commit several snapshots");
 
     let table = table_path(&harness);
