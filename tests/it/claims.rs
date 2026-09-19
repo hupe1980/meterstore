@@ -10,9 +10,20 @@
 
 use std::path::PathBuf;
 
+/// Read a file this repository **tracks**.
+///
+/// Only tracked files: a working copy carries design notes and scratch that a
+/// fresh checkout does not, so a check reading one of those passes on the
+/// machine that wrote it and fails in CI.
 fn repo(relative: &str) -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
-        .unwrap_or_else(|e| panic!("read {relative}: {e}"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "read {relative}: {e}\n\
+                 If this file is gitignored it cannot be checked here — a fresh \
+                 checkout does not have it."
+            )
+        })
 }
 
 #[test]
@@ -62,12 +73,11 @@ fn no_document_names_a_floor_the_code_does_not_declare() {
         .parse()
         .expect("a major version");
 
+    // Tracked files only. A fresh checkout has no design notes — they are
+    // gitignored — so naming one here is a test that passes on the machine that
+    // wrote it and fails in CI.
     let mut wrong = Vec::new();
-    for file in [
-        "README.md",
-        "concepts/README.md",
-        "site/content/docs/getting-started.md",
-    ] {
+    for file in ["README.md", "site/content/docs/getting-started.md"] {
         let text = repo(file);
         let mut named = Vec::new();
 
