@@ -109,7 +109,8 @@ doc-open:
 # `--all-features` hides this entirely: an optional dependency reached from
 # non-optional code compiles fine as long as *something* enables it. The failure
 # only appears for someone who picked a narrower set — that is, only after
-# publishing, in someone else's build.
+# publishing, in someone else's build. So the sets here are the narrow ones;
+# `just test` is what covers `--all-features`.
 features:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -143,7 +144,6 @@ features:
     check "sql-catalog"    --no-default-features --features sql-catalog
     check "s3tables"       --no-default-features --features s3tables
     check "testkit"        --no-default-features --features testkit
-    check "all"            --all-features
     if [ "$fail" -ne 0 ]; then
       echo "a feature combination does not build; a published crate's users can select it" >&2
       exit 1

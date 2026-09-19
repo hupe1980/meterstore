@@ -346,17 +346,25 @@ documentation says what is true now; a test enforces it.
   the same boundary back, and a second run commits nothing. A fresh deployment
   runs it clean in the smoke test, because a verb that failed on a quiet table
   could not be scheduled.
+- **The feature-matrix CI job runs its sets in parallel.** Eight sequential
+  `cargo test --lib` runs over one `target/` took 48 minutes, of which the tests
+  were 0.11 seconds each: changing the feature set changes the whole resolve
+  graph, so every set rebuilt DataFusion, Arrow, Iceberg and sqlx from scratch.
+  One job per set, `fail-fast: false` so a broken combination does not hide the
+  others, and a cache keyed per set — which is the half that makes it quick,
+  since one shared cache is a cache every set misses. The `--all-features` entry
+  is gone: the `check` job already runs the whole suite under it.
 - **A third documentation convention, enforced**: a published page may not carry
   a plan. The sibling of the changelog rule, pointed forward — a page that says
   what somebody means to write is stale the moment the plan changes, and nobody
   editing the plan goes looking for the page. Scoped to `site/content`, because
   a pre-1.0 README names its gaps on purpose.
 - **`tests/it/claims.rs`**: the sentences this repository writes about itself,
-  checked against whatever would make them true. Two now — that a CI job actually
-  runs the integration suite against the floor and derives the version from the
-  code, and that no document promises a floor the code does not declare. These
-  are the claims that rot in silence, because nothing fails when they stop being
-  true.
+  checked against whatever would make them true. Three now — that a CI job runs
+  the integration suite against the floor and derives the version from the code,
+  that no document promises a floor the code does not declare, and that
+  `just features` and the CI matrix check the same feature sets. These are the
+  claims that rot in silence, because nothing fails when they stop being true.
 - **`tests/it/interop_adbc.rs`**: the Flight SQL surface driven from **ADBC**, the
   API a non-Rust consumer actually holds, by a driver written in another language
   that validates responses against the specification. A connection opened, a query
@@ -374,7 +382,7 @@ documentation says what is true now; a test enforces it.
   and carries **no** file-size target while none is declared; a size declared
   after the table exists still reaches it, and a re-measured one replaces it; and
   an archival commit reports the bytes and file count it wrote, which is the
-  figure the setting is meant to be copied from. 1000 tests.
+  figure the setting is meant to be copied from. 1001 tests.
 
 ### Documentation
 

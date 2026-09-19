@@ -121,7 +121,23 @@ jobs:
   # *something* enables it. The failure only appears for someone who picked a
   # narrower set — that is, only after publishing, in someone else's build.
   features:
+    name: features (${{ matrix.set.name }})
     runs-on: ubuntu-latest
+    strategy:
+      # **Every set, not the first to fail.** A broken feature combination
+      # usually breaks alone, and cancelling the siblings would hide which
+      # others are broken too — turning one red run into several.
+      fail-fast: false
+      matrix:
+        set:
+          - { name: none,            flags: --no-default-features }
+          - { name: rest-catalog,    flags: --no-default-features --features rest-catalog }
+          - { name: sql-catalog,     flags: --no-default-features --features sql-catalog }
+          - { name: s3tables,        flags: --no-default-features --features s3tables }
+          - { name: catalog-facade,  flags: --no-default-features --features catalog-facade }
+          - { name: flight,          flags: --no-default-features --features flight }
+          - { name: testkit,         flags: --no-default-features --features testkit }
+          - { name: cli,             flags: --no-default-features --features cli }
     steps:
       - uses: actions/checkout@v4
       - name: Free runner disk
@@ -129,35 +145,28 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
       - uses: dtolnay/rust-toolchain@stable
+
+      # Keyed per feature set, which is the half that makes this quick. Changing
+      # the feature set changes the whole resolve graph, so one shared cache is
+      # a cache each set misses: the sets ran in sequence over one `target/` and
+      # every one of them rebuilt DataFusion, Arrow, Iceberg and sqlx from
+      # scratch. A cache per set is a cache each set hits.
       - uses: Swatinem/rust-cache@v2
-      - name: Every feature combination a published crate's users can select
-        run: |
-          set -uo pipefail
-          fail=0
-          for set in "--no-default-features" \
-                     "--no-default-features --features rest-catalog" \
-                     "--no-default-features --features flight" \
-                     "--no-default-features --features cli" \
-                     "--no-default-features --features catalog-facade" \
-                     "--no-default-features --features sql-catalog" \
-                     "--no-default-features --features s3tables" \
-                     "--no-default-features --features testkit" \
-                     "--all-features"; do
-            printf '%-56s' "$set"
-            # `test --lib`, not `check`: a feature set can compile and still be
-            # wrong. The documented example names both a catalogue and an
-            # object-store scheme, and validating it needs both features present
-            # — a coupling a type check cannot see. Unit tests only; the
-            # integration suite needs Docker and runs once, under `--all-features`.
-            if cargo test --quiet --lib $set 2>/tmp/out; then
-              echo ok
-            else
-              echo FAILED
-              grep -E '^error' -A 6 /tmp/out | head -20
-              fail=1
-            fi
-          done
-          exit "$fail"
+        with:
+          key: ${{ matrix.set.name }}
+
+      # No `--all-features` entry: the `check` job already runs the whole suite
+      # under it, so a tenth job here would rebuild the same graph to re-run a
+      # subset of the same tests. What this job is for is the sets `--all-features`
+      # *hides*.
+      #
+      # `test --lib`, not `check`: a feature set can compile and still be wrong.
+      # The documented example names both a catalogue and an object-store
+      # scheme, and validating it needs both features present — a coupling a
+      # type check cannot see. Unit tests only; the integration suite needs
+      # Docker and runs under `check` and `floor`.
+      - name: ${{ matrix.set.flags }}
+        run: cargo test --quiet --lib ${{ matrix.set.flags }}
 
   # A declared MSRV that nothing checks is a guess. This makes it a fact.
   msrv:

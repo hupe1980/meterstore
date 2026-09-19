@@ -123,3 +123,53 @@ fn no_document_names_a_floor_the_code_does_not_declare() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn ci_and_the_local_gate_check_the_same_feature_sets() {
+    // `--all-features` hides a broken feature combination entirely, so the point
+    // of both lists is the narrow sets. Spelled twice — once for the matrix CI
+    // runs, once for `just features` — and a set present in only one is the
+    // worst arrangement of the two: it either fails on a push nobody could have
+    // caught locally, or passes locally on a gate weaker than the real one.
+    fn sets(text: &str, line_start: &str, flags_from: impl Fn(&str) -> String) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(line_start))
+            .map(|line| {
+                flags_from(line)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    // `check "sql-catalog"    --no-default-features --features sql-catalog`
+    let local = sets(&repo("justfile"), "check \"", |line| {
+        line.split_once("\" ")
+            .map_or_else(String::new, |(_, rest)| rest.to_string())
+    });
+
+    // `- { name: sql-catalog, flags: --no-default-features --features sql-catalog }`
+    let remote = sets(&repo(".github/workflows/ci.yml"), "- { name:", |line| {
+        line.split_once("flags:")
+            .map_or_else(String::new, |(_, rest)| {
+                rest.trim_end_matches('}').to_string()
+            })
+    });
+
+    assert!(
+        !local.is_empty() && !remote.is_empty(),
+        "neither list may be empty"
+    );
+
+    let mut local_sorted = local.clone();
+    let mut remote_sorted = remote.clone();
+    local_sorted.sort();
+    remote_sorted.sort();
+    assert_eq!(
+        local_sorted, remote_sorted,
+        "`just features` and the CI matrix check different feature sets.\n\
+         local:  {local:#?}\nremote: {remote:#?}"
+    );
+}

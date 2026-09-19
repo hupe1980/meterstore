@@ -236,7 +236,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**1000 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+**1001 tests** — unit, property, doc and integration against real PostgreSQL 18 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle
 over generated workloads:
 
