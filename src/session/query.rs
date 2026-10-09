@@ -1,6 +1,6 @@
 //! Query results that carry the tier boundary they were computed against.
 //!
-//! P1 says correctness is observable rather than assumed, and this is where that
+//! Correctness is observable rather than assumed, and this is where that
 //! becomes concrete. A bare `Vec<RecordBatch>` from a tiered store is missing the
 //! one fact needed to reason about it: *which boundary was in force*. Two
 //! identical queries a minute apart can read the same rows from different tiers,
@@ -20,8 +20,7 @@
 //!
 //! The nodes are identified by **type**, not by name. A renamed node in a
 //! pre-1.0 dependency then fails to compile, rather than silently reporting that
-//! no cold tier was scanned — which would be a lie of exactly the kind P6
-//! forbids.
+//! no cold tier was scanned.
 
 use std::sync::Arc;
 
@@ -480,6 +479,8 @@ fn walk(plan: &Arc<dyn ExecutionPlan>, found: &mut Vec<Tier>) {
         .is_some()
     {
         found.push(Tier::Cold);
+    } else if let Some(report) = any.downcast_ref::<super::completeness::CompletenessExec>() {
+        found.extend(report.tiers.iter().copied());
     }
     for child in plan.children() {
         walk(child, found);

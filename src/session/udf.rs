@@ -24,7 +24,7 @@
 //!
 //! # And the OBIS functions
 //!
-//! `ObisPredicate` wraps `metering::obis`'s own predicates, [`ObisDirection`]
+//! `ObisPredicate` wraps `metering::ids::obis`'s own predicates, [`ObisDirection`]
 //! the primitive the two directional ones are derived from — three-valued,
 //! because a register may have no direction at all — and [`ObisTariffRegister`]
 //! and [`ObisNormalise`] the two accessors a query needs.
@@ -36,7 +36,7 @@
 //! the value was an EIC in the first place, which is what tells the two kinds of
 //! null in the second apart.
 //!
-//! The arithmetic is `metering::calendar`'s. These are wrappers: they convert
+//! The arithmetic is `metering::time::calendar`'s. These are wrappers: they convert
 //! between Arrow arrays and the domain functions and nothing else. Their tests
 //! assert that the wrapper preserves the upstream answer, not that the answer is
 //! right — that is `metering`'s suite's job, plus the contract test in
@@ -50,12 +50,12 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use metering::IntervalResolution;
+use metering::DayBoundary;
 use metering::QualityFlag;
-use metering::calendar;
+use metering::Resolution;
+use metering::ids::obis::ObisCode;
 use metering::ids::{Eic, EicType, Regelzone};
-use metering::interval::{Direction, Sparte};
-use metering::obis::ObisCode;
+use metering::series::interval::{Direction, Sparte};
 use time::{Date, OffsetDateTime};
 
 use crate::arrow::array::{
@@ -177,7 +177,7 @@ fn as_obis(args: &ScalarFunctionArgs) -> DfResult<(StringArray, Vec<Option<ObisC
     Ok((raw, out))
 }
 
-/// One of `metering::obis`'s predicates, as a SQL function.
+/// One of `metering::ids::obis`'s predicates, as a SQL function.
 ///
 /// # Why these are wrappers and nothing more
 ///
@@ -440,10 +440,8 @@ impl ScalarUDFImpl for ObisTariffRegister {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let (_, codes) = as_obis(&args)?;
-        let out: crate::arrow::array::UInt8Array = codes
-            .iter()
-            .map(|c| c.and_then(|c| c.tariff_register()))
-            .collect();
+        let out: crate::arrow::array::UInt8Array =
+            codes.iter().map(|c| c.and_then(|c| c.tariff())).collect();
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
@@ -801,7 +799,12 @@ impl ScalarUDFImpl for LocalDay {
             if input.is_null(i) {
                 out.append_null();
             } else {
-                out.append_value(to_date32(calendar::local_day(from_micros(input.value(i))?)));
+                // Null outside the years the calendar covers: no rule to answer from.
+                out.append_option(
+                    DayBoundary::Strom
+                        .day_of(from_micros(input.value(i))?)
+                        .map(to_date32),
+                );
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -810,11 +813,11 @@ impl ScalarUDFImpl for LocalDay {
 
 /// `meter_gas_day(ts)` — the **Gastag** an instant falls on.
 ///
-/// 06:00 to 06:00 `Europe/Berlin` (GaBi Gas, following Art. 3 Nr. 6 VO (EU)
-/// 312/2014). The German gas market balances on this day and not on the calendar
-/// one, so `meter_local_day` over a gas Lastgang books the 00:00–06:00 draw into
-/// the previous Bilanzierungstag's neighbour — six hours a day, every day, with
-/// totals that still look plausible.
+/// 06:00 to 06:00 `Europe/Berlin` (GaBi Gas, following
+/// `[VO (EU) 2017/459 Art. 3 Nr. 16]`). The German gas market balances on this
+/// day and not on the calendar one, so `meter_local_day` over a gas Lastgang
+/// books the 00:00–06:00 draw into the previous Bilanzierungstag's neighbour —
+/// six hours a day, every day, with totals that still look plausible.
 ///
 /// ```sql
 /// SELECT meter_gas_day("from") AS gastag, SUM(value)
@@ -857,9 +860,11 @@ impl ScalarUDFImpl for GasDay {
             if input.is_null(i) {
                 out.append_null();
             } else {
-                out.append_value(to_date32(calendar::local_gas_day(from_micros(
-                    input.value(i),
-                )?)));
+                out.append_option(
+                    DayBoundary::Gas
+                        .day_of(from_micros(input.value(i))?)
+                        .map(to_date32),
+                );
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -924,10 +929,13 @@ impl ScalarUDFImpl for BalancingDay {
                 out.append_null();
                 continue;
             }
-            out.append_value(to_date32(balancing::balancing_day(
-                from_micros(input.value(i))?,
-                parse_sparte(sparte.value(i))?,
-            )));
+            out.append_option(
+                balancing::balancing_day(
+                    from_micros(input.value(i))?,
+                    parse_sparte(sparte.value(i))?,
+                )
+                .map(to_date32),
+            );
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -968,9 +976,12 @@ impl ScalarUDFImpl for LocalMonth {
             if input.is_null(i) {
                 out.append_null();
             } else {
-                out.append_value(to_date32(calendar::local_month(from_micros(
-                    input.value(i),
-                )?)));
+                out.append_option(
+                    DayBoundary::Strom
+                        .day_of(from_micros(input.value(i))?)
+                        .and_then(|day| day.replace_day(1).ok())
+                        .map(to_date32),
+                );
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1042,10 +1053,13 @@ impl ScalarUDFImpl for BalancingMonth {
                 out.append_null();
                 continue;
             }
-            out.append_value(to_date32(balancing::balancing_month(
-                from_micros(input.value(i))?,
-                parse_sparte(sparte.value(i))?,
-            )));
+            out.append_option(
+                balancing::balancing_month(
+                    from_micros(input.value(i))?,
+                    parse_sparte(sparte.value(i))?,
+                )
+                .map(to_date32),
+            );
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -1179,7 +1193,7 @@ impl ScalarUDFImpl for ExpectedIntervals {
 }
 
 /// Parse an ISO 8601 resolution, the form storage uses.
-fn parse_resolution(s: &str) -> DfResult<IntervalResolution> {
+fn parse_resolution(s: &str) -> DfResult<Resolution> {
     s.parse()
         .map_err(|e| DataFusionError::Execution(format!("bad resolution {s:?}: {e}")))
 }
@@ -1212,7 +1226,7 @@ pub fn all() -> Vec<ScalarUDF> {
     ] {
         udfs.push(ScalarUDF::from(QualityPredicate::new(name, test)));
     }
-    // One-to-one with `metering::obis`'s own predicates. Listed rather than
+    // One-to-one with `metering::ids::obis`'s own predicates. Listed rather than
     // generated so that adding one upstream is a deliberate act here, and so the
     // SQL name and the method it wraps sit on the same line.
     for (name, test) in [
@@ -1397,7 +1411,7 @@ mod tests {
             );
             assert_eq!(
                 one_date(&sql).await,
-                Some(calendar::local_day(instant)),
+                DayBoundary::Strom.day_of(instant),
                 "wrapper disagreed with metering for {instant}"
             );
         }
@@ -1733,7 +1747,7 @@ mod tests {
             );
             assert_eq!(
                 one_date(&sql).await,
-                Some(calendar::local_gas_day(instant)),
+                DayBoundary::Gas.day_of(instant),
                 "wrapper disagreed with metering for {instant}"
             );
         }

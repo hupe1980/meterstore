@@ -22,7 +22,7 @@ async fn collect_stream(stream: BatchStream) -> Vec<datafusion::arrow::array::Re
 }
 use meterstore::watermark::TieringWatermark;
 
-use metering::measurement_series::MeasurementSource;
+use meterstore::delivery::MeasurementSource;
 use sqlx::{PgPool, Row};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -63,7 +63,7 @@ impl Harness {
         let source = MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         };
         let source_detail = serde_json::to_string(&source).expect("serialize source");
 
@@ -89,7 +89,7 @@ impl Harness {
             .bind(Some(source_detail.as_str()))
             .bind(Some("[]"))
             .bind(rust_decimal::Decimal::new(20_260_727_000_001, 0))
-            .bind("9900000000001:2026-07")
+            .bind("9900000000003:2026-07")
             .bind(datetime!(2026-07-27 06:00 UTC))
             .execute(self.pool())
             .await
@@ -208,7 +208,7 @@ async fn insert_fails_when_no_partition_covers_the_interval() {
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
            VALUES ('1','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED','MSCONS',1,
-                   '9900000000001:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
+                   '9900000000003:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D22)
     .bind(D22 + Duration::minutes(15))
@@ -282,8 +282,10 @@ async fn a_scan_reaching_below_what_was_reclaimed_says_so() {
         .await
         .map(|_| ())
         .expect_err("a scan below the reclaimed boundary must not return silently");
+    // The rows are durable in the cold tier and a fresh plan reads them there:
+    // the boundary moved, nothing is wrong with the store.
     assert!(
-        matches!(err, meterstore::Error::InvariantViolated { .. }),
+        matches!(err, meterstore::Error::BoundaryMoved { .. }) && err.is_retryable(),
         "{err:?}"
     );
 }
@@ -763,7 +765,7 @@ async fn scan_returns_the_storage_schema_in_merge_key_order() {
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].series.intervals.len(), 3);
     assert_eq!(
-        decoded[0].series.intervals[0].value,
+        decoded[0].series.intervals[0].value(),
         "1.234567".parse::<rust_decimal::Decimal>().unwrap(),
         "decimals must not lose precision through NUMERIC"
     );
@@ -962,7 +964,7 @@ async fn a_non_canonical_obis_code_is_rejected_at_the_write() {
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                 source_kind, version, version_scope, recorded_at, balancing_day)
                VALUES ('1',$1,'STROM',$2,$3,1.0,'KWH','MEASURED','MSCONS',1,
-                       '9900000000001:2026-07',$2,CAST(($2 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
+                       '9900000000003:2026-07',$2,CAST(($2 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(bad)
         .bind(D20)
@@ -989,7 +991,7 @@ async fn a_storage_group_that_carries_information_is_accepted() {
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
            VALUES ('1','1-0:1.8.0*1','STROM',$1,$2,1.0,'KWH','MEASURED','MSCONS',1,
-                   '9900000000001:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
+                   '9900000000003:2026-07',$1,CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D20)
     .bind(D20 + Duration::minutes(15))
@@ -1066,7 +1068,7 @@ fn batch(start: OffsetDateTime, count: usize, kwh: i64, version: i64) -> RecordB
                 .with_precision_and_scale(schema::VERSION_PRECISION, schema::VERSION_SCALE)
                 .unwrap(),
         ),
-        Arc::new(StringArray::from(vec!["9900000000001:2026-07"; count])),
+        Arc::new(StringArray::from(vec!["9900000000003:2026-07"; count])),
         Arc::new(TimestampMicrosecondArray::from(vec![micros(D20); count]).with_timezone("UTC")),
         // The balancing day, as the encoder would derive it. STROM, so the
         // Berlin calendar day rather than the Gastag.
@@ -1074,8 +1076,11 @@ fn batch(start: OffsetDateTime, count: usize, kwh: i64, version: i64) -> RecordB
             (0..count)
                 .map(|i| {
                     let at = start + Duration::minutes(15 * i as i64);
-                    let day =
-                        meterstore::planner::balancing_day(at, metering::interval::Sparte::Strom);
+                    let day = meterstore::planner::balancing_day(
+                        at,
+                        metering::series::interval::Sparte::Strom,
+                    )
+                    .unwrap();
                     (day - time::Date::from_ordinal_date(1970, 1).unwrap()).whole_days() as i32
                 })
                 .collect::<Vec<i32>>(),
@@ -1291,7 +1296,7 @@ async fn corrections_coexist_with_the_values_they_supersede() {
            (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
             source_kind, version, version_scope, recorded_at, balancing_day)
            VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,9.9,'KWH','CORRECTED','MSCONS',
-                   20260728000002,'9900000000001:2026-07',$3,
+                   20260728000002,'9900000000003:2026-07',$3,
                    CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
     )
     .bind(D20)
@@ -1331,7 +1336,7 @@ async fn a_chunk_boundary_inside_a_tie_does_not_drop_rows() {
     let source = MeasurementSource::Mscons {
         pid: 13_005,
         message_ref: None,
-        sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+        sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
     };
     let detail = serde_json::to_string(&source).unwrap();
     for obis in ["1-0:1.8.0", "1-0:2.8.0"] {
@@ -1346,7 +1351,7 @@ async fn a_chunk_boundary_inside_a_tie_does_not_drop_rows() {
                     quality, resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,1,'KWH','MEASURED','PT15M','MSCONS',
-                           $5,'[]',$6,'9900000000001:2026-07',$7,
+                           $5,'[]',$6,'9900000000003:2026-07',$7,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
             )
             .bind("12345678905")
@@ -1453,7 +1458,7 @@ async fn overlapping_intervals_in_one_version_are_refused() {
                (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                 source_kind, version, version_scope, recorded_at, balancing_day)
                VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.0,'KWH','MEASURED',
-                       'MSCONS',$3,'9900000000001:2026-07',$1,
+                       'MSCONS',$3,'9900000000003:2026-07',$1,
                        CAST(($1 AT TIME ZONE 'Europe/Berlin') AS DATE))"#,
         )
         .bind(from)
@@ -1520,11 +1525,11 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
     };
 
     for bad in [
-        "9900000000001",          // no month
-        "9900000000001:2026",     // no month part
-        "9900000000001:2026-13",  // month out of range
+        "9900000000003",          // no month
+        "9900000000003:2026",     // no month part
+        "9900000000003:2026-13",  // month out of range
         "990000000000:2026-07",   // twelve digits — a Marktpartner-ID is thirteen
-        "99000000000012:2026-07", // fourteen
+        "99000000000032:2026-07", // fourteen
         "99:2026-07",             // an operator too short to be a Marktpartner-ID
         "a:b:2026-07",            // a second separator, which split_part would mis-read
         "2026-07",
@@ -1535,7 +1540,7 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
         );
     }
 
-    insert("9900000000001:2026-07")
+    insert("9900000000003:2026-07")
         .await
         .expect("the canonical form must be storable");
 }

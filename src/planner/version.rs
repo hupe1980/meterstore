@@ -36,10 +36,9 @@
 //! column.
 //!
 //! It is not used, because that rests on the spec being the one this crate wrote.
-//! A table repartitioned out of band — the compaction this crate tells an operator
-//! to run with Spark — could carry a field on an attribute column, and the
-//! inference would then be silently wrong in the direction that returns a
-//! superseded row.
+//! A table repartitioned out of band — by a tool this crate does not control —
+//! could carry a field on an attribute column, and the inference would then be
+//! silently wrong in the direction that returns a superseded row.
 
 use time::OffsetDateTime;
 

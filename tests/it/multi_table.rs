@@ -132,7 +132,7 @@ async fn one_statement_can_mention_both_tables() {
         .expect("a cross-table join must plan and run");
 
     // The populations are disjoint by construction, so the join is empty — and
-    // that is the point: it *planned*, which is what was impossible before.
+    // that is the point: it *planned*.
     assert_eq!(count(&joined), 0);
 
     // A union over both is the query an operator actually writes, and it must
@@ -224,7 +224,7 @@ async fn isolating_an_unknown_table_names_what_is_there() {
 
 #[tokio::test]
 async fn a_result_carries_every_table_boundary_not_one() {
-    // P1 across tables. Two tables genuinely have two watermarks, so a
+    // Provenance across tables. Two tables genuinely have two watermarks, so a
     // result that reported one number would be attributing a figure spanning
     // both to a boundary that governs only one of them.
     let (_h, catalog) = two_tables().await;
@@ -268,7 +268,7 @@ async fn a_result_carries_every_table_boundary_not_one() {
 
 #[tokio::test]
 async fn a_result_is_attributed_only_to_the_tables_it_read() {
-    // The other half of P1, and the one a naive implementation gets wrong:
+    // The other half of provenance, and the one a naive implementation gets wrong:
     // `watermark()` is the *conservative* boundary — the oldest reported — so
     // attributing every hosted table to every query means a single-table figure
     // is reconciled against whichever unrelated table archives least often.
@@ -727,16 +727,17 @@ fn tenanted(name: &str) -> ValidatedTableConfig {
 /// One quarter-hour reading for a tenant, on a named table's shape.
 fn tenant_reading(tenant: &str, kwh: i64, version: u128) -> meterstore::encode::StoredSeries {
     use datafusion::common::ScalarValue;
-    use metering::interval::{MeterInterval, Sparte};
-    use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+    use metering::series::interval::{MeterInterval, Sparte};
+    use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 
-    let interval = MeterInterval {
-        from: START,
-        to: START + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(kwh, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "1-0:1.8.0".parse().ok(),
-    };
+    let interval = MeterInterval::new(
+        START,
+        START + Duration::minutes(15),
+        rust_decimal::Decimal::new(kwh, 0),
+        metering::QualityFlag::Measured,
+    )
+    .expect("a non-empty interval")
+    .with_obis("1-0:1.8.0".parse().unwrap());
     let series = MeasurementSeries::new(
         "11111111115".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
@@ -750,7 +751,7 @@ fn tenant_reading(tenant: &str, kwh: i64, version: u128) -> meterstore::encode::
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom).unwrap(),
+            meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom).unwrap(),
             meterstore::Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -1006,4 +1007,108 @@ async fn a_failing_table_reaches_the_caller_as_the_error_it_raised() {
         direct.is_retryable(),
         "wrapping changed whether a supervisor will retry"
     );
+}
+
+#[tokio::test]
+async fn completeness_in_a_catalog_reports_on_the_table_it_names() {
+    // One function per session, bound to every table. Unnamed, it would have
+    // to pick one; named, it reports on that one whatever order the tables
+    // were registered in, and its provenance is that table's.
+    use meterstore::arrow::array::AsArray;
+    let (_h, catalog) = two_tables().await;
+
+    let err = catalog
+        .query("SELECT * FROM meter_completeness('2026-07-20', '2026-07-22')")
+        .await
+        .map(|_| ())
+        .expect_err("two tables, no name");
+    let text = err.to_string();
+    assert!(
+        text.contains("esa_typ2") && text.contains("readings"),
+        "{text}"
+    );
+
+    for (table, channels) in [("readings", 3), ("esa_typ2", 1)] {
+        let result = catalog
+            .query(&format!(
+                "SELECT COUNT(*) AS n FROM meter_completeness('{table}', '2026-07-20', '2026-07-22')"
+            ))
+            .await
+            .expect("named");
+        let n = result.batches()[0]
+            .column(0)
+            .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
+            .value(0);
+        assert_eq!(n, channels, "{table} reports its own channels");
+        assert_eq!(
+            result.watermarks().len(),
+            1,
+            "{table}: {:?}",
+            result.watermarks()
+        );
+        assert!(
+            result.watermarks()[0].0.starts_with(table),
+            "the boundary is the named table's: {:?}",
+            result.watermarks()
+        );
+        assert!(
+            result
+                .tiers_scanned()
+                .contains(&meterstore::watermark::Tier::Hot),
+            "the report read the hot tier, and says so"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_with_no_registry_says_what_is_missing() {
+    // What is missing is a registry, not a column: a deployment that no longer
+    // declares one still has a registry if its map exists. The message names
+    // the thing to configure, and nothing it does not depend on.
+    let (_h, catalog) = two_tables().await;
+    let err = catalog
+        .anonymise_before(START, "§ 60 Abs. 6 MsbG", "retention-job", START)
+        .await
+        .expect_err("no registry at all");
+    assert!(matches!(err, meterstore::Error::Config(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("subject_registry"),
+        "names the remedy: {text}"
+    );
+    assert!(
+        !text.contains("declares a subject column"),
+        "does not blame a column the sweep does not need: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_derived_catalog_binds_completeness_to_every_table_too() {
+    // `as_known_at` rebuilds every table into a fresh session. That session's
+    // function has to be bound to all of them, as the original's is.
+    use meterstore::arrow::array::AsArray;
+    let (_h, catalog) = two_tables().await;
+    let derived = catalog
+        .as_known_at(START + Duration::days(30))
+        .await
+        .expect("derived");
+
+    derived
+        .query("SELECT * FROM meter_completeness('2026-07-20', '2026-07-22')")
+        .await
+        .map(|_| ())
+        .expect_err("two tables, no name");
+    for (table, channels) in [("readings", 3), ("esa_typ2", 1)] {
+        let result = derived
+            .query(&format!(
+                "SELECT COUNT(*) FROM meter_completeness('{table}', '2026-07-20', '2026-07-22')"
+            ))
+            .await
+            .expect("named");
+        let n = result.batches()[0]
+            .column(0)
+            .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
+            .value(0);
+        assert_eq!(n, channels, "{table} reports its own channels");
+    }
 }

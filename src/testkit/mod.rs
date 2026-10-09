@@ -30,10 +30,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::delivery::{MeasurementSeries, MeasurementSource};
+use metering::Resolution;
 use metering::ids::{MaloId, MeloId};
-use metering::interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
-use metering::resolution::IntervalResolution;
+use metering::series::interval::{MeterInterval, QualityFlag, Sparte, Unit};
 use rust_decimal::Decimal;
 use time::{Duration, OffsetDateTime};
 
@@ -100,7 +100,7 @@ pub struct MeteringWorkload {
     operator: metering::ids::BdewCode,
     malo_offset: usize,
     sparte: Sparte,
-    unit: MeasurementUnit,
+    unit: Unit,
     messlokationen: usize,
     version: u128,
 }
@@ -116,7 +116,7 @@ impl MeteringWorkload {
             resolution: Duration::minutes(15),
             correction_rate: 0.0,
             gap_rate: 0.0,
-            operator: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            operator: "9900000000003".parse().expect("a valid Marktpartner-ID"),
             malo_offset: 0,
             sparte: Sparte::Strom,
             unit: Sparte::Strom.billing_unit(),
@@ -171,7 +171,7 @@ impl MeteringWorkload {
     }
 
     /// Store the values in a unit other than the Sparte's billing unit.
-    pub fn in_unit(mut self, unit: MeasurementUnit) -> Self {
+    pub fn in_unit(mut self, unit: Unit) -> Self {
         self.unit = unit;
         self
     }
@@ -307,7 +307,7 @@ impl MeteringWorkload {
                     // ingestion has the same constraint, which is the point of
                     // generating it.
                     for (_, group) in group_by_scope(intervals, self.sparte) {
-                        let anchor = group[0].from;
+                        let anchor = group[0].from();
                         out.push(self.stored(malo, meter, group, self.version, anchor)?);
                     }
                 }
@@ -324,12 +324,12 @@ impl MeteringWorkload {
                 .push(self.interval(from, kwh));
         }
         for ((malo, meter), mut intervals) in by_meter {
-            intervals.sort_by_key(|i| i.from);
+            intervals.sort_by_key(|i| i.from());
             // A version scope covers one local month, so a correction batch
             // spanning a month boundary has to be split — encoding rejects a
             // scope that does not cover its intervals.
             for (_, group) in group_by_scope(intervals, self.sparte) {
-                let anchor = group[0].from;
+                let anchor = group[0].from();
                 out.push(self.stored(malo, meter, group, self.version + 1, anchor)?);
             }
         }
@@ -352,7 +352,7 @@ impl MeteringWorkload {
     /// `identify_by_melo` is on by default for a point table, and a delivery
     /// naming no Messlokation is refused there.
     pub fn generate_readings(&self) -> Result<Vec<StoredReadings>> {
-        use metering::reading::MeterReading;
+        use metering::series::reading::MeterReading;
 
         let mut rng = Rng::new(self.seed);
         let mut out = Vec::new();
@@ -429,10 +429,10 @@ impl MeteringWorkload {
     }
 
     fn interval(&self, from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
-        // The named constructors rather than a struct literal: the quality is
-        // `Measured` because the constructor says so, and a field added upstream
-        // does not silently acquire a default here.
-        let interval = MeterInterval::measured(from, from + self.resolution, kwh);
+        // The constructor rather than a struct literal, so a field added
+        // upstream does not silently acquire a default here.
+        let interval = MeterInterval::new(from, from + self.resolution, kwh, QualityFlag::Measured)
+            .expect("a generated interval spans one positive resolution");
         match "1-0:1.8.0".parse() {
             Ok(code) => interval.with_obis(code),
             Err(_) => interval,
@@ -448,7 +448,7 @@ impl MeteringWorkload {
         scope_anchor: OffsetDateTime,
     ) -> Result<StoredSeries> {
         let malo_id = malo_id(self.malo_offset + malo);
-        let recorded_at = intervals.last().map(|i| i.to).unwrap_or(scope_anchor);
+        let recorded_at = intervals.last().map(|i| i.to()).unwrap_or(scope_anchor);
 
         let mut series = MeasurementSeries::new(
             malo_id,
@@ -485,7 +485,7 @@ impl MeteringWorkload {
         &self,
         malo: usize,
         meter: usize,
-        readings: Vec<metering::reading::MeterReading>,
+        readings: Vec<metering::series::reading::MeterReading>,
         version: u128,
         scope_anchor: OffsetDateTime,
     ) -> Result<StoredReadings> {
@@ -520,11 +520,10 @@ impl MeteringWorkload {
     }
 
     /// The workload's interval length as the domain spells it.
-    fn declared_resolution(&self) -> IntervalResolution {
+    fn declared_resolution(&self) -> Resolution {
         let seconds = u32::try_from(self.resolution.whole_seconds())
             .expect("the builder rejects non-positive resolutions");
-        IntervalResolution::from_seconds(seconds)
-            .expect("the builder rejects a zero-length resolution")
+        Resolution::from_seconds(seconds).expect("the builder rejects a zero-length resolution")
     }
 }
 
@@ -542,7 +541,8 @@ fn group_by_scope(
 ) -> Vec<(time::Date, Vec<MeterInterval>)> {
     let mut out: Vec<(time::Date, Vec<MeterInterval>)> = Vec::new();
     for interval in intervals {
-        let month = crate::planner::balancing_month(interval.from, sparte);
+        let month = crate::planner::balancing_month(interval.from(), sparte)
+            .expect("a generated instant is inside the calendar's years");
         match out.last_mut() {
             Some((m, group)) if *m == month => group.push(interval),
             _ => out.push((month, vec![interval])),
@@ -554,12 +554,13 @@ fn group_by_scope(
 /// [`group_by_scope`] over register readings, which carry an instant rather than
 /// a span.
 fn group_readings_by_scope(
-    readings: Vec<metering::reading::MeterReading>,
+    readings: Vec<metering::series::reading::MeterReading>,
     sparte: Sparte,
-) -> Vec<(time::Date, Vec<metering::reading::MeterReading>)> {
-    let mut out: Vec<(time::Date, Vec<metering::reading::MeterReading>)> = Vec::new();
+) -> Vec<(time::Date, Vec<metering::series::reading::MeterReading>)> {
+    let mut out: Vec<(time::Date, Vec<metering::series::reading::MeterReading>)> = Vec::new();
     for reading in readings {
-        let month = crate::planner::balancing_month(reading.at, sparte);
+        let month = crate::planner::balancing_month(reading.at, sparte)
+            .expect("a generated instant is inside the calendar's years");
         match out.last_mut() {
             Some((m, group)) if *m == month => group.push(reading),
             _ => out.push((month, vec![reading])),
@@ -736,18 +737,18 @@ impl Oracle {
 
             for interval in &stored.series.intervals {
                 let obis = interval
-                    .obis_code
+                    .obis()
                     .or(stored.series.obis_code)
                     .ok_or_else(|| Error::encode("obis_code", "no channel on interval or series"))?
                     .to_string();
                 let key = (
                     stored.series.malo_id.to_string(),
                     obis,
-                    interval.from,
+                    interval.from(),
                     identity.clone(),
                 );
 
-                self.observe(key, scope.clone(), version, interval.value)?;
+                self.observe(key, scope.clone(), version, interval.value())?;
             }
         }
         Ok(())
@@ -1061,7 +1062,7 @@ mod tests {
         let mut restated = first.clone();
         for s in &mut restated {
             for i in &mut s.series.intervals {
-                i.value += Decimal::ONE;
+                *i = i.clone().with_value(i.value() + Decimal::ONE, i.quality());
             }
         }
 
@@ -1162,7 +1163,9 @@ mod tests {
         let mut corrected = base.clone();
         for stored in &mut corrected {
             for interval in &mut stored.series.intervals {
-                interval.value += Decimal::ONE;
+                *interval = interval
+                    .clone()
+                    .with_value(interval.value() + Decimal::ONE, interval.quality());
             }
             stored.version = ScopedVersion::new(
                 stored.version.scope().clone(),
@@ -1189,7 +1192,7 @@ mod tests {
                 s.series
                     .intervals
                     .iter()
-                    .map(|i| (s.series.malo_id, i.from))
+                    .map(|i| (s.series.malo_id, i.from()))
             })
             .collect::<std::collections::BTreeSet<_>>()
             .len();
@@ -1272,10 +1275,13 @@ mod tests {
             for stored in &series {
                 for interval in &stored.series.intervals {
                     assert!(
-                        stored.version.scope().covers(interval.from, stored.sparte),
+                        stored
+                            .version
+                            .scope()
+                            .covers(interval.from(), stored.sparte),
                         "scope {} does not cover {} ({sparte})",
                         stored.version.scope(),
-                        interval.from
+                        interval.from()
                     );
                 }
             }
@@ -1308,10 +1314,13 @@ mod tests {
         for stored in &series {
             for interval in &stored.series.intervals {
                 assert!(
-                    stored.version.scope().covers(interval.from, stored.sparte),
+                    stored
+                        .version
+                        .scope()
+                        .covers(interval.from(), stored.sparte),
                     "scope {} does not cover {}",
                     stored.version.scope(),
-                    interval.from
+                    interval.from()
                 );
             }
         }

@@ -5,28 +5,70 @@
 //! gone, but the properties still matter to completeness reporting, so they are
 //! kept here as a contract test against the upstream crate.
 
-use metering::IntervalResolution;
-use metering::calendar::{
-    DayKind, day_kind, day_length, gas_day_end_utc, gas_day_start_utc, intervals_in_day, local_day,
-    local_gas_day,
-};
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
+use metering::time::calendar::DayKind;
+use metering::{DayBoundary, Resolution};
 use meterstore::planner::{
     balancing_day, balancing_day_length, balancing_month, bilanzierungsmonat,
     expected_intervals_in_balancing_day,
 };
-use time::Duration;
 use time::macros::{date, datetime};
+use time::{Date, Duration, OffsetDateTime};
+
+// `metering`'s calendar is a `DayBoundary` handing out `Period`s. These name
+// the questions the vectors below ask of it; each is one call, so the answers
+// are still upstream's.
+
+fn civil(day: Date) -> metering::Period {
+    DayBoundary::Strom
+        .day(day)
+        .expect("inside the calendar's years")
+}
+
+fn day_length(day: Date) -> Duration {
+    civil(day).duration()
+}
+
+fn day_kind(day: Date) -> DayKind {
+    civil(day).kind()
+}
+
+fn intervals_in_day(day: Date, resolution: Resolution) -> Option<u32> {
+    civil(day).count(resolution)
+}
+
+fn local_day(at: OffsetDateTime) -> Date {
+    DayBoundary::Strom
+        .day_of(at)
+        .expect("inside the calendar's years")
+}
+
+fn local_gas_day(at: OffsetDateTime) -> Date {
+    DayBoundary::Gas
+        .day_of(at)
+        .expect("inside the calendar's years")
+}
+
+fn gas_day_start_utc(day: Date) -> OffsetDateTime {
+    DayBoundary::Gas
+        .day(day)
+        .expect("inside the calendar's years")
+        .start()
+}
+
+fn gas_day_end_utc(day: Date) -> OffsetDateTime {
+    DayBoundary::Gas
+        .day(day)
+        .expect("inside the calendar's years")
+        .end()
+}
 
 #[test]
 fn a_normal_day_has_96_quarter_hours() {
     let day = date!(2026 - 07 - 20);
     assert_eq!(day_length(day), Duration::hours(24));
     assert_eq!(day_kind(day), DayKind::Normal);
-    assert_eq!(
-        intervals_in_day(day, IntervalResolution::QuarterHour),
-        Some(96)
-    );
+    assert_eq!(intervals_in_day(day, Resolution::QUARTER_HOUR), Some(96));
 }
 
 #[test]
@@ -34,10 +76,7 @@ fn the_spring_forward_day_has_92_quarter_hours() {
     let day = date!(2026 - 03 - 29);
     assert_eq!(day_length(day), Duration::hours(23));
     assert_eq!(day_kind(day), DayKind::ShortDay);
-    assert_eq!(
-        intervals_in_day(day, IntervalResolution::QuarterHour),
-        Some(92)
-    );
+    assert_eq!(intervals_in_day(day, Resolution::QUARTER_HOUR), Some(92));
 }
 
 #[test]
@@ -45,10 +84,7 @@ fn the_autumn_back_day_has_100_quarter_hours() {
     let day = date!(2026 - 10 - 25);
     assert_eq!(day_length(day), Duration::hours(25));
     assert_eq!(day_kind(day), DayKind::LongDay);
-    assert_eq!(
-        intervals_in_day(day, IntervalResolution::QuarterHour),
-        Some(100)
-    );
+    assert_eq!(intervals_in_day(day, Resolution::QUARTER_HOUR), Some(100));
 }
 
 #[test]
@@ -77,7 +113,7 @@ fn a_march_of_quarter_hours_is_four_short() {
     let total: u32 = (1..=31)
         .map(|d| {
             let day = time::Date::from_calendar_date(2026, time::Month::March, d).unwrap();
-            intervals_in_day(day, IntervalResolution::QuarterHour).unwrap()
+            intervals_in_day(day, Resolution::QUARTER_HOUR).unwrap()
         })
         .sum();
     assert_eq!(total, 2_976 - 4);
@@ -115,24 +151,32 @@ fn the_long_and_short_gas_days_are_named_after_the_saturday() {
     // Saturday, not the transition Sunday. This is the property that makes a
     // completeness check on calendar days wrong in both directions at once.
     assert_eq!(
-        balancing_day_length(date!(2026 - 10 - 24), Sparte::Gas).whole_hours(),
+        balancing_day_length(date!(2026 - 10 - 24), Sparte::Gas)
+            .unwrap()
+            .whole_hours(),
         25
     );
     assert_eq!(
-        balancing_day_length(date!(2026 - 10 - 25), Sparte::Gas).whole_hours(),
+        balancing_day_length(date!(2026 - 10 - 25), Sparte::Gas)
+            .unwrap()
+            .whole_hours(),
         24
     );
     assert_eq!(
-        balancing_day_length(date!(2026 - 03 - 28), Sparte::Gas).whole_hours(),
+        balancing_day_length(date!(2026 - 03 - 28), Sparte::Gas)
+            .unwrap()
+            .whole_hours(),
         23
     );
     assert_eq!(
-        balancing_day_length(date!(2026 - 03 - 29), Sparte::Gas).whole_hours(),
+        balancing_day_length(date!(2026 - 03 - 29), Sparte::Gas)
+            .unwrap()
+            .whole_hours(),
         24
     );
 
     // Mirror image of the calendar day, quarter-hour by quarter-hour.
-    let q = IntervalResolution::QuarterHour;
+    let q = Resolution::QUARTER_HOUR;
     assert_eq!(
         expected_intervals_in_balancing_day(date!(2026 - 10 - 24), q, Sparte::Gas),
         Some(100)
@@ -168,15 +212,15 @@ fn balancing_day_delegates_to_whichever_calendar_the_commodity_uses() {
     // `metering`'s, and this asserts the wrapper did not invent a third.
     let at = datetime!(2026-07-14 22:15 UTC);
     assert_eq!(
-        balancing_day(at, metering::interval::Sparte::Gas),
-        local_gas_day(at)
+        balancing_day(at, metering::series::interval::Sparte::Gas),
+        Some(local_gas_day(at))
     );
     for sparte in [
-        metering::interval::Sparte::Strom,
-        metering::interval::Sparte::Waerme,
-        metering::interval::Sparte::Wasser,
+        metering::series::interval::Sparte::Strom,
+        metering::series::interval::Sparte::Waerme,
+        metering::series::interval::Sparte::Wasser,
     ] {
-        assert_eq!(balancing_day(at, sparte), local_day(at), "{sparte}");
+        assert_eq!(balancing_day(at, sparte), Some(local_day(at)), "{sparte}");
     }
 }
 
@@ -189,10 +233,13 @@ fn a_balancing_month_delegates_the_same_way_and_tiles_the_same_timeline() {
     let at = datetime!(2026-03-01 01:00 UTC); // 02:00 local — the March/February seam
     assert_eq!(
         balancing_month(at, Sparte::Gas),
-        first_of(local_gas_day(at)),
+        Some(first_of(local_gas_day(at))),
         "a gas month is the month of the Gastag, not of the calendar day"
     );
-    assert_eq!(balancing_month(at, Sparte::Strom), first_of(local_day(at)));
+    assert_eq!(
+        balancing_month(at, Sparte::Strom),
+        Some(first_of(local_day(at)))
+    );
 
     // Consecutive months tile with no gap and no overlap, for both boundaries
     // and across both transitions — the property a settlement rerun over
@@ -201,7 +248,7 @@ fn a_balancing_month_delegates_the_same_way_and_tiles_the_same_timeline() {
         let mut previous_end = None;
         for month in 1u8..=12 {
             let month = time::Month::try_from(month).unwrap();
-            let (from, to) = bilanzierungsmonat(2026, month, sparte);
+            let (from, to) = bilanzierungsmonat(2026, month, sparte).unwrap();
             assert!(from < to, "{sparte} {month:?}");
             if let Some(end) = previous_end {
                 assert_eq!(from, end, "{sparte} {month:?} does not abut the previous");
@@ -209,10 +256,14 @@ fn a_balancing_month_delegates_the_same_way_and_tiles_the_same_timeline() {
             previous_end = Some(to);
         }
         // And the twelve of them are exactly the year.
-        let (year_from, _) = bilanzierungsmonat(2026, time::Month::January, sparte);
+        let (year_from, _) = bilanzierungsmonat(2026, time::Month::January, sparte).unwrap();
         assert_eq!(
             previous_end,
-            Some(bilanzierungsmonat(2027, time::Month::January, sparte).0),
+            Some(
+                bilanzierungsmonat(2027, time::Month::January, sparte)
+                    .unwrap()
+                    .0
+            ),
             "{sparte}"
         );
         assert_eq!(
@@ -237,8 +288,7 @@ fn a_march_of_gas_days_is_also_four_short() {
     let total: u32 = (1..=31)
         .map(|d| {
             let day = time::Date::from_calendar_date(2026, time::Month::March, d).unwrap();
-            expected_intervals_in_balancing_day(day, IntervalResolution::QuarterHour, Sparte::Gas)
-                .unwrap()
+            expected_intervals_in_balancing_day(day, Resolution::QUARTER_HOUR, Sparte::Gas).unwrap()
         })
         .sum();
     assert_eq!(total, 2_976 - 4);

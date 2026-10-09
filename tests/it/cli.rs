@@ -266,10 +266,9 @@ async fn foreign_commit(cold: &meterstore::cold::IcebergCold, table: &str) {
 
 #[tokio::test]
 async fn reassert_watermark_puts_the_boundary_back_after_a_foreign_commit() {
-    // R15's whole point: this is the one step of the maintenance contract whose
-    // omission fails *every* query on the table at once, and until now it was
-    // reachable only by writing a Rust binary whose body is one call. The person
-    // running out-of-band compaction is writing a cron entry.
+    // This is the one step of the maintenance contract whose omission fails
+    // *every* query on the table at once, and the person running out-of-band
+    // compaction is writing a cron entry, not a Rust binary.
     use meterstore::tiering::store::ColdStore;
 
     let url = meterstore::testkit::postgres::fresh_database()
@@ -519,7 +518,7 @@ async fn the_erasure_trail_is_readable_from_the_shell() {
         .register(
             "tenant-a:12345678905",
             time::macros::datetime!(2026-07-20 00:00 UTC),
-            metering::interval::Sparte::Strom,
+            metering::series::interval::Sparte::Strom,
         )
         .await
         .expect("register");
@@ -633,4 +632,38 @@ async fn asking_for_erasures_where_no_subject_is_declared_says_so() {
     .await
     .expect_err("no subject column is declared");
     assert!(err.to_string().contains("subject_column"), "{err}");
+}
+
+#[tokio::test]
+async fn a_reading_verb_creates_nothing() {
+    // A query, a status check or a server opens what exists: it runs no DDL,
+    // so it works on a role that may only read, and a deployment nobody has
+    // created yet is told how to create it rather than created by a query.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let file = config_file(&url, warehouse.path());
+
+    let err = cli(file.path(), Command::Status)
+        .run()
+        .await
+        .expect_err("nothing exists yet");
+    assert!(err.to_string().contains("meterstore create"), "{err}");
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    let hot_table: bool = sqlx::query_scalar("SELECT to_regclass('readings_versions') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("lookup");
+    assert!(!hot_table, "a reading verb created the hot table");
+
+    cli(file.path(), Command::Create)
+        .run()
+        .await
+        .expect("create");
+    cli(file.path(), Command::Status)
+        .run()
+        .await
+        .expect("now it reads");
 }

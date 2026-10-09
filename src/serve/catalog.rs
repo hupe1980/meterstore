@@ -5,7 +5,7 @@
 //! object storage** with nothing MeterStore-specific installed client-side.
 //! MeterStore stays in the metadata path only — never the data path — so readers
 //! scale in parallel and this process is neither a bottleneck nor a single point
-//! of failure (P2).
+//! of failure.
 //!
 //! [REST catalog protocol]: https://iceberg.apache.org/rest-catalog-spec/
 //!

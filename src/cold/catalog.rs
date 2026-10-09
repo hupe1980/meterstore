@@ -284,7 +284,10 @@ impl IcebergSqlCatalog<'_> {
         let mut props = HashMap::from([
             (
                 SQL_CATALOG_PROP_URI.to_string(),
-                self.database_url.to_string(),
+                crate::tls::require_tls(
+                    self.database_url,
+                    std::env::var("PGSSLMODE").ok().as_deref(),
+                )?,
             ),
             (
                 SQL_CATALOG_PROP_WAREHOUSE.to_string(),
@@ -400,6 +403,7 @@ impl IcebergRestCatalog<'_> {
 
         let catalog: Arc<dyn Catalog> = Arc::new(
             RestCatalogBuilder::default()
+                .with_client(https_client()?)
                 // Chosen from the warehouse scheme exactly as for the SQL
                 // catalogue: a scheme whose feature was not compiled in is an
                 // error here rather than a "cloud" warehouse on local disk.
@@ -416,6 +420,33 @@ impl IcebergRestCatalog<'_> {
         ));
         Ok(ColdTier { cold, catalog })
     }
+}
+
+/// The REST catalogue's HTTP client: rustls on the aws-lc-rs provider, the
+/// operating system's trust store verifying.
+///
+/// `iceberg-catalog-rest` builds `reqwest` with no TLS backend, so its own client
+/// reaches no `https://` catalogue. The provider is named rather than taken from
+/// a process default, because two rustls providers in one process with neither
+/// installed as the default is a panic; the trust store is the host's, so a CA
+/// an operator installed system-wide is trusted here as it is everywhere else.
+/// An `http://` URI stays plaintext: the scheme is the deployment's choice.
+#[cfg(feature = "rest-catalog")]
+fn https_client() -> Result<reqwest::Client> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let tls = |e: rustls::Error| Error::config(format!("REST catalogue TLS: {e}"));
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(tls)?
+    .with_platform_verifier()
+    .map_err(tls)?
+    .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(config)
+        .build()
+        .map_err(|e| Error::config(format!("REST catalogue HTTP client: {e}")))
 }
 
 /// The cold tier on **AWS S3 Tables**.
@@ -585,6 +616,15 @@ impl ColdTier {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rest-catalog")]
+    #[test]
+    fn the_rest_client_speaks_tls_without_a_process_default_provider() {
+        // No `CryptoProvider` is installed as the process default here, which
+        // is the state a deployment linking two providers is in: the client
+        // must name its own.
+        super::https_client().expect("an HTTPS-capable client");
+    }
+
     use super::*;
 
     #[cfg(feature = "sql-catalog")]

@@ -9,8 +9,8 @@
 #![cfg(feature = "testkit")]
 
 use metering::QualityFlag;
-use metering::interval::MeterInterval;
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::MeterInterval;
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use meterstore::testkit::TestHarness;
 use rust_decimal::Decimal;
 use time::macros::datetime;
@@ -34,13 +34,14 @@ fn on_channel(
         .enumerate()
         .map(|(i, (kwh, quality))| {
             let from = START + Duration::minutes(15 * i as i64);
-            MeterInterval {
+            MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                value: Decimal::new(*kwh, 0),
-                quality: *quality,
-                obis_code: obis.parse().ok(),
-            }
+                from + Duration::minutes(15),
+                Decimal::new(*kwh, 0),
+                *quality,
+            )
+            .expect("a non-empty interval")
+            .with_obis(obis.parse().unwrap())
         })
         .collect();
     let series = MeasurementSeries::new(
@@ -50,7 +51,7 @@ fn on_channel(
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-26 06:00 UTC),
     );
@@ -58,9 +59,9 @@ fn on_channel(
         series,
         meterstore::ScopedVersion::new(
             meterstore::VersionScope::for_interval(
-                "9900000000001",
+                "9900000000003",
                 START,
-                metering::interval::Sparte::Strom,
+                metering::series::interval::Sparte::Strom,
             )
             .unwrap(),
             meterstore::Version::new(version).unwrap(),
@@ -117,7 +118,7 @@ async fn latest_finds_the_newest_reading_in_either_tier() {
         .expect("latest over an archived channel")
         .expect("the reading is in the cold tier, not gone");
     assert_eq!(
-        found.from,
+        found.from(),
         START + Duration::minutes(15),
         "the fallback must find the newest archived reading"
     );
@@ -147,11 +148,11 @@ async fn latest_returns_the_newest_interval() {
         .expect("a reading exists");
 
     assert_eq!(
-        latest.from,
+        latest.from(),
         START + Duration::minutes(30),
         "the newest start"
     );
-    assert_eq!(latest.value, Decimal::new(30, 0));
+    assert_eq!(latest.value(), Decimal::new(30, 0));
 }
 
 #[tokio::test]
@@ -207,7 +208,7 @@ async fn quality_in_filters_to_the_accepted_set() {
         billable
             .intervals
             .iter()
-            .all(|i| i.quality != QualityFlag::Faulty)
+            .all(|i| i.quality() != QualityFlag::Faulty)
     );
 
     // Measured only.
@@ -219,7 +220,7 @@ async fn quality_in_filters_to_the_accepted_set() {
         .await
         .expect("intervals");
     assert_eq!(measured.len(), 1);
-    assert_eq!(measured[0].value, Decimal::new(10, 0));
+    assert_eq!(measured[0].value(), Decimal::new(10, 0));
 }
 
 #[tokio::test]
@@ -268,8 +269,8 @@ async fn latest_respects_the_quality_filter() {
         .await
         .expect("latest")
         .expect("a measured reading exists");
-    assert_eq!(last_good.from, START + Duration::minutes(15));
-    assert_eq!(last_good.value, Decimal::new(20, 0));
+    assert_eq!(last_good.from(), START + Duration::minutes(15));
+    assert_eq!(last_good.value(), Decimal::new(20, 0));
 }
 
 #[tokio::test]
@@ -332,7 +333,7 @@ async fn a_measuring_point_reads_back_channel_by_channel() {
     assert_eq!(by_channel.len(), 3);
     let total: Decimal = by_channel
         .values()
-        .flat_map(|r| r.series.intervals.iter().map(|i| i.value))
+        .flat_map(|r| r.series.intervals.iter().map(|i| i.value()))
         .sum();
     assert_eq!(total, Decimal::new(20, 0), "10 + 4 + 6, each counted once");
 
@@ -347,7 +348,7 @@ async fn a_measuring_point_reads_back_channel_by_channel() {
                 .series
                 .intervals
                 .iter()
-                .all(|i| i.obis_code.as_ref() == Some(channel)),
+                .all(|i| i.obis().as_ref() == Some(channel)),
             "and carries no other channel's intervals"
         );
     }
@@ -504,7 +505,7 @@ async fn a_series_read_narrows_to_one_messlokation() {
             .expect("collect")
             .expect("rows");
         assert_eq!(one.intervals.len(), 1, "{melo}");
-        assert_eq!(one.intervals[0].value, Decimal::new(want, 0), "{melo}");
+        assert_eq!(one.intervals[0].value(), Decimal::new(want, 0), "{melo}");
     }
 }
 
@@ -555,7 +556,7 @@ async fn a_messlokation_is_parsed_rather_than_matched_as_a_string() {
         .await
         .expect("collect")
         .expect("rows");
-    assert_eq!(found.intervals[0].value, Decimal::new(10, 0));
+    assert_eq!(found.intervals[0].value(), Decimal::new(10, 0));
 
     // And a value that is not a Zählpunktbezeichnung fails at the call, naming
     // the column, rather than becoming a predicate nothing matches.

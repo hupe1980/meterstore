@@ -64,6 +64,10 @@ pub struct MeterCatalog {
     /// operator comparing two status dumps should be diffing state, not
     /// hash order.
     stores: BTreeMap<String, MeterStore>,
+    /// The deployment's subject registry, held by the catalog rather than found
+    /// through a table: the mapping outlives any table's declaration, and the
+    /// retention sweep is owed for every row it holds.
+    registry: Option<crate::erasure::SubjectRegistry>,
 }
 
 impl std::fmt::Debug for MeterCatalog {
@@ -282,7 +286,12 @@ impl MeterCatalog {
             let derived = f(name, store).session(ctx.clone()).build().await?;
             stores.insert(name.clone(), derived);
         }
-        Ok(Self { ctx, stores })
+        register_completeness(&ctx, &stores);
+        Ok(Self {
+            ctx,
+            stores,
+            registry: self.registry.clone(),
+        })
     }
 
     /// Every table, in name order.
@@ -460,6 +469,7 @@ impl MeterCatalog {
     /// unhealthy rather than reporting a number nobody can act on.
     pub fn maintenance(&self) -> super::Maintenance {
         super::Maintenance::over(self.stores.values().cloned().collect())
+            .with_registry(self.registry.clone())
     }
 
     /// Create every table's storage, in both tiers.
@@ -559,13 +569,10 @@ impl MeterCatalog {
     /// longer necessary, *"spätestens jedoch nach drei Jahren ab dem Schluss des
     /// Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*.
     ///
-    /// Three years is a **ceiling**, and the operative trigger is earlier — the
-    /// opposite of a retention mandate. A store built to keep personal metering
-    /// values for three years *because the law says so* has it inverted.
-    ///
+    /// Three years is a **ceiling**, not a retention mandate.
     /// [`erase_subject_by_id`](Self::erase_subject_by_id) answers an Article 17
-    /// request, one subject at a time, when someone asks. This is the standing
-    /// obligation: nobody asks, and it comes due anyway.
+    /// request when someone asks; this is the standing obligation, which comes
+    /// due with nobody asking.
     ///
     /// The statute says *löschen **oder** anonymisieren*, and the second branch
     /// is the one an immutable lake can take: destroying the mapping leaves
@@ -579,9 +586,8 @@ impl MeterCatalog {
     /// ([`register_subject`](Self::register_subject)) and this deletes the
     /// mapping rows whose year has passed the ceiling — so an active customer's
     /// 2021 values stop being attributable on schedule while their 2026 values
-    /// are untouched. It reads no reading at all, so a quiet table, a
-    /// quarantined one and a session that cannot see the hot window make no
-    /// difference to what is due.
+    /// are untouched. It reads no reading at all, so the state of any table
+    /// makes no difference to what is due.
     ///
     /// `cutoff` is the caller's: the statutory ceiling is a calendar computation
     /// over the year a value was *erhoben*, and the earlier "no longer necessary"
@@ -592,9 +598,8 @@ impl MeterCatalog {
     /// The subject map is deployment-wide: one `meterstore_subject_map` keyed by
     /// `(natural identifier, collection year)`, so two tables registering the
     /// same identifier for the same year share one [`SubjectRef`] and one expiry
-    /// unlinks both. That is why this is a **catalog** operation and has no
-    /// per-table form — a sweep scoped to one table would name a scope the data
-    /// does not have.
+    /// unlinks both — which is why this is a **catalog** operation with no
+    /// per-table form.
     ///
     /// References the registry no longer resolves are skipped, so the sweep is
     /// idempotent and a re-run writes no second audit row; see
@@ -608,17 +613,17 @@ impl MeterCatalog {
         actor: &str,
         now: OffsetDateTime,
     ) -> Result<crate::erasure::SweepOutcome> {
-        anonymise_across(self.stores.values(), cutoff, reason, actor, now).await
+        anonymise_across(self.registry.as_ref(), cutoff, reason, actor, now).await
     }
 
-    /// The registry every subject-bearing table in this catalog shares.
+    /// The deployment's subject registry.
     ///
     /// One `meterstore_subject_map` for the deployment, so there is one to
-    /// return rather than one per table. `None` when no table declares a subject
-    /// column.
+    /// return rather than one per table: the one given to
+    /// [`MeterCatalogBuilder::subject_registry`], else the one a table carries.
     #[must_use]
     pub fn subject_registry(&self) -> Option<&crate::erasure::SubjectRegistry> {
-        self.stores.values().find_map(MeterStore::subject_registry)
+        self.registry.as_ref()
     }
 
     /// Register a natural identifier for the retention epoch containing `at`,
@@ -642,19 +647,22 @@ impl MeterCatalog {
         &self,
         natural_id: &str,
         at: OffsetDateTime,
-        sparte: metering::interval::Sparte,
+        sparte: metering::series::interval::Sparte,
     ) -> Result<crate::erasure::SubjectRef> {
         self.require_registry()?
             .register(natural_id, at, sparte)
             .await
     }
 
-    /// Destroy one reference's linkage, leaving its readings anonymous.
+    /// Destroy the linkage behind a reference, leaving its readings anonymous.
     ///
-    /// One collection year of one subject.
-    /// [`erase_subject_by_id`](Self::erase_subject_by_id) is what an Article 17
-    /// request needs, because a request names a person and a person has as many
-    /// references as years on record.
+    /// A live reference unlinks **every** year of its subject, as
+    /// [`SubjectRegistry::erase`](crate::erasure::SubjectRegistry::erase) does.
+    /// A reference the retention sweep has expired is refused with
+    /// [`Error::SubjectUnresolvable`]: the
+    /// identifier behind it is gone by design, so its later years cannot be found
+    /// through it. [`erase_subject_by_id`](Self::erase_subject_by_id) is what an
+    /// Article 17 request needs, because a request names a person.
     pub async fn erase_subject(
         &self,
         subject: &crate::erasure::SubjectRef,
@@ -759,9 +767,11 @@ impl MeterCatalog {
     fn require_registry(&self) -> Result<&crate::erasure::SubjectRegistry> {
         self.subject_registry().ok_or_else(|| {
             Error::config(
-                "no table in this catalog declares a subject column, so this \
-                 deployment holds no subject mapping: there is nothing to enumerate \
-                 and nothing to erase",
+                "this catalog has no subject registry: none was given to the \
+                 builder and no table carries one, so there is nothing to enumerate \
+                 and nothing to erase. A deployment opened from configuration has one \
+                 whenever a table declares a subject column or the database already \
+                 holds a subject map",
             )
         })
     }
@@ -776,46 +786,27 @@ impl MeterCatalog {
 ///
 /// The mapping row carries the collection year it may attribute, so what comes
 /// due is decided by the calendar and an indexed `epoch` column — not by
-/// `max("from")` over whatever a session can see. The stores are consulted only
-/// to find the registry and to check that some table actually stores a subject
-/// reference, which is the difference between "nothing was due" and "this
-/// deployment has no linkage to destroy".
-pub(crate) async fn anonymise_across<'a>(
-    stores: impl Iterator<Item = &'a MeterStore>,
+/// `max("from")` over whatever a session can see. No store is consulted: the
+/// registry is the deployment's, and the mapping rows it holds are due whether
+/// or not any table still declares the column that wrote them.
+pub(crate) async fn anonymise_across(
+    registry: Option<&crate::erasure::SubjectRegistry>,
     cutoff: OffsetDateTime,
     reason: &str,
     actor: &str,
     now: OffsetDateTime,
 ) -> Result<crate::erasure::SweepOutcome> {
-    let mut registry = None;
-    let mut subject_tables = 0usize;
-
-    for store in stores {
-        if store.config().subject_column().is_none() {
-            continue;
-        }
-        subject_tables += 1;
-        registry = registry.or_else(|| store.subject_registry());
-    }
-
-    // Not a refusal. See `MeterStore::anonymise_before`: the sweep is a registry
-    // operation over a deployment-wide map, and a deployment that has *stopped*
-    // declaring subject columns still holds every mapping row it wrote before —
-    // rows still due under `[MsbG § 60 Abs. 6]`. Refusing here would decline to
-    // discharge a statutory deletion duty because of an unrelated schema change.
-    if subject_tables == 0 {
-        tracing::debug!(
-            "retention sweep run over a catalog where no table declares a subject \
-             column; the sweep is deployment-wide and unaffected"
-        );
-    }
+    // Not gated on a subject column. A deployment that has stopped declaring
+    // one still holds every mapping row it wrote before — rows still due under
+    // `[MsbG § 60 Abs. 6]` — and the sweep reads nothing but the registry's own
+    // `epoch` column.
     let registry = registry.ok_or_else(|| {
         Error::config(
-            "a table declares a subject column but no SubjectRegistry is configured, \
-             so the references it stores resolve to nothing this process can erase",
+            "the retention sweep needs the deployment's SubjectRegistry, and none is \
+             configured: give one to MeterCatalogBuilder::subject_registry, or to \
+             MeterStoreBuilder::subject_registry for a single table",
         )
     })?;
-
     registry
         .expire_epochs_before(cutoff, reason, actor, now)
         .await
@@ -843,6 +834,13 @@ fn scanned_relations(
     let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::TableScan(scan) = node {
             found.insert(scan.table_name.table().to_string());
+            // A table function's scan is named for the function; the table it
+            // reports on is the provider's.
+            if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source)
+                && let Some(table) = super::completeness::reported_table(provider.as_ref())
+            {
+                found.insert(table.to_string());
+            }
         }
         Ok(TreeNodeRecursion::Continue)
     });
@@ -879,6 +877,7 @@ impl super::SqlSurface for MeterCatalog {
 #[derive(Default)]
 pub struct MeterCatalogBuilder {
     tables: Vec<MeterStoreBuilder>,
+    registry: Option<crate::erasure::SubjectRegistry>,
 }
 
 impl std::fmt::Debug for MeterCatalogBuilder {
@@ -897,6 +896,17 @@ impl MeterCatalogBuilder {
     /// read mode, subject registry and registered name.
     pub fn table(mut self, table: MeterStoreBuilder) -> Self {
         self.tables.push(table);
+        self
+    }
+
+    /// The deployment's subject registry, for the retention sweep and the
+    /// catalog's erasure methods.
+    ///
+    /// Needed only where no table carries one — a deployment that has stopped
+    /// declaring subject columns still owes the sweep for the mapping rows it
+    /// wrote. Otherwise the catalog takes the registry its tables share.
+    pub fn subject_registry(mut self, registry: crate::erasure::SubjectRegistry) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -978,6 +988,31 @@ impl MeterCatalogBuilder {
             )));
         }
 
-        Ok(MeterCatalog { ctx, stores })
+        let registry = self
+            .registry
+            .or_else(|| stores.values().find_map(|s| s.subject_registry().cloned()));
+        register_completeness(&ctx, &stores);
+        Ok(MeterCatalog {
+            ctx,
+            stores,
+            registry,
+        })
     }
+}
+
+/// Register `meter_completeness` over every table of a catalog.
+///
+/// Each store registered the function over its own table as it was built, so
+/// the last one built would otherwise answer every unnamed call. Replaced here
+/// once all of them exist.
+fn register_completeness(ctx: &SessionContext, stores: &BTreeMap<String, MeterStore>) {
+    ctx.register_udtf(
+        super::CompletenessFunction::NAME,
+        std::sync::Arc::new(super::CompletenessFunction::new(
+            stores
+                .values()
+                .map(MeterStore::completeness_binding)
+                .collect(),
+        )),
+    );
 }

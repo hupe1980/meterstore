@@ -110,7 +110,7 @@ fn the_crate_reaches_for_no_feature_that_replaces_a_wire_format() {
             "Cargo.toml reaches for the {feature:?} feature, which {what}. That is not \
              an impl added, it is one replaced — for every crate in the consumer's build \
              graph, including crates that never named this one. State the representation \
-             on the field instead, as `metering::wire` does."
+             on the field instead, as `delivery::ProvenanceEntry` does."
         );
     }
 
@@ -187,7 +187,7 @@ fn no_serde_type_in_this_crate_leaves_its_representation_to_the_build_graph() {
         offenders.is_empty(),
         "a serde-derived type carries a field whose representation the build graph \
          decides:\n  {}\nState it on the field — `#[serde(with = \"…\")]` — the way \
-         `metering::wire` does, or the bytes change when an unrelated crate turns a \
+         `delivery::ProvenanceEntry` does, or the bytes change when an unrelated crate turns a \
          feature on.",
         offenders.join("\n  ")
     );

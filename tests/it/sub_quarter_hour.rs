@@ -1,32 +1,40 @@
 //! Resolutions finer than 15 minutes.
 //!
-//! iMSys already delivers 1-minute and 1-second values over the SMGW HAN
-//! interface, and § 14a steering needs them; the quarter-hour is the *settlement*
-//! grain, not the only one a store will be asked to hold. Nothing in MeterStore
-//! is written against 96 — the expected interval count is asked of
-//! [`metering::calendar::intervals_in_day`] per declared resolution — but until
-//! this file existed, every test fixture in the crate declared `PT15M`, so that
-//! was a claim about the design rather than a fact about the code.
+//! iMSys delivers 1-minute values over the SMGW HAN interface, and § 14a
+//! steering needs them; the quarter-hour is the *settlement* grain, not the only
+//! one a store will be asked to hold. Nothing in MeterStore is written against
+//! 96 — the expected interval count is asked of `metering`'s calendar per
+//! declared resolution — and this file is what makes that a fact about the code
+//! rather than a claim about the design.
+//!
+//! A grid is whole minutes dividing the hour, as `metering`'s `Resolution` has
+//! it. A finer one is not a resolution storage holds.
 //!
 //! The two things that could break and would break quietly:
 //!
-//! - **The declared resolution round-trip.** `IntervalResolution::Custom(60)`
-//!   renders `PT60S`, and if storage could not read that back, completeness
-//!   would silently fall through to "no declared resolution" and report every
-//!   series as unmeasurable rather than as short.
+//! - **The declared resolution round-trip.** One minute renders `PT1M`, and if
+//!   storage could not read that back, completeness would silently fall through
+//!   to "no declared resolution" and report every series as unmeasurable rather
+//!   than as short.
 //! - **The DST day.** A 25-hour local day holds 1500 one-minute intervals, not
 //!   1440. A count derived from a flat 86 400 would call a 60-interval gap
 //!   complete — the direction that reaches a bill.
 
 #![cfg(feature = "testkit")]
 
-use metering::resolution::IntervalResolution;
-use metering::{Sparte, calendar};
+use metering::{DayBoundary, Resolution, Sparte};
 use meterstore::testkit::{MeteringWorkload, Oracle, TestHarness};
 use time::macros::{date, datetime};
 use time::{Duration, OffsetDateTime};
 
 const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
+
+/// The Berlin calendar day, as `metering` cuts it.
+fn civil(day: time::Date) -> metering::Period {
+    DayBoundary::Strom
+        .day(day)
+        .expect("inside the calendar's years")
+}
 
 /// The rows a workload produces, ingested with the first day archived.
 async fn split_store(workload: &MeteringWorkload) -> (TestHarness, meterstore::MeterStore, Oracle) {
@@ -58,28 +66,27 @@ async fn split_store(workload: &MeteringWorkload) -> (TestHarness, meterstore::M
 fn the_domain_counts_sub_quarter_hour_intervals_per_calendar_day() {
     // The arithmetic everything below depends on. Asserted directly first, so a
     // failure downstream is attributable to storage rather than to the calendar.
-    // `from_seconds` is the one way in: `Custom` carries an opaque
-    // `CustomSeconds` that refuses the durations a named variant already spells,
-    // so there is no `Custom(900)` beside `QuarterHour`.
-    let minute = IntervalResolution::from_seconds(60).expect("a minute is a resolution");
-    assert_eq!(minute.to_iso8601(), "PT60S");
+    // One value per grid: fifteen minutes is the quarter-hour, not a second
+    // name for it.
+    let minute = Resolution::from_seconds(60).expect("a minute is a resolution");
+    assert_eq!(minute.to_string(), "PT1M");
     assert_eq!(
-        IntervalResolution::from_seconds(900),
-        Some(IntervalResolution::QuarterHour)
+        Resolution::from_seconds(900),
+        Some(Resolution::QUARTER_HOUR)
     );
 
     assert_eq!(
-        calendar::intervals_in_day(date!(2026 - 07 - 20), minute),
+        civil(date!(2026 - 07 - 20)).count(minute),
         Some(1440),
         "an ordinary day"
     );
     assert_eq!(
-        calendar::intervals_in_day(date!(2026 - 03 - 29), minute),
+        civil(date!(2026 - 03 - 29)).count(minute),
         Some(1380),
         "the 23-hour spring day"
     );
     assert_eq!(
-        calendar::intervals_in_day(date!(2026 - 10 - 25), minute),
+        civil(date!(2026 - 10 - 25)).count(minute),
         Some(1500),
         "the 25-hour autumn day — the direction a flat 1440 gets dangerously wrong"
     );
@@ -87,15 +94,18 @@ fn the_domain_counts_sub_quarter_hour_intervals_per_calendar_day() {
 
 #[test]
 fn a_sub_quarter_hour_resolution_round_trips_through_storage() {
-    // `Custom(n)` renders `PT{n}S`, which is not one of the named spellings. If
-    // the column could not read it back, completeness would report every series
-    // as unmeasurable instead of as complete or short — a silent downgrade.
-    for seconds in [1u32, 30, 60, 300, 600] {
-        let declared = IntervalResolution::from_seconds(seconds).expect("positive");
-        let rendered = declared.to_iso8601();
-        let parsed: IntervalResolution =
-            rendered.parse().expect("storage reads back what it wrote");
+    // If the column could not read a sub-quarter-hour grid back, completeness
+    // would report every series as unmeasurable instead of as complete or short
+    // — a silent downgrade.
+    for seconds in [60u32, 300, 600] {
+        let declared = Resolution::from_seconds(seconds).expect("whole minutes");
+        let rendered = declared.to_string();
+        let parsed: Resolution = rendered.parse().expect("storage reads back what it wrote");
         assert_eq!(parsed, declared, "{rendered} did not round-trip");
+    }
+    // Finer than a minute is not a grid at all.
+    for seconds in [1u32, 30] {
+        assert_eq!(Resolution::from_seconds(seconds), None, "{seconds} s");
     }
 }
 
@@ -183,8 +193,7 @@ async fn completeness_measures_a_one_minute_series_against_the_right_day_length(
     // The local day 2026-10-25 runs 22:00Z on the 24th to 23:00Z on the 25th —
     // 25 hours, 1500 minutes. Asked over exactly that span, a complete series
     // reports 1500 expected and no gap.
-    let local_start = calendar::day_start_utc(date!(2026 - 10 - 25));
-    let local_end = local_start + calendar::day_length(date!(2026 - 10 - 25));
+    let (local_start, local_end) = civil(date!(2026 - 10 - 25)).range();
     assert_eq!(local_end - local_start, Duration::hours(25));
 
     let rows = store
@@ -193,7 +202,7 @@ async fn completeness_measures_a_one_minute_series_against_the_right_day_length(
         .expect("completeness");
     let row = rows.first().expect("one channel reported");
 
-    assert_eq!(row.resolution.as_deref(), Some("PT60S"));
+    assert_eq!(row.resolution.as_deref(), Some("PT1M"));
     assert!(
         row.is_measurable(),
         "a declared sub-quarter-hour resolution must yield an expectation"
@@ -230,8 +239,7 @@ async fn a_gap_in_one_minute_data_is_reported_rather_than_absorbed() {
         .await
         .expect("ingest");
 
-    let local_start = calendar::day_start_utc(date!(2026 - 07 - 20));
-    let local_end = local_start + calendar::day_length(date!(2026 - 07 - 20));
+    let (local_start, local_end) = civil(date!(2026 - 07 - 20)).range();
     let rows = store
         .completeness(local_start, local_end)
         .await

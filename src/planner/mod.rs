@@ -1,6 +1,6 @@
 //! Query planning across the two tiers.
 //!
-//! Local calendar arithmetic is **not** here: `metering::calendar` owns the
+//! Local calendar arithmetic is **not** here: `metering::time::calendar` owns the
 //! `Europe/Berlin` conversion, day lengths and DST-aware interval counts. This
 //! crate re-exports the parts the query layer uses so callers need not depend on
 //! both, but the implementation is upstream and there is only one of it.
@@ -9,7 +9,7 @@
 //!
 //! Electricity, heat and water balance on the **Berlin calendar day**, 00:00 to
 //! 00:00 local. Gas does not: the German gas market balances on the **Gastag**,
-//! 06:00 to 06:00 local (GaBi Gas, following Art. 3 Nr. 6 VO (EU) 312/2014).
+//! 06:00 to 06:00 local (GaBi Gas, following `[VO (EU) 2017/459 Art. 3 Nr. 16]`).
 //! `metering` models that choice as [`DayBoundary`] and carries it through days,
 //! months and years alike. The one thing this crate adds is the mapping from a
 //! stored row's `sparte` to that boundary — [`day_boundary`] — because which of
@@ -24,10 +24,7 @@ pub mod resolved;
 pub mod split;
 pub mod version;
 
-pub use metering::calendar::{
-    DayBoundary, DayKind, day_end_utc, day_kind, day_length, day_start_utc, gas_day_end_utc,
-    gas_day_start_utc, intervals_in_day, local_day, local_gas_day, local_month, shift_back_days,
-};
+pub use metering::time::calendar::{DayBoundary, DayKind, Period, shift_back_days};
 
 pub use calendar::{
     balancing_day, balancing_day_bounds, balancing_day_length, balancing_month,

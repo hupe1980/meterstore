@@ -52,7 +52,7 @@ async fn two_tenants() -> TestHarness {
     harness.seed_watermark(START).await.expect("watermark");
     let store = harness.store().await.expect("store");
 
-    for (i, tenant) in ["9900000000001", "9900000000002"].into_iter().enumerate() {
+    for (i, tenant) in ["9900000000003", "9900000000029"].into_iter().enumerate() {
         let workload = MeteringWorkload::new(START)
             .seed(0x7E1 + i as u64)
             // Distinct measuring points per operator. Two tenants *may* share a
@@ -123,7 +123,7 @@ async fn each_tenant_lands_in_its_own_files() {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
 
-    for tenant in ["9900000000001", "9900000000002"] {
+    for tenant in ["9900000000003", "9900000000029"] {
         assert!(
             paths
                 .iter()
@@ -135,7 +135,7 @@ async fn each_tenant_lands_in_its_own_files() {
     // And no file may belong to both. Hidden partitioning writes the value into
     // the path, so a file carrying two tenants would have to omit it.
     for path in &paths {
-        let tagged = ["9900000000001", "9900000000002"]
+        let tagged = ["9900000000003", "9900000000029"]
             .iter()
             .filter(|t| path.contains(&format!("tenant={t}")))
             .count();
@@ -183,8 +183,8 @@ async fn a_tenant_scoped_query_still_returns_only_that_tenant() {
         .expect("render")
         .to_string();
 
-    assert!(rendered.contains("9900000000001"), "{rendered}");
-    assert!(rendered.contains("9900000000002"), "{rendered}");
+    assert!(rendered.contains("9900000000003"), "{rendered}");
+    assert!(rendered.contains("9900000000029"), "{rendered}");
 
     // Both tenants generated the same shape, so their counts must match — a
     // splitter that dropped or duplicated a partition's rows would show up here
@@ -297,7 +297,7 @@ async fn a_tenant_predicate_eliminates_the_other_tenant_s_files() {
 
     let all = count_files(None).await;
     let one = count_files(Some(
-        Reference::new("tenant").equal_to(Datum::string("9900000000001")),
+        Reference::new("tenant").equal_to(Datum::string("9900000000003")),
     ))
     .await;
 
@@ -309,7 +309,7 @@ async fn a_tenant_predicate_eliminates_the_other_tenant_s_files() {
 
     // And it must eliminate exactly the other tenant's, not merely some.
     let other = count_files(Some(
-        Reference::new("tenant").equal_to(Datum::string("9900000000002")),
+        Reference::new("tenant").equal_to(Datum::string("9900000000029")),
     ))
     .await;
     assert_eq!(

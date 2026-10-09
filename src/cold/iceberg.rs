@@ -134,6 +134,7 @@ impl IcebergCold {
         if self.catalog.table_exists(&ident).await.map_err(ice)? {
             let existing = self.catalog.load_table(&ident).await.map_err(ice)?;
             check_partition_spec(table, &existing, identity)?;
+            let existing = self.add_declared_columns(table, existing, extra).await?;
             return self.reconcile_properties(existing, policy).await;
         }
 
@@ -173,22 +174,67 @@ impl IcebergCold {
         Ok(created)
     }
 
+    /// Add every **nullable** column the configuration declares and the table
+    /// lacks, each as an optional field with a fresh id.
+    ///
+    /// The one schema change this crate applies (see [`crate::evolution`]).
+    /// Every existing data file reads null for it, which is what the column
+    /// means for a row written before it was declared. A schema update creates
+    /// no snapshot, so the watermark is untouched. A required column is left
+    /// alone: the gate quarantines it, because no existing row could satisfy it.
+    async fn add_declared_columns(
+        &self,
+        table: &str,
+        existing: Table,
+        extra: &[crate::arrow::datatypes::Field],
+    ) -> Result<Table> {
+        let current = existing.metadata().current_schema();
+        let missing: Vec<_> = schema::storage_schema(extra)
+            .fields()
+            .iter()
+            .filter(|f| f.is_nullable() && current.field_by_name(f.name()).is_none())
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(existing);
+        }
+
+        let txn = Transaction::new(&existing);
+        let mut action = txn.update_schema();
+        for field in &missing {
+            action = action.add_column(iceberg::transaction::AddColumn::optional(
+                field.name(),
+                iceberg::arrow::arrow_type_to_type(field.data_type()).map_err(ice)?,
+            ));
+        }
+        let updated = action
+            .apply(txn)
+            .map_err(ice)?
+            .commit(self.catalog.as_ref())
+            .await
+            .map_err(ice)?;
+        info!(
+            table,
+            columns = ?missing.iter().map(|f| f.name()).collect::<Vec<_>>(),
+            "cold table gained declared columns"
+        );
+        Ok(updated)
+    }
+
     /// A DataFusion provider for the cold tier.
     ///
-    /// Delegates the actual scan to `iceberg-datafusion`, so partition pruning,
-    /// bloom filters and page statistics all apply without this crate
-    /// reimplementing any of them. The result is the cold half of a
-    /// [`TieredTableProvider`].
+    /// Delegates the actual scan to `iceberg-datafusion`, so partition, manifest
+    /// and row-group pruning apply without this crate reimplementing any of
+    /// them. Bloom filters and page indexes do not: `iceberg` 0.10.1 has no
+    /// bloom-filter reader and leaves page-index row selection off. The result
+    /// is the cold half of a [`TieredTableProvider`].
     ///
     /// **It reloads the table's metadata on every scan**, and that is a
-    /// correctness requirement rather than freshness for its own sake. The
-    /// obvious construction — build a static provider once and register it —
-    /// freezes the snapshot at the moment the store was built. In the embedded
-    /// topology one process both archives and serves queries, so after
-    /// the first archival run the rows are gone from PostgreSQL (the partition
-    /// was dropped) and invisible in Iceberg (the provider still points at the
-    /// snapshot from before the commit). They would reappear only when the
-    /// process restarted.
+    /// correctness requirement. A static provider freezes the snapshot at the
+    /// moment the store was built, so in a process that both archives and
+    /// serves, an archived window would be below the watermark — no longer read
+    /// from PostgreSQL — and absent from the snapshot the provider still points
+    /// at, until the process restarted.
     ///
     /// [`TieredTableProvider`]: crate::planner::TieredTableProvider
     pub async fn table_provider(
@@ -325,10 +371,18 @@ impl IcebergCold {
             .retain_last(retain_last.max(1))
             .expire_snapshot_ids(doomed);
 
+        // Conditional on `loaded`: the doomed set and the protected chain were
+        // computed from it, and a commit that landed since — an archival advance
+        // among them — would otherwise be expired against a history this run
+        // never read. A moved table fails as a conflict, and the next cycle
+        // recomputes.
         let committed = action
             .apply(txn)
             .map_err(ice)?
-            .commit(self.catalog.as_ref())
+            .commit(&super::conditional::BaseGuard::on(
+                self.catalog.clone(),
+                &loaded,
+            ))
             .await
             .map_err(ice)?;
 
@@ -344,21 +398,20 @@ impl IcebergCold {
     /// Put the tiering boundary back on the **current** snapshot.
     ///
     /// Every MeterStore commit stamps the boundary into its own snapshot summary.
-    /// A commit from anything else does not — and this design explicitly
-    /// recommends such commits, because compaction and orphan cleanup are blocked
-    /// upstream, and the documented answer is to run them out of
-    /// band with Spark or PyIceberg.
+    /// A commit from anything else does not — an out-of-band maintenance run
+    /// with Spark or PyIceberg, which the maintenance contract expects for
+    /// manifest rewrites and orphan removal.
     ///
     /// After one, the boundary is still *findable*: the lookup walks back the
-    /// parent chain. But it is no longer where every reader expects it, which
-    /// costs a walk on every read and forces snapshot expiry to keep an ancestor
-    /// alive indefinitely to avoid stranding it. Re-stamping restores the
-    /// invariant that the current snapshot states the boundary.
+    /// parent chain. But that costs a walk on every read and forces snapshot
+    /// expiry to keep an ancestor alive to avoid stranding it. Re-stamping
+    /// restores the invariant that the current snapshot states the boundary.
     ///
-    /// The value is **read from the history, never invented**: this republishes
-    /// what the table already said, so it cannot move the boundary. It commits an
-    /// empty append carrying the property, which is the same shape as an archival
-    /// window that held no rows.
+    /// The value is **read from the history, never invented**, and the commit is
+    /// conditional on the snapshot it was read from: an archival commit landing
+    /// in between makes the re-stamp re-derive against the new boundary rather
+    /// than restate the old one over it. It commits an empty append carrying the
+    /// property, which is the same shape as an archival window that held no rows.
     ///
     /// `Ok(None)` when the current snapshot already carries it — so this is
     /// idempotent and cheap to run on a schedule.
@@ -708,10 +761,9 @@ impl IcebergCold {
     /// Bring an existing table's properties up to the contract it should state.
     ///
     /// A new table gets them at creation, so this is for a table that already
-    /// exists and whose properties differ — whatever put it in that state, and
-    /// including the ordinary case of a deployment that has just measured its
-    /// file size or moved its retention. It runs on every `create_tables`, which
-    /// is idempotent, so restating is a matter of calling it again.
+    /// exists and whose properties differ — for instance a deployment that has
+    /// just measured its file size or moved its retention. It runs on every
+    /// `create_tables`, which is idempotent.
     ///
     /// One of these is not a preference. `commit.retry.num-retries = 0` turns off
     /// the library's own retry so this crate's can run instead — see
@@ -762,27 +814,29 @@ impl IcebergCold {
     ///
     /// # Why the retry cannot be left to the library
     ///
-    /// `iceberg` 0.10 already retries a conflicting commit: it reloads the table
-    /// and re-applies the same action — including the snapshot summary the action
-    /// was **built with**, four times by default. For an ordinary append that is
-    /// exactly right, because an append's summary describes only itself.
-    ///
-    /// Ours does not. It carries the tiering watermark, which is a property of
-    /// the base the commit lands on, and re-publishing a stale one moves the
-    /// boundary **backwards**. The path that gets there is ordinary traffic: a
-    /// late-correction append reads the current watermark, an archival commit
-    /// lands first, and the correction's retry then republishes the older value.
-    /// Intervals PostgreSQL has already purged are claimed by the hot tier, which
-    /// does not hold them, and they vanish from every unified query with nothing
-    /// reporting a failure. That is the single failure the in-snapshot watermark
-    /// exists to make
-    /// impossible, reintroduced by a dependency being helpful.
+    /// `iceberg` 0.10 retries a conflicting commit by reloading the table and
+    /// re-applying the same action — including the snapshot summary the action
+    /// was **built with**. Ours carries the tiering watermark, a property of the
+    /// base the commit lands on, so re-publishing a stale one moves the boundary
+    /// **backwards**: a late correction reads the watermark, an archival commit
+    /// lands first, and the retry republishes the older value. Intervals
+    /// PostgreSQL has already purged are then claimed by the hot tier and vanish
+    /// from every unified query with nothing reporting a failure.
     ///
     /// So library retry is off (`commit.retry.num-retries = 0`) and the loop is
     /// here, where the summary — and the monotonicity assertion behind it — is
-    /// rebuilt from the refreshed base on every attempt. The data files are
-    /// written once and reused: they are independent of which snapshot they land
-    /// on, and re-writing them per attempt would rewrite the whole window.
+    /// rebuilt from the refreshed base on every attempt. The library also
+    /// rebases on the first attempt, so each commit goes through a guard that
+    /// admits it only onto the snapshot its summary was derived from
+    /// (`conditional`). Every writer —
+    /// archival, a late correction, `reassert_watermark` and the re-stamp before
+    /// expiry — commits through this function. The data files are written once
+    /// and reused: they are independent of which snapshot they land on, and
+    /// re-writing them per attempt would rewrite the whole window.
+    ///
+    /// Each commit carries a `meterstore.commit_id` shared by its attempts, so an
+    /// outcome the catalogue never answered is resolved by looking for it rather
+    /// than by a retry that appends the same rows twice.
     async fn append_with_summary(
         &self,
         table: &str,
@@ -792,12 +846,24 @@ impl IcebergCold {
     ) -> Result<CommitInfo> {
         let mut base = self.load(table).await?;
         let (data_files, rows) = self.write_data_files(&base, batches, hints).await?;
+        // One id for every attempt of this commit, so an outcome the catalogue
+        // never answered can be resolved by looking for it.
+        let commit_id = uuid::Uuid::now_v7().to_string();
 
         for attempt in 0..COMMIT_ATTEMPTS {
-            let watermark = summary.watermark_for(table, &base)?;
+            let watermark = match summary.watermark_for(table, &base) {
+                Ok(watermark) => watermark,
+                Err(e) => {
+                    // Nothing was committed and nothing will be: these files
+                    // are referenced by no snapshot.
+                    self.discard(table, &base, &data_files, true).await;
+                    return Err(e);
+                }
+            };
             let mut properties = HashMap::from([
                 (WATERMARK_PROPERTY.to_string(), watermark.to_property()?),
                 (ROW_COUNT_PROPERTY.to_string(), rows.to_string()),
+                (COMMIT_ID_PROPERTY.to_string(), commit_id.clone()),
             ]);
             if let Summary::Advance(window, step, archived_at) = summary {
                 properties.insert(ARCHIVED_RANGE_PROPERTY.to_string(), window.to_property()?);
@@ -825,32 +891,42 @@ impl IcebergCold {
                 .add_data_files(data_files.clone())
                 .set_snapshot_properties(properties);
 
-            match action
+            // Committed through a guard that admits the commit only onto `base`
+            // — the snapshot the summary above was derived from. Without it the
+            // library reloads and rebases silently, and the catalogue validates a
+            // base no check here ever read.
+            let committed = action
                 .apply(txn)
                 .map_err(ice)?
-                .commit(self.catalog.as_ref())
-                .await
-            {
+                .commit(&super::conditional::BaseGuard::on(
+                    self.catalog.clone(),
+                    &base,
+                ))
+                .await;
+            let info = |snapshot_id: i64| {
+                debug!(table, rows, %watermark, snapshot_id, "cold commit");
+                CommitInfo {
+                    snapshot_id,
+                    rows,
+                    watermark,
+                    // Taken from the files this commit wrote rather than read
+                    // back out of the snapshot summary: it is the same number,
+                    // and the caller wants it in order to compare it against a
+                    // declared target.
+                    added: (!data_files.is_empty()).then(|| AddedFiles {
+                        bytes: data_files.iter().map(|f| f.file_size_in_bytes()).sum(),
+                        files: data_files.len() as u64,
+                    }),
+                }
+            };
+            match committed {
                 Ok(committed) => {
                     let snapshot_id = committed
                         .metadata()
                         .current_snapshot()
                         .map(|s| s.snapshot_id())
                         .unwrap_or_default();
-                    debug!(table, rows, %watermark, snapshot_id, "cold commit");
-                    return Ok(CommitInfo {
-                        snapshot_id,
-                        rows,
-                        watermark,
-                        // Taken from the files this commit wrote rather than read
-                        // back out of the snapshot summary: it is the same
-                        // number, and the caller wants it in order to compare it
-                        // against a declared target.
-                        added: (!data_files.is_empty()).then(|| AddedFiles {
-                            bytes: data_files.iter().map(|f| f.file_size_in_bytes()).sum(),
-                            files: data_files.len() as u64,
-                        }),
-                    });
+                    return Ok(info(snapshot_id));
                 }
                 Err(e) if e.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
                     // Someone else committed first. Reload and rebuild the
@@ -869,7 +945,31 @@ impl IcebergCold {
                     );
                     if attempt + 1 < COMMIT_ATTEMPTS {
                         tokio::time::sleep(backoff(attempt)).await;
+                        let previous = current_snapshot_id(&base);
                         base = self.load(table).await?;
+                        let landed_since = snapshots_since(&base, previous);
+                        // A commit can land and still be answered as a conflict —
+                        // a proxy that retried the request. Ours is then already
+                        // in the history, and a retry would offer the same files
+                        // a second time.
+                        if let Some(id) = find_commit(&landed_since, &commit_id) {
+                            return Ok(info(id));
+                        }
+                        // A correction decided which of its rows are replays
+                        // against the base it read. A row-carrying commit landing
+                        // since may hold the same readings, so the decision is
+                        // stale and only the caller can make it again.
+                        if matches!(summary, Summary::Preserve)
+                            && rows > 0
+                            && landed_since.iter().any(carries_rows_without_advancing)
+                        {
+                            self.discard(table, &base, &data_files, true).await;
+                            return Err(Error::Storage(format!(
+                                "{table}: another writer added rows while this correction \
+                                 was being committed, so which of its rows are replays must \
+                                 be decided again; redeliver"
+                            )));
+                        }
                     }
                 }
                 Err(e) => {
@@ -879,6 +979,16 @@ impl IcebergCold {
                     // means the commit may have landed and a snapshot may already
                     // reference them.
                     let refused = Self::commit_was_refused(&e);
+                    // An unanswered commit may have landed. Its id says whether
+                    // it did, so the caller learns the outcome instead of a
+                    // retry appending the same rows a second time.
+                    if !refused
+                        && let Some(snapshot_id) = self
+                            .landed(table, &commit_id, current_snapshot_id(&base))
+                            .await
+                    {
+                        return Ok(info(snapshot_id));
+                    }
                     self.discard(table, &base, &data_files, refused).await;
                     return Err(ice(e));
                 }
@@ -893,6 +1003,16 @@ impl IcebergCold {
             "{table}: {COMMIT_ATTEMPTS} commit attempts all lost the compare-and-swap; \
              another writer is committing continuously"
         )))
+    }
+
+    /// The snapshot on `main` since `base` that carries `commit_id`, if the
+    /// commit it names landed.
+    ///
+    /// `None` when the table cannot be read either: the outcome then stays
+    /// unknown, which is what the caller is told.
+    async fn landed(&self, table: &str, commit_id: &str, base: Option<i64>) -> Option<i64> {
+        let loaded = self.load(table).await.ok()?;
+        find_commit(&snapshots_since(&loaded, base), commit_id)
     }
 
     /// Whether a failed commit definitively did not land.
@@ -931,21 +1051,19 @@ impl IcebergCold {
     /// Files are written before the commit and reused across its retries, so a
     /// run that exhausts them leaves unreferenced Parquet — the warehouse's only
     /// source of orphans, since nothing here removes a committed file. General
-    /// orphan cleanup stays blocked on `FileIO` having no listing operation;
-    /// this needs none, because the writer still holds every path.
+    /// orphan cleanup needs a listing operation `FileIO` does not have; this needs
+    /// none, because the writer still holds every path.
     ///
     /// `refused` is the caller's verdict from [`Self::commit_was_refused`]. When
     /// the commit may have landed, **nothing is deleted**: the files are left for
     /// out-of-band orphan removal, which is the operation that reclaims them and
     /// the one this crate does not perform.
     ///
-    /// It **re-reads first** even when refused: a re-read is one more chance to
-    /// notice a file the current snapshot references, and deleting then would
-    /// take it out from under a live snapshot. Anything referenced is left alone,
-    /// and so is everything if the reload fails. That read is a second belt
-    /// rather than the argument — a catalogue behind a cache, or one whose read
-    /// lands on a replica, can answer from before the commit it just applied,
-    /// which is precisely why an ambiguous outcome deletes nothing at all.
+    /// It **re-reads first** even when refused, and leaves alone anything the
+    /// current snapshot references — and everything, if the reload fails. That
+    /// read is a second belt rather than the argument: a catalogue behind a cache
+    /// can answer from before the commit it just applied, which is why an
+    /// ambiguous outcome deletes nothing at all.
     ///
     /// Best-effort, and silent about its own failures: the caller is already
     /// returning the error that matters, and an orphan costs storage rather than
@@ -1087,16 +1205,10 @@ impl Summary {
                 // rather than impossible. A window already at the boundary was
                 // archived by somebody, so the answer is to stop.
                 if next.get() <= current.get() {
-                    return Err(Error::InvariantViolated {
+                    return Err(Error::AlreadyArchived {
                         table: table.to_string(),
-                        detail: format!(
-                            "the window [{}, {}) is already committed: the boundary is \
-                             at {current} and archiving it again would append a second \
-                             copy of rows the cold tier already holds. Another writer \
-                             committed this window — abort rather than duplicate it",
-                            window.from(),
-                            window.to(),
-                        ),
+                        from: window.from(),
+                        to: window.to(),
                     });
                 }
                 current
@@ -1112,6 +1224,55 @@ impl Summary {
             }
         }
     }
+}
+
+use crate::watermark::COMMIT_ID_PROPERTY;
+
+fn current_snapshot_id(table: &Table) -> Option<i64> {
+    table.metadata().current_snapshot().map(|s| s.snapshot_id())
+}
+
+/// The snapshots on `main` after `since`, newest first.
+///
+/// Walked by parent from the current snapshot rather than read off the
+/// metadata's list, which also holds staged and rolled-back snapshots that never
+/// became part of the table's history. Stops at `since`, or where the chain
+/// ends or has been expired.
+fn snapshots_since(table: &Table, since: Option<i64>) -> Vec<iceberg::spec::SnapshotRef> {
+    let metadata = table.metadata();
+    let mut out = Vec::new();
+    let mut walk = metadata.current_snapshot().cloned();
+    while let Some(snapshot) = walk {
+        if Some(snapshot.snapshot_id()) == since {
+            break;
+        }
+        walk = snapshot
+            .parent_snapshot_id()
+            .and_then(|id| metadata.snapshot_by_id(id))
+            .cloned();
+        out.push(snapshot);
+    }
+    out
+}
+
+fn find_commit(snapshots: &[iceberg::spec::SnapshotRef], commit_id: &str) -> Option<i64> {
+    snapshots
+        .iter()
+        .find(|s| {
+            s.summary()
+                .additional_properties
+                .get(COMMIT_ID_PROPERTY)
+                .is_some_and(|id| id == commit_id)
+        })
+        .map(|s| s.snapshot_id())
+}
+
+/// Whether a snapshot added rows without being an archival advance — a
+/// correction, or a commit from something other than this crate.
+fn carries_rows_without_advancing(snapshot: &iceberg::spec::SnapshotRef) -> bool {
+    let properties = &snapshot.summary().additional_properties;
+    !properties.contains_key(ARCHIVED_RANGE_PROPERTY)
+        && properties.get(ROW_COUNT_PROPERTY).is_none_or(|n| n != "0")
 }
 
 /// Table property switching off the library's own commit retry.
@@ -1264,7 +1425,8 @@ impl datafusion::catalog::TableProvider for RefreshingProvider {
         let provider = iceberg_datafusion::IcebergStaticTableProvider::try_new_from_table(loaded)
             .await
             .map_err(|e| external(ice(e)))?;
-        provider.scan(state, projection, filters, limit).await
+        let pushable = cold_pushable(filters, &self.schema);
+        provider.scan(state, projection, &pushable, limit).await
     }
 
     fn supports_filters_pushdown(
@@ -1283,6 +1445,133 @@ impl datafusion::catalog::TableProvider for RefreshingProvider {
     }
 }
 
+/// The filters this crate hands to the Iceberg scan: only shapes whose pushed
+/// form is provably implied by the filter.
+///
+/// A pushed filter can go wrong two ways. **Dropped**, it costs pruning and
+/// nothing else, because every filter is `Inexact` and the engine applies it
+/// again above the scan. **Strengthened** — a cast stripped, a `LIKE` escape
+/// ignored, a `NOT` over a conjunction the conversion weakened
+/// (apache/datafusion-iceberg #36, #40, #44) — it prunes files holding rows the
+/// filter accepts, and no re-application can bring them back. So the scan is
+/// handed a closed set of shapes and everything else is withheld from it and
+/// applied only above:
+///
+/// - `column op literal` for `=`, `<`, `<=`, `>`, `>=`, with the literal of the
+///   column's own type — the two UTC spellings counting as one, or the range
+///   filter would never prune — and no cast anywhere;
+/// - `column IN (literals)` of the column's type, not negated;
+/// - `column IS [NOT] NULL`;
+/// - `column LIKE 'prefix%'` with no escape, no wildcard in the prefix, and
+///   case-sensitive;
+/// - a conjunction of the above.
+///
+/// A withheld conjunct only weakens what is pushed, which is always safe.
+pub(crate) fn cold_pushable(
+    filters: &[datafusion::logical_expr::Expr],
+    schema: &crate::arrow::datatypes::Schema,
+) -> Vec<datafusion::logical_expr::Expr> {
+    filters
+        .iter()
+        .flat_map(datafusion::logical_expr::utils::split_conjunction)
+        .filter(|e| pushable(e, schema))
+        .cloned()
+        .collect()
+}
+
+fn pushable(e: &datafusion::logical_expr::Expr, schema: &crate::arrow::datatypes::Schema) -> bool {
+    use datafusion::logical_expr::{Expr, Operator};
+    let column_type = |e: &Expr| match e {
+        Expr::Column(c) => schema
+            .field_with_name(&c.name)
+            .ok()
+            .map(|f| f.data_type().clone()),
+        _ => None,
+    };
+    let literal_of = |e: &Expr, ty: &crate::arrow::datatypes::DataType| match e {
+        Expr::Literal(v, _) => !v.is_null() && crate::evolution::same_type(&v.data_type(), ty),
+        _ => false,
+    };
+    match e {
+        Expr::BinaryExpr(b) => match b.op {
+            Operator::And => pushable(&b.left, schema) && pushable(&b.right, schema),
+            Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                match (column_type(&b.left), column_type(&b.right)) {
+                    (Some(ty), None) => literal_of(&b.right, &ty),
+                    (None, Some(ty)) => literal_of(&b.left, &ty),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        Expr::InList(list) => {
+            !list.negated
+                && column_type(&list.expr)
+                    .is_some_and(|ty| list.list.iter().all(|v| literal_of(v, &ty)))
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => column_type(inner).is_some(),
+        Expr::Like(like) => {
+            !like.negated
+                && !like.case_insensitive
+                && like.escape_char.is_none()
+                && column_type(&like.expr)
+                    .is_some_and(|ty| matches!(ty, crate::arrow::datatypes::DataType::Utf8))
+                && match like.pattern.as_ref() {
+                    Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(p)), _) => p
+                        .strip_suffix('%')
+                        .is_some_and(|prefix| !prefix.contains(['%', '_', '\\'])),
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// A pinned-snapshot provider whose scan is handed only [`cold_pushable`]
+/// filters.
+#[derive(Debug)]
+struct PushdownGuard {
+    inner: std::sync::Arc<dyn datafusion::catalog::TableProvider>,
+}
+
+#[async_trait]
+impl datafusion::catalog::TableProvider for PushdownGuard {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> crate::arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.inner.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>>
+    {
+        let pushable = cold_pushable(filters, &self.inner.schema());
+        self.inner.scan(state, projection, &pushable, limit).await
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::logical_expr::Expr],
+    ) -> datafusion::common::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
+    {
+        Ok(vec![
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact;
+            filters.len()
+        ])
+    }
+}
+
 /// Re-wrap a batch's columns in the ID-annotated schema the writer expects.
 ///
 /// Batches arrive with a plain Arrow schema carrying no field IDs, but the
@@ -1291,50 +1580,45 @@ impl datafusion::catalog::TableProvider for RefreshingProvider {
 /// different string — so each column is cast, which is metadata-only for
 /// equal-unit timestamps.
 ///
-/// The column *count* is checked rather than zipped: a `zip` silently truncates
-/// to the shorter side, so a batch missing the deployment's columns would have
-/// produced a file with the wrong shape instead of an error naming the problem.
+/// Every column is accounted for by name in both directions: a batch column the
+/// table lacks is refused, so a write cannot silently lose a value, and a
+/// **nullable** table column the batch lacks is written as null — a column the
+/// configuration no longer declares, which both tiers keep for the rows that
+/// carry it. A required column the batch lacks is refused.
 ///
 /// # Columns are matched by name, never by position
 ///
-/// Iceberg resolves columns by field id and this function is what decides which
-/// id a given array lands under, so a positional match makes the *order* of the
-/// declaration part of the stored contract — silently.
-///
-/// The failure it caused: `evolution::compare` matches strictly by name, so a
-/// **permutation** of two same-typed attribute columns — `bilanzkreis`,
-/// `netzgebiet` reordered to `netzgebiet`, `bilanzkreis` by an alphabetised TOML
-/// or a second deployment — reports `is_identical()` and passes the compatibility
-/// gate. Both are `Utf8` (config validation admits nothing else), so the
-/// subsequent `cast` is a no-op and succeeds. Every row archived from then on
-/// carries each value under the other's name, in the tier whose whole purpose is
-/// to be read by engines that trust the schema. Nothing errors, ever.
-///
-/// Matching by name cannot express that mistake. The count check stays, because
-/// by-name lookup alone would not notice a batch carrying a column the table does
-/// not have.
+/// This function decides which field id an array lands under, so a positional
+/// match would make declaration order part of the stored contract.
+/// `evolution::compare` matches by name, so a **permutation** of two `Utf8`
+/// attribute columns passes the compatibility gate, the `cast` is a no-op, and
+/// every row archived afterwards would carry each value under the other's name
+/// — with no error. The count check stays, because by-name lookup alone would
+/// not notice a batch carrying a column the table does not have.
 fn align(
     batch: &RecordBatch,
     write_schema: &crate::arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch> {
-    if batch.num_columns() != write_schema.fields().len() {
+    let names = |schema: &crate::arrow::datatypes::Schema| {
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    };
+    if let Some(extra) = batch
+        .schema()
+        .fields()
+        .iter()
+        .find(|f| write_schema.field_with_name(f.name()).is_err())
+    {
         return Err(Error::encode(
             "cold batch",
             format!(
-                "batch has {} columns but the table's schema has {}: {:?} vs {:?}",
-                batch.num_columns(),
-                write_schema.fields().len(),
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect::<Vec<_>>(),
-                write_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect::<Vec<_>>(),
+                "the batch has a column {:?} the table's schema does not: {:?} vs {:?}",
+                extra.name(),
+                names(&batch.schema()),
+                names(write_schema),
             ),
         ));
     }
@@ -1342,23 +1626,23 @@ fn align(
     let columns = write_schema
         .fields()
         .iter()
-        .map(|field| {
-            let array = batch.column_by_name(field.name()).ok_or_else(|| {
-                Error::encode(
-                    "cold batch",
-                    format!(
-                        "the table's schema has a column {:?} that the batch does not: {:?}",
-                        field.name(),
-                        batch
-                            .schema()
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-            })?;
-            crate::arrow::compute::cast(array, field.data_type()).map_err(Error::from)
+        .map(|field| match batch.column_by_name(field.name()) {
+            Some(array) => {
+                crate::arrow::compute::cast(array, field.data_type()).map_err(Error::from)
+            }
+            None if field.is_nullable() => Ok(crate::arrow::array::new_null_array(
+                field.data_type(),
+                batch.num_rows(),
+            )),
+            None => Err(Error::encode(
+                "cold batch",
+                format!(
+                    "the table's schema requires a column {:?} that the batch does not \
+                     have: {:?}",
+                    field.name(),
+                    names(&batch.schema()),
+                ),
+            )),
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(write_schema.clone(), columns)?)
@@ -1381,9 +1665,8 @@ const DEFAULT_BLOOM_FILTER_NDV: u64 = 100_000;
 /// silent data loss in the tier whose entire job is to be durable.
 ///
 /// 64 bits from the OS CSPRNG puts a collision beyond reach at any commit rate
-/// this store will see, and it is the same entropy source a subject reference
-/// already requires
-/// for subject references.
+/// this store will see, and it is the same entropy source subject references
+/// already require.
 fn file_suffix() -> String {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("OS entropy source unavailable");
@@ -1415,10 +1698,10 @@ fn file_suffix() -> String {
 ///
 /// # Why not `bucket(malo_id)`
 ///
-/// Earlier drafts specified it. Rows are written sorted by `(malo_id, from)` and
-/// carry a bloom filter on `malo_id`, which is what actually answers the
-/// single-meter read; hashing into buckets would scatter that sort order across
-/// files and add nothing a bloom filter does not already do.
+/// Rows are written sorted by `(malo_id, from)` and carry a bloom filter on
+/// `malo_id`, which answers the single-meter read for an engine that reads it;
+/// hashing into buckets would scatter that sort order across files and add
+/// nothing a bloom filter does not already do.
 fn partition_spec(
     schema: &iceberg::spec::Schema,
     identity: &[String],
@@ -1592,7 +1875,9 @@ impl ColdStore for IcebergCold {
         .await
         .map_err(ice)?;
         debug!(table, snapshot_id, %at, "pinned cold provider");
-        Ok(std::sync::Arc::new(provider))
+        Ok(std::sync::Arc::new(PushdownGuard {
+            inner: std::sync::Arc::new(provider),
+        }))
     }
 
     async fn snapshots(&self, table: &str) -> Result<Vec<SnapshotInfo>> {
@@ -1641,23 +1926,6 @@ impl ColdStore for IcebergCold {
     }
 }
 
-/// The durable watermark carried by a loaded table's snapshot history.
-///
-/// The current snapshot normally carries it, because every MeterStore commit
-/// re-states it. It may not, though, and the reason is one this design actively
-/// recommends: there is no native compaction, and the documented workaround is
-/// to run it out of band with Spark or PyIceberg against the same standard
-/// table. Such a snapshot is a perfectly valid Iceberg commit that simply knows
-/// nothing about tiering.
-///
-/// So the lookup walks back along the parent chain to the most recent snapshot
-/// MeterStore did write. Every foreign snapshot in between rewrote *files*, not
-/// the interval range each tier owns, so the boundary is unchanged and the
-/// older value is still the right one.
-///
-/// Only a table whose entire history carries no watermark is refused: that is
-/// not a MeterStore table, and guessing a boundary for it would either
-/// re-archive everything or strand it.
 /// The nearest value of `key` in a snapshot summary, walking back the parent
 /// chain from the current snapshot.
 ///
@@ -1694,6 +1962,19 @@ fn archival_step_of(table: &Table) -> Result<Option<time::Duration>> {
         .transpose()
 }
 
+/// The durable watermark carried by a loaded table's snapshot history.
+///
+/// The current snapshot normally carries it, because every MeterStore commit
+/// re-states it. A foreign commit — an out-of-band maintenance run with Spark
+/// or PyIceberg against the same standard table — is a valid Iceberg commit
+/// that knows nothing about tiering, so the lookup walks back the parent chain
+/// to the most recent snapshot MeterStore wrote. A foreign snapshot rewrites
+/// *files*, not the interval range each tier owns, so that older value is still
+/// the right one.
+///
+/// Only a table whose entire history carries no watermark is refused: that is
+/// not a MeterStore table, and guessing a boundary for it would either
+/// re-archive everything or strand it.
 fn watermark_of(table: &Table) -> Result<TieringWatermark> {
     let metadata = table.metadata();
 
@@ -1743,6 +2024,93 @@ fn as_timestamp(datum: &iceberg::spec::Datum) -> Option<OffsetDateTime> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_filters_implied_by_their_pushed_form_reach_the_cold_scan() {
+        use crate::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::logical_expr::{Expr, cast, col, lit};
+        use datafusion::scalar::ScalarValue;
+
+        // The table spells UTC as Iceberg does; the query's literal as Arrow does.
+        let schema = Schema::new(vec![
+            Field::new("malo_id", DataType::Utf8, false),
+            Field::new("source_detail", DataType::Utf8, true),
+            Field::new(
+                "from",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new("value", DataType::Decimal128(18, 6), false),
+        ]);
+        let instant = || {
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(1_784_505_600_000_000),
+                Some("UTC".into()),
+            ))
+        };
+        let pushed = |e: Expr| super::cold_pushable(&[e], &schema).len() == 1;
+
+        // Admitted.
+        assert!(
+            pushed(col("from").gt_eq(instant())),
+            "the range filter prunes"
+        );
+        assert!(pushed(col("malo_id").eq(lit("12345678905"))));
+        assert!(pushed(
+            col("malo_id").in_list(vec![lit("a"), lit("b")], false)
+        ));
+        assert!(pushed(col("source_detail").is_null()));
+        assert!(pushed(col("source_detail").like(lit("abc%"))));
+        assert_eq!(
+            super::cold_pushable(
+                &[col("malo_id").eq(lit("a")).and(col("from").lt(instant()))],
+                &schema
+            )
+            .len(),
+            2,
+            "both conjuncts"
+        );
+
+        // Withheld.
+        assert!(
+            !pushed(cast(col("value"), DataType::Float64).gt(lit(0.1))),
+            "a cast"
+        );
+        assert!(
+            !pushed(col("value").gt(lit(0.1))),
+            "a literal of another type"
+        );
+        assert!(!pushed(col("source_detail").like(lit("a\\%"))), "an escape");
+        assert!(
+            !pushed(col("source_detail").like(lit("a_c%"))),
+            "a wildcard inside"
+        );
+        assert!(
+            !pushed(Expr::Not(Box::new(col("malo_id").eq(lit("a"))))),
+            "NOT"
+        );
+        assert!(
+            !pushed(
+                col("malo_id")
+                    .eq(lit("a"))
+                    .or(cast(col("value"), DataType::Float64).gt(lit(1.0)))
+            ),
+            "OR"
+        );
+        assert!(
+            !pushed(col("malo_id").in_list(vec![lit("a")], true)),
+            "NOT IN"
+        );
+
+        // A conjunction keeps its admitted halves and loses the rest.
+        let split = super::cold_pushable(
+            &[col("malo_id")
+                .eq(lit("a"))
+                .and(cast(col("value"), DataType::Float64).gt(lit(0.1)))],
+            &schema,
+        );
+        assert_eq!(split, vec![col("malo_id").eq(lit("a"))]);
+    }
+
+    #[test]
     fn an_ambiguous_commit_failure_is_not_a_refusal() {
         // `Unexpected` is where a timeout, a reset connection and a 5xx arrive,
         // and upstream documents it as "Iceberg don't know what happened here".
@@ -1781,10 +2149,11 @@ mod tests {
 
     #[test]
     fn the_exhaustion_diagnostic_counts_the_attempts_the_loop_makes() {
-        // `0..=COMMIT_ATTEMPTS` is one more attempt than the constant names, and
-        // the conflict arm's own `attempt < COMMIT_ATTEMPTS` guard then sent the
-        // last conflict to the generic arm — so the message below could never be
-        // reached and an operator saw a raw catalogue error instead.
+        // The loop makes exactly `COMMIT_ATTEMPTS` attempts. `0..=COMMIT_ATTEMPTS`
+        // would make one more than the constant names, and the conflict arm's
+        // guard would then send the last conflict to the generic arm — so the
+        // exhaustion message could never be reached and an operator would see a
+        // raw catalogue error instead.
         assert_eq!((0..COMMIT_ATTEMPTS).count(), COMMIT_ATTEMPTS as usize);
     }
 

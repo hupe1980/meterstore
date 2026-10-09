@@ -11,9 +11,13 @@
 //! says what it *is*. Those two drift for exactly two reasons, and they need
 //! opposite responses:
 //!
-//! - **A deployment added a column.** The Iceberg table gains it with a fresh
-//!   field id; every existing Parquet file still reads, with null for the new
-//!   column. Nothing to do but proceed.
+//! - **A deployment added a nullable column.** Safe, and *pending* until
+//!   [`StoreAdmin::create_tables`] applies it: PostgreSQL gains the column, the
+//!   Iceberg table gains it with a fresh field id, and every existing Parquet
+//!   file reads null for it. Until then archival refuses to run and a write
+//!   naming it is refused, both naming `create_tables`. A nullable column no
+//!   longer declared is safe and needs nothing applied: both tiers keep it, and
+//!   rows written from then on leave it null.
 //! - **Something narrowed, retyped, or moved into or out of the merge key.**
 //!   Then rows already written mean something different from rows about to be
 //!   written, and *no* amount of care downstream recovers that. The table halts.
@@ -26,8 +30,8 @@
 //!
 //! # Why halting is the right answer
 //!
-//! Quarantine is the honest response to a change that cannot be applied safely
-//! (P6). A store that guessed would keep accepting writes and produce a table
+//! Quarantine is the honest response to a change that cannot be applied safely.
+//! A store that guessed would keep accepting writes and produce a table
 //! where the same column carries two meanings, discoverable months later by
 //! whoever reconciles a settlement. Halting one table while the others keep
 //! running costs an operator an afternoon; not halting costs a restatement.
@@ -35,6 +39,19 @@
 //! The watermark freezes with it, which is the point: nothing is archived out of
 //! PostgreSQL — where it can still be corrected — into a lake layout nobody has
 //! agreed on.
+//!
+//! # What this crate applies
+//!
+//! An added nullable column, and nothing else. `iceberg` 0.10.1's public schema
+//! update can add an optional field and delete one; it cannot make a field
+//! optional or promote a type. So a column widened to nullable quarantines like
+//! a narrowing does, with the steps for both tiers named; and a safe
+//! [`Retyped`](SchemaChange::Retyped) — a decimal's precision, `Int32` to `Int64`
+//! — is classified for completeness and reached by no configuration, because
+//! every deployment column is `Utf8` and every core column's type is this
+//! crate's.
+//!
+//! [`StoreAdmin::create_tables`]: crate::session::StoreAdmin::create_tables
 
 use crate::arrow::datatypes::{DataType, Field, SchemaRef};
 use crate::error::{Error, Result};
@@ -90,13 +107,15 @@ pub enum SchemaChange {
     },
     /// A column that became nullable, or stopped being nullable.
     ///
-    /// Widening to nullable is safe. Narrowing is not: existing rows may hold
-    /// nulls the new declaration forbids, and no rewrite is available to find out.
+    /// Neither is safe. Narrowing forbids nulls existing rows may hold, and no
+    /// rewrite is available to find out. Widening is sound in principle and
+    /// cannot be applied here: Iceberg's field stays required, so the first null
+    /// written fails, and `iceberg` 0.10.1 has no public action to relax it.
     Nullability {
         /// The column's name.
         name: String,
-        /// Whether the change widens rather than narrows.
-        safe: bool,
+        /// Whether the declaration widened to nullable rather than narrowed.
+        widened: bool,
     },
 }
 
@@ -107,7 +126,7 @@ impl SchemaChange {
             Self::Added { safe, .. } => *safe,
             Self::Dropped { safe, .. } => *safe,
             Self::Retyped { safe, .. } => *safe,
-            Self::Nullability { safe, .. } => *safe,
+            Self::Nullability { .. } => false,
         }
     }
 
@@ -150,10 +169,20 @@ impl SchemaChange {
                 "column {name:?} changed {from:?} -> {to:?}, which Iceberg cannot promote; \
                  stored values would be reinterpreted rather than converted"
             ),
-            Self::Nullability { name, safe: true } => {
-                format!("column {name:?} widened to nullable")
-            }
-            Self::Nullability { name, safe: false } => format!(
+            Self::Nullability {
+                name,
+                widened: true,
+            } => format!(
+                "column {name:?} widened to nullable, which this crate cannot apply: the \
+                 Iceberg field stays required and the first null written fails. Make it \
+                 optional out of band in both tiers (`ALTER TABLE … ALTER COLUMN … DROP NOT \
+                 NULL`; an Iceberg schema update making the field optional), or keep it \
+                 required"
+            ),
+            Self::Nullability {
+                name,
+                widened: false,
+            } => format!(
                 "column {name:?} narrowed to NOT NULL, but stored rows may already hold nulls"
             ),
         }
@@ -176,6 +205,42 @@ impl Compatibility {
     /// Whether every change can be applied safely.
     pub fn is_safe(&self) -> bool {
         self.changes.iter().all(SchemaChange::is_safe)
+    }
+
+    /// The safe changes still to be applied: columns declared and not yet
+    /// stored, which [`StoreAdmin::create_tables`] adds to both tiers.
+    ///
+    /// [`StoreAdmin::create_tables`]: crate::session::StoreAdmin::create_tables
+    pub fn pending(&self) -> Vec<&Field> {
+        self.changes
+            .iter()
+            .filter_map(|c| match c {
+                SchemaChange::Added { field, safe: true } => Some(field),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Refuse to proceed while a safe change is still pending.
+    ///
+    /// The archiver runs this after [`require_safe`](Self::require_safe): an
+    /// added column the tiers do not have yet fails every scan that names it,
+    /// and archiving rows without it would store them as if it did not exist.
+    pub fn require_applied(&self, table: &str) -> Result<()> {
+        let pending = self.pending();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        Err(Error::config(format!(
+            "table {table}: the configuration declares {} that the stored table does not \
+             have yet. Run `create_tables` (`meterstore create`) to add {} to both tiers",
+            pending
+                .iter()
+                .map(|f| format!("{:?}", f.name()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if pending.len() == 1 { "it" } else { "them" },
+        )))
     }
 
     /// The changes that cannot be applied.
@@ -231,7 +296,7 @@ pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
                 // and reporting only the first hides the second: a promotion is
                 // safe on its own, so a widened decimal that also became
                 // required would pass a gate whose whole job is to refuse that.
-                if existing.data_type() != field.data_type() {
+                if !same_type(existing.data_type(), field.data_type()) {
                     changes.push(SchemaChange::Retyped {
                         name: field.name().clone(),
                         from: existing.data_type().clone(),
@@ -242,10 +307,10 @@ pub fn compare(configured: &SchemaRef, stored: &SchemaRef) -> Compatibility {
                 if existing.is_nullable() != field.is_nullable() {
                     changes.push(SchemaChange::Nullability {
                         name: field.name().clone(),
-                        // Widening only. Narrowing would forbid nulls that may
-                        // already be stored, and nothing here can prove they are
-                        // not.
-                        safe: field.is_nullable(),
+                        // Unsafe either way: narrowing forbids nulls that may
+                        // already be stored, and widening cannot be applied to
+                        // the Iceberg field (see the module doc).
+                        widened: field.is_nullable(),
                     });
                 }
             }
@@ -284,13 +349,22 @@ fn is_promotable(from: &DataType, to: &DataType) -> bool {
             DataType::Decimal128(from_precision, from_scale),
             DataType::Decimal128(to_precision, to_scale),
         ) => from_scale == to_scale && to_precision >= from_precision,
-        // Iceberg spells a UTC timestamp `+00:00` where the canonical Arrow
-        // schema says `UTC`; the same instant, a different string. Treating that
-        // as a retype would quarantine every table on its first check.
-        (DataType::Timestamp(a, Some(x)), DataType::Timestamp(b, Some(y))) => {
-            a == b && is_utc(x) && is_utc(y)
-        }
         _ => false,
+    }
+}
+
+/// Whether two types are the same type, spelling aside.
+///
+/// Iceberg spells a UTC timestamp `+00:00` where the canonical Arrow schema says
+/// `UTC`: the same instant, a different string. Reported as a change, it would
+/// make every crate-created table differ from its own configuration, and no
+/// question about what is pending could be answered.
+pub(crate) fn same_type(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        (DataType::Timestamp(x, Some(p)), DataType::Timestamp(y, Some(q))) => {
+            x == y && is_utc(p) && is_utc(q)
+        }
+        _ => a == b,
     }
 }
 
@@ -351,7 +425,7 @@ mod tests {
             report
                 .changes
                 .iter()
-                .any(|c| matches!(c, SchemaChange::Nullability { safe: false, .. })),
+                .any(|c| matches!(c, SchemaChange::Nullability { .. })),
             "requiring a column that may already hold nulls is not safe: {report:?}"
         );
         assert!(report.require_safe("readings_versions").is_err());
@@ -478,13 +552,36 @@ mod tests {
     }
 
     #[test]
-    fn widening_to_nullable_is_safe_and_narrowing_is_not() {
+    fn neither_widening_nor_narrowing_nullability_is_applied() {
+        // Widening is sound and unappliable: the Iceberg field stays required
+        // and the first null written fails, so it quarantines with the steps.
         let widened = schema(vec![
             Field::new("malo_id", DataType::Utf8, true),
             Field::new("value", DataType::Decimal128(18, 6), false),
         ]);
-        assert!(compare(&widened, &base()).is_safe());
+        let c = compare(&widened, &base());
+        assert!(!c.is_safe());
+        assert!(c.unsafe_changes()[0].describe().contains("DROP NOT NULL"));
         assert!(!compare(&base(), &widened).is_safe());
+    }
+
+    #[test]
+    fn an_added_nullable_column_is_pending_until_stored() {
+        let added = schema(vec![
+            Field::new("malo_id", DataType::Utf8, false),
+            Field::new("value", DataType::Decimal128(18, 6), false),
+            Field::new("bilanzkreis", DataType::Utf8, true),
+        ]);
+        let c = compare(&added, &base());
+        assert!(c.is_safe());
+        assert_eq!(c.pending().len(), 1);
+        let err = c.require_applied("readings").unwrap_err().to_string();
+        assert!(
+            err.contains("bilanzkreis") && err.contains("create_tables"),
+            "{err}"
+        );
+        // A column no longer declared needs nothing applied.
+        assert!(compare(&base(), &added).require_applied("readings").is_ok());
     }
 
     #[test]
@@ -508,8 +605,7 @@ mod tests {
             ),
             false,
         )]);
-        assert!(compare(&ours, &theirs).is_safe());
-        assert!(compare(&ours, &theirs).is_identical() || compare(&ours, &theirs).is_safe());
+        assert!(compare(&ours, &theirs).is_identical());
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub struct ArchiveLine {
     /// Rows moved.
     pub rows: u64,
     /// Orphaned partitions reclaimed.
-    pub orphans_reclaimed: usize,
+    pub partitions_reclaimed: usize,
     /// Whether another archiver owns this table right now.
     pub lease_contended: bool,
     /// Whether a statement declined to wait for a lock.
@@ -136,7 +136,7 @@ impl ArchiveLine {
             table: table.to_string(),
             windows: outcomes.iter().filter(|o| o.archived_anything()).count(),
             rows: outcomes.iter().map(|o| o.rows).sum(),
-            orphans_reclaimed: outcomes.iter().map(|o| o.orphans_reclaimed).sum(),
+            partitions_reclaimed: outcomes.iter().map(|o| o.partitions_reclaimed).sum(),
             lease_contended: outcomes.iter().any(|o| o.lease_contended),
             deferred: outcomes.iter().any(|o| o.deferred),
             watermark: outcomes
@@ -155,7 +155,7 @@ pub fn archive(lines: &[ArchiveLine], format: Format) -> Result<()> {
                 "table": l.table,
                 "windows": l.windows,
                 "rows": l.rows,
-                "orphans_reclaimed": l.orphans_reclaimed,
+                "partitions_reclaimed": l.partitions_reclaimed,
                 "lease_contended": l.lease_contended,
                 "deferred": l.deferred,
                 "watermark": instant(l.watermark),
@@ -178,7 +178,7 @@ pub fn archive(lines: &[ArchiveLine], format: Format) -> Result<()> {
                 instant(l.watermark),
                 // Neither of these is a failure, and both explain a run that
                 // moved nothing — which otherwise reads as "up to date".
-                match (l.lease_contended, l.deferred, l.orphans_reclaimed) {
+                match (l.lease_contended, l.deferred, l.partitions_reclaimed) {
                     (true, _, _) => "another archiver holds the lease".to_string(),
                     (_, true, _) => "deferred: a lock was not available".to_string(),
                     (_, _, n) if n > 0 => format!("reclaimed {n} orphaned partition(s)"),
@@ -698,7 +698,7 @@ mod tests {
             malo_id: "12345678905".to_string(),
             obis_code: "1-0:1.8.0".to_string(),
             identity: Vec::new(),
-            sparte: metering::interval::Sparte::Strom,
+            sparte: metering::series::interval::Sparte::Strom,
             resolution: resolution.map(str::to_string),
             expected: resolution.map_or(0, |_| 96),
             actual,
@@ -758,7 +758,7 @@ mod tests {
             window: Some(window(day)),
             rows,
             watermark: window(day).resulting_watermark(),
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 0,
             lease_contended: false,
             deferred: false,
@@ -778,7 +778,7 @@ mod tests {
             window: None,
             rows: 0,
             watermark: TieringWatermark::empty(),
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 0,
             lease_contended: false,
             deferred: true,

@@ -53,6 +53,15 @@ impl ScanSpec {
         }
     }
 
+    /// Select one more deployment column, which the configuration no longer
+    /// declares and the table still holds.
+    pub(crate) fn with_extra_column(mut self, name: String) -> Self {
+        if !self.extra.contains(&name) {
+            self.extra.push(name);
+        }
+        self
+    }
+
     /// Rows to fetch per round trip.
     ///
     /// **Rows, not measuring points.** An earlier setting bounded a chunk by
@@ -559,6 +568,11 @@ pub trait HotStore: Send + Sync {
     /// reclaims space for rows already durable in the cold tier and destroys
     /// nothing. This destroys the hot half of a table outright, and is only
     /// correct as one step of decommissioning the whole table.
+    ///
+    /// Its bookkeeping goes with it — the reclaimed mark and any reader pins —
+    /// because a table created again under the name would otherwise refuse
+    /// every scan below a mark that describes rows it never held. Dropping what
+    /// is already gone is not an error, so an interrupted purge can be re-run.
     async fn drop_table(&self, table: &str) -> Result<()>;
 
     /// Partitions that are detached but not yet dropped.

@@ -18,7 +18,7 @@
 
 #![cfg(feature = "testkit")]
 
-use metering::interval::{MeasurementUnit, Sparte};
+use metering::series::interval::{Sparte, Unit};
 use meterstore::encode::StoredSeries;
 use meterstore::testkit::{MeteringWorkload, Oracle, TestHarness};
 use time::macros::datetime;
@@ -112,7 +112,7 @@ async fn gas_may_be_stored_on_either_side_of_the_brennwert_conversion() {
         .sparte(Sparte::Gas)
         .malo_ids(2)
         .days(2);
-    assert_eq!(Sparte::Gas.billing_unit(), MeasurementUnit::KiloWattHour);
+    assert_eq!(Sparte::Gas.billing_unit(), Unit::KiloWattHour);
 
     let (_h, store, _oracle) = split_store(&converted).await;
     assert_eq!(
@@ -125,7 +125,7 @@ async fn gas_may_be_stored_on_either_side_of_the_brennwert_conversion() {
     let raw = MeteringWorkload::new(START)
         .seed(0x6A5_0002)
         .sparte(Sparte::Gas)
-        .in_unit(MeasurementUnit::CubicMetre)
+        .in_unit(Unit::CubicMetre)
         .malo_ids(2)
         .days(2);
     let (_h2, store2, _o2) = split_store(&raw).await;
@@ -142,7 +142,7 @@ fn a_unit_the_commodity_cannot_have_is_refused_at_the_write() {
     // labelled KWH would sum straight into an electricity total.
     let workload = MeteringWorkload::new(START)
         .sparte(Sparte::Wasser)
-        .in_unit(MeasurementUnit::KiloWattHour)
+        .in_unit(Unit::KiloWattHour)
         .malo_ids(1)
         .days(1);
     let series = workload.generate().expect("generating is not what fails");
@@ -160,11 +160,11 @@ fn a_unit_the_commodity_cannot_have_is_refused_at_the_write() {
 
 #[test]
 fn every_sparte_admits_its_own_measured_and_billing_units() {
-    // The rule is `metering`'s, not ours (P5). This pins that we enforce exactly
+    // The rule is `metering`'s, not ours. This pins that we enforce exactly
     // it — no narrower, which would reject legitimate gas m³, and no wider,
     // which would let anything through.
     for sparte in Sparte::ALL {
-        for unit in MeasurementUnit::ALL {
+        for unit in Unit::ALL {
             let admissible = unit == sparte.measured_unit() || unit == sparte.billing_unit();
             let series = MeteringWorkload::new(START)
                 .sparte(sparte)
@@ -244,14 +244,15 @@ async fn a_mixed_portfolio_sums_per_unit_and_never_across_them() {
 
 /// One gas quarter-hour, valued so a mis-bucketed interval is arithmetically
 /// visible rather than merely miscounted.
-fn gas_quarter(from: OffsetDateTime, value: i64) -> metering::interval::MeterInterval {
-    metering::interval::MeterInterval {
+fn gas_quarter(from: OffsetDateTime, value: i64) -> metering::series::interval::MeterInterval {
+    metering::MeterInterval::new(
         from,
-        to: from + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(value, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "7-1:99.33.0".parse().ok(),
-    }
+        from + Duration::minutes(15),
+        rust_decimal::Decimal::new(value, 0),
+        metering::QualityFlag::Measured,
+    )
+    .expect("a non-empty interval")
+    .with_obis("7-1:99.33.0".parse().unwrap())
 }
 
 /// A gas delivery covering `[from, to)` at the quarter-hour.
@@ -261,24 +262,24 @@ fn gas_series(malo: &str, from: OffsetDateTime, to: OffsetDateTime, value: i64) 
         .map(|t| gas_quarter(t, value))
         .collect();
 
-    let mut series = metering::measurement_series::MeasurementSeries::new(
+    let mut series = meterstore::delivery::MeasurementSeries::new(
         malo.parse().expect("a valid MaLo-ID"),
         "7-1:99.33.0".parse().ok(),
         intervals,
-        metering::measurement_series::MeasurementSource::Mscons {
+        meterstore::delivery::MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         to,
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
     StoredSeries::of(
         Sparte::Gas,
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", from, Sparte::Gas)
+            meterstore::VersionScope::for_interval("9900000000003", from, Sparte::Gas)
                 .expect("scope"),
             meterstore::Version::new(20_261_001_000_001).expect("version"),
         ),
@@ -334,7 +335,7 @@ async fn a_gas_delivery_scoped_to_its_real_bilanzierungsmonat_is_accepted() {
         7,
     );
     wrong.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::new("9900000000001", 2026, 3).expect("scope"),
+        meterstore::VersionScope::new("9900000000003", 2026, 3).expect("scope"),
         meterstore::Version::new(20_261_001_000_002).expect("version"),
     );
     let err = store

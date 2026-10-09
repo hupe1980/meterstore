@@ -7,7 +7,7 @@
 //! - **Completeness.** A missing interval is information, and the expectation
 //!   comes from the DST-aware calendar rather than a hardcoded 96.
 //! - **Provenance.** Every result carries the boundary it was computed against,
-//!   and says which tiers produced it (P1).
+//!   and says which tiers produced it.
 //! - **Single archiver.** Two archivers cannot both own the detach window.
 //!
 //! Each of these is a claim about behaviour under real storage, so a fake would
@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use meterstore::cold::IcebergCold;
 use meterstore::config::TableConfig;
 use meterstore::hot::PostgresHot;
@@ -35,7 +35,7 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use metering::measurement_series::MeasurementSource;
+use meterstore::delivery::MeasurementSource;
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -123,7 +123,7 @@ impl Harness {
         let detail = serde_json::to_string(&MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         })
         .unwrap();
 
@@ -141,7 +141,7 @@ impl Harness {
                     quality, resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'MSCONS',
-                           $6,'[]',$7,'9900000000001:2026-07',$8,
+                           $6,'[]',$7,'9900000000003:2026-07',$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
             ))
             .bind(malo)
@@ -218,7 +218,7 @@ fn scalar(result: &meterstore::QueryResult) -> i64 {
 
 #[tokio::test]
 async fn every_result_carries_the_boundary_it_was_computed_against() {
-    // P1: correctness is observable. Two identical queries a minute apart can
+    // Correctness is observable. Two identical queries a minute apart can
     // read the same rows from different tiers, and a bare number cannot say so.
     let h = Harness::start().await;
     h.hot
@@ -598,7 +598,9 @@ async fn completeness_is_reachable_from_sql() {
         .store(ReadMode::Unified)
         .await
         .query(
-            "SELECT missing FROM meter_completeness('2026-07-18', '2026-07-19') \
+            // Instants: a bare date would be the start of that day in Berlin.
+            "SELECT missing FROM meter_completeness('2026-07-18T00:00:00Z', \
+             '2026-07-19T00:00:00Z') \
              WHERE malo_id = '11111111115'",
         )
         .await
@@ -636,10 +638,18 @@ async fn the_typed_read_returns_the_domain_type_across_both_tiers() {
     assert_eq!(series.malo_id.as_str(), "11111111115");
     assert_eq!(series.intervals.len(), 192);
     // Ordered, so the domain layer's arithmetic sees a series that runs forwards.
-    assert!(series.intervals.windows(2).all(|w| w[0].from < w[1].from));
-    assert_eq!(series.intervals[0].from, D18);
+    assert!(
+        series
+            .intervals
+            .windows(2)
+            .all(|w| w[0].from() < w[1].from())
+    );
+    assert_eq!(series.intervals[0].from(), D18);
     // The decimal survives the whole round trip.
-    assert_eq!(series.intervals[0].value, rust_decimal::Decimal::new(3, 0));
+    assert_eq!(
+        series.intervals[0].value(),
+        rust_decimal::Decimal::new(3, 0)
+    );
 }
 
 #[tokio::test]
@@ -668,7 +678,7 @@ async fn the_typed_read_returns_the_corrected_value() {
         series
             .intervals
             .iter()
-            .all(|i| i.value == rust_decimal::Decimal::new(40, 0)),
+            .all(|i| i.value() == rust_decimal::Decimal::new(40, 0)),
         "the correction must win"
     );
 }
@@ -1083,21 +1093,22 @@ async fn a_safe_schema_difference_does_not_halt_the_table() {
 
 /// A restated day at 40 kWh per interval, encoded for a direct cold append.
 async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
-    use metering::interval::{MeterInterval, QualityFlag};
-    use metering::measurement_series::MeasurementSeries;
+    use metering::series::interval::{MeterInterval, QualityFlag};
+    use meterstore::delivery::MeasurementSeries;
     use meterstore::encode::StoredSeries;
     use meterstore::{ScopedVersion, Version, VersionScope};
 
     let intervals: Vec<MeterInterval> = (0..96)
         .map(|i| {
             let from = D18 + Duration::minutes(15 * i);
-            MeterInterval {
+            MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                value: rust_decimal::Decimal::new(40, 0),
-                quality: QualityFlag::Corrected,
-                obis_code: Some("1-0:1.8.0".parse().unwrap()),
-            }
+                from + Duration::minutes(15),
+                rust_decimal::Decimal::new(40, 0),
+                QualityFlag::Corrected,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap())
         })
         .collect();
 
@@ -1108,16 +1119,16 @@ async fn corrected_batch(h: &Harness) -> datafusion::arrow::array::RecordBatch {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-08-01 06:00 UTC),
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
     let stored = StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", D18, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),
@@ -1259,21 +1270,22 @@ async fn writes_during_archival_are_never_stranded_below_the_watermark() {
 
 /// The restated day the late-correction test writes.
 fn corrected_series() -> meterstore::encode::StoredSeries {
-    use metering::interval::{MeterInterval, QualityFlag};
-    use metering::measurement_series::MeasurementSeries;
+    use metering::series::interval::{MeterInterval, QualityFlag};
+    use meterstore::delivery::MeasurementSeries;
     use meterstore::encode::StoredSeries;
     use meterstore::{ScopedVersion, Version, VersionScope};
 
     let intervals: Vec<MeterInterval> = (0..96)
         .map(|i| {
             let from = D18 + Duration::minutes(15 * i);
-            MeterInterval {
+            MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                value: rust_decimal::Decimal::new(40, 0),
-                quality: QualityFlag::Corrected,
-                obis_code: Some("1-0:1.8.0".parse().unwrap()),
-            }
+                from + Duration::minutes(15),
+                rust_decimal::Decimal::new(40, 0),
+                QualityFlag::Corrected,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap())
         })
         .collect();
 
@@ -1284,18 +1296,110 @@ fn corrected_series() -> meterstore::encode::StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-08-01 06:00 UTC),
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", D18, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", D18, Sparte::Strom).unwrap(),
             Version::new(V2 as u128).unwrap(),
         ),
         datetime!(2026-08-01 06:00 UTC),
     )
+}
+
+#[tokio::test]
+async fn an_as_of_by_instant_reads_one_snapshot_for_its_whole_life() {
+    // The instant is resolved once, when the session is made. A session that
+    // re-resolved it per scan would move onto a commit landing afterwards with
+    // a timestamp at or before the instant — here a late correction inside the
+    // range it reports — while still reporting the boundary it started on.
+    use meterstore::testkit::{MeteringWorkload, TestHarness};
+    let start = datetime!(2026-07-20 00:00 UTC);
+    let h = TestHarness::start().await.expect("harness");
+    h.ensure_partitions(start, start + Duration::days(4))
+        .await
+        .expect("partitions");
+    h.seed_watermark(start).await.expect("watermark");
+    let store = h.store().await.expect("store");
+    let day = |version: u128| {
+        MeteringWorkload::new(start)
+            .seed(0x13)
+            .malo_ids(1)
+            .days(1)
+            .version(version)
+            .generate()
+            .expect("workload")
+    };
+    h.ingest(&store, &day(20_260_721_000_001))
+        .await
+        .expect("ingest");
+    store
+        .admin()
+        .archive(start + Duration::days(2), 1)
+        .await
+        .expect("the day, archived");
+
+    let pinned = store
+        .as_of(
+            SnapshotSelector::Timestamp(datetime!(2100-01-01 00:00 UTC)),
+            None,
+        )
+        .await
+        .expect("pin");
+    let sum = |s: &meterstore::MeterStore| {
+        let s = s.clone();
+        async move {
+            s.query("SELECT CAST(SUM(value) AS VARCHAR) FROM readings")
+                .await
+                .expect("sum")
+                .to_json()
+                .expect("json")[0]
+                .to_string()
+        }
+    };
+    let before = sum(&pinned).await;
+
+    // A correction of the archived day, committed after the session was made.
+    let mut corrected = day(20_260_726_000_002);
+    for series in &mut corrected {
+        series.series.intervals = series
+            .series
+            .intervals
+            .iter()
+            .map(|i| {
+                metering::series::interval::MeterInterval::new(
+                    i.from(),
+                    i.to(),
+                    i.value() + rust_decimal::Decimal::ONE,
+                    i.quality(),
+                )
+                .expect("interval")
+                .with_obis(i.obis().expect("obis"))
+            })
+            .collect();
+    }
+    store.append(&corrected).await.expect("a late correction");
+    assert_ne!(
+        sum(&store
+            .as_of(
+                SnapshotSelector::Timestamp(datetime!(2100-01-01 00:00 UTC)),
+                None
+            )
+            .await
+            .unwrap())
+        .await,
+        before,
+        "the correction is visible to a fresh session"
+    );
+
+    assert_eq!(
+        sum(&pinned).await,
+        before,
+        "the session moved onto a snapshot committed after it was made"
+    );
 }

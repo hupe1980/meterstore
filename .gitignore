@@ -44,6 +44,17 @@ target
 # `just references` rebuilds the folder from the index beside it.
 /concepts/
 
+# This project's own feature specifications and the Spec Kit machinery that
+# produces them (`/speckit-*` skills, templates, `.specify/memory/constitution.md`).
+# Same rule as `concepts/`: internal, and every specification is named by an item
+# in the roadmap there, so neither half means anything without the other.
+/specs/
+/.specify/
+
+# The checker `just concepts` runs over `concepts/` and `specs/`. It tests the
+# design notes' own rules and nothing tracked, so it goes where they go.
+/tools/
+
 # Agent skills. The procedure for working this repository, which reads
 # `concepts/` on every phase and is meaningless without it — so it is ignored for
 # the same reason `concepts/` is. `AGENTS.md` is committed, because it is what an

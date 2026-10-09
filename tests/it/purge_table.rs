@@ -243,3 +243,179 @@ async fn purging_one_table_leaves_another_intact() {
         .value(0);
     assert!(n > 0, "the table that stayed must still hold its readings");
 }
+
+#[tokio::test]
+async fn a_purged_table_leaves_no_reclaimed_mark_for_its_successor() {
+    let (harness, store) = populated().await;
+    // The mark a later reclamation would have written, set directly so the test
+    // does not wait out the reader grace.
+    sqlx::query(
+        r#"INSERT INTO meterstore_reclaimed ("table", reclaimed_below) VALUES ($1, $2)
+           ON CONFLICT ("table") DO UPDATE SET reclaimed_below = EXCLUDED.reclaimed_below"#,
+    )
+    .bind(TestHarness::TABLE)
+    .bind(START + Duration::days(2))
+    .execute(harness.hot().pool())
+    .await
+    .expect("mark");
+
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("purge");
+
+    let marks: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM meterstore_reclaimed WHERE "table" = $1"#)
+            .bind(TestHarness::TABLE)
+            .fetch_one(harness.hot().pool())
+            .await
+            .expect("count marks");
+    assert_eq!(marks, 0, "the purged table's reclaimed mark survived it");
+
+    // And a table recreated under the same name answers a query reaching below
+    // where the old mark stood.
+    let fresh = harness.store().await.expect("store");
+    fresh.admin().create_tables().await.expect("recreate");
+    harness
+        .ensure_partitions(START, START + Duration::days(4))
+        .await
+        .expect("partitions");
+    harness.seed_watermark(START).await.expect("watermark");
+    fresh
+        .query(&format!("SELECT COUNT(*) FROM {}", fresh.resolved_table()))
+        .await
+        .expect("a recreated table is queryable");
+}
+
+#[tokio::test]
+async fn a_write_into_a_window_being_archived_is_a_retryable_boundary_move() {
+    // Archival has detached the window but not yet committed it, so the
+    // boundary still routes the write to the hot tier and PostgreSQL finds no
+    // partition for it. Nothing was written; the delivery is valid and succeeds
+    // once the boundary is published, so the caller must be told to retry —
+    // not that the delivery was refused.
+    let (harness, store) = populated().await;
+    let window = START + Duration::days(3);
+    let partition = meterstore::tiering::store::PartitionId::new(TestHarness::TABLE, window);
+    harness
+        .hot()
+        .detach_partition(&partition)
+        .await
+        .expect("detach");
+
+    let late = MeteringWorkload::new(window)
+        .seed(0x27)
+        .malo_ids(1)
+        .days(1)
+        .generate()
+        .expect("workload");
+    let err = harness
+        .ingest(&store, &late)
+        .await
+        .expect_err("the window's partition is detached");
+    assert!(
+        matches!(err, meterstore::Error::BoundaryMoved { .. }) && err.is_retryable(),
+        "a write losing the race to archival must be a retryable boundary move, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_write_that_loses_the_race_to_archival_lands_in_the_cold_tier_once() {
+    // The window above the boundary is detached for archival while a correction
+    // for it is in flight. The write finds no partition, and the archival run
+    // commits the window under it: `append` backs off, is routed by the new
+    // boundary to the cold tier, and lands there once.
+    let (harness, store) = populated().await;
+    let window = store.watermark().await.expect("watermark").get();
+    harness
+        .hot()
+        .detach_partition(&meterstore::tiering::store::PartitionId::new(
+            TestHarness::TABLE,
+            window,
+        ))
+        .await
+        .expect("detach, as archival does first");
+
+    let archiving = {
+        let store = store.clone();
+        tokio::spawn(async move { store.admin().archive(window + Duration::days(2), 1).await })
+    };
+
+    let correction = MeteringWorkload::new(window)
+        .seed(0x9E12)
+        .malo_ids(1)
+        .days(1)
+        .version(20_260_726_000_009)
+        .generate()
+        .expect("workload");
+    // One call, no retry of our own: `append` itself waits out the commit and
+    // routes again against the boundary it publishes.
+    let outcome = store
+        .append(&correction)
+        .await
+        .expect("a valid correction lands within append's own rounds");
+    archiving.await.expect("join").expect("archive");
+
+    assert_eq!(
+        store.watermark().await.unwrap().get(),
+        window + Duration::DAY,
+        "the window was archived"
+    );
+    assert_eq!(
+        outcome.cold_rows, 96,
+        "routed to the cold tier: {outcome:?}"
+    );
+    assert_eq!(outcome.hot_rows, 0, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn a_purge_interrupted_or_repeated_finishes_the_job() {
+    // A purge is a sequence of drops across two systems, and the process can
+    // die between them. Run again, it must finish what is left rather than
+    // fail on what is already gone.
+    let (harness, store) = populated().await;
+    // Interrupted after the cold half: the cold table and its files are gone,
+    // the hot table and its bookkeeping are not.
+    sqlx::query(
+        r#"INSERT INTO meterstore_reclaimed ("table", reclaimed_below) VALUES ($1, $2)
+           ON CONFLICT ("table") DO UPDATE SET reclaimed_below = EXCLUDED.reclaimed_below"#,
+    )
+    .bind(TestHarness::TABLE)
+    .bind(START + Duration::days(1))
+    .execute(harness.hot().pool())
+    .await
+    .expect("mark");
+    store
+        .admin()
+        .cold_store()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("the cold half");
+
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("the purge finishes what is left");
+    store
+        .admin()
+        .purge_table(TestHarness::TABLE)
+        .await
+        .expect("and over nothing finds nothing to do");
+
+    let marks: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM meterstore_reclaimed WHERE "table" = $1"#)
+            .bind(TestHarness::TABLE)
+            .fetch_one(harness.hot().pool())
+            .await
+            .expect("count marks");
+    assert_eq!(marks, 0, "the bookkeeping went with the hot half");
+    let hot_table: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(TestHarness::TABLE)
+        .fetch_one(harness.hot().pool())
+        .await
+        .expect("lookup");
+    assert!(!hot_table, "the hot half was finished");
+    assert!(harness.parquet_files().is_empty());
+}

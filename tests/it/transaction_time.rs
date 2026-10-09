@@ -10,8 +10,8 @@
 #![cfg(feature = "testkit")]
 
 use metering::QualityFlag;
-use metering::interval::MeterInterval;
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::MeterInterval;
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use meterstore::testkit::TestHarness;
 use rust_decimal::Decimal;
 use time::macros::datetime;
@@ -34,17 +34,20 @@ fn stored(
     let series = MeasurementSeries::new(
         "12345678905".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
-        vec![MeterInterval {
-            from,
-            to: from + Duration::minutes(15),
-            value: Decimal::new(kwh, 0),
-            quality: QualityFlag::Measured,
-            obis_code: "1-0:1.8.0".parse().ok(),
-        }],
+        vec![
+            MeterInterval::new(
+                from,
+                from + Duration::minutes(15),
+                Decimal::new(kwh, 0),
+                QualityFlag::Measured,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap()),
+        ],
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         recorded_at,
     );
@@ -52,9 +55,9 @@ fn stored(
         series,
         meterstore::ScopedVersion::new(
             meterstore::VersionScope::for_interval(
-                "9900000000001",
+                "9900000000003",
                 from,
-                metering::interval::Sparte::Strom,
+                metering::series::interval::Sparte::Strom,
             )
             .unwrap(),
             meterstore::Version::new(version).unwrap(),
@@ -83,7 +86,7 @@ async fn value_at(store: &meterstore::MeterStore, from: OffsetDateTime) -> Optio
         .collect()
         .await
         .expect("collect");
-    series.and_then(|s| s.intervals.first().map(|i| i.value))
+    series.and_then(|s| s.intervals.first().map(|i| i.value()))
 }
 
 #[tokio::test]

@@ -244,8 +244,8 @@ for name in names:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_adbc_client_is_told_what_the_server_is() {
     // `GetSqlInfo` is the call a driver makes while opening a connection, and
-    // answering it `Unimplemented` is survivable rather than fatal — which is
-    // exactly why nothing caught it. What the driver falls back to is a server
+    // answering it `Unimplemented` is survivable rather than fatal, so nothing
+    // else would notice. What the driver falls back to is a server
     // with no name and no version, so a client cannot say what it reached and a
     // bug report cannot say which build produced the answer.
     //
@@ -271,7 +271,8 @@ print("arrow=" + info["vendor_arrow_version"])
         "the server has to name itself, or a client cannot tell what it reached: {out:?}"
     );
     assert!(
-        out.iter().any(|line| line == "version=0.14.0"),
+        out.iter()
+            .any(|line| *line == format!("version={}", env!("CARGO_PKG_VERSION"))),
         "and say which build, which is what a bug report needs: {out:?}"
     );
     assert!(

@@ -158,20 +158,18 @@ impl ReadMode {
 ///
 /// # Why the boundary travels with the plan
 ///
-/// A caller reports the boundary an answer was computed against (P1), and the
-/// providers decide the tier split. Left to read the watermark separately, those
-/// are **two reads of a value archival is moving**: the report is taken before
-/// planning and the split during it, so an archival commit in between makes the
-/// label a statement about a boundary the answer was not computed against. For a
-/// statement over several tables it is worse — every provider reads its own, at
-/// its own moment, and no two are guaranteed consistent.
+/// A caller reports the boundary an answer was computed against, and the
+/// providers decide the tier split. Read separately, those are **two reads of a
+/// value archival is moving**, and an archival commit in between makes the label
+/// name a boundary the answer was not computed against — over several tables,
+/// every provider would read its own at its own moment.
 ///
 /// So the boundaries are read **once**, placed on the session config for the
-/// duration of one physical plan, and read back here. One statement, one set of
+/// duration of one physical plan, and read back here: one statement, one set of
 /// boundaries, and the label is the thing that was used. A provider planned
 /// without one — a caller reaching DataFusion directly through
-/// [`MeterStore::context`](crate::MeterStore::context) — reads a fresh watermark
-/// as before.
+/// [`MeterStore::context`](crate::MeterStore::context) — reads a fresh
+/// watermark.
 ///
 /// [`MeterStore::context`]: crate::session::MeterStore::context
 #[derive(Debug, Clone, Default)]
@@ -234,8 +232,9 @@ impl TieredTableProvider {
     /// Build a provider over both tiers.
     ///
     /// `cold_provider` supplies the cold half — normally an
-    /// `IcebergStaticTableProvider`, so partition pruning, bloom filters and
-    /// page statistics all apply without this crate reimplementing them.
+    /// `IcebergStaticTableProvider`, so partition, manifest and row-group
+    /// pruning apply without this crate reimplementing them. Bloom filters and
+    /// page indexes do not: `iceberg` 0.10.1 reads neither.
     ///
     /// **The schema is taken from the cold provider**, not from
     /// `encode::schema::storage_schema`. The two describe the same columns but
@@ -265,7 +264,7 @@ impl TieredTableProvider {
             cold_provider,
             mode: ReadMode::default(),
             // Defaults to the core merge key. A deployment that extends the
-            // identity must say so with `with_merge_key`, or the hot scan pages
+            // identity must say so with `with_scan_spec`, or the hot scan pages
             // by a cursor that is not unique and silently drops rows.
             spec: crate::tiering::store::ScanSpec::new(
                 crate::encode::schema::MERGE_KEY
@@ -444,9 +443,10 @@ impl TieredTableProvider {
 
         let ceiling = max_version.map(predicate::version_ceiling);
         if let Some(expr) = &ceiling {
-            // Also pushed down, so Iceberg can prune whole files whose `version`
-            // bounds are entirely above the ceiling. The enforcement below is
-            // what makes it correct; this is what makes it fast.
+            // Also offered to the cold scan, which passes it on (its literal has
+            // the column's own decimal type). `iceberg-datafusion` 0.10.1 does not
+            // translate decimals, so today it prunes no file; the enforcement
+            // below is what makes the read correct either way.
             all.push(expr.clone());
         }
 
@@ -456,17 +456,18 @@ impl TieredTableProvider {
             .await
             .map_err(external)?;
 
-        // A pinned snapshot predates any schema evolution since, so its columns
-        // may be a prefix of today's. Projection indices and the union schema
-        // are the current ones, so a mismatch has to fail with the reason rather
-        // than as an opaque Arrow error several layers down.
+        // A pinned snapshot predates any column added since. It is read through
+        // the current schema, matched by name — a column it predates reads as
+        // null, which is what Iceberg itself answers for a file written before
+        // the column existed — so a settlement rerun keeps working after a
+        // deployment adds an attribute, and projection indices stay today's.
         if pinned.schema() != self.schema {
-            return Err(DataFusionError::Plan(format!(
-                "cannot read {} {snapshot}: its schema differs from the current one, so a \
-                 reproducible read would silently change shape. Pin an explicit snapshot id \
-                 from before the schema change, or query the raw table directly.",
-                self.table,
-            )));
+            let scanned = pinned.scan(state, None, &all, None).await?;
+            let conformed = conform(scanned, &self.schema)?;
+            return match ceiling {
+                Some(ceiling) => self.enforce(state, vec![ceiling], conformed, projection, limit),
+                None => Ok(self.restore(conformed, projection, limit)?),
+            };
         }
 
         let Some(ceiling) = ceiling else {
@@ -586,9 +587,14 @@ impl TieredTableProvider {
                         .map_err(external)?
                     && reclaimed_below > watermark.get()
                 {
-                    return Err(DataFusionError::Plan(format!(
-                        "the hot tier reclaimed {} up to {reclaimed_below} while this plan was                          being made at boundary {watermark}, so the plan is already short a                          window. Retry: a fresh plan reads the new boundary and is whole",
-                        self.table,
+                    return Err(external(crate::error::Error::boundary_moved(
+                        self.table.as_str(),
+                        "plan",
+                        format!(
+                            "the hot tier reclaimed up to {reclaimed_below} while this plan \
+                             was being made at boundary {watermark}, so the plan is already \
+                             short a window; a fresh plan reads the new boundary and is whole"
+                        ),
                     )));
                 }
                 held
@@ -663,9 +669,18 @@ impl TieredTableProvider {
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(
             datafusion::physical_plan::filter::FilterExec::try_new(physical, input)?,
         );
+        self.restore(filtered, projection, limit)
+    }
 
+    /// Apply `projection` and `limit` above a plan producing the full schema.
+    fn restore(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projected: Arc<dyn ExecutionPlan> = match projection {
-            None => filtered,
+            None => input,
             Some(indices) => {
                 let exprs = indices
                     .iter()
@@ -678,9 +693,7 @@ impl TieredTableProvider {
                     })
                     .collect::<Vec<_>>();
                 Arc::new(
-                    datafusion::physical_plan::projection::ProjectionExec::try_new(
-                        exprs, filtered,
-                    )?,
+                    datafusion::physical_plan::projection::ProjectionExec::try_new(exprs, input)?,
                 )
             }
         };
@@ -922,21 +935,75 @@ impl ExecutionPlan for HotScanExec {
     }
 }
 
-/// Cast a batch's columns to a target schema.
+/// Cast a batch to a target schema, **matching columns by name**.
 ///
-/// A no-op for identical types and metadata-only for a timestamp whose unit
-/// matches but whose zone is spelled differently.
+/// The hot scan selects its columns in configuration order and the union schema
+/// is in table-creation order; paired by position, two attribute columns of one
+/// type declared in a different order would return each value under the other's
+/// name with no error. `evolution::compare` matches by name, so it would admit
+/// that permutation as identical. A nullable column the batch lacks reads as
+/// null; a required one is an error naming it. A timestamp whose zone is
+/// spelled differently casts as metadata only.
 fn cast_to(batch: &RecordBatch, schema: &SchemaRef) -> DfResult<RecordBatch> {
     if batch.schema() == *schema {
         return Ok(batch.clone());
     }
-    let columns = batch
-        .columns()
+    let columns = schema
+        .fields()
         .iter()
-        .zip(schema.fields())
-        .map(|(array, field)| crate::arrow::compute::cast(array, field.data_type()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|field| match batch.column_by_name(field.name()) {
+            Some(array) => Ok(crate::arrow::compute::cast(array, field.data_type())?),
+            None if field.is_nullable() => Ok(crate::arrow::array::new_null_array(
+                field.data_type(),
+                batch.num_rows(),
+            )),
+            None => Err(DataFusionError::Execution(format!(
+                "the hot scan returned no column {:?}, which the table requires",
+                field.name()
+            ))),
+        })
+        .collect::<DfResult<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
+}
+
+/// Project `input` onto `schema` by name — the plan-level [`cast_to`].
+///
+/// For a snapshot older than a column: the column it predates is a typed null,
+/// a required one it lacks is an error naming it.
+fn conform(input: Arc<dyn ExecutionPlan>, schema: &SchemaRef) -> DfResult<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+
+    let source = input.schema();
+    let exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let expr: Arc<dyn PhysicalExpr> = match source.index_of(field.name()) {
+                Ok(i) if source.field(i).data_type() == field.data_type() => {
+                    Arc::new(Column::new(field.name(), i))
+                }
+                Ok(i) => Arc::new(CastExpr::new(
+                    Arc::new(Column::new(field.name(), i)),
+                    field.data_type().clone(),
+                    None,
+                )),
+                Err(_) if field.is_nullable() => Arc::new(Literal::new(
+                    datafusion::scalar::ScalarValue::try_from(field.data_type())?,
+                )),
+                Err(_) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "this snapshot has no column {:?}, which the table requires",
+                        field.name()
+                    )));
+                }
+            };
+            Ok((expr, field.name().clone()))
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    Ok(Arc::new(
+        datafusion::physical_plan::projection::ProjectionExec::try_new(exprs, input)?,
+    ))
 }
 
 /// Wrap a MeterStore error for DataFusion.
@@ -981,16 +1048,19 @@ impl TableProvider for TieredTableProvider {
         // provider's promise. The hot half keeps that promise — the range is a
         // `WHERE` clause in the SQL. The cold half cannot: it hands the filters
         // to `iceberg-datafusion`, which converts them with a `filter_map` and
-        // **silently discards whatever it cannot translate**. Today it translates
-        // our range; a future version that stopped would produce rows outside
-        // the requested window, with nothing above the scan to catch them and no
+        // **silently discards whatever it cannot translate**. It translates the
+        // range; a version that did not would produce rows outside the
+        // requested window, with nothing above the scan to catch them and no
         // error anywhere.
         //
-        // That is a guarantee held by a third party's internals, and P6 says
-        // degrade rather than lie. `Inexact` costs one timestamp comparison per
-        // row on a scan that has already read them, and the filters still reach
-        // Iceberg for pruning — the optimisation that actually matters is
-        // skipping files, not skipping the comparison.
+        // That is a guarantee held by a third party's internals, and the store
+        // degrades rather than lies. `Inexact` costs one timestamp comparison per
+        // row on a scan that has already read them, and guards a **dropped**
+        // filter. It cannot guard a **strengthened** one — a pushed form that
+        // prunes files holding rows the filter accepts — so the cold scan is
+        // handed only the shapes `cold::iceberg::cold_pushable` admits, whose
+        // pushed form is implied by the filter. Skipping files is the
+        // optimisation that matters, and the range filter is always admitted.
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }

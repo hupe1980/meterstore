@@ -11,7 +11,7 @@
 // across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
@@ -28,7 +28,7 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -124,13 +124,14 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
 
 /// A reading for one tenant at a given version and value.
 fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
-    let interval = metering::interval::MeterInterval {
-        from: D20,
-        to: D20 + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(kwh, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "1-0:1.8.0".parse().ok(),
-    };
+    let interval = metering::series::interval::MeterInterval::new(
+        D20,
+        D20 + Duration::minutes(15),
+        rust_decimal::Decimal::new(kwh, 0),
+        metering::QualityFlag::Measured,
+    )
+    .expect("a non-empty interval")
+    .with_obis("1-0:1.8.0".parse().unwrap());
     let series = MeasurementSeries::new(
         "11111111115".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
@@ -145,7 +146,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", D20, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", D20, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -319,7 +320,10 @@ async fn an_unscoped_typed_read_refuses_to_fold_two_tenants() {
         .unwrap()
         .expect("tenant a has a reading");
     assert_eq!(scoped.intervals.len(), 1);
-    assert_eq!(scoped.intervals[0].value, rust_decimal::Decimal::new(10, 0));
+    assert_eq!(
+        scoped.intervals[0].value(),
+        rust_decimal::Decimal::new(10, 0)
+    );
 
     // …and so is scoping the session, which is what a service exposing SQL uses.
     let confined = store.scoped("tenant", "b").await.unwrap();
@@ -331,7 +335,10 @@ async fn an_unscoped_typed_read_refuses_to_fold_two_tenants() {
         .await
         .unwrap()
         .expect("tenant b has a reading");
-    assert_eq!(only_b.intervals[0].value, rust_decimal::Decimal::new(25, 0));
+    assert_eq!(
+        only_b.intervals[0].value(),
+        rust_decimal::Decimal::new(25, 0)
+    );
 }
 
 #[tokio::test]
@@ -481,7 +488,7 @@ async fn the_overlap_exclusion_is_scoped_to_a_tenant() {
     // overlap would be cross-tenant interference dressed up as data validation.
     let (store, _w) = store_with_tenant_identity().await;
 
-    for tenant in ["9900000000001", "9900000000002"] {
+    for tenant in ["9900000000003", "9900000000029"] {
         store
             .append(&[reading(tenant, 10, 20_260_720_000_001)])
             .await
@@ -645,21 +652,78 @@ async fn only_a_merge_key_column_can_scope_a_session() {
 }
 
 #[tokio::test]
-async fn writes_are_unaffected_by_a_session_scope() {
-    // A scope confines reads. Writes carry their identity in the row itself and
-    // route by `from`, so there is nothing for a session scope to add — and
-    // silently rewriting a caller's row would be worse than not scoping it.
+async fn a_scoped_handle_writes_only_inside_its_scope() {
+    // A scope confines what a handle reaches, writes included. Refused before
+    // anything is written, so the refusal is the whole effect.
     let (store, _w) = store_with_tenant_identity().await;
     let scoped = store.scoped("tenant", "a").await.expect("scope");
 
-    scoped
+    let err = scoped
         .append(&[reading("b", 99, 20_260_720_000_001)])
         .await
-        .expect("a write names its own tenant");
+        .expect_err("a tenant-a handle writing tenant b");
+    assert!(matches!(err, meterstore::Error::Config(_)), "{err:?}");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM readings").await, 0);
 
-    // Written, and invisible from the scoped session by construction.
-    assert_eq!(count(&scoped, "SELECT COUNT(*) FROM readings").await, 0);
-    assert_eq!(count(&store, "SELECT COUNT(*) FROM readings").await, 1);
+    let err = scoped
+        .hot_writer()
+        .await
+        .expect("writer")
+        .append(&[reading("b", 99, 20_260_720_000_001)])
+        .await
+        .expect_err("the bulk writer is confined too");
+    assert!(matches!(err, meterstore::Error::Config(_)), "{err:?}");
+
+    scoped
+        .append(&[reading("a", 99, 20_260_720_000_001)])
+        .await
+        .expect("its own tenant");
+    assert_eq!(count(&scoped, "SELECT COUNT(*) FROM readings").await, 1);
+}
+
+#[tokio::test]
+async fn a_scoped_handle_cannot_store_another_tenants_cold_row_twice() {
+    // A late correction is reconciled against what the session sees. A tenant-a
+    // handle sees none of tenant b's stored rows, so a redelivered tenant-b
+    // reading would find nothing and be written a second time.
+    let (store, _w) = store_with_tenant_identity().await;
+    store
+        .append(&[reading("b", 40, 20_260_720_000_001)])
+        .await
+        .expect("tenant b");
+    store
+        .admin()
+        .cold_store()
+        .append_and_commit(
+            TABLE,
+            stream_of(Vec::new()),
+            WriteHints::default(),
+            meterstore::watermark::ArchivalWindow::new(D20 - Duration::DAY, D20).unwrap(),
+            Duration::DAY,
+            D20,
+        )
+        .await
+        .expect("seed watermark");
+    store
+        .admin()
+        .archive(D21 + Duration::DAY, 4)
+        .await
+        .expect("archive");
+
+    let scoped = store.scoped("tenant", "a").await.expect("scope");
+    scoped
+        .append(&[reading("b", 40, 20_260_720_000_001)])
+        .await
+        .expect_err("outside the scope");
+
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM readings_versions WHERE tenant = 'b'"
+        )
+        .await,
+        1
+    );
 }
 
 /// A scalar `i64` from a query against `store`.

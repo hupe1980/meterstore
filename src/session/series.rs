@@ -19,12 +19,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::delivery::{MeasurementSeries, MeasurementSource, ProvenanceEntry};
 use datafusion::common::ScalarValue;
+use metering::ids::obis::ObisCode;
 use metering::ids::{MaloId, MeloId};
-use metering::interval::QualityFlag;
-use metering::interval::Sparte;
-use metering::measurement_series::{MeasurementSeries, MeasurementSource, ProvenanceEntry};
-use metering::obis::ObisCode;
+use metering::series::interval::QualityFlag;
+use metering::series::interval::Sparte;
 use time::OffsetDateTime;
 
 use crate::encode::schema::col;
@@ -269,7 +269,7 @@ impl<'a> SeriesQuery<'a> {
     /// empty series. A `MeasurementSeries` asserts a `source` — who reported these
     /// values — and with no values there is nobody to name. Fabricating one would
     /// put a source in the audit trail that never delivered anything. Absence is
-    /// information (P1); use [`intervals`](Self::intervals) when the caller
+    /// information; use [`intervals`](Self::intervals) when the caller
     /// genuinely wants to treat it as zero, or
     /// [`completeness`](crate::session::MeterStore::completeness) to find out why
     /// it is absent.
@@ -336,8 +336,8 @@ impl<'a> SeriesQuery<'a> {
     /// both halves, the cold half is the entire archive, and a hot half in range
     /// forces version resolution over all of it. The limit cannot be pushed below
     /// the sort, so nothing prunes it. Each `latest` is then a full history scan
-    /// rather than a point lookup, and N channels are N of them (R24).
-    pub async fn latest(self) -> Result<Option<metering::interval::MeterInterval>> {
+    /// rather than a point lookup, and N channels are N of them.
+    pub async fn latest(self) -> Result<Option<metering::series::interval::MeterInterval>> {
         Ok(self
             .latest_resolved()
             .await?
@@ -357,7 +357,7 @@ impl<'a> SeriesQuery<'a> {
     /// The shape `metering`'s computations actually take —
     /// `aggregate(&intervals, …)` — and the one where an empty range is an
     /// ordinary answer rather than a missing series.
-    pub async fn intervals(self) -> Result<Vec<metering::interval::MeterInterval>> {
+    pub async fn intervals(self) -> Result<Vec<metering::series::interval::MeterInterval>> {
         Ok(self
             .collect()
             .await?
@@ -728,7 +728,7 @@ fn merge(
         extra = series.extra;
     }
 
-    intervals.sort_by_key(|i| i.from);
+    intervals.sort_by_key(|i| i.from());
     refuse_repeated_instants(malo_id, &intervals)?;
 
     let obis = match obis_code {
@@ -777,11 +777,11 @@ fn merge(
 /// is being refused at a boundary, something that should not be true already is.
 fn refuse_repeated_instants(
     malo_id: MaloId,
-    intervals: &[metering::interval::MeterInterval],
+    intervals: &[metering::series::interval::MeterInterval],
 ) -> Result<()> {
     // Sorted by `from` on the way in, so a repeat is adjacent.
     for pair in intervals.windows(2) {
-        if pair[0].from != pair[1].from {
+        if pair[0].from() != pair[1].from() {
             continue;
         }
         return Err(Error::InvariantViolated {
@@ -793,9 +793,9 @@ fn refuse_repeated_instants(
                  write paths refuse, unless integrity constraints are off or something \
                  other than meterstore wrote these rows. Folding them into one series \
                  would sum to twice the truth",
-                at = pair[0].from,
-                a = pair[0].value,
-                b = pair[1].value,
+                at = pair[0].from(),
+                a = pair[0].value(),
+                b = pair[1].value(),
             ),
         });
     }
@@ -942,10 +942,10 @@ fn render(values: &[(String, String)]) -> String {
 }
 
 /// The one channel every interval shares, if they do share one.
-fn single_channel(intervals: &[metering::interval::MeterInterval]) -> Option<ObisCode> {
+fn single_channel(intervals: &[metering::series::interval::MeterInterval]) -> Option<ObisCode> {
     let mut seen: Option<ObisCode> = None;
     for interval in intervals {
-        match (seen, interval.obis_code) {
+        match (seen, interval.obis()) {
             (_, None) => return None,
             (None, Some(code)) => seen = Some(code),
             (Some(a), Some(b)) if a == b => {}
@@ -999,18 +999,29 @@ mod tests {
     use super::*;
     use crate::encode::StoredSeries;
     use crate::version::{ScopedVersion, Version, VersionScope};
-    use metering::interval::{MeterInterval, QualityFlag};
+    use metering::series::interval::{MeterInterval, QualityFlag};
     use rust_decimal::Decimal;
     use time::macros::datetime;
 
-    fn interval(from: OffsetDateTime, kwh: i64) -> MeterInterval {
-        MeterInterval {
-            from,
-            to: from + time::Duration::minutes(15),
-            value: Decimal::new(kwh, 0),
-            quality: QualityFlag::Measured,
-            obis_code: Some("1-0:1.8.0".parse().unwrap()),
+    /// `iv` moved by `by`, everything else kept.
+    fn shifted(iv: &MeterInterval, by: time::Duration) -> MeterInterval {
+        let moved = MeterInterval::new(iv.from() + by, iv.to() + by, iv.value(), iv.quality())
+            .expect("a shifted interval keeps its length");
+        match iv.obis() {
+            Some(code) => moved.with_obis(code),
+            None => moved,
         }
+    }
+
+    fn interval(from: OffsetDateTime, kwh: i64) -> MeterInterval {
+        MeterInterval::new(
+            from,
+            from + time::Duration::minutes(15),
+            Decimal::new(kwh, 0),
+            QualityFlag::Measured,
+        )
+        .expect("a non-empty interval")
+        .with_obis("1-0:1.8.0".parse().unwrap())
     }
 
     /// The MaLo-ID these tests read: check digit included, because `MaloId`
@@ -1023,13 +1034,13 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSG-1".to_owned()),
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
     fn stored(intervals: Vec<MeterInterval>, recorded_at: OffsetDateTime) -> StoredSeries {
-        let scope =
-            VersionScope::for_interval("9900000000001", intervals[0].from, Sparte::Strom).unwrap();
+        let scope = VersionScope::for_interval("9900000000003", intervals[0].from(), Sparte::Strom)
+            .unwrap();
         StoredSeries::new(
             MeasurementSeries::new(
                 malo(),
@@ -1050,13 +1061,16 @@ mod tests {
     fn one_interval(obis: &str) -> StoredSeries {
         let from = datetime!(2026-07-20 00:00 UTC);
         let mut s = stored(
-            vec![MeterInterval {
-                from,
-                to: from + time::Duration::minutes(15),
-                value: rust_decimal::Decimal::new(15, 1),
-                quality: metering::QualityFlag::Measured,
-                obis_code: obis.parse().ok(),
-            }],
+            vec![
+                MeterInterval::new(
+                    from,
+                    from + time::Duration::minutes(15),
+                    rust_decimal::Decimal::new(15, 1),
+                    metering::QualityFlag::Measured,
+                )
+                .expect("a non-empty interval")
+                .with_obis(obis.parse().unwrap()),
+            ],
             from,
         );
         s.series.obis_code = obis.parse().ok();
@@ -1116,8 +1130,8 @@ mod tests {
         assert_eq!(split[&import].series.intervals.len(), 1);
         assert_eq!(split[&export].series.intervals.len(), 1);
         assert_eq!(
-            split[&import].series.intervals[0].from,
-            split[&export].series.intervals[0].from
+            split[&import].series.intervals[0].from(),
+            split[&export].series.intervals[0].from()
         );
     }
 
@@ -1223,7 +1237,10 @@ mod tests {
         // the after-the-fact detection a duplicated scope otherwise has
         // none of.
         let mut second = one_interval("1-0:1.8.0");
-        second.series.intervals[0].value = rust_decimal::Decimal::new(99, 1);
+        let quality = second.series.intervals[0].quality();
+        second.series.intervals[0] = second.series.intervals[0]
+            .clone()
+            .with_value(rust_decimal::Decimal::new(99, 1), quality);
         second.recorded_at += time::Duration::hours(1);
 
         let err = merge(malo(), None, &[], vec![one_interval("1-0:1.8.0"), second]).unwrap_err();
@@ -1246,8 +1263,8 @@ mod tests {
         // deliveries covering *different* instants of one channel.
         let first = one_interval("1-0:1.8.0");
         let mut later = one_interval("1-0:1.8.0");
-        later.series.intervals[0].from += time::Duration::minutes(15);
-        later.series.intervals[0].to += time::Duration::minutes(15);
+        later.series.intervals[0] =
+            shifted(&later.series.intervals[0], time::Duration::minutes(15));
         later.recorded_at += time::Duration::hours(1);
 
         let folded = merge(malo(), None, &[], vec![first, later])
@@ -1304,8 +1321,7 @@ mod tests {
         let of = |bk: &str, quarters: i64| {
             let mut s = one_interval("1-0:1.8.0");
             let shift = time::Duration::minutes(15 * quarters);
-            s.series.intervals[0].from += shift;
-            s.series.intervals[0].to += shift;
+            s.series.intervals[0] = shifted(&s.series.intervals[0], shift);
             s.extra.insert(
                 "bilanzkreis".to_string(),
                 ScalarValue::Utf8(Some(bk.into())),
@@ -1362,8 +1378,8 @@ mod tests {
             merge(malo(), Some("1-0:1.8.0"), &[], vec![later, earlier])
                 .unwrap()
                 .expect("rows were supplied");
-        assert_eq!(series.intervals[0].from, datetime!(2026-07-20 00:00 UTC));
-        assert_eq!(series.intervals[1].from, datetime!(2026-07-20 12:00 UTC));
+        assert_eq!(series.intervals[0].from(), datetime!(2026-07-20 00:00 UTC));
+        assert_eq!(series.intervals[1].from(), datetime!(2026-07-20 12:00 UTC));
     }
 
     #[test]
@@ -1391,22 +1407,19 @@ mod tests {
             vec![interval(datetime!(2026-07-20 00:15 UTC), 2)],
             datetime!(2026-07-25 00:00 UTC),
         );
-        new.series.resolution = Some(metering::IntervalResolution::QuarterHour);
+        new.series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
         let ResolvedSeries { series, .. } = merge(malo(), Some("1-0:1.8.0"), &[], vec![new, old])
             .unwrap()
             .expect("rows were supplied");
-        assert_eq!(
-            series.resolution,
-            Some(metering::IntervalResolution::QuarterHour)
-        );
+        assert_eq!(series.resolution, Some(metering::Resolution::QUARTER_HOUR));
     }
 
     #[test]
     fn a_mixed_channel_read_carries_no_series_level_obis() {
         // Claiming one channel for a series holding two would misdescribe it.
         let mut other = interval(datetime!(2026-07-20 00:15 UTC), 2);
-        other.obis_code = Some("1-0:2.8.0".parse().unwrap());
+        other = other.with_obis("1-0:2.8.0".parse().unwrap());
         let mixed = stored(
             vec![interval(datetime!(2026-07-20 00:00 UTC), 1), other],
             datetime!(2026-07-21 00:00 UTC),
@@ -1455,7 +1468,7 @@ mod tests {
         // every gas and water series as electricity — silently, since the numbers
         // look the same.
         let scope = VersionScope::for_interval(
-            "9900000000001",
+            "9900000000003",
             datetime!(2026-07-20 00:00 UTC),
             Sparte::Strom,
         )

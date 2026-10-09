@@ -72,15 +72,13 @@ pub const VALUE_CHECK_KEY: &str = "meterstore.value_check";
 /// | [`Eic`](Self::Eic) | 16 | `0-9 A-Z -`, letter at 3, check character not `-` | **check character** | trim, uppercase |
 /// | [`Malo`](Self::Malo) | 11 | digits, first not `0` | **check digit** | trim |
 /// | [`Melo`](Self::Melo) | 33 | 2 letters, 6 digits, 25 alphanumerics | none exists | trim, uppercase |
-/// | [`Bdew`](Self::Bdew) | 13 | digits | **deliberately not checked** | trim |
+/// | [`Bdew`](Self::Bdew) | 13 | digits | **check digit**, BDEW's procedure or GS1's | trim |
 ///
-/// The two with arithmetic are the two where a transposition is *detectable*
-/// while the delivery that carried it is still in hand. The other two are still
-/// worth declaring: [`Melo`](Self::Melo) canonicalises the casing, and a
-/// Messlokation in two casings on an identity column is two readings that never
-/// supersede each other; [`Bdew`](Self::Bdew) fixes the length and the alphabet,
-/// which is the whole of the rule that can be enforced — see its own
-/// documentation for why the thirteenth digit is not.
+/// The three with arithmetic are the three where a transposition is
+/// *detectable* while the delivery that carried it is still in hand.
+/// [`Melo`](Self::Melo) is still worth declaring: it canonicalises the casing,
+/// and a Messlokation in two casings on an identity column is two readings that
+/// never supersede each other.
 ///
 /// Deliberately **not** `#[non_exhaustive]`, unlike [`Error`]: a
 /// scheme added here is a scheme a caller matching on this has to decide about,
@@ -148,10 +146,10 @@ pub enum ValueCheck {
     /// The commonest identifier on a deployment's own columns — a Lieferant, a
     /// Messstellenbetreiber, a Netzbetreiber — and the one whose validation stops
     /// soonest. BDEW *Identifikatoren in der Marktkommunikation* §2.3 gives the
-    /// Prüfziffer the same procedure as the MaLo-ID and then carves out
-    /// GS1-issued GLNs, which use a different one and are legitimate
-    /// Marktpartner-IDs. So the thirteenth digit is **not** enforced, here or in
-    /// [`VersionScope`](crate::VersionScope), and thirteen digits is the rule.
+    /// Prüfziffer the same procedure as the MaLo-ID and admits GS1-issued GLNs,
+    /// which use a different one. So the thirteenth digit must satisfy either
+    /// procedure — here and in [`VersionScope`](crate::VersionScope) alike — and
+    /// a transposition is refused at the write.
     Bdew,
 }
 
@@ -202,6 +200,10 @@ impl ValueCheck {
             Self::Eic(Some(EicType::TieLine)) => "EIC:T",
             Self::Eic(Some(EicType::Location)) => "EIC:V",
             Self::Eic(Some(EicType::Substation)) => "EIC:A",
+            // `EicType` is `#[non_exhaustive]` upstream. A type added there has
+            // no code, pattern or noun here, and answering as an unrefined EIC
+            // would drop the narrowing the declaration exists for.
+            Self::Eic(Some(_)) => panic!("an EIC object type this build does not know"),
             Self::Malo => "MALO",
             Self::Melo => "MELO",
             Self::Bdew => "BDEW",
@@ -263,6 +265,7 @@ impl ValueCheck {
             Self::Eic(Some(EicType::TieLine)) => "^[0-9A-Z-]{2}T[0-9A-Z-]{12}[0-9A-Z]$",
             Self::Eic(Some(EicType::Location)) => "^[0-9A-Z-]{2}V[0-9A-Z-]{12}[0-9A-Z]$",
             Self::Eic(Some(EicType::Substation)) => "^[0-9A-Z-]{2}A[0-9A-Z-]{12}[0-9A-Z]$",
+            Self::Eic(Some(_)) => panic!("an EIC object type this build does not know"),
             // Eleven digits. No Codevergabestelle issues a leading zero, which
             // is why `MaloId` refuses one — a value that parses nowhere must not
             // pass the shape check either.
@@ -349,6 +352,7 @@ impl ValueCheck {
             Self::Eic(Some(EicType::TieLine)) => "a T (tie-line) EIC",
             Self::Eic(Some(EicType::Location)) => "a V (location) EIC",
             Self::Eic(Some(EicType::Substation)) => "an A (substation) EIC",
+            Self::Eic(Some(_)) => panic!("an EIC object type this build does not know"),
             Self::Malo => "a MaLo-ID",
             Self::Melo => "a MeLo-ID",
             Self::Bdew => "a Marktpartner-ID",
@@ -378,10 +382,10 @@ impl ValueCheck {
                  names."
             }
             Self::Bdew => {
-                "The thirteenth digit is deliberately not checked, because BDEW's \
-                 Bildungsvorschrift exempts GS1-issued GLNs — so thirteen digits is the \
-                 whole of the rule that can be enforced, and a value failing it is not a \
-                 Marktpartner-ID at all."
+                "A Marktpartner-ID's thirteenth digit is a check digit under BDEW's \
+                 procedure or, for a GS1-issued GLN, under GS1's; a value failing both \
+                 is a mistyped code, not a market participant, and a correction keyed \
+                 on the right one would never reach it."
             }
         }
     }
@@ -493,7 +497,7 @@ pub fn declared_value_check(field: &Field) -> Option<&str> {
 ///
 /// A zero-width interval is the tempting shortcut and makes `MeterInterval` a
 /// lie: `metering` computes `demand_kw` as energy over duration. A point series
-/// carries [`MeterReading`](metering::reading::MeterReading).
+/// carries [`MeterReading`](metering::series::reading::MeterReading).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -953,7 +957,8 @@ impl TableConfig {
         }
         if self.max_pin_age < Duration::ZERO {
             return Err(Error::config(
-                "max_pin_age must not be negative: it is how long one query may hold                  reclamation back before the floor advances anyway",
+                "max_pin_age must not be negative: it is how long one query may hold \
+                 reclamation back before the floor advances anyway",
             ));
         }
 
@@ -1009,7 +1014,12 @@ impl TableConfig {
             && self.identity_columns.iter().any(|f| f.name() == subject)
         {
             return Err(Error::config(format!(
-                "{subject:?} is declared both as an identity column and as the subject                  column. A pseudonymous reference must not join the merge key: a correction                  carrying a re-derived reference would get a different key and silently fail                  to supersede the value it corrects. Erasure does not need it in the key — it                  destroys the mapping, which leaves every row unattributable wherever the                  column sits"
+                "{subject:?} is declared both as an identity column and as the subject \
+                 column. A pseudonymous reference must not join the merge key: a correction \
+                 carrying a re-derived reference would get a different key and silently fail \
+                 to supersede the value it corrects. Erasure does not need it in the key — it \
+                 destroys the mapping, which leaves every row unattributable wherever the \
+                 column sits"
             )));
         }
 
@@ -1393,11 +1403,11 @@ mod tests {
             "DE00056266802AO6G56M11SN51G21M24S"
         );
         assert_eq!(ok(ValueCheck::Malo, " 41373559241 "), "41373559241");
-        assert_eq!(ok(ValueCheck::Bdew, " 9900987654321 "), "9900987654321");
+        assert_eq!(ok(ValueCheck::Bdew, " 9900987654329 "), "9900987654329");
 
-        // And where each one stops. The two with arithmetic refuse a
-        // transposition; the Marktpartner-ID cannot, because BDEW's own
-        // Bildungsvorschrift carves out GS1-issued GLNs.
+        // And where each one stops. All three with arithmetic refuse a
+        // transposition; a Marktpartner-ID passes on BDEW's procedure or on
+        // GS1's, because the Bildungsvorschrift admits GS1-issued GLNs.
         let bad = |c: ValueCheck, text: &str| {
             c.canonicalise("declared", text)
                 .expect_err(text)
@@ -1406,6 +1416,7 @@ mod tests {
         assert!(bad(ValueCheck::Eic(None), "11XBK0000000001B").contains("declared"));
         assert!(bad(ValueCheck::Malo, "41373559214").contains("check digit"));
         assert_eq!(ok(ValueCheck::Bdew, "9900987654320"), "9900987654320");
+        assert!(bad(ValueCheck::Bdew, "9900987654392").contains("declared"));
     }
 
     #[test]

@@ -227,6 +227,9 @@ pub struct Maintenance {
     max_windows: usize,
     expire_snapshots: bool,
     retention: Option<RetentionSweep>,
+    /// The registry the retention sweep runs against — the deployment's, not a
+    /// table's, because the mapping outlives any table's declaration.
+    registry: Option<crate::erasure::SubjectRegistry>,
 }
 
 /// A configured § 60 Abs. 6 sweep: the policy, and who to record as having run it.
@@ -251,7 +254,8 @@ impl Maintenance {
 
     /// Build maintenance for one store, with defaults.
     pub fn new(store: crate::session::MeterStore) -> Self {
-        Self::over(vec![store])
+        let registry = store.subject_registry().cloned();
+        Self::over(vec![store]).with_registry(registry)
     }
 
     /// Build maintenance over several stores — every table of a catalog.
@@ -266,13 +270,28 @@ impl Maintenance {
     /// and the next tick tries again — because the tables share nothing a partial
     /// run could corrupt.
     pub fn over(stores: Vec<crate::session::MeterStore>) -> Self {
+        let registry = stores.iter().find_map(|s| s.subject_registry().cloned());
         Self {
             stores,
             interval: Self::DEFAULT_INTERVAL,
             max_windows: Self::DEFAULT_MAX_WINDOWS,
             expire_snapshots: false,
             retention: None,
+            registry,
         }
+    }
+
+    /// The deployment's subject registry, for the retention sweep, where no
+    /// maintained table carries one.
+    #[must_use]
+    pub(crate) fn with_registry(
+        mut self,
+        registry: Option<crate::erasure::SubjectRegistry>,
+    ) -> Self {
+        if registry.is_some() {
+            self.registry = registry;
+        }
+        self
     }
 
     /// The tables this loop maintains.
@@ -400,15 +419,14 @@ impl Maintenance {
         // longer load-bearing — the sweep reads no relation, only the registry's
         // own `epoch` column — but it stays last because that is where a duty
         // that comes due on a clock belongs in a cycle whose other steps are
-        // about moving data. Over every store because the registry is
-        // deployment-wide: the stores are consulted to find it and to tell
-        // "nothing was due" apart from "this deployment stores no reference".
+        // about moving data. Once per deployment, because the registry is
+        // deployment-wide and carried here independently of any table.
         let (anonymised, retention_failure) = match &self.retention {
             None => (None, None),
             Some(sweep) => {
                 let cutoff = sweep.policy.cutoff(now);
                 match super::catalog::anonymise_across(
-                    self.stores.iter(),
+                    self.registry.as_ref(),
                     cutoff,
                     &sweep.reason,
                     &sweep.actor,
@@ -460,9 +478,9 @@ impl Maintenance {
         // schedule by design; a loser that went on to expire snapshots anyway
         // would have two processes rewriting one table's metadata on their own
         // clocks, racing for a compare-and-swap that only one can win and
-        // reporting the loss as a failed cycle. It also re-stamps the boundary
-        // onto the current snapshot, which is the one step that must not
-        // interleave with a commit moving it.
+        // reporting the loss as a failed cycle. The re-stamp it starts with is
+        // conditional on the snapshot it read, so an archival commit landing in
+        // between makes it re-derive rather than restate an older boundary.
         //
         // Reading `status` below is not a mutation, so every replica still does
         // it — the invariant is worth checking from wherever it is noticed.
@@ -584,7 +602,7 @@ mod tests {
             window: Some(window()),
             rows,
             watermark: window().resulting_watermark(),
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 0,
             lease_contended: false,
             deferred: false,
@@ -597,7 +615,7 @@ mod tests {
             window: None,
             rows: 0,
             watermark: TieringWatermark::empty(),
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 3,
             lease_contended: false,
             deferred: false,

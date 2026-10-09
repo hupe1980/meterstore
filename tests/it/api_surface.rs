@@ -129,7 +129,7 @@ fn the_prelude_carries_only_what_a_caller_writes() {
         .sum::<usize>();
 
     assert_eq!(
-        names, 33,
+        names, 35,
         "the prelude exports {names} names. If the new one is something a caller \
          has to *write* — a builder argument, a struct literal, a trait bound — \
          update the number. If it only ever comes back from a method, leave it at \

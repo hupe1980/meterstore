@@ -5,14 +5,13 @@
 //! cannot see the class of defect that lives **between** two steps — a decision
 //! taken from state read at one moment and served from state read at another.
 //!
-//! Two such defects were found by reading rather than by testing:
+//! Two defects of that class:
 //!
-//! * a query planned before an archival commit and executed after it lost the
-//!   window archival had just moved, because the partition was dropped in the
-//!   same run that committed it;
-//! * a scan whose merge-elision decision was judged against a snapshot older
-//!   than the one it read, so a correction landing in between could be counted
-//!   twice.
+//! * a query planned before an archival commit and executed after it loses the
+//!   window archival just moved if the partition is dropped in the same run
+//!   that committed it;
+//! * a scan whose merge-elision decision is judged against a snapshot older
+//!   than the one it reads counts a correction landing in between twice.
 //!
 //! Neither raises an error, and neither is reachable from a sequential fixture.
 //! This suite is the one that runs the three roles at once and asserts the

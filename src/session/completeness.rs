@@ -1,7 +1,7 @@
 //! Completeness: a missing interval is information, not an empty set.
 //!
 //! Regulators require knowing whether a series is complete, so an aggregate over
-//! an incomplete month must not look like one over a complete month (P1). A
+//! an incomplete month must not look like one over a complete month. A
 //! `SUM` cannot say that — it returns a smaller number and no reason.
 //!
 //! # Why the expected count is not 96
@@ -11,8 +11,8 @@
 //! spring, and — worse — masks a genuine four-interval gap every autumn, which is
 //! the direction that reaches a bill.
 //!
-//! The count comes from [`metering::calendar::intervals_in_day`] against the
-//! series' own declared `resolution`. MeterStore does not implement it (P5), and
+//! The count comes from [`Period::count`](metering::Period::count) against the
+//! series' own declared `resolution`. MeterStore does not implement it, and
 //! this module does not re-derive it: the aggregate below reports what was
 //! *found*, and the expectation is asked of the domain per (day, resolution).
 //!
@@ -33,9 +33,9 @@
 //! The heavy half — group a range by measuring point, channel and local day — is
 //! a single DataFusion aggregate over the resolved table, so it prunes and
 //! streams like any other query. The result is one row per meter-channel-day,
-//! which is small: a month of 100 k meters is ~3 M rows in and ~3 M rows out at
-//! day granularity, and the roll-up to one row per channel happens in Rust,
-//! where the calendar lives.
+//! which is small — a month of 100 k single-channel meters aggregates to ~3 M
+//! rows — and the roll-up to one row per channel happens in Rust, where the
+//! calendar lives.
 //!
 //! The roll-up walks the **range's** balancing days rather than the aggregate's
 //! rows: a `GROUP BY` yields no group for a day with nothing in it, and a day
@@ -52,8 +52,8 @@ use datafusion::logical_expr::{
     Expr, LogicalPlanBuilder, TableProviderFilterPushDown, TableType, col, lit,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use metering::IntervalResolution;
-use metering::interval::Sparte;
+use metering::Resolution;
+use metering::series::interval::Sparte;
 use time::{Date, OffsetDateTime};
 
 use crate::planner::calendar as balancing;
@@ -165,6 +165,19 @@ impl Completeness {
     /// In SQL it is `actual = 0`.
     pub fn is_silent(&self) -> bool {
         self.actual == 0
+    }
+
+    /// Whether a gap report shows this row: short or long, silent, or not
+    /// judgeable at all.
+    ///
+    /// None of the three implies another. A channel with no declared resolution
+    /// has no expectation, so it reports `missing = 0` and calls itself complete
+    /// — including when it delivered nothing, and including when it delivered
+    /// rows nobody can judge. Hiding either would hide a channel the report
+    /// cannot vouch for. In SQL it is
+    /// `NOT complete OR NOT measurable OR actual = 0`.
+    pub fn needs_attention(&self) -> bool {
+        !self.is_complete() || !self.is_measurable() || self.is_silent()
     }
 }
 
@@ -331,10 +344,10 @@ fn is_billable(quality: &str) -> bool {
 /// The aggregate that produces the daily grain.
 ///
 /// Grouped by the **balancing** day, because that is the unit the expectation is
-/// defined over. Grouping by UTC day would put 22:00–24:00 local in the wrong
-/// bucket every day of the year, and the resulting counts would be short by two
-/// hours at one end and long at the other — the exact error the balancing-day
-/// functions exist to stop.
+/// defined over. A UTC day starts at 01:00 or 02:00 Berlin, so grouping by it
+/// would put the first one or two local hours of every day in the previous
+/// day's bucket, and the counts would be short at one end and long at the other
+/// — the exact error the balancing-day functions exist to stop.
 /// Grouping gas by the *calendar* day is the same error six hours wide, so the
 /// bucket follows the row's Sparte.
 fn daily_plan(
@@ -353,7 +366,7 @@ fn daily_plan(
     // billability are domain rules — § 60 Abs. 2 MsbG for the latter — so the
     // query counts flags and Rust asks `metering` which of them mean what. A
     // `CASE` listing the billable set here would be a second copy of the statute
-    // to keep in step (P5).
+    // to keep in step.
     LogicalPlanBuilder::scan(
         table.to_string(),
         datafusion::datasource::provider_as_source(resolved),
@@ -486,6 +499,20 @@ pub(crate) async fn compute(
     discriminators: &[String],
     request: Request<'_>,
 ) -> Result<Vec<Completeness>> {
+    compute_traced(state, resolved, table, discriminators, request)
+        .await
+        .map(|(rows, _)| rows)
+}
+
+/// [`compute`], with the tiers its scans read — what a SQL call's provenance
+/// reports.
+async fn compute_traced(
+    state: &dyn Session,
+    resolved: Arc<dyn TableProvider>,
+    table: &str,
+    discriminators: &[String],
+    request: Request<'_>,
+) -> Result<(Vec<Completeness>, Vec<crate::watermark::Tier>)> {
     let Request {
         from,
         to,
@@ -516,6 +543,7 @@ pub(crate) async fn compute(
         narrowing,
     )?;
     let physical = state.create_physical_plan(&plan).await?;
+    let mut tiers = crate::session::query::tiers_of(&physical);
     let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
     let mut daily: Vec<DailyRow> = Vec::new();
@@ -523,11 +551,39 @@ pub(crate) async fn compute(
         daily.extend(decode_daily(batch, discriminators)?);
     }
 
-    let mut rows = roll_up(daily, from, to);
+    // A day two grids of one channel both delivered on is judged by the time
+    // its rows cover, which takes their spans: counts would net an overlap on
+    // one hour against a gap on another.
+    let mixed = mixed_days(&daily);
+    let coverage = if mixed.is_empty() {
+        Default::default()
+    } else {
+        let plan = span_plan(
+            Arc::clone(&resolved),
+            table,
+            discriminators,
+            &mixed,
+            narrowing,
+        )?;
+        let physical = state.create_physical_plan(&plan).await?;
+        let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
+        let mut spans = Vec::new();
+        for batch in &batches {
+            spans.extend(decode_spans(batch, discriminators)?);
+        }
+        coverage_of(spans, &mixed, from, to)
+    };
+
+    let mut rows = roll_up_covered(daily, from, to, &coverage);
 
     if let Some(since) = seen_since {
         let plan = roster_plan(resolved, table, discriminators, since, from, narrowing)?;
         let physical = state.create_physical_plan(&plan).await?;
+        for tier in crate::session::query::tiers_of(&physical) {
+            if !tiers.contains(&tier) {
+                tiers.push(tier);
+            }
+        }
         let batches = datafusion::physical_plan::collect(physical, state.task_ctx()).await?;
 
         let mut roster = Vec::new();
@@ -548,7 +604,244 @@ pub(crate) async fn compute(
         });
     }
 
-    Ok(rows)
+    Ok((rows, tiers))
+}
+
+/// `(malo_id, obis_code, identity, sparte)`: a channel, whatever its grid.
+type DayKey = (String, String, Vec<(String, String)>, &'static str);
+
+/// What a day several grids delivered on comes to, in the finest grid's
+/// intervals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Coverage {
+    /// The grid the day is charged to: the one whose row starts last.
+    closing: Option<String>,
+    expected: u64,
+    /// Time no row covers.
+    missing: u64,
+    /// Time more than one row covers.
+    surplus: u64,
+}
+
+/// The `(channel, day)`s more than one grid delivered on.
+fn mixed_days(daily: &[DailyRow]) -> std::collections::BTreeSet<(DayKey, Date)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut grids: BTreeMap<(DayKey, Date), BTreeSet<Option<&str>>> = BTreeMap::new();
+    for row in daily {
+        grids
+            .entry((
+                (
+                    row.malo_id.clone(),
+                    row.obis_code.clone(),
+                    row.identity.clone(),
+                    row.sparte.as_str(),
+                ),
+                row.day,
+            ))
+            .or_default()
+            .insert(row.resolution.as_deref());
+    }
+    grids
+        .into_iter()
+        .filter(|(_, g)| g.len() > 1)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// The rows of the mixed days' channels on those days: their starts and grids.
+fn span_plan(
+    resolved: Arc<dyn TableProvider>,
+    table: &str,
+    discriminators: &[String],
+    mixed: &std::collections::BTreeSet<(DayKey, Date)>,
+    narrowing: &[(String, ScalarValue)],
+) -> DfResult<datafusion::logical_expr::LogicalPlan> {
+    let malos: std::collections::BTreeSet<&str> = mixed.iter().map(|(k, _)| k.0.as_str()).collect();
+    let days: std::collections::BTreeSet<Date> = mixed.iter().map(|(_, d)| *d).collect();
+    let filter = col(column::MALO_ID)
+        .in_list(malos.iter().map(|m| lit(m.to_string())).collect(), false)
+        .and(
+            col(column::BALANCING_DAY).in_list(
+                days.iter()
+                    .map(|d| lit(ScalarValue::Date32(Some(crate::encode::schema::date32(*d)))))
+                    .collect(),
+                false,
+            ),
+        );
+    let mut columns = vec![
+        col(column::MALO_ID),
+        col(column::OBIS_CODE),
+        col(column::SPARTE),
+        col(column::RESOLUTION),
+        col(column::BALANCING_DAY).alias("day"),
+        col(column::FROM),
+    ];
+    columns.extend(discriminators.iter().map(col));
+    LogicalPlanBuilder::scan(
+        table.to_string(),
+        datafusion::datasource::provider_as_source(resolved),
+        None,
+    )?
+    .filter(narrow(filter, narrowing))?
+    .project(columns)?
+    .build()
+}
+
+/// One row of a mixed day: where it starts, and on which grid.
+#[derive(Debug, Clone)]
+struct Span {
+    key: DayKey,
+    day: Date,
+    from: OffsetDateTime,
+    resolution: Option<String>,
+}
+
+fn decode_spans(batch: &RecordBatch, discriminators: &[String]) -> Result<Vec<Span>> {
+    let text = |name: &str| -> Result<&StringArray> {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_string_opt::<i32>())
+            .ok_or_else(|| Error::decode(name, "expected a string column"))
+    };
+    let malo = text(column::MALO_ID)?;
+    let obis = text(column::OBIS_CODE)?;
+    let sparte = text(column::SPARTE)?;
+    let resolution = text(column::RESOLUTION)?;
+    let identity_columns = discriminators
+        .iter()
+        .map(|name| text(name))
+        .collect::<Result<Vec<_>>>()?;
+    let day = batch
+        .column_by_name("day")
+        .and_then(|c| c.as_any().downcast_ref::<Date32Array>())
+        .ok_or_else(|| Error::decode("day", "expected a date column"))?;
+    let from = batch
+        .column_by_name(column::FROM)
+        .and_then(|c| c.as_primitive_opt::<crate::arrow::datatypes::TimestampMicrosecondType>())
+        .ok_or_else(|| Error::decode(column::FROM, "expected a timestamp column"))?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        if day.is_null(i) || from.is_null(i) {
+            continue;
+        }
+        let sparte: Sparte = sparte
+            .value(i)
+            .parse()
+            .map_err(|e| Error::decode(column::SPARTE, format!("{:?}: {e}", sparte.value(i))))?;
+        out.push(Span {
+            key: (
+                malo.value(i).to_string(),
+                obis.value(i).to_string(),
+                discriminators
+                    .iter()
+                    .zip(&identity_columns)
+                    .map(|(name, column)| (name.clone(), column.value(i).to_string()))
+                    .collect(),
+                sparte.as_str(),
+            ),
+            day: crate::encode::schema::date_of(day.value(i))?,
+            from: crate::encode::schema::instant(from.value(i))?,
+            resolution: (!resolution.is_null(i)).then(|| resolution.value(i).to_string()),
+        });
+    }
+    Ok(out)
+}
+
+/// Judge each mixed day by the time its rows cover.
+///
+/// Within the day — clipped to the reported range — time no row covers is
+/// `missing` and time more than one covers is `surplus`, both counted in the
+/// finest grid's intervals, rounded up: part of an interval uncovered is an
+/// interval short. A clean conversion mid-day covers the day exactly once and
+/// is complete. A day with a grid of no fixed length (none, or a calendar one)
+/// cannot be measured this way and is left to the per-grid judgement.
+fn coverage_of(
+    spans: Vec<Span>,
+    mixed: &std::collections::BTreeSet<(DayKey, Date)>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> std::collections::BTreeMap<(DayKey, Date), Coverage> {
+    use std::collections::BTreeMap;
+    let mut by_day: BTreeMap<(DayKey, Date), Vec<Span>> = BTreeMap::new();
+    for span in spans {
+        let key = (span.key.clone(), span.day);
+        if mixed.contains(&key) {
+            by_day.entry(key).or_default().push(span);
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    'day: for ((key, day), mut rows) in by_day {
+        let Ok(sparte) = key.3.parse::<Sparte>() else {
+            continue;
+        };
+        let Some((start, end)) = balancing::balancing_day_bounds(day, sparte) else {
+            continue;
+        };
+        let (lo, hi) = (start.max(from), end.min(to));
+        if hi <= lo {
+            continue;
+        }
+        let mut intervals = Vec::with_capacity(rows.len());
+        let mut finest: Option<(u32, String)> = None;
+        for row in &rows {
+            let Some(seconds) = row
+                .resolution
+                .as_deref()
+                .and_then(|r| r.parse::<Resolution>().ok())
+                .and_then(Resolution::fixed_seconds)
+            else {
+                continue 'day;
+            };
+            if finest.as_ref().is_none_or(|(s, _)| seconds < *s) {
+                finest = Some((seconds, row.resolution.clone().unwrap_or_default()));
+            }
+            let a = row.from.max(lo);
+            let b = (row.from + time::Duration::seconds(i64::from(seconds))).min(hi);
+            if b > a {
+                intervals.push((a, b));
+            }
+        }
+        let Some((step, finest)) = finest else {
+            continue;
+        };
+
+        intervals.sort();
+        let mut union = time::Duration::ZERO;
+        let mut total = time::Duration::ZERO;
+        let mut reach: Option<OffsetDateTime> = None;
+        for (a, b) in &intervals {
+            total += *b - *a;
+            match reach {
+                Some(r) if *a < r => {
+                    if *b > r {
+                        union += *b - r;
+                        reach = Some(*b);
+                    }
+                }
+                _ => {
+                    union += *b - *a;
+                    reach = Some(*b);
+                }
+            }
+        }
+        let units = |d: time::Duration| -> u64 {
+            let s = d.whole_seconds().max(0) as u64;
+            s.div_ceil(u64::from(step))
+        };
+        rows.sort_by_key(|r| r.from);
+        out.insert(
+            (key, day),
+            Coverage {
+                closing: rows.last().and_then(|r| r.resolution.clone()),
+                expected: expected_in_day(day, Some(&finest), sparte, from, to),
+                missing: units((hi - lo) - union),
+                surplus: units(total - union),
+            },
+        );
+    }
+    out
 }
 
 /// One roster entry: a channel that reported in the reference window.
@@ -705,10 +998,16 @@ fn expectations(
 /// what lets [`roll_up`] compute the span once for a channel and the
 /// expectations once per grid, rather than either of them once per reported row.
 fn day_span(from: OffsetDateTime, to: OffsetDateTime, sparte: Sparte) -> Vec<Date> {
-    let mut day = balancing::balancing_day(from, sparte);
     // `to` is exclusive, so the last day is the one holding the final instant
-    // inside the range rather than the one `to` itself falls on.
-    let last = balancing::balancing_day(to - time::Duration::nanoseconds(1), sparte);
+    // inside the range rather than the one `to` itself falls on. A range the
+    // calendar cannot place holds no balancing day — and no stored row, since
+    // the encoder refuses one there.
+    let (Some(mut day), Some(last)) = (
+        balancing::balancing_day(from, sparte),
+        balancing::balancing_day(to - time::Duration::nanoseconds(1), sparte),
+    ) else {
+        return Vec::new();
+    };
 
     let mut out = Vec::new();
     while day <= last {
@@ -808,7 +1107,19 @@ fn decode_daily(batch: &RecordBatch, discriminators: &[String]) -> Result<Vec<Da
 /// first grid it used. Charging it to every grid would report a clean conversion
 /// as two badly incomplete halves. For a single-grid channel this is simply "the
 /// whole range".
+#[cfg(test)]
 fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Vec<Completeness> {
+    roll_up_covered(daily, from, to, &Default::default())
+}
+
+/// The roll-up, with the days several grids delivered on judged by
+/// [`coverage`](coverage_of) rather than per grid.
+fn roll_up_covered(
+    daily: Vec<DailyRow>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    coverage: &std::collections::BTreeMap<(DayKey, Date), Coverage>,
+) -> Vec<Completeness> {
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `(malo_id, obis_code, identity, sparte)` — the unit an **absent** day is
@@ -962,6 +1273,30 @@ fn roll_up(daily: Vec<DailyRow>, from: OffsetDateTime, to: OffsetDateTime) -> Ve
         let mut tallies: Vec<Tally> = (0..group.len()).map(|_| Tally::default()).collect();
         for (index, day) in span.iter().enumerate() {
             let delivered_by = days_reported.and_then(|d| d.get(day));
+            // Several grids on this day: judged once, by covered time, and
+            // charged to the grid in force at the day's end.
+            let day_key: DayKey = (
+                attribution.0.clone(),
+                attribution.1.clone(),
+                attribution.2.clone(),
+                attribution.3,
+            );
+            if let Some(covered) = coverage.get(&(day_key, *day)) {
+                in_force = covered.closing.clone();
+                if let Some(slot) = group
+                    .iter()
+                    .position(|(key, _)| key.1 == covered.closing)
+                    .map(|i| &mut tallies[i])
+                {
+                    slot.expected += covered.expected;
+                    slot.missing += covered.missing;
+                    slot.surplus += covered.surplus;
+                    if covered.missing > 0 && slot.first_gap.is_none() {
+                        slot.first_gap = Some(*day);
+                    }
+                }
+                continue;
+            }
             // A conversion takes effect on the first day only the new grid
             // reports. While the old one is still delivering it stays in force,
             // which is both the operational reading and the only one that does
@@ -1044,7 +1379,7 @@ fn expected_in_day(
     from: OffsetDateTime,
     to: OffsetDateTime,
 ) -> u64 {
-    let Some(parsed) = resolution.and_then(|r| r.parse::<IntervalResolution>().ok()) else {
+    let Some(parsed) = resolution.and_then(|r| r.parse::<Resolution>().ok()) else {
         return 0;
     };
     let Some(full) = balancing::expected_intervals_in_balancing_day(day, parsed, sparte) else {
@@ -1058,7 +1393,9 @@ fn expected_in_day(
         return 0;
     }
 
-    let (start, end) = balancing::balancing_day_bounds(day, sparte);
+    let Some((start, end)) = balancing::balancing_day_bounds(day, sparte) else {
+        return 0;
+    };
     let length = end - start;
 
     // Fully inside the range: the common case, and the only one where the day's
@@ -1310,25 +1647,35 @@ impl<'a> std::future::IntoFuture for CompletenessQuery<'a> {
 
 /// `meter_completeness(from, to)` — completeness as a queryable table.
 ///
-/// Registered by [`MeterStore`], so the table it reports on is the store's own.
-/// The optional leading argument names it, matching the report's spelling; passing a
-/// different name is an error rather than a silent report on the wrong table.
+/// One function per session, holding a binding for every table the session
+/// serves: a [`MeterStore`] registers it over its own table, and a
+/// [`MeterCatalog`] registers it again over all of its tables once they are
+/// built, so which table a call reports on never depends on registration
+/// order. The optional leading argument names the table, by its configured or
+/// its resolved name. Without it the call reports on the one table there is;
+/// over several it is refused, naming them, rather than answering about
+/// whichever one a default would pick.
 ///
 /// [`MeterStore`]: crate::session::MeterStore
+/// [`MeterCatalog`]: crate::session::MeterCatalog
 #[derive(Debug)]
 pub struct CompletenessFunction {
+    tables: Vec<CompletenessBinding>,
+}
+
+/// One table a [`CompletenessFunction`] can report on.
+#[derive(Debug, Clone)]
+pub struct CompletenessBinding {
     resolved: Arc<dyn TableProvider>,
     table: String,
     discriminators: Vec<String>,
 }
 
-impl CompletenessFunction {
-    /// Bind the function to a store's resolved table.
-    ///
-    /// `discriminators` are the table's merge-key columns beyond
-    /// `(malo_id, obis_code, from)` — what the report groups by and reports, so
-    /// that two tenants' or two meters' rows are two rows rather than one wrong
-    /// one.
+impl CompletenessBinding {
+    /// A table's resolved provider, its resolved name, and its discriminators —
+    /// the merge-key columns beyond `(malo_id, obis_code, from)`, which the
+    /// report groups by so that two tenants' or two meters' rows are two rows
+    /// rather than one wrong one.
     pub fn new(
         resolved: Arc<dyn TableProvider>,
         table: impl Into<String>,
@@ -1339,6 +1686,17 @@ impl CompletenessFunction {
             table: table.into(),
             discriminators,
         }
+    }
+
+    fn answers_to(&self, name: &str) -> bool {
+        name == self.table || crate::session::store::resolved_name(name) == self.table
+    }
+}
+
+impl CompletenessFunction {
+    /// A function over the given tables.
+    pub fn new(tables: Vec<CompletenessBinding>) -> Self {
+        Self { tables }
     }
 
     /// The SQL name.
@@ -1370,20 +1728,39 @@ impl datafusion::catalog::TableFunctionImpl for CompletenessFunction {
             }
         };
 
-        if let Some(requested) = name
-            && requested != self.table
-            && requested != crate::session::store::resolved_name(&self.table)
-        {
-            return Err(DataFusionError::Plan(format!(
-                "this store manages {:?}, not {requested:?}",
-                self.table
-            )));
-        }
+        let names = || {
+            self.tables
+                .iter()
+                .map(|b| b.table.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let binding = match (name, self.tables.as_slice()) {
+            (Some(requested), tables) => tables
+                .iter()
+                .find(|b| b.answers_to(&requested))
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "{requested:?} is not a table this session serves: {}",
+                        names()
+                    ))
+                })?,
+            (None, [one]) => one,
+            (None, _) => {
+                return Err(DataFusionError::Plan(format!(
+                    "{} needs a table name here, because this session serves several: {}. \
+                     Write {}(table, from, to)",
+                    Self::NAME,
+                    names(),
+                    Self::NAME,
+                )));
+            }
+        };
 
         Ok(Arc::new(CompletenessProvider {
-            resolved: Arc::clone(&self.resolved),
-            table: self.table.clone(),
-            discriminators: self.discriminators.clone(),
+            resolved: Arc::clone(&binding.resolved),
+            table: binding.table.clone(),
+            discriminators: binding.discriminators.clone(),
             from: as_instant(from)?,
             to: as_instant(to)?,
             seen_since: seen_since.map(as_instant).transpose()?,
@@ -1404,8 +1781,12 @@ fn as_string(expr: &Expr) -> DfResult<String> {
 /// Reads a literal argument as an instant.
 ///
 /// Accepts the spellings SQL produces for a timestamp literal, including a bare
-/// string — `'2026-03-01'` is what an operator types, and rejecting it in favour
-/// of `TIMESTAMP '2026-03-01'` would be pedantry rather than safety.
+/// date — `'2026-03-01'` is what an operator types. A date names a German
+/// calendar day, so it is read as the start of that day in Berlin: the Strom
+/// balancing day, from `metering`'s calendar. Read as UTC midnight it would
+/// start a March report at 01:00 Berlin and lose an hour of the month. A gas
+/// range starts at 06:00 and is written as instants. A typed `TIMESTAMP` is an
+/// instant already and is taken as given.
 fn as_instant(expr: &Expr) -> DfResult<OffsetDateTime> {
     use time::format_description::well_known::Rfc3339;
 
@@ -1415,7 +1796,11 @@ fn as_instant(expr: &Expr) -> DfResult<OffsetDateTime> {
         Expr::Literal(ScalarValue::TimestampSecond(Some(v), _), _) => Some(v * 1_000_000),
         Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), _), _) => Some(v / 1_000),
         Expr::Literal(ScalarValue::Date32(Some(days)), _) => {
-            Some(i64::from(*days) * 86_400 * 1_000_000)
+            let date = time::Date::from_julian_day(
+                time::macros::date!(1970 - 01 - 01).to_julian_day() + days,
+            )
+            .map_err(|e| DataFusionError::Plan(format!("date out of range: {e}")))?;
+            return berlin_day_start(date);
         }
         _ => None,
     };
@@ -1434,12 +1819,23 @@ fn as_instant(expr: &Expr) -> DfResult<OffsetDateTime> {
         &text,
         &time::macros::format_description!("[year]-[month]-[day]"),
     )
-    .map(|d| d.midnight().assume_utc())
     .map_err(|e| {
         DataFusionError::Plan(format!(
             "{text:?} is not an RFC 3339 timestamp or a YYYY-MM-DD date: {e}"
         ))
     })
+    .and_then(berlin_day_start)
+}
+
+/// The instant a calendar day starts in Berlin.
+fn berlin_day_start(date: Date) -> DfResult<OffsetDateTime> {
+    balancing::balancing_day_bounds(date, Sparte::Strom)
+        .map(|(start, _)| start)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{date} is outside the years the calendar has rules for"
+            ))
+        })
 }
 
 /// The provider one `meter_completeness(...)` call produces.
@@ -1488,7 +1884,7 @@ impl TableProvider for CompletenessProvider {
         // applies it above this provider. The typed builder's `malo`/`obis`
         // narrowing exists because a Rust caller has no `WHERE` to write and
         // would otherwise compute a portfolio to read one meter.
-        let rows = compute(
+        let (rows, tiers) = compute_traced(
             state,
             Arc::clone(&self.resolved),
             &self.table,
@@ -1505,9 +1901,11 @@ impl TableProvider for CompletenessProvider {
 
         let batch = completeness_batch(&rows, &self.discriminators)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        MemTable::try_new(completeness_schema(&self.discriminators), vec![vec![batch]])?
-            .scan(state, projection, filters, limit)
-            .await
+        let inner =
+            MemTable::try_new(completeness_schema(&self.discriminators), vec![vec![batch]])?
+                .scan(state, projection, filters, limit)
+                .await?;
+        Ok(Arc::new(CompletenessExec { inner, tiers }))
     }
 
     fn supports_filters_pushdown(
@@ -1518,12 +1916,107 @@ impl TableProvider for CompletenessProvider {
     }
 }
 
+/// The table a completeness provider reports on, for attributing a statement's
+/// boundary to it.
+pub(crate) fn reported_table(provider: &dyn TableProvider) -> Option<&str> {
+    provider
+        .as_any()
+        .downcast_ref::<CompletenessProvider>()
+        .map(|p| p.table.as_str())
+}
+
+/// The computed report, carrying the tiers its computation read.
+///
+/// The rows are computed at plan time and served from memory, so the plan a
+/// result's provenance is read from holds no scan of either tier. This node
+/// carries what the computation's own scans read, so a completeness answer
+/// reports the tiers it came from rather than none.
+#[derive(Debug)]
+pub(crate) struct CompletenessExec {
+    inner: Arc<dyn ExecutionPlan>,
+    pub(crate) tiers: Vec<crate::watermark::Tier>,
+}
+
+impl datafusion::physical_plan::DisplayAs for CompletenessExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "CompletenessExec: tiers={:?}", self.tiers)
+    }
+}
+
+impl ExecutionPlan for CompletenessExec {
+    fn name(&self) -> &str {
+        "CompletenessExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let [inner] = <[_; 1]>::try_from(children).map_err(|_| {
+            DataFusionError::Internal("CompletenessExec takes one child".to_string())
+        })?;
+        Ok(Arc::new(Self {
+            inner,
+            tiers: self.tiers.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DfResult<datafusion::physical_plan::SendableRecordBatchStream> {
+        self.inner.execute(partition, context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use time::macros::{date, datetime};
 
     const FROM: OffsetDateTime = datetime!(2026-03-01 00:00 UTC);
+
+    #[test]
+    fn a_bare_date_is_the_start_of_that_day_in_berlin() {
+        // Winter and summer: 23:00 and 22:00 UTC the evening before. UTC
+        // midnight would start a March report at 01:00 Berlin and lose an hour.
+        let text = |t: &str| Expr::Literal(ScalarValue::Utf8(Some(t.to_string())), None);
+        assert_eq!(
+            as_instant(&text("2026-03-01")).unwrap(),
+            datetime!(2026-02-28 23:00 UTC)
+        );
+        assert_eq!(
+            as_instant(&text("2026-07-01")).unwrap(),
+            datetime!(2026-06-30 22:00 UTC)
+        );
+        let days = (date!(2026 - 03 - 01) - date!(1970 - 01 - 01)).whole_days() as i32;
+        assert_eq!(
+            as_instant(&Expr::Literal(ScalarValue::Date32(Some(days)), None)).unwrap(),
+            datetime!(2026-02-28 23:00 UTC)
+        );
+        // An instant is taken as given.
+        assert_eq!(
+            as_instant(&text("2026-03-01T00:00:00Z")).unwrap(),
+            datetime!(2026-03-01 00:00 UTC)
+        );
+    }
     const TO: OffsetDateTime = datetime!(2026-04-01 00:00 UTC);
 
     /// The exact balancing-day range covering `[first, last]` inclusive.
@@ -1534,8 +2027,8 @@ mod tests {
     /// the opposite of what the report means.
     fn over(first: Date, last: Date, sparte: Sparte) -> (OffsetDateTime, OffsetDateTime) {
         (
-            balancing::balancing_day_bounds(first, sparte).0,
-            balancing::balancing_day_bounds(last, sparte).1,
+            balancing::balancing_day_bounds(first, sparte).unwrap().0,
+            balancing::balancing_day_bounds(last, sparte).unwrap().1,
         )
     }
 
@@ -1723,6 +2216,32 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_report_keeps_what_it_cannot_judge() {
+        let d = date!(2026 - 03 - 02);
+        let (from, to) = day(d);
+        let judged = |daily: DailyRow| roll_up(vec![daily], from, to).remove(0);
+
+        assert!(!judged(row(d, 96, "MEASURED")).needs_attention());
+        assert!(judged(row(d, 92, "MEASURED")).needs_attention(), "short");
+
+        let mut silent = judged(row(d, 96, "MEASURED"));
+        silent.actual = 0;
+        assert!(silent.needs_attention(), "silent");
+
+        let mut unjudgeable = row(d, 96, "MEASURED");
+        unjudgeable.resolution = None;
+        let unjudgeable = judged(unjudgeable);
+        assert!(
+            unjudgeable.is_complete(),
+            "no expectation, so nothing missing"
+        );
+        assert!(
+            unjudgeable.needs_attention(),
+            "delivered rows nobody can judge are not hidden"
+        );
+    }
+
+    #[test]
     fn a_series_with_no_resolution_is_not_measurable() {
         // Without a declared resolution there is no expectation. Assuming 15
         // minutes would invent a gap or invent completeness.
@@ -1814,6 +2333,11 @@ mod tests {
 
     #[test]
     fn a_conversion_day_does_not_move_the_grid_while_the_old_one_still_delivers() {
+        // The per-grid fallback, reached in production when a grid of the day has
+        // no fixed length (a calendar one). Driven here through `roll_up`, which
+        // computes no coverage, so two fixed grids stand in for the shape: what
+        // is pinned is that the fallback's attribution does not depend on scan
+        // order.
         // The 3rd holds both grids — a meter converted part-way through a day —
         // and the 4th holds nothing. Reading the day's grid as "whichever the
         // aggregate yielded first" would put the 4th on one row or the other
@@ -1861,6 +2385,73 @@ mod tests {
         assert_eq!(by_grid["PT1H"].first_gap, Some(date!(2026 - 03 - 03)));
         // The quarter-hourly row judges only the day it delivered on.
         assert_eq!(by_grid["PT15M"].expected, 96);
+    }
+
+    /// Rows on one grid, every `step` from `first`, `count` of them.
+    fn spans(first: OffsetDateTime, count: i64, grid: &str, minutes: i64) -> Vec<Span> {
+        (0..count)
+            .map(|i| Span {
+                key: (
+                    "12345678905".into(),
+                    "1-0:1.8.0".into(),
+                    Vec::new(),
+                    Sparte::Strom.as_str(),
+                ),
+                day: date!(2026 - 03 - 03),
+                from: first + time::Duration::minutes(minutes * i),
+                resolution: Some(grid.into()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_day_two_grids_share_is_judged_by_the_time_it_covers() {
+        let d = date!(2026 - 03 - 03);
+        let (from, to) = day(d);
+        let start = from;
+        let quarter = |n| row(d, n, "MEASURED");
+        let hourly = |n| {
+            let mut r = row(d, n, "MEASURED");
+            r.resolution = Some("PT1H".into());
+            r
+        };
+        let judge = |rows: Vec<Span>, daily: Vec<DailyRow>| {
+            let mixed = mixed_days(&daily);
+            let coverage = coverage_of(rows, &mixed, from, to);
+            roll_up_covered(daily, from, to, &coverage)
+        };
+
+        // A clean conversion at noon: the day is covered once, so complete,
+        // and charged to the grid in force at its end.
+        let clean = [
+            spans(start, 48, "PT15M", 15),
+            spans(start + time::Duration::hours(12), 12, "PT1H", 60),
+        ]
+        .concat();
+        let out = judge(clean, vec![quarter(48), hourly(12)]);
+        let hourly_row = out
+            .iter()
+            .find(|r| r.resolution.as_deref() == Some("PT1H"))
+            .unwrap();
+        assert_eq!((hourly_row.missing, hourly_row.surplus), (0, 0));
+        assert_eq!(hourly_row.expected, 96, "in the finer grid's intervals");
+        assert!(out.iter().all(Completeness::is_complete), "{out:?}");
+
+        // An hour delivered twice and an hour delivered never: counts would
+        // net them to complete; covered time reports both.
+        let overlapped = [
+            spans(start, 48, "PT15M", 15),
+            spans(start + time::Duration::hours(11), 12, "PT1H", 60),
+        ]
+        .concat();
+        let out = judge(overlapped, vec![quarter(48), hourly(12)]);
+        let charged = out
+            .iter()
+            .find(|r| r.resolution.as_deref() == Some("PT1H"))
+            .unwrap();
+        assert_eq!(charged.surplus, 4, "one hour twice, in quarter-hours");
+        assert_eq!(charged.missing, 4, "the last hour, uncovered");
+        assert_eq!(charged.first_gap, Some(d));
     }
 
     #[test]

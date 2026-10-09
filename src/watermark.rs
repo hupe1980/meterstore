@@ -83,6 +83,19 @@ pub const ROW_COUNT_PROPERTY: &str = "meterstore.row_count";
 /// that drives months in milliseconds drives the grace with them.
 pub const ARCHIVED_AT_PROPERTY: &str = "meterstore.archived_at";
 
+/// The snapshot summary property naming **the commit that wrote the snapshot**,
+/// the same on every attempt of it (a UUIDv7).
+///
+/// How an ambiguous outcome is resolved: after a timeout, a reset connection or
+/// a conflict, the commit looks for its own id on `main` back to the base it
+/// was derived from, and a commit that already landed is reported as landed
+/// rather than retried into a second copy or discarded with its files.
+///
+/// Found only while its snapshot is on `main`: the lookup runs right after the
+/// commit, long before any retention could expire it, and a snapshot expired by
+/// then would be one the commit itself had already been superseded past.
+pub const COMMIT_ID_PROPERTY: &str = "meterstore.commit_id";
+
 /// Which tier a given interval belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -347,7 +360,7 @@ mod tests {
         // boundary it found, so the general helper must admit equality. An
         // **archival** commit is stricter — `Summary::Advance` refuses a window
         // already at the boundary, because equality there means another writer
-        // committed it and appending would duplicate the rows (R23).
+        // committed it and appending would duplicate the rows.
         assert!(w.can_advance_to(w), "idempotent re-advance is legal");
 
         let err = w.advance_to("readings_versions", back).unwrap_err();

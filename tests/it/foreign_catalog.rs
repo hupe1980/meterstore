@@ -2,8 +2,8 @@
 //!
 //! `IcebergCold::new` takes a pre-built `Arc<dyn Catalog>` precisely so a
 //! deployment can bring a REST catalog, Glue, Polaris, Lakekeeper or Nessie.
-//! That is the whole extension story for the cold tier, and until now every test
-//! reached it through the implementations the crate builds itself.
+//! That is the whole extension story for the cold tier, and every other test
+//! reaches it through the implementations the crate builds itself.
 //!
 //! A seam that has only ever been exercised by the thing on the near side of it
 //! is a seam nobody has tested. This drives the store through a catalog

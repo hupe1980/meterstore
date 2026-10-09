@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -11,8 +11,8 @@ documentation = "https://docs.rs/meterstore"
 keywords = ["metering", "iceberg", "timeseries", "postgres"]
 categories = ["database", "data-structures"]
 readme = "README.md"
-# Set by the highest dependency floor (metering and iceberg both want
-# 1.94), not by this crate's own syntax, which needs only 1.88.
+# Set by the highest dependency floor (`iceberg` 0.10 wants 1.94), not by this
+# crate's own syntax or by `metering` 0.25, both of which need only 1.88.
 rust-version = "1.94"
 
 # The crate documentation describes Flight SQL, the façade and the testkit, none
@@ -21,7 +21,7 @@ rust-version = "1.94"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# Full debug info makes each test binary ~420 MB of dependency DWARF, and twenty
+# Full debug info makes each test binary ~420 MB of dependency DWARF, and enough
 # of those exhaust a CI runner's disk — reported by `rust-lld` as a bus error.
 # `line-tables-only` keeps `file:line` in a backtrace. Set `debug = true` locally
 # to step through a dependency.
@@ -73,24 +73,30 @@ iceberg-catalog-s3tables = { version = "0.10", optional = true }
 # --- Hot Tier: PostgreSQL ---
 # The defaults (`any`, `macros`, `migrate`, `json`) are unused — every statement
 # is a runtime `sqlx::query` — and carry the optional SQLite driver.
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+# `tls-rustls-aws-lc-rs`: without a TLS backend every connection is plaintext,
+# and `sslmode=require` cannot be satisfied at all. aws-lc-rs because it is the
+# one rustls provider already in the graph — `reqwest`, `bollard` and the AWS
+# SDK use it — and two providers with neither installed as the process default
+# is a `rustls` panic. Feature unification gives the SQL catalogue's `sqlx` the
+# same backend.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 # Asked of the driver, not the facade: `sqlx/time` names `sqlx-sqlite?/time`, and
 # naming an optional dependency is enough to put it in the resolve graph.
 sqlx-postgres = { version = "0.8", default-features = false, features = ["time", "rust_decimal"] }
 
 # --- Domain Layer ---
-# The domain layer (hupe1980/mako): every quantity, calendar, unit, quality flag
+# The domain layer (hupe1980/metering): every quantity, calendar, unit, quality flag
 # and identifier is its type, and this crate computes with none of them. A floor
 # rather than a preference — `ids::{BdewCode, Eic, MaloId, MeloId}` are what a
-# `check =` column parses with, and `wire::rfc3339` fixes the stored shape of
-# `provenance`.
-metering = { version = "0.24", features = ["serde"] }
+# `check =` column parses with.
+metering = { version = "0.25", features = ["serde"] }
 
 # `metering`'s choice, not chrono: mixing the two would convert at every row.
 # Deliberately without `serde-human-readable` — `time`'s serde impl is
 # feature-conditional, so enabling it would make the stored shape of `provenance`
-# depend on what else is in the binary. `encode::encode_provenance` writes it.
-time = { version = "0.3", features = ["macros"] }
+# depend on what else is in the binary. `delivery` formats the instant itself,
+# which is what `formatting` and `parsing` are for.
+time = { version = "0.3", features = ["macros", "formatting", "parsing"] }
 time-tz = "2"
 # Settlement is money — never f64.
 rust_decimal = "1"
@@ -117,6 +123,8 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# A commit's id, so an unanswered commit can be looked for rather than guessed.
+uuid = { version = "1.26", default-features = false, features = ["v7"] }
 toml = "1.1"
 # Metrics only. The library records; installing an SDK is the application's
 # decision, so nothing here pulls one.
@@ -137,6 +145,16 @@ tonic = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 # `catalog-facade`: the read-only Iceberg REST endpoint.
 axum = { version = "0.8", optional = true }
+
+# The REST catalogue's HTTPS client. `iceberg-catalog-rest` builds `reqwest`
+# with no TLS backend, so an `https://` catalogue is unreachable through its own
+# client; this crate builds one and hands it over. `-no-provider` because every
+# provider-bundling feature selects `ring`, and the client is built on the
+# aws-lc-rs provider explicitly; the operating system's trust store verifies,
+# as it does for the object stores' `reqwest`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 
 # --- Optional: the `testkit` feature ---
 # `default-features = false` because the default of each is `["ring"]`, which
@@ -164,6 +182,10 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }
 # Collects an `axum::body::Body` back into bytes in those tests.
 http-body-util = "0.1"
+# An in-memory meter provider, so a test can read back the gauges an operator
+# alerts on. Installed in a test binary of its own: the crate's instruments bind
+# to the global provider once, at first use.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
 [features]
 default = ["rest-catalog", "sql-catalog"]
@@ -178,7 +200,7 @@ object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 # Gravitino. Default, because `CatalogKind::Rest` is what a configuration file
 # that says nothing selects, and a default naming a catalogue the crate could not
 # construct is a default nobody can take.
-rest-catalog = ["dep:iceberg-catalog-rest"]
+rest-catalog = ["dep:iceberg-catalog-rest", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier"]
 # The cold tier on a PostgreSQL-backed Iceberg SQL catalogue: one database to
 # operate. Default; turn it off in a workspace that also links SQLite.
 sql-catalog = ["dep:iceberg-catalog-sql"]

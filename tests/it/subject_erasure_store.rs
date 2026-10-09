@@ -10,7 +10,7 @@
 // across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
@@ -26,7 +26,7 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -231,13 +231,14 @@ fn reading(subject: Option<&str>) -> StoredSeries {
 /// The same, at a chosen interval start — for the retention sweep, whose whole
 /// question is how old a subject's readings are.
 fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
-    let interval = metering::interval::MeterInterval {
+    let interval = metering::series::interval::MeterInterval::new(
         from,
-        to: from + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(42, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "1-0:1.8.0".parse().ok(),
-    };
+        from + Duration::minutes(15),
+        rust_decimal::Decimal::new(42, 0),
+        metering::QualityFlag::Measured,
+    )
+    .expect("a non-empty interval")
+    .with_obis("1-0:1.8.0".parse().unwrap());
     let series = MeasurementSeries::new(
         "11111111115".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
@@ -254,7 +255,7 @@ fn reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
         ScopedVersion::new(
             // Derived from the interval, not from a fixture constant: a scope
             // that does not cover its intervals is refused at encode time.
-            VersionScope::for_interval("9900000000001", from, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", from, Sparte::Strom).unwrap(),
             Version::new(1).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -779,13 +780,14 @@ async fn a_sweep_needs_no_session_at_all_so_a_restricted_view_cannot_skew_it() {
 /// Gas is the only commodity whose balancing day is not the calendar day, so it
 /// is the only one where the epoch and the wall-clock year can disagree.
 fn gas_reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
-    let interval = metering::interval::MeterInterval {
+    let interval = metering::series::interval::MeterInterval::new(
         from,
-        to: from + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(42, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "7-1:99.33.0".parse().ok(),
-    };
+        from + Duration::minutes(15),
+        rust_decimal::Decimal::new(42, 0),
+        metering::QualityFlag::Measured,
+    )
+    .expect("a non-empty interval")
+    .with_obis("7-1:99.33.0".parse().unwrap());
     let series = MeasurementSeries::new(
         "11111111115".parse().unwrap(),
         "7-1:99.33.0".parse().ok(),
@@ -801,7 +803,7 @@ fn gas_reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
         Sparte::Gas,
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", from, Sparte::Gas).unwrap(),
+            VersionScope::for_interval("9900000000003", from, Sparte::Gas).unwrap(),
             Version::new(1).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -815,7 +817,7 @@ fn gas_reading_at(from: OffsetDateTime, subject: Option<&str>) -> StoredSeries {
 
 #[tokio::test]
 async fn a_gas_reading_in_the_first_hours_of_the_year_is_storable() {
-    // The regression. `2026-01-01T00:00Z` is 01:00 on New Year's Day in Berlin:
+    // `2026-01-01T00:00Z` is 01:00 on New Year's Day in Berlin:
     // calendar year 2026, and still Gastag 2025-12-31 — the day it is balanced,
     // settled and invoiced on.
     //
@@ -993,5 +995,89 @@ async fn a_request_that_arrives_before_the_ingest_is_still_honoured() {
             .await
             .is_err(),
         "the delivery that follows must not rebuild the link"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_runs_for_a_deployment_that_no_longer_declares_a_subject_column() {
+    // The mapping outlives every table's declaration: a deployment that has
+    // stopped declaring a subject column still owes the sweep for the rows it
+    // wrote. The catalog holds the registry itself, so the sweep needs no table.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let pool = PgPool::connect(&url).await.expect("connect");
+    let hot = Arc::new(PostgresHot::new(pool.clone()));
+    let warehouse = tempfile::tempdir().expect("warehouse");
+    let iceberg_catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+        .load(
+            "meterstore",
+            std::collections::HashMap::from([
+                (SQL_CATALOG_PROP_URI.to_string(), url.clone()),
+                (
+                    SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                    format!("file://{}", warehouse.path().display()),
+                ),
+                (
+                    SQL_CATALOG_PROP_BIND_STYLE.to_string(),
+                    SqlBindStyle::DollarNumeric.to_string(),
+                ),
+            ]),
+        )
+        .await
+        .expect("catalog");
+    let cold = Arc::new(IcebergCold::new(
+        Arc::new(iceberg_catalog) as Arc<dyn Catalog>,
+        NamespaceIdent::new("metering".to_string()),
+        8 * 1024 * 1024,
+    ));
+    let registry = SubjectRegistry::new(pool);
+    registry.create_tables().await.expect("registry tables");
+    // A mapping row from a year long past the ceiling.
+    registry
+        .register_in_epoch("12345678905", 2015)
+        .await
+        .expect("an old registration");
+
+    let config = TableConfig::new("no_subject_readings")
+        .build()
+        .expect("config");
+    let hot_dyn: Arc<dyn HotStore> = hot;
+    let cold_dyn: Arc<dyn ColdStore> = cold.clone();
+    let catalog = meterstore::MeterCatalog::builder()
+        .table(
+            MeterStore::builder()
+                .hot(hot_dyn)
+                .cold(cold_dyn, {
+                    cold.create_tables(
+                        config.name(),
+                        &config.identity_column_names(),
+                        &config.extra_columns(),
+                        &config.maintenance_policy(),
+                    )
+                    .await
+                    .expect("cold table");
+                    cold.table_provider(config.name()).await.expect("provider")
+                })
+                .table(config),
+        )
+        .subject_registry(registry)
+        .build()
+        .await
+        .expect("catalog");
+
+    let swept = catalog
+        .anonymise_before(
+            datetime!(2023-01-01 00:00 UTC),
+            "§ 60 Abs. 6 MsbG",
+            "retention-job",
+            datetime!(2026-07-01 00:00 UTC),
+        )
+        .await
+        .expect("the sweep runs without a subject column");
+    assert!(
+        swept.subjects >= 1,
+        "the due mapping row was swept: {swept:?}"
     );
 }

@@ -11,6 +11,9 @@
 
 # --- The hot tier: PostgreSQL holds the recent interval window. ---
 [hot]
+# Verified TLS unless the URL (or PGSSLMODE) says otherwise: no sslmode means
+# verify-full; add sslrootcert=/path/to/ca.pem for a private CA. prefer and allow
+# are refused, because each falls back to plaintext without a word.
 url = "${DATABASE_URL}"
 max_connections = 16
 
@@ -36,6 +39,7 @@ ddl_lock_timeout = "3s"
 # side. "s3tables" for an AWS S3 Tables bucket, where `warehouse` below is the
 # table bucket ARN and `uri` is unused.
 catalog = "sql"
+# The same TLS rule as [hot] url.
 uri = "${DATABASE_URL}"
 
 # file:// and memory:// are always available. s3://, gs:// and abfss:// need the
@@ -173,8 +177,8 @@ snapshot_retention = "10y"
 #   "MALO"  11 digits — a Marktlokations-ID, check digit enforced.
 #   "MELO"  33 characters — a Zählpunktbezeichnung. No check digit exists;
 #           what this adds is the casing, so one Messlokation is one key.
-#   "BDEW"  13 digits — a Marktpartner-ID. The 13th digit is deliberately NOT
-#           checked: BDEW's Bildungsvorschrift exempts GS1-issued GLNs.
+#   "BDEW"  13 digits — a Marktpartner-ID. The 13th digit must satisfy BDEW's
+#           check-digit procedure or, for a GS1-issued GLN, GS1's.
 #
 # [[tables.extra_columns]]
 # name = "bilanzkreis"

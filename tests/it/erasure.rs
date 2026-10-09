@@ -10,7 +10,7 @@
 // across the binary instead of starting one per test.
 #![cfg(feature = "testkit")]
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use meterstore::{ErasureQuery, ErasureRecord, ErasureTrigger, SubjectRef, SubjectRegistry};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -1130,7 +1130,7 @@ async fn a_lifted_suppression_is_not_reported_as_orphaned() {
 
 #[tokio::test]
 async fn a_registry_that_lost_its_only_key_reports_every_live_suppression() {
-    // R6 by the shortest road: the secret is gone rather than mis-rotated. The
+    // A lost erasure secret by the shortest road: gone rather than mis-rotated. The
     // registry has no ring, so it cannot check anything — and that is exactly
     // when the trail's own record of which key wrote what is the only thing
     // that can speak.
@@ -1263,4 +1263,103 @@ async fn a_registry_carrying_an_earlier_schema_says_so_at_setup() {
     // And it says what to do about it, which is the whole point of catching it
     // here rather than at the first request.
     assert!(err.contains("drop"), "{err}");
+}
+
+#[tokio::test]
+async fn erasure_through_an_expired_reference_is_refused() {
+    // A billing system kept the 2021 reference; the sweep expired 2021; an
+    // Article 17 request arrives through it. The identifier behind it is gone by
+    // design, so 2022 cannot be found through it — and reporting the request
+    // honoured would leave 2022 attributable.
+    let pool = pool().await;
+    let r = SubjectRegistry::new(pool.clone());
+    r.create_tables().await.expect("tables");
+    let old = r.register_in_epoch("customer-4821", 2021).await.unwrap();
+    let later = r.register_in_epoch("customer-4821", 2022).await.unwrap();
+    r.expire_epochs_before(
+        datetime!(2022-01-01 00:00 UTC),
+        "§ 60 Abs. 6 MsbG",
+        "retention-job",
+        datetime!(2026-07-29 03:00 UTC),
+    )
+    .await
+    .unwrap();
+    let swept = r.erasures(&ErasureQuery::new()).await.unwrap();
+
+    let err = r
+        .erase(
+            &old,
+            "DSAR-2026-0042",
+            "dpo",
+            datetime!(2026-08-01 09:00 UTC),
+        )
+        .await
+        .expect_err("an expired reference cannot reach its subject's other years");
+    assert!(
+        matches!(err, meterstore::Error::SubjectUnresolvable { .. }) && !err.is_retryable(),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("erase_all"),
+        "names the remedy: {err}"
+    );
+
+    // Inside a caller's transaction too, with nothing written to it.
+    let mut tx = pool.begin().await.expect("begin");
+    r.erase_in(
+        &mut tx,
+        &old,
+        "DSAR-2026-0042",
+        "dpo",
+        datetime!(2026-08-01 09:00 UTC),
+    )
+    .await
+    .expect_err("refused identically");
+    tx.rollback().await.expect("rollback");
+
+    // The refusal is not an erasure: the trail is the sweep's, and 2022 resolves.
+    assert_eq!(r.erasures(&ErasureQuery::new()).await.unwrap(), swept);
+    assert_eq!(
+        r.resolve(&later).await.unwrap().as_deref(),
+        Some("customer-4821")
+    );
+
+    // The remedy reaches it.
+    r.erase_all(
+        "customer-4821",
+        "DSAR-2026-0042",
+        "dpo",
+        datetime!(2026-08-01 09:00 UTC),
+    )
+    .await
+    .expect("by identifier");
+    assert_eq!(r.resolve(&later).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_repeated_request_returns_the_record_the_trail_holds() {
+    // The erasure happened at the first request; a repeat is recorded against
+    // it, and what the call returns is the trail's row, not the repeat's
+    // arguments.
+    let r = registry().await;
+    let subject = r
+        .register("customer-4821", IN_2026, Sparte::Strom)
+        .await
+        .unwrap();
+    r.erase(&subject, "DSAR-1", "dpo", datetime!(2026-07-28 09:00 UTC))
+        .await
+        .unwrap();
+
+    let repeat = r
+        .erase(
+            &subject,
+            "DSAR-2",
+            "someone-else",
+            datetime!(2026-09-01 09:00 UTC),
+        )
+        .await
+        .unwrap();
+    let trail = r.erasures(&ErasureQuery::new()).await.unwrap();
+    assert_eq!(repeat, trail, "the return value and the trail disagree");
+    assert_eq!(repeat[0].erased_at, datetime!(2026-07-28 09:00 UTC));
 }

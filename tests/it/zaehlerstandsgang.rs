@@ -21,11 +21,11 @@ use iceberg_catalog_sql::{
     SqlCatalogBuilder,
 };
 use metering::QualityFlag;
-use metering::interval::{MeasurementUnit, Sparte};
-use metering::measurement_series::MeasurementSource;
-use metering::reading::MeterReading;
+use metering::series::interval::{Sparte, Unit};
+use metering::series::reading::MeterReading;
 use meterstore::cold::IcebergCold;
 use meterstore::config::{TableConfig, TimeModel};
+use meterstore::delivery::MeasurementSource;
 use meterstore::encode::StoredReadings;
 use meterstore::hot::PostgresHot;
 use meterstore::tiering::store::{ColdStore, HotStore};
@@ -163,18 +163,18 @@ fn zsg_register(
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", first, Sparte::Strom)
+            meterstore::VersionScope::for_interval("9900000000003", first, Sparte::Strom)
                 .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
         datetime!(2026-07-27 06:00 UTC),
     )
     .with_melo_id(melo.parse().expect("a valid MeLo-ID"))
-    .at_cadence(metering::IntervalResolution::QuarterHour)
-    .in_unit(MeasurementUnit::KiloWattHour)
+    .at_cadence(metering::Resolution::QUARTER_HOUR)
+    .in_unit(Unit::KiloWattHour)
 }
 
 #[tokio::test]
@@ -199,8 +199,8 @@ async fn a_zaehlerstandsgang_round_trips_as_the_domain_type() {
     let d = &back[0];
     assert_eq!(d.readings.len(), 96);
     assert_eq!(d.sparte, Sparte::Strom);
-    assert_eq!(d.unit, MeasurementUnit::KiloWattHour);
-    assert_eq!(d.cadence, Some(metering::IntervalResolution::QuarterHour));
+    assert_eq!(d.unit, Unit::KiloWattHour);
+    assert_eq!(d.cadence, Some(metering::Resolution::QUARTER_HOUR));
     assert_eq!(d.obis_code.to_string(), "1-0:1.8.0");
 
     // Cumulative and ascending — the register, not a difference of it.
@@ -355,29 +355,32 @@ async fn an_interval_table_still_refuses_readings() {
 
 /// A Lastgang delivery, for the refusal tests.
 fn interval_series() -> meterstore::encode::StoredSeries {
-    let mut series = metering::measurement_series::MeasurementSeries::new(
+    let mut series = meterstore::delivery::MeasurementSeries::new(
         MALO.parse().expect("a valid MaLo-ID"),
         "1-0:1.29.0".parse().ok(),
-        vec![metering::interval::MeterInterval {
-            from: START,
-            to: START + Duration::minutes(15),
-            value: Decimal::new(3, 0),
-            quality: QualityFlag::Measured,
-            obis_code: "1-0:1.29.0".parse().ok(),
-        }],
+        vec![
+            metering::series::interval::MeterInterval::new(
+                START,
+                START + Duration::minutes(15),
+                Decimal::new(3, 0),
+                QualityFlag::Measured,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.29.0".parse().unwrap()),
+        ],
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-27 06:00 UTC),
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
                 .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
@@ -478,7 +481,7 @@ async fn corrections_still_supersede_within_one_messlokation() {
 
     let mut corrected = zsg_at(MELO, START, 4, 200_000, 3);
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+        meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
             .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
@@ -537,7 +540,7 @@ async fn a_late_correction_reconciles_per_messlokation() {
     // A correction for an archived instant, for one meter only.
     let mut corrected = zsg_at(MELO, START, 4, 200_000, 3);
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+        meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
             .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
@@ -573,7 +576,7 @@ async fn a_late_correction_reconciles_per_messlokation() {
     // precisely when the files hold one version.
     let mut replay = zsg_at(MELO, START, 4, 200_000, 3);
     replay.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+        meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
             .expect("scope"),
         meterstore::Version::new(20_260_720_000_002).expect("version"),
     );
@@ -688,8 +691,13 @@ async fn completeness_reports_a_row_per_meter() {
         .query(&format!(
             "SELECT melo_id, missing FROM {}('{}', '{}') ORDER BY melo_id",
             meterstore::session::CompletenessFunction::NAME,
-            START.date(),
-            (START + Duration::days(1)).date(),
+            // Instants: a bare date is the start of that day in Berlin.
+            START
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            (START + Duration::days(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
         ))
         .await
         .expect("query")
@@ -799,7 +807,7 @@ async fn a_register_read_resolves_corrections_and_spans_the_boundary() {
     let mut corrected = zsg(START, 1, 999_999, 0);
     corrected.readings[0].quality = QualityFlag::Corrected;
     corrected.version = meterstore::ScopedVersion::new(
-        meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+        meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
             .expect("scope"),
         meterstore::Version::new(20_260_726_000_002).expect("version"),
     );
@@ -934,7 +942,7 @@ async fn a_per_register_read_keeps_two_meters_apart() {
         .await
         .expect("one meter");
     assert_eq!(mine.len(), 1);
-    let register: metering::obis::ObisCode = "1-0:1.8.0".parse().unwrap();
+    let register: metering::ids::obis::ObisCode = "1-0:1.8.0".parse().unwrap();
     assert_eq!(mine[&register].readings[0].value, Decimal::new(7_000, 0));
 
     // And the register list spans both meters unless narrowed, which is a fact
@@ -950,4 +958,103 @@ async fn a_per_register_read_keeps_two_meters_apart() {
         1,
         "one register, reported by two meters"
     );
+}
+
+/// Publish a boundary at `START + 1d`, so a reading at `START` is a late
+/// correction routed to the cold tier.
+async fn below_the_boundary(store: &meterstore::MeterStore) {
+    store
+        .admin()
+        .cold_store()
+        .append_and_commit(
+            TABLE,
+            meterstore::tiering::store::stream_of(Vec::new()),
+            meterstore::tiering::store::WriteHints::default(),
+            meterstore::watermark::ArchivalWindow::new(START, START + Duration::DAY)
+                .expect("window"),
+            Duration::DAY,
+            START + Duration::DAY,
+        )
+        .await
+        .expect("boundary");
+}
+
+/// `SELECT COUNT(*)` over the raw table, every version included.
+async fn raw_rows(store: &meterstore::MeterStore) -> i64 {
+    use meterstore::arrow::array::AsArray;
+    let result = store
+        .query(&format!("SELECT COUNT(*) FROM {TABLE}"))
+        .await
+        .expect("count");
+    result.batches()[0]
+        .column(0)
+        .as_primitive::<meterstore::arrow::datatypes::Int64Type>()
+        .value(0)
+}
+
+#[tokio::test]
+async fn two_meters_in_one_cold_batch_are_refused_on_a_table_not_keyed_by_melo() {
+    // The cold tier refuses what the hot tier refuses. Two meters' registers
+    // share a merge key here, and a reconciliation that compared the second only
+    // against stored rows would read it as a replay of the first — and the write
+    // would store both at one `(merge key, version)`, a tie resolution breaks
+    // arbitrarily.
+    let (store, _w) = point_store_keyed(false).await;
+    below_the_boundary(&store).await;
+
+    // Agreeing, and disagreeing: two meters either way, named as two meters.
+    for second in [0, 5] {
+        let err = store
+            .append_readings(&[
+                zsg_at(MELO, START, 4, 0, 0),
+                zsg_at(MELO_2, START, 4, second, 0),
+            ])
+            .await
+            .expect_err("a second meter in one late batch is a collision");
+        assert!(
+            matches!(
+                &err,
+                meterstore::Error::IntegrityViolation { constraint: Some(c), .. }
+                    if c == "melo_identifies_the_reading"
+            ),
+            "{err:?}"
+        );
+    }
+    assert_eq!(
+        raw_rows(&store).await,
+        0,
+        "nothing of a refused batch lands"
+    );
+}
+
+#[tokio::test]
+async fn what_a_cold_reconciliation_decides_is_what_is_written() {
+    // The decision is per row and the write honours it per row: an in-batch
+    // replay is written once, and a version already stored is not rewritten
+    // beside a new one.
+    let (store, _w) = point_store().await;
+    below_the_boundary(&store).await;
+
+    let first = store
+        .append_readings(&[
+            zsg_at(MELO, START, 4, 100, 1),
+            zsg_at(MELO, START, 4, 100, 1),
+        ])
+        .await
+        .expect("a batch carrying its own replay");
+    assert_eq!(first.cold_rows, 4, "one row per reading, not two");
+    assert_eq!(raw_rows(&store).await, 4);
+
+    let mut newer = zsg_at(MELO, START, 4, 200, 1);
+    newer.version = meterstore::ScopedVersion::new(
+        meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
+            .expect("scope"),
+        meterstore::Version::new(20_260_720_000_009).expect("version"),
+    );
+    let second = store
+        .append_readings(&[zsg_at(MELO, START, 4, 100, 1), newer])
+        .await
+        .expect("a stored version beside a new one");
+    assert_eq!(second.cold_rows, 4, "only the new version is written");
+    assert_eq!(raw_rows(&store).await, 8);
 }

@@ -234,7 +234,27 @@ coverage:
     cargo llvm-cov --all-features --html
     @echo "report: target/llvm-cov/html/index.html"
 
+# --- stored form ------------------------------------------------------------
+
+# Record what this release writes, so every later build is held to decoding it.
+# Run once per release, before tagging; `release.yml` refuses a tag without it,
+# and the file is never edited afterwards.
+#
+# 🗄️  Write tests/stored-form/<version>.json from the current encoder
+stored-form:
+    cargo test --test it stored_form::write_this_release -- --ignored --exact
+
 # --- sources ----------------------------------------------------------------
+
+# The gitignored design notes and specifications against their own rules: links
+# resolve, code references name code, every roadmap item has one specification
+# and every specification one item, and the published tree cites none of them.
+# Not part of `check` — a clean checkout has nothing to check, and a stage that
+# passes by finding nothing is the shape this crate treats as a defect.
+#
+# 🧭 Check `concepts/` and `specs/` against the rules `tools/check-concepts.py` states
+concepts:
+    python3 tools/check-concepts.py
 
 # Gitignored: the files are third-party publications under their own terms.
 # Existing files are kept, so a re-run only fetches what is missing; anything

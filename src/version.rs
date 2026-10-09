@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use metering::ids::BdewCode;
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -159,58 +159,43 @@ impl fmt::Display for Version {
 /// The (network operator, month) pair a [`Version`] is comparable within.
 ///
 /// Stored as a canonical `"<operator>:<YYYY-MM>"` string so it dictionary-encodes
-/// well and remains greppable in the lake — twenty characters, the same twenty
-/// on every row, because the operator half is a [`BdewCode`] and those are
-/// always thirteen digits.
+/// well and remains greppable in the lake — twenty-one characters, the same
+/// twenty-one on every row, because the operator half is a [`BdewCode`] and
+/// those are always thirteen digits.
 ///
 /// # The operator is parsed, not carried
 ///
 /// It is the **Marktpartner-ID** of the network operator that issued the
-/// version — what MSCONS puts in `NAD+MS`, and the same identifier
-/// [`MeasurementSource::Mscons`] carries. This crate takes the parsed
-/// [`BdewCode`] for the reason it takes [`MaloId`] rather than
-/// eleven digits: past the constructor a wrong-but-plausible operator is simply
-/// a *different scope*, so a correction fails to supersede the value it corrects
-/// and both rows survive into the resolved view. There is no error anywhere and
-/// the total is inflated.
+/// version — what MSCONS puts in `NAD+MS`, and the identifier
+/// [`MeasurementSource::Mscons`] carries. Past the constructor a
+/// wrong-but-plausible operator is simply a *different scope*, so a correction
+/// fails to supersede the value it corrects and both survive into the resolved
+/// view. So the scope takes a parsed [`BdewCode`], whose check digit — BDEW's
+/// procedure or GS1's, since the Bildungsvorschrift admits GS1-issued GLNs —
+/// refuses a transposed operator while the delivery is still in hand.
 ///
-/// The check digit is verified but **not enforced**, which is `BdewCode`'s
-/// rule rather than a choice made here: BDEW's own Anwendungshilfe carves out
-/// GS1-issued GLNs, which use a different procedure, so a well-formed
-/// Marktpartner-ID may legitimately fail the BDEW one.
-/// [`operator_has_bdew_check_digit`](Self::operator_has_bdew_check_digit)
-/// reports it so ingestion can warn.
-///
-/// [`MeasurementSource::Mscons`]: metering::measurement_series::MeasurementSource::Mscons
-/// [`MaloId`]: metering::ids::MaloId
+/// [`MeasurementSource::Mscons`]: crate::delivery::MeasurementSource::Mscons
 ///
 /// # The month is the interval's, never the delivery's
 ///
-/// MSCONS assigns versions per network operator per month, and resolution
-/// partitions by scope — so two versions of one interval must share a scope or
-/// neither can supersede the other. A July reading corrected in August still
-/// belongs to July's scope; keying the scope to the delivery month instead
-/// would leave both rows standing and double the total, with no error anywhere.
-///
-/// [`VersionScope::for_interval`] derives it correctly.
+/// Two versions of one interval must share a scope or neither can supersede
+/// the other, so a July reading corrected in August still belongs to July's
+/// scope. [`VersionScope::for_interval`] derives it.
 ///
 /// # And the month is the **Bilanzierungsmonat**, which gas cuts at 06:00
 ///
-/// It is a local month rather than a UTC one, because German market processes
-/// are defined in local time: an interval starting 2026-07-31T23:00Z is already
-/// August in Berlin.
-///
+/// It is a local month, because German market processes are defined in local
+/// time: an interval starting 2026-07-31T23:00Z is already August in Berlin.
 /// For gas it is not the calendar month at all. EDI@Energy *Allgemeine
 /// Festlegungen* v6.1c, Kap. 3.1 defines the Bilanzierungsmonat Juni 2021 as
 /// 01.06 00:00 to 01.07 00:00 for Strom and 01.06 **06:00** to 01.07 **06:00**
-/// for Gas — the Gastag boundary carries all the way up, so a gas month is a
-/// whole number of Gastage rather than a calendar month shifted. An interval at
-/// 02:00 local on 1 March belongs to February's gas scope.
+/// for Gas, so an interval at 02:00 local on 1 March belongs to February's gas
+/// scope.
 ///
-/// So every constructor here takes a [`Sparte`]. It is not decoration:
-/// [`covers`](Self::covers) refuses a delivery whose month is not the one the
-/// commodity balances on, so getting it wrong is a rejected delivery rather than
-/// a silently mis-scoped one.
+/// So [`for_interval`](Self::for_interval) and [`covers`](Self::covers) take a
+/// [`Sparte`]. `covers` refuses a delivery whose month is not the one the
+/// commodity balances on, so getting it wrong is a rejected delivery rather
+/// than a silently mis-scoped one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VersionScope(String);
 
@@ -266,11 +251,11 @@ impl VersionScope {
     ///
     /// ```rust
     /// use meterstore::VersionScope;
-    /// use metering::interval::Sparte;
+    /// use metering::series::interval::Sparte;
     /// use time::macros::datetime;
     ///
     /// // The network operator's Marktpartner-ID, as MSCONS carries it in NAD+MS.
-    /// let nb = "9900000000001";
+    /// let nb = "9900000000003";
     ///
     /// // 02:00 local on 1 March: already March, still the February gas month.
     /// let at = datetime!(2026-03-01 1:00 UTC);
@@ -291,7 +276,12 @@ impl VersionScope {
         O: TryInto<BdewCode>,
         O::Error: fmt::Display,
     {
-        let month = crate::planner::balancing_month(interval_start, sparte);
+        let month = crate::planner::balancing_month(interval_start, sparte).ok_or_else(|| {
+            Error::config(format!(
+                "{interval_start} is outside the years the calendar covers, so it has no \
+                 {sparte} Bilanzierungsmonat to scope a version to"
+            ))
+        })?;
         Self::new(operator, month.year(), u8::from(month.month()))
     }
 
@@ -312,17 +302,6 @@ impl VersionScope {
         self.0[..at].parse().expect("constructed from a BdewCode")
     }
 
-    /// Whether the operator's thirteenth digit matches the BDEW procedure.
-    ///
-    /// **Advisory**, and `false` does not mean the code is wrong: BDEW's
-    /// Anwendungshilfe §2.3 carves out GS1-issued GLNs, which use a different
-    /// check-digit procedure and are legitimate Marktpartner-IDs. Use it to warn
-    /// at an ingest boundary, never to reject — the same restraint
-    /// [`Version::is_well_formed`] applies to a short version label.
-    pub fn operator_has_bdew_check_digit(&self) -> bool {
-        self.operator().has_bdew_check_digit()
-    }
-
     /// Whether an interval belongs to this scope.
     ///
     /// Used at encode time so a mismatch fails at the boundary rather than
@@ -336,7 +315,10 @@ impl VersionScope {
     /// [`for_interval`](Self::for_interval). Passing the wrong one here is what
     /// turned a correctly-scoped gas delivery into a write error.
     pub fn covers(&self, interval_start: OffsetDateTime, sparte: Sparte) -> bool {
-        let month = crate::planner::balancing_month(interval_start, sparte);
+        // An instant with no Bilanzierungsmonat is covered by no scope.
+        let Some(month) = crate::planner::balancing_month(interval_start, sparte) else {
+            return false;
+        };
         let period = self.period();
         let Some((year, rest)) = period.split_once('-') else {
             return false;
@@ -523,8 +505,8 @@ mod tests {
         // `TryFrom<String>` upstream to be accepted at all. This pins that the
         // three shapes a caller actually holds are interchangeable.
         let at = time::macros::datetime!(2026-07-20 00:00 UTC);
-        let owned: String = "9900000000001".to_string();
-        let borrowed: &str = "9900000000001";
+        let owned: String = "9900000000003".to_string();
+        let borrowed: &str = "9900000000003";
         let parsed: BdewCode = borrowed.parse().unwrap();
 
         let from_owned = VersionScope::for_interval(owned, at, Sparte::Strom).unwrap();
@@ -548,12 +530,12 @@ mod tests {
         // outside 0..=9999 renders as five characters or with a sign, which the
         // other two refuse — so it has to fail here, where the message can say
         // why.
-        assert!(VersionScope::new("9900000000001", 2026, 7).is_ok());
-        assert!(VersionScope::new("9900000000001", 0, 1).is_ok());
-        assert!(VersionScope::new("9900000000001", 9999, 12).is_ok());
+        assert!(VersionScope::new("9900000000003", 2026, 7).is_ok());
+        assert!(VersionScope::new("9900000000003", 0, 1).is_ok());
+        assert!(VersionScope::new("9900000000003", 9999, 12).is_ok());
 
         for year in [-1, -100, 10_000, i32::MAX, i32::MIN] {
-            let err = VersionScope::new("9900000000001", year, 7)
+            let err = VersionScope::new("9900000000003", year, 7)
                 .expect_err("outside the canonical form")
                 .to_string();
             assert!(err.contains("0..=9999"), "{year}: {err}");
@@ -564,26 +546,26 @@ mod tests {
     fn parse_accepts_exactly_what_new_produces() {
         // The invariant `parse` documents. `"-100"` is four characters and
         // parses as an `i32`, which is why the check is on *digits*.
-        let canonical = VersionScope::new("9900000000001", 2026, 7).unwrap();
+        let canonical = VersionScope::new("9900000000003", 2026, 7).unwrap();
         assert_eq!(
             VersionScope::parse(canonical.as_str().to_string()).unwrap(),
             canonical
         );
         for bad in [
-            "9900000000001:-100-07",
-            "9900000000001:20260-07",
-            "9900000000001:2026-7",
-            "9900000000001:2026-0a",
-            "9900000000001:202a-07",
+            "9900000000003:-100-07",
+            "9900000000003:20260-07",
+            "9900000000003:2026-7",
+            "9900000000003:2026-0a",
+            "9900000000003:202a-07",
         ] {
             assert!(VersionScope::parse(bad).is_err(), "{bad}");
         }
     }
 
     /// A real BDEW Marktpartner-ID: thirteen digits, `99` = BDEW/Strom.
-    const OPERATOR: &str = "9900000000001";
+    const OPERATOR: &str = "9900000000003";
     /// A second one, for the comparisons that must not cross operators.
-    const OTHER_OPERATOR: &str = "9900000000002";
+    const OTHER_OPERATOR: &str = "9900000000029";
 
     fn scope(op: &str, y: i32, m: u8) -> VersionScope {
         VersionScope::new(op, y, m).unwrap()
@@ -893,7 +875,7 @@ mod tests {
     #[test]
     fn scope_round_trips_through_canonical_form() {
         let s = scope(OPERATOR, 2026, 3);
-        assert_eq!(s.as_str(), "9900000000001:2026-03");
+        assert_eq!(s.as_str(), "9900000000003:2026-03");
         assert_eq!(VersionScope::parse(s.as_str()).unwrap(), s);
     }
 
@@ -906,23 +888,23 @@ mod tests {
         // the operator with `split_part(…, ':', 1)`, which takes the other half
         // of a scope carrying two separators.
         for bad in [
-            "9900000000001:2026-13", // month out of range
-            "9900000000001:2026-99",
-            "9900000000001:2026-00",
-            "9900000000001:20x6-03",  // year not a number
+            "9900000000003:2026-13", // month out of range
+            "9900000000003:2026-99",
+            "9900000000003:2026-00",
+            "9900000000003:20x6-03",  // year not a number
             "a:b:2026-03",            // operator carrying the separator
             ":2026-03",               // no operator
-            "9900000000001:2026-3",   // unpadded month
-            "9900000000001:202-003",  // seven characters, wrong shape
-            "9900000000001",          // no separator at all
+            "9900000000003:2026-3",   // unpadded month
+            "9900000000003:202-003",  // seven characters, wrong shape
+            "9900000000003",          // no separator at all
             "99:2026-03",             // an operator too short to be a Marktpartner-ID
             "990000000000:2026-03",   // twelve digits
-            "99000000000012:2026-03", // fourteen
+            "99000000000032:2026-03", // fourteen
             // `BdewCode`'s own `FromStr` trims, which is right at an ingest
             // boundary and wrong for a stored value: this would parse, be kept
             // as it stands, and then be refused by the hot table's CHECK.
-            " 9900000000001:2026-03",
-            "9900000000001 :2026-03",
+            " 9900000000003:2026-03",
+            "9900000000003 :2026-03",
         ] {
             assert!(VersionScope::parse(bad).is_err(), "{bad:?} must not parse");
         }
@@ -953,7 +935,7 @@ mod tests {
             "99",             // the short spelling a fixture reaches for
             "bad:operator",   // the separator, which thirteen digits cannot hold
             "990000000000",   // twelve digits
-            "99000000000012", // fourteen
+            "99000000000032", // fourteen
             "99000000000x1",  // not all digits
             "",
         ] {
@@ -979,22 +961,22 @@ mod tests {
     }
 
     #[test]
-    fn a_gs1_gln_is_stored_and_flagged_rather_than_refused() {
-        // BDEW's Anwendungshilfe §2.3 carves out GS1-issued GLNs, which use a
-        // different check-digit procedure — so a well-formed Marktpartner-ID may
-        // legitimately fail the BDEW one, and refusing it would refuse data the
-        // market issued. Reported instead, like a short version label.
-        let digits = "990098765432";
-        let check = metering::ids::BdewCode::compute_check_digit(digits).expect("twelve digits");
-        let consistent = VersionScope::new(&*format!("{digits}{check}"), 2026, 7).unwrap();
-        assert!(consistent.operator_has_bdew_check_digit());
-
-        let wrong_check = (check + 1) % 10;
-        let inconsistent = VersionScope::new(&*format!("{digits}{wrong_check}"), 2026, 7).unwrap();
-        assert!(!inconsistent.operator_has_bdew_check_digit());
+    fn a_gs1_gln_is_admitted_and_a_transposed_operator_is_refused() {
+        // The Bildungsvorschrift admits GS1-issued GLNs, which use a different
+        // check-digit procedure, so an operator passes on either — and one that
+        // passes on neither is a transposition, refused while the delivery that
+        // carried it is still in hand.
         assert!(
-            VersionScope::parse(inconsistent.as_str()).is_ok(),
-            "stored and readable back: the flag is advisory, not a gate"
+            VersionScope::new("9900987654329", 2026, 7).is_ok(),
+            "BDEW procedure"
+        );
+        assert!(
+            VersionScope::new("9900987654320", 2026, 7).is_ok(),
+            "GS1 procedure"
+        );
+        assert!(
+            VersionScope::new("9900987654392", 2026, 7).is_err(),
+            "neither"
         );
     }
 

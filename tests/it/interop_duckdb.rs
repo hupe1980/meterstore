@@ -7,7 +7,7 @@
 //!
 //! DuckDB is a genuinely independent implementation: a different language, a
 //! different Parquet reader, and — through its `iceberg` extension — a different
-//! reading of the Iceberg spec. That is what makes it able to falsify P2, and it
+//! reading of the Iceberg spec. That is what makes it able to falsify the open-format claim, and it
 //! is the half this crate cannot check from inside itself.
 //!
 //! # Two levels, and the second is the one that matters
@@ -220,7 +220,7 @@ async fn duckdb_reads_the_parquet_files() {
 
 #[tokio::test]
 async fn duckdb_reads_the_iceberg_table_through_its_metadata() {
-    // The assertion that actually tests P2. DuckDB reads the manifests, the
+    // The assertion that actually tests the open-format claim. DuckDB reads the manifests, the
     // manifest list and the snapshot — its own implementation of the spec — and
     // has to agree about which files belong to the table.
     let workload = MeteringWorkload::new(START)
@@ -313,7 +313,7 @@ async fn duckdb_sees_the_snapshot_history_a_reproducible_read_pins_to() {
     // Time travel is the second defensible-core claim, and it is only real if a
     // foreign engine can see the same snapshots. If DuckDB cannot enumerate
     // them, "reproduce the settlement as computed on the 8th working day" is a
-    // promise only MeterStore can keep — which is the lock-in P2 rejects.
+    // promise only MeterStore can keep — which is lock-in.
     let workload = MeteringWorkload::new(START)
         .seed(0x5AA9)
         .malo_ids(3)
@@ -395,7 +395,7 @@ async fn duckdb_grouping_a_gas_lastgang_agrees_with_the_gastag() {
     // here.
     let workload = MeteringWorkload::new(datetime!(2026-10-23 00:00 UTC))
         .seed(0x9A5)
-        .sparte(metering::interval::Sparte::Gas)
+        .sparte(metering::series::interval::Sparte::Gas)
         .malo_ids(2)
         .days(4);
     let (harness, store, _oracle) = archived(workload).await;
@@ -479,11 +479,10 @@ async fn a_foreign_engine_can_read_the_audit_trail() {
     // `ProvenanceEntry::occurred_at` is a `time::OffsetDateTime`, whose own serde
     // impl lands as `[2026,208,6,0,0,0,0,0,0]` unless `serde-human-readable` is
     // on somewhere in the graph — unreadable, and worse, decided by feature
-    // unification rather than by any crate with an opinion. `metering::wire`
-    // settles it upstream, so this crate writes the column with plain `serde`,
-    // and this is the assertion that the result is genuinely portable: an engine
-    // that has never heard of `time` parses the timestamp as a timestamp. If it
-    // ever fails, the upstream wire format moved.
+    // unification rather than by any crate with an opinion. `delivery` states
+    // it on the field, as RFC 3339, and this is the assertion that the result is
+    // genuinely portable: an engine that has never heard of `time` parses the
+    // timestamp as a timestamp. If it ever fails, that formatter moved.
     let workload = MeteringWorkload::new(START)
         .seed(0xA0D17)
         .malo_ids(1)

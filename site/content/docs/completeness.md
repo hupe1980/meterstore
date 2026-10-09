@@ -31,26 +31,30 @@ store.completeness(from, to).melo(melo)?.await?;   // one meter of a Mehrfamilie
 ```
 
 Identifiers are parsed and canonicalised, so a mistyped one fails at the call
-rather than returning an empty report that reads as *"this meter is fine"*. That
-matters most for `melo`: a Zählpunktbezeichnung has no check digit and is stored
-uppercase, so a lower-cased literal through `column_eq` narrows the report to
-nothing and every channel comes back **silent** — which reads as a meter that has
-stopped delivering, the strongest finding the report can make. The narrowing
-applies to the [roster](#the-finding-a-range-cannot-make-about-itself) too, or
-every channel outside it would come back as silent.
+rather than returning an empty report. Prefer `melo` to `column_eq("melo_id", …)`:
+a lower-cased literal there narrows to nothing and reports every channel
+**silent**. The narrowing applies to the
+[roster](#the-finding-a-range-cannot-make-about-itself) too.
 
-Or as a table function, for the operator holding a SQL client rather than a
-compiler:
+Or as a table function:
 
 ```sql
 SELECT * FROM meter_completeness('2026-03-01', '2026-04-01')
 WHERE NOT complete OR NOT measurable;
 ```
 
-`OR NOT measurable` is not defensive spelling. A channel with no fixed daily
-expectation reports `missing = 0` and `surplus = 0`, so it *is* `complete` —
-and `WHERE NOT complete` alone drops exactly the channels nobody could judge,
-reporting them as fine.
+A bare date is the start of that day **in Berlin**: `'2026-03-01'` is
+23:00 UTC on 28 February, so the range above is the electricity month. A gas
+range starts at 06:00 and is written as instants (`'2026-03-01T05:00:00Z'`); a
+typed `TIMESTAMP` is taken as the instant it is. Over a
+[catalog](@/docs/querying.md) with several tables the first argument names the
+table — `meter_completeness('readings', '2026-03-01', '2026-04-01')` — and a
+call without one is refused rather than answered about whichever table a default
+would pick. The result's boundary and tiers are that table's.
+
+`OR NOT measurable` matters: a channel with no fixed daily expectation is
+`complete` (`missing = 0`, `surplus = 0`), so `WHERE NOT complete` alone drops
+exactly the channels nobody could judge.
 
 | Column | Meaning |
 |---|---|
@@ -68,44 +72,31 @@ reporting them as fine.
 | `complete` | `missing == 0 && surplus == 0` — true, and not the same as "checked" |
 | `measurable` | Whether there was an expectation to compare against at all |
 
-`actual = 0` on a row is a channel that delivered nothing at all — `is_silent()`
-in Rust. Such a row exists only when the query was given a reference window, which
-is the next section.
+`actual = 0` is a channel that delivered nothing — `is_silent()` in Rust — and
+appears only when the query has a [reference window](#the-finding-a-range-cannot-make-about-itself).
 
 ## Every day of the range
 
-The expectation covers every balancing day between `from` and `to`, including days
-the channel delivered nothing on: a day with no rows is a day whose whole
-expectation is missing.
+The expectation covers every balancing day between `from` and `to`: a day with no
+rows is a day whose whole expectation is missing, so a meter that stopped on
+2 March does not report the month complete.
 
-The aggregate underneath is a `GROUP BY`, which produces no group for an empty
-day — so counting only the days that came back would measure a channel against
-itself, and a meter that stopped on the 2nd of March would report the month
-complete.
-
-> **A range reaching past the last delivery says so.** A report over a whole
-> month, run mid-month, reports the remainder as missing. Consulting a clock
-> instead would make one report answer differently on two runs, which is what the
-> [reproducibility](@/docs/reproducibility.md) machinery exists to prevent — so
-> ask about periods that are over, or end the range at the last settled instant.
+> **A range reaching past the last delivery says so.** A whole-month report run
+> mid-month reports the remainder as missing; it consults no clock. Ask about
+> periods that are over, or end the range at the last settled instant.
 
 ### Which grid an absent day belongs to
 
-There is one row per channel **per grid**, so a day nobody delivered on has to be
-charged to one of them. It goes to the grid **last in force before it**, and a gap
-preceding the channel's first delivery to the first grid it used. Charging it to
-every grid would report a clean hourly→quarter-hourly conversion as two badly
-incomplete halves. For a single-grid channel — the ordinary case — this is simply
-"the whole range".
+There is one row per channel **per grid**. A day nobody delivered on is charged
+to the grid **last in force before it**, and a gap before the first delivery to
+the first grid used — not to every grid, which would report a clean conversion as
+two incomplete halves.
 
 ## The finding a range cannot make about itself
 
-The report is an aggregate over the rows the range holds, so a channel with **no**
-rows produces no groups and appears nowhere — a meter that stopped delivering
-entirely, a pipeline that dropped a Bilanzkreis, a market-location change nobody
-carried through. Nothing inside the range can supply the missing roster, because
-the missing roster is precisely what the range does not contain. It comes from an
-earlier window:
+A channel with **no** rows in the range appears nowhere — a meter that stopped
+entirely, a pipeline that dropped a Bilanzkreis. The roster comes from an earlier
+window:
 
 ```rust
 // Anything that reported in the month before this one is expected in it.
@@ -119,12 +110,9 @@ for gone in report.iter().filter(|r| r.is_silent()) {
 }
 ```
 
-Such a channel comes back with `actual = 0`, the whole range as `missing`, and
-`first_gap` on its first balancing day — which is what an operator needs: not that
-a value is absent, but from when.
-
-In SQL the arguments read left to right in time order, so the reference window is
-the **leading** one:
+Such a channel comes back with `actual = 0`, the whole range `missing`, and
+`first_gap` on its first balancing day. In SQL the reference window is the
+**leading** argument:
 
 ```sql
 -- Reported: March. Expected: whatever reported in February.
@@ -132,17 +120,11 @@ SELECT * FROM meter_completeness('2026-02-01', '2026-03-01', '2026-04-01')
 WHERE actual = 0;
 ```
 
-**The window is yours, because there is no honest default.** Too short and a meter
-read monthly looks decommissioned; too long and every terminated measuring point
-is a standing finding. What a roster means — "still in service" — is master data
-this crate does not hold.
-
-A channel whose *grid* changed is still reporting and is not called silent: the
-match is on what names a reading, not on the resolution it is delivered at.
+**The window is yours**: too short and a monthly-read meter looks decommissioned,
+too long and every terminated measuring point is a standing finding. A channel
+whose *grid* changed is not called silent.
 
 ## From the command line
-
-The same question, without a compiler:
 
 ```bash
 meterstore completeness --month 2026-06 --seen-since 30d --gaps-only
@@ -161,116 +143,69 @@ The report groups by the **merge key**, so identity columns and a key-carrying
 `melo_id` are both grouped on and reported — `row.identity` carries them in key
 order.
 
-That matters on a shared store. Two tenants, or the two meters of a
-Mehrfamilienhaus, each deliver a full day of one channel: folded, that is 192
-intervals against an expectation of 96 and a `surplus` of 96 where nothing is
-wrong. Worse in the other direction — one of them four short nets against the
-other's full day and the channel reads as **complete**, the one answer this
-report must never give about a series with a real gap.
-
-Scoping the session narrows the report as it narrows a query.
+Folded, two tenants or two meters delivering a full day would report a `surplus`
+of 96, and one of them four short could net to **complete**. Scoping the session
+narrows the report as it narrows a query.
 
 ### And one row per interval grid
 
-`resolution` is grouped on for the same reason `sparte` is: both decide which
-expectation a row is measured against, and a channel can hold two of either. A
-meter converted from an hourly profile to a quarter-hourly one mid-month is the
-ordinary case, and it is the *grid* that says whether a day of 24 values is
-complete or 72 short.
+`resolution` is grouped on because the *grid* decides whether a day of 24 values
+is complete or 72 short; a meter converted from hourly to quarter-hourly
+mid-month comes back as two complete rows.
 
-Folded, such a channel would report one arbitrary grid against a count drawn from
-both — arbitrary literally, since the aggregate yields groups in no defined order.
-Split, a clean conversion comes back as two complete rows, which is what it is.
+**The day both grids delivered on is judged by the time it covers**: time no row
+covers is `missing`, time more than one row covers is `surplus`, both in the finer
+grid's intervals, and the day is charged to the grid in force at its end. A clean
+conversion is complete; a partial re-grid shows as surplus.
 
 ## Why the expected count is not 96
 
-`Europe/Berlin` gives **92**-interval and **100**-interval days at the DST
-transitions. A check that assumes 96 raises a false alarm on every meter every
-spring — and, worse, masks a genuine four-interval gap every autumn, which is the
-direction that reaches a bill.
-
-The count comes from `metering`'s own `DayBoundary::intervals_in_day` against the
-series' declared `resolution`. At one value a minute the autumn expectation is
-**1 500**, not 1 440. A resolution coarser than a day (`P1M`, `P1Y`) has no fixed
-count within one, so the row reports what it found and declines to call it
-complete or short — `is_measurable()` says which.
-
-A **daily** series expects one interval per day, on both boundaries alike.
+`Europe/Berlin` gives **92**- and **100**-interval days at the DST transitions; a
+check assuming 96 masks a genuine four-interval gap every autumn. The count is
+`metering`'s `Period::count` over the balancing day at the declared `resolution` —
+**1 500** for a one-minute grid in autumn. A **daily** series expects one interval
+per day. A resolution coarser than a day (`P1M`, `P1Y`) has no fixed count, so
+the row is not measurable (`is_measurable()`).
 
 ## And why the day is not always the calendar day
 
-Gas balances on the **Gastag** — 06:00 to 06:00 local — so a gas channel's day is
-not the day electricity's is. Both the bucketing and the expected count follow
-the row's `sparte`, which is why it is a reported column rather than an implicit
-assumption.
-
-That choice is `metering`'s own `DayBoundary`. MeterStore adds one thing to it:
-the mapping from a stored row's `sparte` to the boundary that applies, written
-once in `planner::day_boundary`. Which of the two applies is a storage fact — a
-row carries its commodity — rather than a calendar one.
-
-This matters twice over at a DST transition. The clocks change at 02:00/03:00
-local, *before* the 06:00 boundary, so the long and short gas days are the ones
-named after the **Saturday**:
+Gas balances on the **Gastag** — 06:00 to 06:00 local — so both the bucketing and
+the expected count follow the row's `sparte` (`metering`'s `DayBoundary`, mapped
+in `planner::day_boundary`). The clocks change *before* 06:00, so the long and
+short gas days are named after the **Saturday**:
 
 | 2026 | Calendar day | Gastag |
 |---|---|---|
 | Sat 24 Oct | 96 | **100** |
 | Sun 25 Oct | **100** | 96 |
 
-Reporting gas on calendar days would call the Saturday four intervals in surplus
-and the Sunday four short — two findings, neither of them real, in the one report
-an operator is meant to be able to trust. Heat and water stay on the calendar
-day: the rule is *gas*, not *everything that is not electricity*.
+Heat and water stay on the calendar day.
 
 ## Four decisions this made concrete
 
-**Grouped by the balancing day, and the report says so.** The expectation is
-defined over a Berlin day, so `first_gap` names a Berlin day — which is usually
-*not* the UTC one. Six intervals missing from the end of UTC 2026-07-19 are
-00:30–02:00 Berlin on the 20th, and a report grouped on UTC days would send an
-operator to the wrong day's delivery. For gas the same argument runs six hours
-further: `first_gap` names the Gastag.
+**`first_gap` names a balancing day**, usually *not* the UTC one: six intervals
+missing from the end of UTC 2026-07-19 are 00:30–02:00 Berlin on the 20th. For gas
+it names the Gastag.
 
-**It reads the resolved table.** Counting both versions of a corrected interval
-would report a complete day as holding more intervals than the calendar allows.
+**It reads the resolved table**, so a corrected interval counts once.
 
-**Surplus is not a negative gap, and both are summed per day.** More rows than
-expected is a duplicate or a mis-declared resolution — a real and different
-condition. Computed over range totals, a day four intervals long would net against
-a day four intervals short and the channel would report *complete*, which is the
-one answer a completeness report must never give about a series with a real gap.
-So `missing` and `expected - actual` can legitimately disagree.
+**Surplus is not a negative gap, and both are summed per day**, so a long day
+cannot net against a short one. `missing` and `expected - actual` can
+legitimately disagree.
 
-**No resolution means no expectation.** A series that declares none, or declares a
-calendar one like `P1M` which has no fixed count within a day, reports `actual`
-and admits it cannot judge. Assuming fifteen minutes would invent either a gap or
-a completeness. Such a row is `complete` **and** not `measurable`, in SQL and in
-Rust alike — so a check that reads only the first passes a month nothing was
-verified about.
+**No resolution means no expectation.** A series declaring none, or a calendar one
+like `P1M`, reports `actual` and is `complete` **and** not `measurable`, in SQL and
+Rust alike.
 
-A range that is not day-aligned expects only what it covers on each end day, so a
-billing period starting at noon does not report the morning as missing. What it
-counts is **interval starts inside the range**, not the covered duration divided
-by the step: a reading belongs to the range when its own `from` does. The two
-part whenever the range ends off the grid — over `[00:00, 00:07)` a division
-expects nothing while the interval at 00:00 is counted in `actual`, and the day
-reports a surplus that never happened.
+A range that is not day-aligned expects only what it covers on each end day,
+counting **interval starts inside the range**: over `[00:00, 00:07)` the interval
+at 00:00 is both expected and counted.
 
 ## Where the work happens
 
-The heavy half — group a range by measuring point, channel, commodity, grid and
-balancing day — is a single DataFusion aggregate over the resolved table, so it
-prunes and streams like any other query. The balancing day is a **stored column**
-rather than a function call, so the group-by is an ordinary column reference the
-engine can collect statistics for.
-
-The roll-up to one row per channel happens in Rust, where the calendar lives and
-where billability can be *asked* of `metering` rather than restated as a `CASE`.
-§ 60 Abs. 2 MsbG is a statute; a second copy of it in SQL is a second thing to
-keep in step with it.
-
-The roll-up walks the range's balancing days, so its cost is bounded by the
-*period* as well as by the data. The expectation depends on `(Sparte, resolution)`
-and never on the channel, so it is computed once per grid rather than once per
-channel, and no absent day is materialised.
+Grouping by measuring point, channel, commodity, grid and the stored balancing
+day is one DataFusion aggregate over the resolved table, pruned and streamed like
+any query. The roll-up to one row per channel happens in Rust, where billability
+(§ 60 Abs. 2 MsbG) is asked of `metering` rather than restated in SQL. The
+expectation is computed once per `(Sparte, resolution)`, and no absent day is
+materialised.

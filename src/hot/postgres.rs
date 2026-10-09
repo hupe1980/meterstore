@@ -57,6 +57,13 @@ impl PostgresHot {
     const DEFAULT_DDL_LOCK_TIMEOUT: Duration = Duration::seconds(3);
 
     /// Wrap an existing connection pool.
+    ///
+    /// The pool is the caller's, and so is its transport: its `sslmode`
+    /// governs, and `sqlx`'s own default is `prefer`, which falls back to
+    /// plaintext without saying so. [`HotSettings::connect`] opens one with
+    /// verified TLS by default.
+    ///
+    /// [`HotSettings::connect`]: crate::settings::HotSettings::connect
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -103,23 +110,16 @@ impl PostgresHot {
     ///    higher version covering the same span and has to stay legal.
     ///
     /// 2. **A second network operator for one interval.** A version is
-    ///    comparable only within its `(operator, month)` scope. The month
-    ///    half is guarded at encode time; the operator half is whatever the
-    ///    caller passed. Two operators for one `(malo_id, obis_code, from)`
-    ///    therefore give two incomparable scopes, resolution picks a winner in
-    ///    each, and **both** survive into the resolved view. The realistic cause
-    ///    is not a grid-operator change — those deliver for different intervals —
-    ///    but a caller passing a forwarding party's MP-ID, or a tenant id, where
+    ///    comparable only within its `(operator, month)` scope, so two operators
+    ///    for one `(malo_id, obis_code, from)` give two incomparable scopes and
+    ///    **both** winners survive into the resolved view. The realistic cause
+    ///    is a caller passing a forwarding party's MP-ID, or a tenant id, where
     ///    the network operator belongs.
     ///
-    /// # When the second one is not what you want
-    ///
-    /// A store deliberately keeping **two parties' assertions about one reading**
-    /// — reconciling what a grid operator and a supplier each reported — is a
-    /// legitimate shape that constraint 2 refuses. Say so in the schema instead:
-    /// an `identity_column` for the reporting party makes them two readings no
-    /// aggregate can conflate, which states the intent rather than resting
-    /// on a constraint being off.
+    /// A store deliberately keeping **two parties' assertions about one
+    /// reading** is refused by constraint 2; declare an `identity_column` for
+    /// the reporting party instead, which makes them two readings no aggregate
+    /// can conflate.
     ///
     /// Turning this off trades both guarantees for insert throughput — two GiST
     /// indexes per partition on the busiest table in the schema — and wants a
@@ -182,47 +182,8 @@ impl PostgresHot {
     ) -> Result<()> {
         let mut extra_ddl = String::new();
         for f in extra {
-            // A coded column (declared via `config::coded_column`) carries its
-            // allowed-value set in field metadata; render it as a CHECK so the
-            // deployment's vocabulary is enforced at the DB layer like sparte/
-            // unit/quality, not only by the application that writes the column.
-            let check = f
-                .metadata()
-                .get(crate::config::CHECK_VALUES_KEY)
-                .map(|vals| {
-                    let codes: Vec<&str> = vals.split(',').collect();
-                    format!(
-                        " CONSTRAINT {constraint:?} CHECK ({col:?} IN ({list}))",
-                        constraint = format!("{}_known", f.name()),
-                        col = f.name(),
-                        list = sql_code_list(&codes),
-                    )
-                })
-                // A checked-identifier column (`config::checked_column`) gets
-                // the half of its rule a regular expression can carry: the
-                // shape. Whatever arithmetic the scheme has — an EIC check
-                // character, a MaLo check digit — is a function of the other
-                // characters, so the write path enforces that half; a row
-                // PostgreSQL accepts from another writer is well-shaped, not
-                // necessarily well-formed.
-                .or_else(|| {
-                    crate::config::declared_value_check(f).map(|kind| {
-                        format!(
-                            " CONSTRAINT {constraint:?} CHECK ({col:?} ~ '{pattern}')",
-                            constraint = format!("{}_shape", f.name()),
-                            col = f.name(),
-                            pattern = value_check_pattern(kind),
-                        )
-                    })
-                })
-                .unwrap_or_default();
-            extra_ddl.push_str(&format!(
-                "{:?} {} {}{},\n                ",
-                f.name(),
-                pg_type(f.data_type())?,
-                if f.is_nullable() { "" } else { "NOT NULL" },
-                check,
-            ));
+            extra_ddl.push_str(&column_ddl(f)?);
+            extra_ddl.push_str(",\n                ");
         }
 
         // A table that identifies a reading by its Messlokation puts `melo_id` in
@@ -296,9 +257,8 @@ impl PostgresHot {
                 -- one-operator exclusion below reads it back with
                 -- (`split_part(version_scope, ':', 1)`).
                 --
-                -- The check digit is deliberately not checked: BDEW's
-                -- Anwendungshilfe §2.3 carves out GS1-issued GLNs, so a
-                -- well-formed Marktpartner-ID may legitimately fail it.
+                -- The check digit is the write path's half: it must satisfy
+                -- BDEW's procedure or GS1's, which no pattern can express.
                 version_scope TEXT             NOT NULL
                     CONSTRAINT version_scope_canonical CHECK (
                         version_scope ~ '^[0-9]{{13}}:[0-9]{{4}}-(0[1-9]|1[0-2])$'
@@ -317,7 +277,7 @@ impl PostgresHot {
             "#,
             extra_ddl = extra_ddl,
             sparte_codes = sql_code_list(metering::Sparte::CODES),
-            unit_codes = sql_code_list(metering::interval::MeasurementUnit::CODES),
+            unit_codes = sql_code_list(&crate::encode::schema::stored_unit_codes()),
             quality_codes = sql_code_list(metering::QualityFlag::CODES),
             pk = merge_key
                 .iter()
@@ -334,6 +294,7 @@ impl PostgresHot {
         // encodes are therefore read back and compared.
         self.verify_declaration(table, merge_key, time_model)
             .await?;
+        self.add_declared_columns(table, extra).await?;
 
         // The dominant read is one meter over a time range.
         let idx = format!(
@@ -1369,6 +1330,43 @@ impl PostgresHot {
         Ok(true)
     }
 
+    /// Add every **nullable** deployment column the table lacks, to the parent
+    /// and to every detached partition.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a
+    /// column declared later reaches PostgreSQL only here. Attached partitions
+    /// inherit it from the parent; a detached one is a table of its own, and the
+    /// archival scan that reads it names the column. A required column is left
+    /// alone — no existing row could satisfy it, and the gate quarantines it.
+    async fn add_declared_columns(
+        &self,
+        table: &str,
+        extra: &[crate::arrow::datatypes::Field],
+    ) -> Result<()> {
+        let nullable: Vec<_> = extra.iter().filter(|f| f.is_nullable()).collect();
+        if nullable.is_empty() {
+            return Ok(());
+        }
+        let mut relations = vec![table.to_string()];
+        for partition in partitions_of(&self.pool, table, Attachment::Detached).await? {
+            relations.push(partition.relation_name()?);
+        }
+        let mut tx = self.begin_ddl().await?;
+        for relation in &relations {
+            for f in &nullable {
+                sqlx::query(&format!(
+                    r#"ALTER TABLE "{relation}" ADD COLUMN IF NOT EXISTS {}"#,
+                    column_ddl(f)?
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(pg)?;
+            }
+        }
+        tx.commit().await.map_err(pg)?;
+        Ok(())
+    }
+
     /// Begin a transaction with this store's `lock_timeout` applied.
     ///
     /// `SET LOCAL`, so the setting dies with the transaction. A bare `SET` would
@@ -1531,9 +1529,8 @@ impl crate::tiering::store::TableLease for PgTableLease {
 /// A `version` column value as the domain type.
 fn decimal_to_version(value: Decimal) -> Result<crate::version::Version> {
     // Via the decimal's own text form rather than `to_u128`: the column is
-    // `NUMERIC(20,0)`, three orders of magnitude past `u64::MAX`, and a lossy
-    // hop through a narrower integer is exactly the bug already recorded
-    // for this column once.
+    // `NUMERIC(20,0)`, past `u64::MAX`, so a hop through a narrower integer
+    // would be lossy.
     let digits = value.trunc().to_string();
     crate::version::Version::new(
         digits
@@ -1938,7 +1935,7 @@ impl<'a> RowView<'a> {
 ///
 /// `Settings` also installs an `after_release` hook that does this on checkin,
 /// which is better because it frees the lock sooner. This is the half that works
-/// for the pool a deployment built itself — which P3 says is the normal case.
+/// for the pool a deployment built itself, which is the normal case.
 async fn clear_leaked_locks(connection: &mut sqlx::PgConnection) -> Result<()> {
     sqlx::query("SELECT pg_advisory_unlock_all()")
         .execute(connection)
@@ -1978,11 +1975,10 @@ fn without_partition_suffix(name: &str) -> Option<&str> {
 /// after one — `readings_2026_07_20_0000_one_operator` — so the raw name is a
 /// different string every window, and branching on it means parsing after all.
 ///
-/// The cold path already reports stable names for the same rules
-/// (`version_identifies_one_assertion`, `melo_identifies_the_reading`), so
-/// passing the raw name through also meant one rule answering to two
-/// identifiers depending on which tier refused the write. These are the hot
-/// tier's half of that vocabulary.
+/// The rules the write paths check themselves already carry stable names
+/// (`version_identifies_one_assertion`, `melo_identifies_the_reading`); these
+/// are the exclusion constraints' half of that vocabulary, so a rule answers to
+/// one identifier whichever tier or partition refused the write.
 ///
 /// Constraints declared on the parent — the `CHECK`s — are inherited by name and
 /// are already stable, so they pass through unchanged.
@@ -2031,16 +2027,17 @@ fn scan_err(relation: &str, e: sqlx::Error) -> Error {
     if let Some(db) = e.as_database_error()
         && db.code().as_deref() == Some(UNDEFINED_TABLE)
     {
-        return Error::InvariantViolated {
-            table: relation.to_string(),
-            detail: format!(
+        return Error::boundary_moved(
+            relation,
+            "scan",
+            format!(
                 "the partition {relation:?} was reclaimed while this query was \
                  reading it: the scan enumerated it and archival dropped it before \
                  the read reached it. A plan holds the reclamation floor for \
                  `max_pin_age`, so raise that past the longest query this \
                  deployment runs"
             ),
-        };
+        );
     }
     pg(e)
 }
@@ -2051,6 +2048,19 @@ fn pg(e: sqlx::Error) -> Error {
         return Error::Storage(e.to_string());
     };
     match db.code().as_deref() {
+        // A `check_violation` naming no constraint is PostgreSQL finding no
+        // partition for the row: archival detached the window between the
+        // write's routing and its insert. Every rule this crate declares is a
+        // named constraint, so the unnamed one is exactly this race — a valid
+        // delivery that succeeds against the boundary archival is about to
+        // publish.
+        Some("23514") if db.constraint().is_none() => Error::boundary_moved(
+            db.table()
+                .map(|t| without_partition_suffix(t).unwrap_or(t).to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            "write",
+            db.message(),
+        ),
         // Class 23 — integrity constraint violation. Every one of these is a
         // delivery the store refused on purpose, and none of them succeeds on a
         // retry, so they must not read as a transient storage failure.
@@ -2066,6 +2076,14 @@ fn pg(e: sqlx::Error) -> Error {
             constraint: db.constraint().map(rule_name),
             detail: db.message().to_string(),
         },
+        // `undefined_column`. Every statement here names only columns the
+        // configuration declares, so one the table lacks is a declaration not
+        // yet applied — retrying would loop on it forever.
+        Some("42703") => Error::config(format!(
+            "{}: the configuration declares a column this table does not have yet. \
+             Run `create_tables` (`meterstore create`) to add it to both tiers",
+            db.message()
+        )),
         _ => Error::Storage(e.to_string()),
     }
 }
@@ -2247,6 +2265,27 @@ impl HotStore for PostgresHot {
         let mut created = Vec::new();
         let mut start = crate::watermark::align_to_step(from, step)?;
 
+        // **A reclaimed window is never created again.** Its rows are in the
+        // cold tier and the boundary is past it, so a partition made for it
+        // would hold rows no query reads — a writer acting on a boundary it read
+        // before archival moved it would land them there with no error. Refused
+        // as the boundary move it is; the caller reads the boundary again.
+        if start < until
+            && self.relation_exists("meterstore_reclaimed").await?
+            && let Some(reclaimed) = self.reclaimed_below(table).await?
+            && start < reclaimed
+        {
+            return Err(Error::boundary_moved(
+                table,
+                "write",
+                format!(
+                    "a partition from {start} was asked for, and the hot tier has \
+                     reclaimed everything below {reclaimed}: those rows belong to the \
+                     cold tier now"
+                ),
+            ));
+        }
+
         while start < until {
             let id = PartitionId::new(table, start);
             if self.create_partition(table, &id, step).await? {
@@ -2280,6 +2319,20 @@ impl HotStore for PostgresHot {
                 .execute(&self.pool)
                 .await
                 .map_err(pg)?;
+        }
+
+        // The table's rows in the shared bookkeeping go with it. A reclaimed mark
+        // left behind is a statement about rows a recreated table never held: its
+        // scans would refuse below the old mark, and every unified query with
+        // them, until its own boundary passed it.
+        for bookkeeping in ["meterstore_reclaimed", "meterstore_pins"] {
+            if self.relation_exists(bookkeeping).await? {
+                sqlx::query(&format!(r#"DELETE FROM {bookkeeping} WHERE "table" = $1"#))
+                    .bind(table)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(pg)?;
+            }
         }
 
         info!(table, "hot table dropped");
@@ -2431,17 +2484,17 @@ impl HotStore for PostgresHot {
             && let Some(reclaimed_below) = self.reclaimed_below(table).await?
             && from < reclaimed_below
         {
-            return Err(Error::InvariantViolated {
-                table: table.to_string(),
-                detail: format!(
+            return Err(Error::boundary_moved(
+                table,
+                "scan",
+                format!(
                     "this scan asks for rows from {from}, and the hot tier has \
                      reclaimed everything below {reclaimed_below}: the plan was \
-                     built against a boundary that has since moved and the space \
-                     was taken back before the scan reached it. The rows are \
-                     durable in the cold tier — re-run the query, and raise \
-                     `max_pin_age` past the longest query this deployment runs"
+                     built against a boundary that has since moved. The rows are \
+                     durable in the cold tier, and a fresh plan reads them there; \
+                     raise `max_pin_age` past the longest query this deployment runs"
                 ),
-            });
+            ));
         }
 
         // Ascending, and each one's exclusive upper bound is the next one's
@@ -2662,6 +2715,54 @@ impl HotStore for PostgresHot {
     }
 }
 
+/// One deployment column's definition: name, type, nullability and the check
+/// its declaration carries. Shared by table creation and by
+/// [`PostgresHot::add_declared_columns`], so a column added later is the column
+/// a fresh table would have had.
+fn column_ddl(f: &crate::arrow::datatypes::Field) -> Result<String> {
+    // A coded column (declared via `config::coded_column`) carries its
+    // allowed-value set in field metadata; render it as a CHECK so the
+    // deployment's vocabulary is enforced at the DB layer like sparte/
+    // unit/quality, not only by the application that writes the column.
+    let check = f
+        .metadata()
+        .get(crate::config::CHECK_VALUES_KEY)
+        .map(|vals| {
+            let codes: Vec<&str> = vals.split(',').collect();
+            format!(
+                " CONSTRAINT {constraint:?} CHECK ({col:?} IN ({list}))",
+                constraint = format!("{}_known", f.name()),
+                col = f.name(),
+                list = sql_code_list(&codes),
+            )
+        })
+        // A checked-identifier column (`config::checked_column`) gets
+        // the half of its rule a regular expression can carry: the
+        // shape. Whatever arithmetic the scheme has — an EIC check
+        // character, a MaLo check digit — is a function of the other
+        // characters, so the write path enforces that half; a row
+        // PostgreSQL accepts from another writer is well-shaped, not
+        // necessarily well-formed.
+        .or_else(|| {
+            crate::config::declared_value_check(f).map(|kind| {
+                format!(
+                    " CONSTRAINT {constraint:?} CHECK ({col:?} ~ '{pattern}')",
+                    constraint = format!("{}_shape", f.name()),
+                    col = f.name(),
+                    pattern = value_check_pattern(kind),
+                )
+            })
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "{:?} {} {}{}",
+        f.name(),
+        pg_type(f.data_type())?,
+        if f.is_nullable() { "" } else { "NOT NULL" },
+        check,
+    ))
+}
+
 /// The Unix epoch as a date, the origin `Date32` counts from.
 /// Render a timestamp for inclusion in DDL.
 ///
@@ -2832,8 +2933,8 @@ mod tests {
             (ValueCheck::Malo, "41373559241"),
             (ValueCheck::Malo, "12345678905"),
             (ValueCheck::Melo, "DE00056266802AO6G56M11SN51G21M24S"),
-            (ValueCheck::Bdew, "9900987654321"),
-            (ValueCheck::Bdew, "9812345678901"),
+            (ValueCheck::Bdew, "9900987654329"),
+            (ValueCheck::Bdew, "9812345678900"),
         ] {
             assert_eq!(
                 scheme.canonicalise("c", valid).ok().as_deref(),

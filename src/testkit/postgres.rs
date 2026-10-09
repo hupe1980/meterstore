@@ -77,13 +77,10 @@ pub const FLOOR: u32 = 15;
 /// there, so the lock properties the tests assert would have been asserted
 /// against the one server where they do not hold.
 ///
-/// **18, because three things the design's own performance argument rests on
-/// arrived there**: fast-path lock slots are sized from
-/// `max_locks_per_transaction` instead of being sixteen per backend, a prepared
-/// statement no longer locks every partition while its plan is validated, and
-/// `btree_gist` gained sortsupport — which is what the `EXCLUDE USING gist`
-/// integrity constraints are built and checked through. A suite on an older
-/// server demonstrates the design on the last version with none of them.
+/// **18, because it is the release a new deployment installs.** Fast-path lock
+/// slots there are sized from `max_locks_per_transaction` rather than sixteen per
+/// backend, which matters to a statement reaching many partitions through the
+/// parent; this crate's own hot scan reads one partition per statement.
 pub const IMAGE_TAG: &str = "18-alpine";
 
 /// Override the server every suite runs against.
@@ -138,7 +135,9 @@ async fn start_container() -> Result<(String, testcontainers::ContainerAsync<Pos
         .await
         .map_err(|e| Error::Storage(format!("mapping postgres port: {e}")))?;
     Ok((
-        format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres"),
+        // Plaintext, and said so: the container serves no TLS, and a URL
+        // naming no `sslmode` is verified TLS by default.
+        format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres?sslmode=disable"),
         container,
     ))
 }
@@ -205,11 +204,18 @@ pub async fn fresh_database() -> Result<String> {
         .map_err(|e| Error::Storage(format!("creating test database {name}: {e}")))?;
     admin.close().await.ok();
 
-    Ok(shared
+    let (path, query) = shared
         .admin_url
+        .split_once('?')
+        .unwrap_or((&shared.admin_url, ""));
+    let prefix = path
         .rsplit_once('/')
-        .map(|(prefix, _)| format!("{prefix}/{name}"))
-        .expect("the admin URL carries a database path"))
+        .map(|(prefix, _)| prefix)
+        .expect("the admin URL carries a database path");
+    Ok(match query {
+        "" => format!("{prefix}/{name}"),
+        query => format!("{prefix}/{name}?{query}"),
+    })
 }
 
 /// A PostgreSQL nothing else shares, and the container keeping it alive.

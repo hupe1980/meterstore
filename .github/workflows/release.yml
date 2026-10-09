@@ -44,6 +44,16 @@ jobs:
           echo "version=$crate_version" >> "$GITHUB_OUTPUT"
           echo "releasing $crate_version"
 
+      # Every later build is held to decoding what this release writes, which it
+      # can only be if the release left its stored spellings behind.
+      - name: The release's stored form is recorded
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if ! jq -e --arg v "$version" '.releases | index($v)' tests/stored-form/*.json > /dev/null; then
+            echo "::error::no file in tests/stored-form/ records $version — run \`just stored-form\` and commit it before tagging"
+            exit 1
+          fi
+
       - name: Reject a pre-release version on a stable tag
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"

@@ -70,6 +70,10 @@ pub struct MeterStore {
     /// into any session derived from this one so a reproducible read of a scoped
     /// store stays scoped.
     row_scope: Vec<(String, datafusion::scalar::ScalarValue)>,
+    /// What `meter_completeness` needs to report on this table, kept so a
+    /// catalog sharing the session can register one function over all of its
+    /// tables.
+    completeness: super::completeness::CompletenessBinding,
     /// The boundary that was in force at the pinned snapshot, for an as-of
     /// session.
     ///
@@ -165,7 +169,7 @@ impl MeterStore {
     /// Run a query and keep the provenance of the result.
     ///
     /// The tier boundary and the tiers actually read are what make a figure
-    /// reconcilable later (P1). A `SUM` alone cannot say whether it crossed the
+    /// reconcilable later. A `SUM` alone cannot say whether it crossed the
     /// boundary, and two identical queries a minute apart can read the same rows
     /// from different tiers.
     ///
@@ -292,7 +296,7 @@ impl MeterStore {
     ///
     /// The [`QueryDescription`] comes back **first**, before any row, because a
     /// caller that has to put the boundary on the wire needs it before it starts
-    /// writing (P1). It is the same type [`describe`](Self::describe) returns, so
+    /// writing. It is the same type [`describe`](Self::describe) returns, so
     /// the two surfaces cannot disagree about what a statement produces.
     ///
     /// This is what Flight SQL serves, so it is the surface most likely to be
@@ -438,7 +442,7 @@ impl MeterStore {
     /// splits a series, so a Bilanzkreis reassigned between two deliveries is
     /// still one series.
     ///
-    /// [`MeasurementSeries`]: metering::measurement_series::MeasurementSeries
+    /// [`MeasurementSeries`]: crate::delivery::MeasurementSeries
     /// [`MaloId`]: metering::ids::MaloId
     pub fn series<M>(&self, malo_id: M) -> Result<super::SeriesQuery<'_>>
     where
@@ -593,14 +597,25 @@ impl MeterStore {
         // against a real boundary. The list is newest-first, so the suffix from
         // the pinned snapshot is its own history.
         let snapshots = self.admin().snapshots().await?;
-        let pinned_watermark = snapshots
-            .iter()
-            .position(|s| match snapshot {
-                crate::planner::SnapshotSelector::Id(id) => s.snapshot_id == id,
-                crate::planner::SnapshotSelector::Timestamp(at) => s.committed_at <= at,
-            })
+        let pinned = snapshots.iter().position(|s| match snapshot {
+            crate::planner::SnapshotSelector::Id(id) => s.snapshot_id == id,
+            crate::planner::SnapshotSelector::Timestamp(at) => s.committed_at <= at,
+        });
+        let pinned_watermark = pinned
             .and_then(|i| snapshots[i..].iter().find_map(|s| s.watermark))
             .unwrap_or_else(TieringWatermark::empty);
+
+        // **A timestamp is resolved once, here, and the session pinned by id.**
+        // Resolved again at every scan, a later commit stamped at or before the
+        // instant — a writer whose clock runs behind — or an expiry of the
+        // snapshot it chose would make the session read a different snapshot
+        // from the one whose boundary it reports.
+        let snapshot = match (snapshot, pinned) {
+            (crate::planner::SnapshotSelector::Timestamp(_), Some(i)) => {
+                crate::planner::SnapshotSelector::Id(snapshots[i].snapshot_id)
+            }
+            (selector, _) => selector,
+        };
 
         // A reproducible read of a scoped store stays scoped, and keeps its
         // registry: a boundary that a derived session drops is not a boundary.
@@ -807,8 +822,13 @@ impl MeterStore {
     /// because a handle that could be re-pointed at another tenant is not a
     /// boundary.
     ///
-    /// Writes are unaffected: [`append`](Self::append) routes by `from` and
-    /// carries the identity in the row.
+    /// # Writes are confined too
+    ///
+    /// [`append`](Self::append), [`append_readings`](Self::append_readings) and
+    /// [`hot_writer`](Self::hot_writer) refuse a delivery whose scope column
+    /// names another value, before anything is written. A late correction is
+    /// reconciled against what the session can see, so a write outside the scope
+    /// would be checked against none of the rows it could duplicate.
     pub async fn scoped(&self, column: &str, value: impl Into<String>) -> Result<Self> {
         // The check and the widened scope come from `narrowed_scope`, which a
         // catalog runs over every table before confining any of them — so the
@@ -838,6 +858,11 @@ impl MeterStore {
     /// The identity equalities every query in this session is confined to.
     pub fn row_scope(&self) -> &[(String, datafusion::scalar::ScalarValue)] {
         &self.row_scope
+    }
+
+    /// This table's binding for `meter_completeness`.
+    pub(crate) fn completeness_binding(&self) -> super::completeness::CompletenessBinding {
+        self.completeness.clone()
     }
 
     /// The current tier boundary.
@@ -905,14 +930,25 @@ impl MeterStore {
                 .iter()
                 .map(|s| (&s.series.malo_id, s.series.melo_id.is_some())),
         )?;
+        self.require_in_scope(series.iter().map(|s| (s.series.melo_id.as_ref(), &s.extra)))?;
 
         let mut total = AppendOutcome::default();
-        for _ in 0..BOUNDARY_ATTEMPTS {
+        for attempt in 0..BOUNDARY_ATTEMPTS {
             let watermark = self.watermark().await?;
-            let round = self.append_routed(series, watermark).await?;
+            let round = match self.append_routed(series, watermark).await {
+                // Archival detached a window this delivery routed into; nothing
+                // was written. Route again against the boundary it publishes.
+                Err(Error::BoundaryMoved { .. }) => {
+                    if attempt + 1 < BOUNDARY_ATTEMPTS {
+                        tokio::time::sleep(boundary_backoff(attempt)).await;
+                    }
+                    continue;
+                }
+                other => other?,
+            };
             let earliest_hot = series
                 .iter()
-                .flat_map(|s| s.series.intervals.iter().map(|i| i.from))
+                .flat_map(|s| s.series.intervals.iter().map(|i| i.from()))
                 .filter(|from| *from >= watermark.get())
                 .min();
             total.absorb(round);
@@ -940,7 +976,7 @@ impl MeterStore {
                 .intervals
                 .iter()
                 .cloned()
-                .partition(|i| i.from < watermark.get());
+                .partition(|i| i.from() < watermark.get());
 
             if !at_or_above.is_empty() {
                 let mut s = stored.clone();
@@ -1036,11 +1072,20 @@ impl MeterStore {
         self.check_reading_subject_refs(readings).await?;
 
         self.require_melo(readings.iter().map(|d| (&d.malo_id, d.melo_id.is_some())))?;
+        self.require_in_scope(readings.iter().map(|d| (d.melo_id.as_ref(), &d.extra)))?;
 
         let mut total = AppendOutcome::default();
-        for _ in 0..BOUNDARY_ATTEMPTS {
+        for attempt in 0..BOUNDARY_ATTEMPTS {
             let watermark = self.watermark().await?;
-            let round = self.append_readings_routed(readings, watermark).await?;
+            let round = match self.append_readings_routed(readings, watermark).await {
+                Err(Error::BoundaryMoved { .. }) => {
+                    if attempt + 1 < BOUNDARY_ATTEMPTS {
+                        tokio::time::sleep(boundary_backoff(attempt)).await;
+                    }
+                    continue;
+                }
+                other => other?,
+            };
             let earliest_hot = readings
                 .iter()
                 .flat_map(|d| d.readings.iter().map(|r| r.at))
@@ -1149,11 +1194,12 @@ impl MeterStore {
     ///
     /// Routing reads the boundary before the write; archival advances it by
     /// committing to Iceberg, a different system sharing no transaction with the
-    /// insert. Detaching a partition before archiving it closes most of the gap,
-    /// since an insert into one being archived fails outright. What is
-    /// left is the moment after the drop, when `ensure_partitions` recreates the
-    /// relation and the row lands below the boundary, where no query looks — not
-    /// lost, invisible, and reported by nothing but `verify_invariant`.
+    /// insert. An insert into a window being detached finds no partition and
+    /// is a retryable [`Error::BoundaryMoved`], and a window already reclaimed is
+    /// never created again (`ensure_partitions` refuses below the reclaimed mark).
+    /// What is left is a hot tier that keeps no reclaimed mark, where a dropped
+    /// window can be recreated and the row land below the boundary, where no
+    /// query looks.
     ///
     /// So the boundary is read again afterwards, at the cost of a second catalog
     /// load. `true` sends the caller round with the fresh one; both writes are
@@ -1187,16 +1233,15 @@ impl MeterStore {
 
     /// The failure a write that keeps losing to archival ends in.
     fn boundary_conflict(&self) -> Error {
-        Error::InvariantViolated {
-            table: self.config.name().to_string(),
-            detail: format!(
-                "the tier boundary advanced under this append {BOUNDARY_ATTEMPTS} times \
-                 running. Archival advances the boundary at most one window per commit, so \
-                 this means the intervals being written sit exactly where archival is \
-                 working — write current data through hot_writer, or wait for the catch-up \
-                 to finish"
+        Error::boundary_moved_exhausted(
+            self.config.name(),
+            format!(
+                "archival was moving the tiering boundary through the window this \
+                 append writes into on each of {BOUNDARY_ATTEMPTS} attempts — detaching \
+                 it, or committing past it. The intervals sit exactly where archival is \
+                 working: retry once the run has committed"
             ),
-        }
+        )
     }
 
     /// Refuse a delivery that names no Messlokation on a table keyed by it.
@@ -1225,6 +1270,49 @@ impl MeterStore {
                         self.config.name(),
                     ),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a delivery outside this session's [row scope](Self::scoped).
+    ///
+    /// A scope confines what the handle can reach, writes included. A handle
+    /// confined to tenant `a` that could write tenant `b`'s readings would be
+    /// no boundary — and its late corrections would be reconciled against only
+    /// tenant `a`'s stored rows, so a redelivered tenant-`b` reading would find
+    /// nothing stored and be written a second time.
+    ///
+    /// Scope columns are merge-key columns, so each is a property of the
+    /// delivery: `melo_id` of the series, an identity column of its `extra`.
+    fn require_in_scope<'a>(
+        &self,
+        deliveries: impl IntoIterator<
+            Item = (
+                Option<&'a metering::ids::MeloId>,
+                &'a std::collections::BTreeMap<String, datafusion::scalar::ScalarValue>,
+            ),
+        >,
+    ) -> Result<()> {
+        if self.row_scope.is_empty() {
+            return Ok(());
+        }
+        for (melo, extra) in deliveries {
+            for (column, scoped) in &self.row_scope {
+                let delivered = match column.as_str() {
+                    crate::encode::schema::col::MELO_ID => {
+                        melo.map(|m| datafusion::scalar::ScalarValue::Utf8(Some(m.to_string())))
+                    }
+                    _ => extra.get(column).cloned(),
+                };
+                if delivered.as_ref() != Some(scoped) {
+                    return Err(Error::config(format!(
+                        "this session is scoped to {column} = {scoped} and this delivery \
+                         names {}. A scoped handle writes only inside its scope; write \
+                         through the store it was derived from",
+                        delivered.map_or_else(|| "none".to_string(), |v| v.to_string()),
+                    )));
+                }
             }
         }
         Ok(())
@@ -1360,8 +1448,12 @@ impl MeterStore {
             pending = merge_authored(retry);
         }
 
-        Err(Error::InvariantViolated {
+        // A conflict between two producers, not a store whose state is wrong:
+        // the store kept either assertion from silently winning, and the
+        // producers have to agree which one is authoritative.
+        Err(Error::IntegrityViolation {
             table: self.config.name().to_string(),
+            constraint: Some("one_author_per_reading".to_string()),
             detail: format!(
                 "{AUTHORITATIVE_ATTEMPTS} rounds of append_authoritative still did not take \
                  effect: another writer is authoring the same readings continuously. That is \
@@ -1415,7 +1507,7 @@ impl MeterStore {
         self.require_time_model(crate::config::TimeModel::Interval, "hot_writer")?;
         Ok(HotWriter {
             store: self,
-            watermark: self.watermark().await?,
+            watermark: std::sync::Mutex::new(self.watermark().await?),
             ensured: Default::default(),
         })
     }
@@ -1509,19 +1601,14 @@ impl MeterStore {
         let table = self.config.name();
         let identity = self.config.discriminator_columns();
         let reconciled = self.reconcile_cold(reading_rows(cold, &identity)?).await?;
-
-        let keep: std::collections::HashSet<ColdKey> = reconciled
-            .iter()
-            .filter(|o| o.write)
-            .map(|o| ColdKey::of(&o.displacement))
-            .collect();
+        let write: Vec<bool> = reconciled.iter().map(|o| o.write).collect();
 
         crate::observe::metrics().rows_deduplicated.add(
             reconciled.iter().filter(|o| !o.write).count() as u64,
             &crate::observe::table(table),
         );
 
-        let cold = retain_readings(cold.to_vec(), &identity, &keep)?;
+        let cold = retain_readings(cold.to_vec(), &write)?;
         outcome
             .displacements
             .extend(reconciled.into_iter().map(|o| o.displacement));
@@ -1567,12 +1654,10 @@ impl MeterStore {
 
         // Rows already stored at this `(merge key, version)` are dropped rather
         // than appended: resolution ranks one row per version, so a duplicate
-        // makes two winners and doubles every sum over the interval.
-        let keep: std::collections::HashSet<ColdKey> = reconciled
-            .iter()
-            .filter(|o| o.write)
-            .map(|o| ColdKey::of(&o.displacement))
-            .collect();
+        // makes two winners and doubles every sum over the interval. The
+        // decision is per row, so it is applied per row — a key two rows share
+        // would keep both whenever either is new.
+        let write: Vec<bool> = reconciled.iter().map(|o| o.write).collect();
 
         // The same instrument as the hot tier's `ON CONFLICT` skips, so
         // `write.rows_deduplicated` is the redelivery rate for the store rather
@@ -1582,7 +1667,7 @@ impl MeterStore {
             &crate::observe::table(table),
         );
 
-        let cold = retain_intervals(cold.to_vec(), &self.config.discriminator_columns(), &keep)?;
+        let cold = retain_intervals(cold.to_vec(), &write)?;
         outcome
             .displacements
             .extend(reconciled.into_iter().map(|o| o.displacement));
@@ -1853,9 +1938,11 @@ impl MeterStore {
                 current.insert(row.key.clone(), row.written.clone());
             }
             // Recorded before the write, so a second interval in this same batch
-            // asserting the same `(merge key, version)` is seen as the replay it
-            // is rather than appended twice — Iceberg would keep both.
+            // asserting the same `(merge key, version)` meets the checks above as
+            // a stored row would: a replay is written once, and a second meter's
+            // register is refused rather than read as a replay of the first.
             stored_versions.insert((row.key.clone(), version), row.written.clone());
+            stored_melo.insert((row.key.clone(), version), row.melo.clone());
 
             out.push(ColdOutcome {
                 displacement: Displacement {
@@ -1891,7 +1978,7 @@ impl MeterStore {
             };
             let subject = crate::erasure::SubjectRef::new(value.clone())?;
             for interval in &stored.series.intervals {
-                check_subject_epoch(&subject, interval.from, stored.sparte)?;
+                check_subject_epoch(&subject, interval.from(), stored.sparte)?;
             }
             refs.insert(value.clone());
         }
@@ -2077,18 +2164,6 @@ pub(crate) struct ColdKey {
     identity: Vec<(String, String)>,
 }
 
-impl ColdKey {
-    /// The key a reported displacement describes.
-    fn of(d: &crate::session::Displacement) -> Self {
-        Self {
-            malo_id: d.malo_id.clone(),
-            obis_code: d.obis_code.clone(),
-            from: d.from,
-            identity: d.identity.clone(),
-        }
-    }
-}
-
 /// One interval a late correction asserts, before it is reconciled.
 struct IncomingRow {
     key: ColdKey,
@@ -2123,28 +2198,25 @@ fn interval_rows(
         let melo = stored.series.melo_id.as_ref().map(ToString::to_string);
         let ident = discriminator_values(stored.series.melo_id.as_ref(), &stored.extra, identity)?;
         for interval in &stored.series.intervals {
-            let code = interval
-                .obis_code
-                .or(stored.series.obis_code)
-                .ok_or_else(|| {
-                    Error::encode(
-                        crate::encode::schema::col::OBIS_CODE,
-                        format!("neither interval nor series {malo} carries one"),
-                    )
-                })?;
+            let code = interval.obis().or(stored.series.obis_code).ok_or_else(|| {
+                Error::encode(
+                    crate::encode::schema::col::OBIS_CODE,
+                    format!("neither interval nor series {malo} carries one"),
+                )
+            })?;
             out.push(IncomingRow {
                 key: ColdKey {
                     malo_id: malo.clone(),
                     obis_code: crate::encode::canonical_obis(&code.to_string())?,
-                    from: interval.from,
+                    from: interval.from(),
                     identity: ident.clone(),
                 },
-                to: Some(interval.to),
+                to: Some(interval.to()),
                 melo: melo.clone(),
                 written: crate::session::StoredValue {
-                    value: interval.value,
+                    value: interval.value(),
                     unit: stored.unit,
-                    quality: interval.quality,
+                    quality: interval.quality(),
                     version: stored.version.clone(),
                     recorded_at: stored.recorded_at,
                 },
@@ -2247,41 +2319,22 @@ fn identity_value(
     }
 }
 
-/// Keep only the intervals whose key is in `keep`, dropping emptied series.
+/// Keep the intervals reconciliation decided to write, dropping emptied series.
 ///
-/// The batch is rebuilt from the surviving intervals rather than written whole
-/// and filtered afterwards, because the filtering decision is per interval and
-/// the encoder works per series.
+/// `write` holds one decision per interval, in the order [`interval_rows`]
+/// produced them, and is applied by position. Matching by key instead would keep
+/// every row of a key whenever one of them is new — an in-batch replay written
+/// twice, a stored version rewritten beside the new one.
 fn retain_intervals(
     cold: Vec<crate::encode::StoredSeries>,
-    identity: &[String],
-    keep: &std::collections::HashSet<ColdKey>,
+    write: &[bool],
 ) -> Result<Vec<crate::encode::StoredSeries>> {
+    let mut decisions = write.iter().copied();
     let mut out = Vec::with_capacity(cold.len());
     for mut stored in cold {
-        let malo = stored.series.malo_id.to_string();
-        let ident = discriminator_values(stored.series.melo_id.as_ref(), &stored.extra, identity)?;
-        let series_obis = stored.series.obis_code;
         let mut kept = Vec::with_capacity(stored.series.intervals.len());
         for interval in std::mem::take(&mut stored.series.intervals) {
-            // Unreachable: `reconcile_cold` has already refused a batch whose
-            // interval names no channel. Spelled as an error rather than a
-            // `continue` all the same — dropping a row here would be silent, and
-            // silently losing a reading is the failure this whole path exists to
-            // stop.
-            let code = interval.obis_code.or(series_obis).ok_or_else(|| {
-                Error::encode(
-                    crate::encode::schema::col::OBIS_CODE,
-                    format!("neither interval nor series {malo} carries one"),
-                )
-            })?;
-            let key = ColdKey {
-                malo_id: malo.clone(),
-                obis_code: crate::encode::canonical_obis(&code.to_string())?,
-                from: interval.from,
-                identity: ident.clone(),
-            };
-            if keep.contains(&key) {
+            if decided(decisions.next())? {
                 kept.push(interval);
             }
         }
@@ -2290,30 +2343,21 @@ fn retain_intervals(
             out.push(stored);
         }
     }
+    exhausted(decisions)?;
     Ok(out)
 }
 
-/// [`retain_intervals`] for a point delivery.
+/// [`retain_intervals`] for a point delivery, in [`reading_rows`]' order.
 fn retain_readings(
     cold: Vec<crate::encode::StoredReadings>,
-    identity: &[String],
-    keep: &std::collections::HashSet<ColdKey>,
+    write: &[bool],
 ) -> Result<Vec<crate::encode::StoredReadings>> {
+    let mut decisions = write.iter().copied();
     let mut out = Vec::with_capacity(cold.len());
     for mut stored in cold {
-        let malo = stored.malo_id.to_string();
-        let ident = discriminator_values(stored.melo_id.as_ref(), &stored.extra, identity)?;
-        let delivery_obis = stored.obis_code;
         let mut kept = Vec::with_capacity(stored.readings.len());
         for reading in std::mem::take(&mut stored.readings) {
-            let code = reading.obis_code.unwrap_or(delivery_obis);
-            let key = ColdKey {
-                malo_id: malo.clone(),
-                obis_code: crate::encode::canonical_obis(&code.to_string())?,
-                from: reading.at,
-                identity: ident.clone(),
-            };
-            if keep.contains(&key) {
+            if decided(decisions.next())? {
                 kept.push(reading);
             }
         }
@@ -2322,7 +2366,33 @@ fn retain_readings(
             out.push(stored);
         }
     }
+    exhausted(decisions)?;
     Ok(out)
+}
+
+/// One reconciliation decision, or the error a missing one is.
+///
+/// Unreachable while reconciliation answers every row it is given. Spelled as an
+/// error rather than a default all the same: either default is a silent wrong
+/// write — a dropped reading or a duplicated one.
+fn decided(decision: Option<bool>) -> Result<bool> {
+    decision.ok_or_else(|| {
+        Error::encode(
+            crate::encode::schema::col::VERSION,
+            "a row of this delivery has no reconciliation decision",
+        )
+    })
+}
+
+/// The counterpart of [`decided`]: a decision left over belongs to no row.
+fn exhausted(mut rest: impl Iterator<Item = bool>) -> Result<()> {
+    match rest.next() {
+        None => Ok(()),
+        Some(_) => Err(Error::encode(
+            crate::encode::schema::col::VERSION,
+            "reconciliation decided more rows than this delivery holds",
+        )),
+    }
 }
 
 /// Decode the reconciliation query's rows into `(key, stored value)` pairs.
@@ -2391,12 +2461,16 @@ fn decode_cold_rows(
         };
         let held = crate::session::StoredValue {
             value: scale(value.value(i), crate::encode::schema::VALUE_SCALE),
-            unit: metering::interval::MeasurementUnit::parse(unit.value(i)).ok_or_else(|| {
-                Error::decode(
-                    col::UNIT,
-                    format!("{:?} is not a known unit", unit.value(i)),
-                )
-            })?,
+            unit: unit
+                .value(i)
+                .parse::<metering::Unit>()
+                .ok()
+                .ok_or_else(|| {
+                    Error::decode(
+                        col::UNIT,
+                        format!("{:?} is not a known unit", unit.value(i)),
+                    )
+                })?,
             quality: quality
                 .value(i)
                 .parse()
@@ -2432,15 +2506,16 @@ fn decode_cold_rows(
 /// reference, so this costs a string parse and no round trip.
 ///
 /// [`retention_epoch`] is the rule, and is the **same call**
-/// [`MeterStore::register_subject`] mints with. Two rules for one year would
+/// [`MeterCatalog::register_subject`] mints with. Two rules for one year would
 /// disagree over the six hours after midnight on 1 January for gas, where the
 /// only reference the API could mint is one this check refuses.
 ///
 /// [`retention_epoch`]: crate::erasure::retention_epoch
+/// [`MeterCatalog::register_subject`]: super::MeterCatalog::register_subject
 fn check_subject_epoch(
     subject: &crate::erasure::SubjectRef,
     at: time::OffsetDateTime,
-    sparte: metering::interval::Sparte,
+    sparte: metering::series::interval::Sparte,
 ) -> Result<()> {
     let epoch = subject.epoch()?;
     let year = crate::erasure::retention_epoch(at, sparte);
@@ -2452,7 +2527,7 @@ fn check_subject_epoch(
                 "subject reference {subject} belongs to retention epoch {epoch} but this \
                  reading is balanced on {year}. A reference covers one collection year, \
                  because § 60 Abs. 6 comes due per value — register one per year with \
-                 `register_subject(natural_id, interval.from, sparte)` rather than \
+                 `register_subject(natural_id, interval.from(), sparte)` rather than \
                  reusing whichever the pipeline happened to fetch first. A delivery \
                  that genuinely spans a balancing-year boundary needs splitting at it, \
                  one reference each side"
@@ -2462,7 +2537,19 @@ fn check_subject_epoch(
     Ok(())
 }
 
-const BOUNDARY_ATTEMPTS: u32 = 3;
+/// How many times a write goes round when the boundary moves under it.
+const BOUNDARY_ATTEMPTS: u32 = 5;
+
+/// The wait before the next round: 50 ms, doubling.
+///
+/// A window stays detached for as long as archival takes to scan and commit
+/// it, which for a large day is longer than any fixed short wait; doubling
+/// covers most of a run in a handful of rounds — four waits, 50 + 100 + 200 +
+/// 400 ms, between five rounds, none after the last — and leaves the rest to
+/// the caller, who is told the failure is retryable.
+fn boundary_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(50 << attempt.min(6))
+}
 
 /// How many rounds [`MeterStore::append_authoritative`] will try before calling
 /// it a conflict.
@@ -2494,22 +2581,23 @@ fn reauthored(
     // one of them re-authors another: the wrong value is written, at a version
     // derived from a reading it is not about, and the reading that actually
     // needed authoring is left shadowed. Nothing downstream can see it.
-    let matches =
-        |s: &crate::encode::StoredSeries, i: &metering::interval::MeterInterval| -> Result<bool> {
-            if s.series.malo_id.to_string() != displacement.malo_id || i.from != displacement.from {
-                return Ok(false);
-            }
-            let Some(code) = i.obis_code.or(s.series.obis_code) else {
-                return Ok(false);
-            };
-            if crate::encode::canonical_obis(&code.to_string())? != displacement.obis_code {
-                return Ok(false);
-            }
-            Ok(
-                discriminator_values(s.series.melo_id.as_ref(), &s.extra, discriminators)?
-                    == displacement.identity,
-            )
+    let matches = |s: &crate::encode::StoredSeries,
+                   i: &metering::series::interval::MeterInterval|
+     -> Result<bool> {
+        if s.series.malo_id.to_string() != displacement.malo_id || i.from() != displacement.from {
+            return Ok(false);
+        }
+        let Some(code) = i.obis().or(s.series.obis_code) else {
+            return Ok(false);
         };
+        if crate::encode::canonical_obis(&code.to_string())? != displacement.obis_code {
+            return Ok(false);
+        }
+        Ok(
+            discriminator_values(s.series.melo_id.as_ref(), &s.extra, discriminators)?
+                == displacement.identity,
+        )
+    };
 
     let mut located = None;
     for series in pending {
@@ -2571,8 +2659,8 @@ fn merge_authored(mut rows: Vec<crate::encode::StoredSeries>) -> Vec<crate::enco
                 a.series
                     .intervals
                     .first()
-                    .map(|i| i.from)
-                    .cmp(&b.series.intervals.first().map(|i| i.from))
+                    .map(|i| i.from())
+                    .cmp(&b.series.intervals.first().map(|i| i.from()))
             })
     });
 
@@ -2600,7 +2688,7 @@ fn merge_authored(mut rows: Vec<crate::encode::StoredSeries>) -> Vec<crate::enco
 fn hot_bounds(hot: &[crate::encode::StoredSeries]) -> (time::OffsetDateTime, time::OffsetDateTime) {
     let starts = || {
         hot.iter()
-            .flat_map(|s| s.series.intervals.iter().map(|i| i.from))
+            .flat_map(|s| s.series.intervals.iter().map(|i| i.from()))
     };
     (
         starts().min().expect("non-empty"),
@@ -2695,19 +2783,25 @@ impl AppendOutcome {
 /// batch, and **refuses** anything below that boundary rather than routing it —
 /// see [`MeterStore::hot_writer`] for why that refusal is the safety argument
 /// rather than a limitation.
+///
+/// When archival moves the boundary past a window the writer still writes
+/// into, the write fails with the retryable [`Error::BoundaryMoved`] and the
+/// writer reads the boundary again and forgets the partitions it confirmed. A
+/// retry through the same writer then either lands or refuses the rows now
+/// below the boundary, by name — it does not fail the same way forever.
 #[derive(Debug)]
 pub struct HotWriter<'a> {
     store: &'a MeterStore,
-    watermark: TieringWatermark,
+    watermark: std::sync::Mutex<TieringWatermark>,
     /// Partition bounds this writer has already ensured exist.
     ///
     /// The boundary read was not the only per-batch round trip: ensuring
     /// partitions costs one catalogue lookup **per partition per batch**, and a
     /// service landing meter-days spends the whole run re-asking about the same
-    /// one or two. A partition cannot stop existing under a writer — only
-    /// archival drops one, and only below the watermark, which this writer
-    /// refuses to cross — so a bound confirmed once stays confirmed for the
-    /// writer's life.
+    /// one or two. A confirmed bound stays confirmed until archival moves the
+    /// boundary past it — archival detaches the window just above the old
+    /// boundary, which this writer may still be writing into — and the
+    /// [`Error::BoundaryMoved`] that surfaces then clears the cache.
     ensured: std::sync::Mutex<std::collections::BTreeSet<OffsetDateTime>>,
 }
 
@@ -2718,7 +2812,7 @@ impl HotWriter<'_> {
     /// late corrections before it gets here — rather than discovering the split
     /// as an error.
     pub fn watermark(&self) -> TieringWatermark {
-        self.watermark
+        *self.watermark.lock().expect("writer state")
     }
 
     /// Write current data, returning the number of rows PostgreSQL accepted.
@@ -2739,25 +2833,51 @@ impl HotWriter<'_> {
                 .iter()
                 .map(|s| (&s.series.malo_id, s.series.melo_id.is_some())),
         )?;
+        self.store
+            .require_in_scope(series.iter().map(|s| (s.series.melo_id.as_ref(), &s.extra)))?;
         let store = self.store;
         store.check_subject_refs(series).await?;
 
         // Checked before anything is written, so a mixed batch fails whole
         // rather than landing its current half and leaving the caller to work
         // out which intervals made it.
+        let watermark = self.watermark();
         for stored in series {
             for interval in &stored.series.intervals {
-                if interval.from < self.watermark.get() {
+                if interval.from() < watermark.get() {
                     return Err(Error::config(format!(
                         "interval starting {} is below the tier boundary {} and belongs \
                          to the cold tier: a hot writer refuses it rather than placing \
                          it where no query looks. Use MeterStore::append, which routes \
                          each interval to the tier that owns it",
-                        interval.from, self.watermark,
+                        interval.from(),
+                        watermark,
                     )));
                 }
             }
         }
+
+        match self.write(series).await {
+            Err(e @ Error::BoundaryMoved { .. }) => {
+                self.refresh().await?;
+                Err(e)
+            }
+            other => other,
+        }
+    }
+
+    /// Read the boundary again and forget every confirmed partition: archival
+    /// moved the first, and may have detached or dropped any of the second.
+    async fn refresh(&self) -> Result<()> {
+        let fresh = self.store.watermark().await?;
+        *self.watermark.lock().expect("writer state") = fresh;
+        self.ensured.lock().expect("writer state").clear();
+        Ok(())
+    }
+
+    /// The write itself, once the batch is known to lie above the boundary.
+    async fn write(&self, series: &[crate::encode::StoredSeries]) -> Result<u64> {
+        let store = self.store;
 
         // Nothing to write, including the case that is not `is_empty()`: a
         // delivery of series that carry no intervals. `hot_bounds` has no answer
@@ -2916,14 +3036,15 @@ impl<'a> StoreAdmin<'a> {
 
     /// Put the tiering boundary back on the cold table's current snapshot.
     ///
-    /// Run this after any out-of-band maintenance — the compaction or orphan
-    /// cleanup this crate cannot perform itself, done with Spark or PyIceberg
-    /// against the same table. Those produce valid Iceberg commits that carry no
-    /// watermark, and the boundary is then only findable by walking back the
-    /// parent chain, which snapshot expiry can punch a hole in.
+    /// Run this at the head of any out-of-band maintenance, before a foreign
+    /// tool expires anything, and after any foreign commit. A foreign commit
+    /// carries no watermark, so the boundary is then only findable by walking
+    /// back the parent chain, which snapshot expiry can punch a hole in.
     ///
-    /// It republishes what the history already says, so it cannot move the
-    /// boundary, and it is a no-op when the current snapshot already carries one.
+    /// It republishes what the history already says, and the commit is
+    /// conditional on the snapshot it read that from, so an archival commit
+    /// landing in between makes it re-derive rather than restate an older
+    /// boundary. It is a no-op when the current snapshot already carries one.
     /// [`expire_snapshots`](Self::expire_snapshots) calls it first for that
     /// reason, so a deployment on the maintenance schedule need not.
     pub async fn reassert_watermark(&self) -> Result<bool> {
@@ -3036,10 +3157,8 @@ impl<'a> StoreAdmin<'a> {
     /// **The only operation in this crate that deletes stored readings.**
     /// Everything else is append-only: a correction is a new version, a
     /// hot partition drop reclaims space for rows already durable in Iceberg, and
-    /// erasure destroys a *mapping* rather than rows. That asymmetry is
-    /// deliberate — a settlement must stay reproducible — and it means this is the
-    /// operation to reach for when the answer really is "none of this data should
-    /// exist any more".
+    /// erasure destroys a *mapping* rather than rows, because a settlement must
+    /// stay reproducible.
     ///
     /// The two cases that need it:
     ///
@@ -3060,10 +3179,13 @@ impl<'a> StoreAdmin<'a> {
     ///
     /// # What is destroyed
     ///
-    /// The PostgreSQL table with every partition, attached or detached; the
-    /// Iceberg catalog entry; and the Parquet data files, manifests and metadata
-    /// in object storage. Snapshots do not survive it, so `as_of` against this
-    /// table stops working — that is the point.
+    /// The PostgreSQL table with every partition, attached or detached, and its
+    /// rows in the shared bookkeeping (`meterstore_reclaimed`,
+    /// `meterstore_pins`); the Iceberg catalog entry; and the Parquet data files,
+    /// manifests and metadata in object storage. What is already gone is
+    /// skipped, so an interrupted purge is finished by running it again.
+    /// Snapshots do not survive it, so `as_of` against this table stops working
+    /// — that is the point.
     ///
     /// The subject registry is **not** touched: it is shared across tables, and
     /// destroying one table's readings says nothing about whether a subject's
@@ -3341,7 +3463,28 @@ impl MeterStoreBuilder {
         // and the operator needs to be told that, not shown a schema dump.
         if let Some(stored) = cold.stored_schema(config.name()).await? {
             let configured = crate::encode::schema::storage_schema(&config.extra_columns());
-            crate::evolution::compare(&configured, &stored).require_safe(config.name())?;
+            let compatibility = crate::evolution::compare(&configured, &stored);
+            compatibility.require_safe(config.name())?;
+            // A declared column the cold table does not have yet: the query
+            // surface names it and the provider cannot supply it, so the
+            // session would fail as "column not found". Creating the tables
+            // first — `meterstore create`, `Deployment::store`, or the cold
+            // tier's `create_tables` before this builder — adds it.
+            let pending = compatibility.pending();
+            if !pending.is_empty() {
+                return Err(Error::config(format!(
+                    "table {}: the configuration declares {} that the cold table does not \
+                     have yet. Create the tables before building a store over them \
+                     (`meterstore create`, `Deployment::store`, or \
+                     `ColdStore::create_tables`), which adds the column to both tiers",
+                    config.name(),
+                    pending
+                        .iter()
+                        .map(|f| format!("{:?}", f.name()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
         }
 
         // `information_schema` is off by default in DataFusion, and without it a
@@ -3426,13 +3569,14 @@ impl MeterStoreBuilder {
         // Completeness reads the *resolved* table: a corrected interval is one
         // interval, and counting both its versions would report a complete day
         // as having more intervals than the calendar allows.
+        let completeness = super::completeness::CompletenessBinding::new(
+            resolved_provider,
+            resolved.clone(),
+            config.discriminator_columns(),
+        );
         ctx.register_udtf(
             super::CompletenessFunction::NAME,
-            Arc::new(super::CompletenessFunction::new(
-                resolved_provider,
-                resolved.clone(),
-                config.discriminator_columns(),
-            )),
+            Arc::new(super::CompletenessFunction::new(vec![completeness.clone()])),
         );
 
         info!(
@@ -3452,6 +3596,7 @@ impl MeterStoreBuilder {
             registry: self.registry,
             mode: self.mode,
             row_scope: self.row_scope,
+            completeness,
             // Set by `as_of`, which is the only thing that pins a snapshot.
             pinned_watermark: None,
         })

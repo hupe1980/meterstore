@@ -13,8 +13,8 @@
 
 #![cfg(feature = "testkit")]
 
-use metering::interval::{MeterInterval, QualityFlag, Sparte};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::{MeterInterval, QualityFlag, Sparte};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use meterstore::encode::StoredSeries;
 use meterstore::testkit::TestHarness;
 use time::macros::{date, datetime};
@@ -33,12 +33,15 @@ fn series_of(malo: &str, obis: &str, from: OffsetDateTime, to: OffsetDateTime) -
     let intervals: Vec<MeterInterval> =
         std::iter::successors(Some(from), |t| Some(*t + Duration::minutes(15)))
             .take_while(|t| *t < to)
-            .map(|t| MeterInterval {
-                from: t,
-                to: t + Duration::minutes(15),
-                value: rust_decimal::Decimal::new(1, 0),
-                quality: QualityFlag::Measured,
-                obis_code: obis.parse().ok(),
+            .map(|t| {
+                MeterInterval::new(
+                    t,
+                    t + Duration::minutes(15),
+                    rust_decimal::Decimal::new(1, 0),
+                    QualityFlag::Measured,
+                )
+                .expect("a non-empty interval")
+                .with_obis(obis.parse().unwrap())
             })
             .collect();
 
@@ -49,16 +52,16 @@ fn series_of(malo: &str, obis: &str, from: OffsetDateTime, to: OffsetDateTime) -
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("Marktpartner-ID"),
         },
         from,
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
     StoredSeries::of(
         Sparte::Strom,
         series,
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", from, Sparte::Strom)
+            meterstore::VersionScope::for_interval("9900000000003", from, Sparte::Strom)
                 .expect("scope"),
             meterstore::Version::new(20_260_727_000_001).expect("version"),
         ),

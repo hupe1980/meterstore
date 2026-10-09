@@ -10,7 +10,7 @@ both.
 
 📖 **[Documentation](https://hupe1980.github.io/meterstore)** · [API reference](https://docs.rs/meterstore) · [Changelog](CHANGELOG.md)
 
-> **Pre-alpha, and unpublished on purpose.** Storage, tiering, archival,
+> **Pre-alpha, and pre-1.0 on purpose.** Storage, tiering, archival,
 > querying, reproducible reads and completeness work end to end against real
 > PostgreSQL 18 and a real Iceberg warehouse. The API is still settling;
 > integrating against a real workload is what settles it.
@@ -45,7 +45,7 @@ boundary between them is a timestamp.
 ## ⚙️ How it works
 
 ```
-  MeterInterval.from ─────────────────────────────────────▶
+  MeterInterval::from() ──────────────────────────────────▶
 
   │◀──── Iceberg (cold, settled) ────▶│
                                       │◀── Postgres (hot) ──▶│
@@ -90,8 +90,8 @@ meterstore status    # boundary, lag, write runway, health
 was computed against; `meterstore completeness --month 2026-06` reports which
 channels are short before a settlement run trusts a `SUM`; `meterstore erasures`
 prints the audit trail a regulator asks for; `meterstore maintain` is the archival
-loop as a foreground process, and `meterstore reassert-watermark` is the one step
-to run after compacting the table with somebody else's tool.
+loop as a foreground process, and `meterstore reassert-watermark` is the step to
+run before somebody else's maintenance tool expires anything.
 [The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
 
 As a library:
@@ -102,7 +102,6 @@ cargo add meterstore
 
 ```rust
 use meterstore::prelude::*;
-use meterstore::hot::PostgresHot;
 use std::sync::Arc;
 use time::Duration;
 
@@ -165,9 +164,9 @@ below rather than repeated here.
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`) |
+| Rust | 1.94 | Set by `iceberg` 0.10's floor; `metering` and this crate's own syntax need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18 and whole again on 15 |
-| `metering` | **0.24 or later** | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.25** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
 Nothing here needs a server newer than PostgreSQL 12 — partition creation runs on
@@ -191,10 +190,15 @@ builds whichever it names — all three, by `catalog = "sql" | "rest" | "s3table
 and `Settings::connect()` returns the pool, both tiers and every validated table.
 [Details](https://hupe1980.github.io/meterstore/docs/getting-started/).
 
-MeterStore needs only `SELECT` plus ownership of its own tables: no server
-configuration, no restart, and no extension beyond `btree_gist`, which ships in
-contrib and is created on demand. That is what makes it deployable on RDS, Cloud
-SQL and Azure Postgres, where an extension-based approach is not.
+MeterStore needs no server configuration, no restart, no superuser and no
+extension beyond `btree_gist`, which ships in contrib, is *trusted*, and is created
+on demand. That is what makes it deployable on RDS, Cloud SQL and Azure Postgres,
+where an extension-based approach is not. It does need more than `SELECT`: `CREATE`
+on the schema for its relations and on the database for the extension, and
+`INSERT`/`DELETE` on `meterstore_pins` for every role that queries — a read-only
+role cannot query the unified view. Connections use TLS: a URL naming no
+`sslmode` connects with `verify-full`, and `prefer`/`allow` are refused.
+[Requirements →](https://hupe1980.github.io/meterstore/docs/getting-started/#requirements)
 
 ## 🔗 Relationship to `metering`
 
@@ -236,7 +240,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**1001 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+**1057 tests** — unit, property, doc and integration against real PostgreSQL 18 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle
 over generated workloads:
 
@@ -250,12 +254,21 @@ over generated workloads:
 | **Compression** | Measured rather than targeted: ~109× (457 B/row against 4.2 B/row; the measurement suite carries the caveats) |
 
 ⛔ **Argued rather than measured**, and named here for that reason: query latency
-on reference hardware, so the p99 targets remain aspirational; Spark and Trino
+on reference hardware, so no latency figure is published; Spark and Trino
 interop; a long-horizon soak; and two replicas as two *processes* rather than two
-pools, so a crash mid-lease is reasoned about rather than run. Compaction and
-general orphan-file cleanup
-[run out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
-because `iceberg-rust` exposes neither.
+pools, so a crash mid-lease is reasoned about rather than run. Orphan-file cleanup
+[runs out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
+because `iceberg-rust` cannot list a warehouse; compaction is refused, because it
+destroys the file statistics merge elision proves itself from.
+
+⛔ **Known gaps**, each stated where it applies:
+
+- **The retention sweep is pseudonymisation.** Deleting the subject mapping leaves
+  `malo_id` in clear on every row, so what remains is pseudonymised rather than
+  anonymous data; whether that discharges `[MsbG § 60 Abs. 6]` is undecided.
+- **Rows written by 0.12.0–0.14.0 in three shapes do not decode** under 0.15:
+  `AUTO_SUBSTITUTE` payloads, resolutions spelled in seconds, and
+  Marktpartner-IDs failing both check-digit procedures.
 
 > ⚠️ **One caveat worth knowing before you deploy.** A query holds the archived
 > partitions its plan is entitled to for up to `max_pin_age` — six hours by

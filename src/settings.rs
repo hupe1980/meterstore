@@ -1,17 +1,17 @@
 //! The TOML front end over the same validated configuration.
 //!
-//! Everything here produces a [`ValidatedTableConfig`](crate::config::ValidatedTableConfig) — the builder's own output
-//! type — so a deployment configured from a file and one configured in Rust pass
-//! through exactly the same cross-field checks. There is no second
-//! validation path to keep in step, and no setting reachable from one and not the
-//! other.
+//! Everything here produces a
+//! [`ValidatedTableConfig`](crate::config::ValidatedTableConfig) — the builder's
+//! own output type — so a deployment configured from a file and one configured
+//! in Rust pass through exactly the same cross-field checks, and no setting is
+//! reachable from one and not the other.
 //!
 //! # Why the file cannot construct the tiers
 //!
 //! It names them; it does not open them. A `hot.url` becomes a
 //! [`HotSettings`] the application uses to build its own `PgPool`, because the
 //! pool is usually shared with the rest of the service and MeterStore never owns
-//! a connection (P3). The same goes for the catalog: the file records
+//! a connection. The same goes for the catalog: the file records
 //! which one and where, and the application constructs it.
 //!
 //! # Environment interpolation
@@ -148,12 +148,14 @@ impl Settings {
         // One registry for the deployment, not one per table: the mapping lives
         // in a single `meterstore_subject_map` keyed by natural identifier, and
         // that is what makes one erasure reach every table that registered the
-        // same subject. Built only where a table asks for it, so a deployment
-        // that stores no personal reference holds no registry at all.
-        let registry = match tables
+        // same subject. Built where a table asks for it — and where the database
+        // already holds a mapping, because a deployment that has stopped
+        // declaring subject columns still owes the retention sweep for every
+        // row it wrote.
+        let declares = tables
             .iter()
-            .any(|t| crate::config::ValidatedTableConfig::subject_column(t).is_some())
-        {
+            .any(|t| crate::config::ValidatedTableConfig::subject_column(t).is_some());
+        let registry = match declares || subject_map_exists(&pool).await? {
             true => Some(self.privacy.registry(pool.clone())?),
             false => None,
         };
@@ -225,8 +227,9 @@ pub struct PrivacySettings {
     /// the same transaction that wrote it, so it can never be re-keyed. Replacing
     /// `erasure_secret` without listing the old key here silently stops every
     /// erasure recorded before the change from being recognised, and
-    /// re-registration re-opens for all of them at once — the one failure this
-    /// crate cannot report.
+    /// re-registration re-opens for all of them at once. Nothing refuses it;
+    /// [`SubjectRegistry::orphaned_suppressions`](crate::SubjectRegistry::orphaned_suppressions)
+    /// and a startup warning report it.
     ///
     /// So rotation is *additive*: move the outgoing key here and put the new one
     /// in `erasure_secret`. A key stays here for as long as the erasures it
@@ -378,7 +381,13 @@ impl HotSettings {
                  blocks the first query for ever rather than failing",
             ));
         }
-        Ok(())
+        self.tls_url().map(|_| ())
+    }
+
+    /// The URL with the `sslmode` this crate connects with — see
+    /// [`require_tls`](crate::tls::require_tls) for the rule.
+    fn tls_url(&self) -> Result<String> {
+        crate::tls::require_tls(&self.url, std::env::var("PGSSLMODE").ok().as_deref())
     }
 
     /// Build the hot tier this section describes, over an existing pool.
@@ -405,8 +414,8 @@ impl HotSettings {
             // `max_lifetime` recycles the connection.
             //
             // One statement per checkin closes it. A deployment that builds its
-            // own pool — which P3 says is the normal case — needs the same hook
-            // (R22).
+            // own pool — the normal case — needs the same hook, or a leaked
+            // archive lease wedges archival.
             .after_release(|conn, _| {
                 Box::pin(async move {
                     sqlx::query("SELECT pg_advisory_unlock_all()")
@@ -415,14 +424,27 @@ impl HotSettings {
                     Ok(true)
                 })
             })
-            .connect(&self.url)
+            .connect(&self.tls_url()?)
             .await
             .map_err(|e| {
                 Error::Storage(format!(
-                    "connecting to {}: {e}",
-                    crate::error::redacted(&self.url)
+                    "connecting to {}: {e}{}",
+                    crate::error::redacted(&self.url),
+                    tls_hint(&e),
                 ))
             })
+    }
+}
+
+/// What to tell an operator when a connection failed over TLS.
+fn tls_hint(e: &sqlx::Error) -> &'static str {
+    let text = e.to_string().to_ascii_lowercase();
+    if text.contains("tls") || text.contains("ssl") || text.contains("certificate") {
+        " — the connection is TLS by default (sslmode=verify-full): a server offering \
+         no TLS, or a certificate this host cannot verify, fails here. Set sslrootcert= \
+         for a private CA, or choose sslmode explicitly"
+    } else {
+        ""
     }
 }
 
@@ -594,7 +616,7 @@ impl ColdSettings {
         // A catalogue whose feature was not compiled in is a configuration error,
         // and `meterstore check` is where a deployment expects to be told: it
         // promises to validate without connecting, so answering "valid" for a
-        // file that cannot open a cold tier is the lie P6 forbids.
+        // file that cannot open a cold tier would be a lie.
         self.catalog.require_compiled_in()?;
         // The scheme decides the object-store backend, and a backend whose
         // feature was not compiled in is a configuration error rather than a
@@ -604,6 +626,12 @@ impl ColdSettings {
         // scheme naming an object-store backend. The catalogue owns the layout.
         if self.catalog != CatalogKind::S3Tables {
             crate::cold::catalog::warehouse_factory(&self.warehouse)?;
+        }
+        // A SQL catalogue is a PostgreSQL connection, under the same TLS rule as
+        // `[hot] url` — refused here, at validation, not first at the build.
+        if self.catalog == CatalogKind::Sql {
+            crate::tls::require_tls(&self.uri, std::env::var("PGSSLMODE").ok().as_deref())
+                .map_err(|e| Error::config(format!("[cold] uri: {e}")))?;
         }
         Ok(())
     }
@@ -707,9 +735,44 @@ impl Deployment {
         &self,
         config: crate::config::ValidatedTableConfig,
     ) -> Result<crate::MeterStoreBuilder> {
+        self.builder(config, Creation::Create).await
+    }
+
+    /// [`table`](Self::table) over a table that must already exist.
+    ///
+    /// Runs no DDL, so it works on a role that may only read. A missing cold
+    /// table is a configuration error naming `meterstore create`.
+    pub async fn open_table(
+        &self,
+        config: crate::config::ValidatedTableConfig,
+    ) -> Result<crate::MeterStoreBuilder> {
+        self.builder(config, Creation::Existing).await
+    }
+
+    async fn builder(
+        &self,
+        config: crate::config::ValidatedTableConfig,
+        creation: Creation,
+    ) -> Result<crate::MeterStoreBuilder> {
         use crate::tiering::ColdStore as _;
 
         let cold = self.cold.cold();
+        if creation == Creation::Existing {
+            if cold.stored_schema(config.name()).await?.is_none() {
+                return Err(Error::config(format!(
+                    "table {} does not exist yet: run `meterstore create` (or \
+                     Deployment::store) once, with a role that may create tables",
+                    config.name()
+                )));
+            }
+            let provider = cold.table_provider(config.name()).await?;
+            return Ok(self.with_registry(
+                crate::MeterStore::builder()
+                    .hot(self.hot.clone() as std::sync::Arc<dyn crate::HotStore>)
+                    .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider),
+                config,
+            ));
+        }
         // **With the declared columns, never bare.** The bare constructor would
         // create the table with the core schema and the default partition spec,
         // and a deployment declaring identity columns would then find its own
@@ -724,9 +787,19 @@ impl Deployment {
         )
         .await?;
         let provider = cold.table_provider(config.name()).await?;
-        let mut builder = crate::MeterStore::builder()
-            .hot(self.hot.clone() as std::sync::Arc<dyn crate::HotStore>)
-            .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider);
+        Ok(self.with_registry(
+            crate::MeterStore::builder()
+                .hot(self.hot.clone() as std::sync::Arc<dyn crate::HotStore>)
+                .cold(cold as std::sync::Arc<dyn crate::ColdStore>, provider),
+            config,
+        ))
+    }
+
+    fn with_registry(
+        &self,
+        mut builder: crate::MeterStoreBuilder,
+        config: crate::config::ValidatedTableConfig,
+    ) -> crate::MeterStoreBuilder {
         // Only where the table asks for it. Attaching a registry to a table that
         // declares no subject column would create the registry's two tables in a
         // database that has no use for them, and `subject_registry()` would then
@@ -736,7 +809,7 @@ impl Deployment {
         {
             builder = builder.subject_registry(registry.clone());
         }
-        Ok(builder.table(config))
+        builder.table(config)
     }
 
     /// Build a store over the **one** table the file declares.
@@ -782,10 +855,44 @@ impl Deployment {
         for config in &self.tables {
             builder = builder.table(self.table(config.clone()).await?);
         }
+        if let Some(registry) = &self.registry {
+            builder = builder.subject_registry(registry.clone());
+        }
         let catalog = builder.build().await?;
         catalog.create_tables().await?;
         Ok(catalog)
     }
+
+    /// A catalog over every declared table, **creating nothing**.
+    ///
+    /// What a reading caller wants: no DDL, so a read-only role can open it,
+    /// and a table missing from the deployment is an error naming
+    /// `meterstore create` rather than created as a side effect of a query.
+    pub async fn open(&self) -> Result<crate::MeterCatalog> {
+        let mut builder = crate::MeterCatalog::builder();
+        for config in &self.tables {
+            builder = builder.table(self.open_table(config.clone()).await?);
+        }
+        if let Some(registry) = &self.registry {
+            builder = builder.subject_registry(registry.clone());
+        }
+        builder.build().await
+    }
+}
+
+/// Whether the deployment's subject map exists in this database.
+async fn subject_map_exists(pool: &sqlx::PgPool) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>("SELECT to_regclass('meterstore_subject_map') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| crate::error::Error::Storage(e.to_string()))
+}
+
+/// Whether opening a table may create it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Creation {
+    Create,
+    Existing,
 }
 
 impl std::fmt::Debug for Deployment {
@@ -1605,6 +1712,19 @@ identify_by_melo = false
                 Box::new(|s: &mut Settings| "ftp://host/wh".clone_into(&mut s.cold.warehouse)),
                 "ftp",
             ),
+            // The TLS modes that fall back to plaintext without a word, in
+            // both places a PostgreSQL URL is configured.
+            (
+                Box::new(|s: &mut Settings| s.hot.url.push_str("?sslmode=prefer")),
+                "sslmode=prefer",
+            ),
+            (
+                Box::new(|s: &mut Settings| {
+                    s.cold.catalog = CatalogKind::Sql;
+                    "postgresql://edm@db.internal/prod?sslmode=allow".clone_into(&mut s.cold.uri);
+                }),
+                "[cold] uri",
+            ),
         ] {
             let mut broken = example.clone();
             mutate(&mut broken);
@@ -1655,7 +1775,7 @@ name = "readings"
         // `meterstore check` promises to validate without connecting, so it is
         // where a deployment expects to be told that the catalogue it named is
         // not in this binary. Answering "valid" and failing at the first connect
-        // is the lie P6 forbids — and it is reachable, since every backend is a
+        // would be a lie — and it is reachable, since every backend is a
         // feature and `--no-default-features --features cli` selects none of the
         // three by itself.
         // `file://` rather than the documented example's `s3://`: the object-store

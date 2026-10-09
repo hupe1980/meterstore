@@ -26,7 +26,7 @@
 //! this saves is the extra round trip and the race, not the history.
 
 use metering::QualityFlag;
-use metering::interval::MeasurementUnit;
+use metering::Unit;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
@@ -42,7 +42,7 @@ pub struct StoredValue {
     /// Carried because a value without it is dimensionless: water settles in m³
     /// and gas may sit on either side of the Brennwert conversion. An
     /// audit row recording a changed number without its unit records half a fact.
-    pub unit: MeasurementUnit,
+    pub unit: Unit,
     /// The reading's quality.
     ///
     /// Carried because a change *of quality* is a change even when the number is
@@ -212,10 +212,10 @@ mod tests {
     fn value(v: i64, version: u128, quality: QualityFlag) -> StoredValue {
         StoredValue {
             value: Decimal::new(v, 0),
-            unit: MeasurementUnit::KiloWattHour,
+            unit: Unit::KiloWattHour,
             quality,
             version: ScopedVersion::new(
-                VersionScope::new("9900000000001", 2026, 7).unwrap(),
+                VersionScope::new("9900000000003", 2026, 7).unwrap(),
                 Version::new(version).unwrap(),
             ),
             recorded_at: datetime!(2026-07-27 06:00 UTC),
@@ -299,7 +299,7 @@ mod tests {
         // the largest change a reading can undergo, and the one a number-only
         // comparison is blindest to.
         let mut restated = value(100, 20_260_728_000_002, QualityFlag::Measured);
-        restated.unit = MeasurementUnit::CubicMetre;
+        restated.unit = Unit::CubicMetre;
 
         let d = displacement(
             Effect::Superseded,

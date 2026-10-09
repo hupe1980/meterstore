@@ -13,9 +13,9 @@
 
 #![cfg(feature = "testkit")]
 
-use metering::interval::{MeterInterval, Sparte};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::{MeterInterval, Sparte};
 use meterstore::Settings;
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use meterstore::testkit::TestHarness;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -83,13 +83,16 @@ async fn a_configuration_file_builds_a_working_store() {
     let store = deployment.store().await.expect("store");
 
     // And it works: a reading in, the same reading out.
-    let intervals = vec![MeterInterval {
-        from: START,
-        to: START + Duration::minutes(15),
-        value: rust_decimal::Decimal::new(42, 0),
-        quality: metering::QualityFlag::Measured,
-        obis_code: "1-0:1.8.0".parse().ok(),
-    }];
+    let intervals = vec![
+        MeterInterval::new(
+            START,
+            START + Duration::minutes(15),
+            rust_decimal::Decimal::new(42, 0),
+            metering::QualityFlag::Measured,
+        )
+        .expect("a non-empty interval")
+        .with_obis("1-0:1.8.0".parse().unwrap()),
+    ];
     let series = meterstore::encode::StoredSeries::new(
         MeasurementSeries::new(
             MALO.parse().expect("a valid MaLo-ID"),
@@ -98,12 +101,12 @@ async fn a_configuration_file_builds_a_working_store() {
             MeasurementSource::Mscons {
                 pid: 13_005,
                 message_ref: None,
-                sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+                sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
             },
             START,
         ),
         meterstore::ScopedVersion::new(
-            meterstore::VersionScope::for_interval("9900000000001", START, Sparte::Strom)
+            meterstore::VersionScope::for_interval("9900000000003", START, Sparte::Strom)
                 .expect("scope"),
             meterstore::Version::new(20_260_720_000_001).expect("version"),
         ),
@@ -120,7 +123,7 @@ async fn a_configuration_file_builds_a_working_store() {
         .await
         .expect("read");
     assert_eq!(back.len(), 1);
-    assert_eq!(back[0].value, rust_decimal::Decimal::new(42, 0));
+    assert_eq!(back[0].value(), rust_decimal::Decimal::new(42, 0));
 
     // The pool comes back too, because the subject registry and the
     // application's own tables belong in the same database.
@@ -326,7 +329,7 @@ archival_step = "1d"
         .register(
             "tenant-a:12345678905",
             START,
-            metering::interval::Sparte::Strom,
+            metering::series::interval::Sparte::Strom,
         )
         .await
         .expect("register");
@@ -350,7 +353,7 @@ archival_step = "1d"
         .register(
             "tenant-a:12345678905",
             START,
-            metering::interval::Sparte::Strom,
+            metering::series::interval::Sparte::Strom,
         )
         .await
         .expect_err("suppressed");
@@ -379,5 +382,34 @@ async fn a_deployment_with_no_subject_column_builds_no_registry() {
             .expect("store")
             .subject_registry()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_stopped_declaring_a_subject_column_still_reaches_its_registry() {
+    // The mapping rows outlive the declaration that created them, and the
+    // retention sweep still owes them `[MsbG § 60 Abs. 6]`. A file that no
+    // longer names a subject column describes a database that still holds them.
+    let url = meterstore::testkit::postgres::fresh_database()
+        .await
+        .expect("postgres");
+    let warehouse = tempfile::tempdir().expect("temp warehouse");
+    let registry =
+        meterstore::SubjectRegistry::new(sqlx::PgPool::connect(&url).await.expect("connect"));
+    registry.create_tables().await.expect("registry tables");
+
+    let deployment = Settings::from_toml(&file(&url, warehouse.path()))
+        .expect("parse")
+        .connect()
+        .await
+        .expect("connect");
+    assert!(
+        deployment.registry.is_some(),
+        "a database holding a subject map gets a registry whatever the file declares"
+    );
+    let catalog = deployment.catalog().await.expect("catalog");
+    assert!(
+        catalog.subject_registry().is_some(),
+        "the catalog the sweep runs through carries it"
     );
 }

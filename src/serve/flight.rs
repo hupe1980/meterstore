@@ -26,7 +26,7 @@
 //! # Results carry their boundary
 //!
 //! The watermark and the tiers scanned travel as **schema metadata** on every
-//! response (P1), so a BI tool that keeps the schema keeps the provenance. A
+//! response, so a BI tool that keeps the schema keeps the provenance. A
 //! number pulled over Flight is otherwise indistinguishable from one pulled a
 //! minute later against a different boundary.
 //!
@@ -125,7 +125,7 @@ impl FlightSqlServer {
         FlightServiceServer::new(self)
     }
 
-    /// The provenance a response carries, as Arrow schema metadata (P1).
+    /// The provenance a response carries, as Arrow schema metadata.
     ///
     /// A client on the far end of a socket needs the boundary as much as one
     /// in-process: a number pulled over Flight is otherwise indistinguishable
@@ -170,11 +170,7 @@ impl FlightSqlServer {
     async fn describe(&self, sql: &str) -> Result<SchemaRef, Status> {
         debug!(%sql, "flight sql describe");
 
-        let described = self
-            .surface
-            .describe_sql(sql)
-            .await
-            .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
+        let described = self.surface.describe_sql(sql).await.map_err(status_of)?;
 
         Ok(Self::with_provenance(&described))
     }
@@ -202,7 +198,7 @@ impl FlightSqlServer {
             .surface
             .stream_sql(sql, Vec::new())
             .await
-            .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
+            .map_err(status_of)?;
 
         let schema = Self::with_provenance(&described);
 
@@ -213,8 +209,9 @@ impl FlightSqlServer {
         // is here to prevent.
         let stamped = schema.clone();
         let batches = rows.map(move |batch| {
-            let batch =
-                batch.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))?;
+            let batch = batch.map_err(|e| {
+                arrow_flight::error::FlightError::Tonic(Box::new(status_of(e.into())))
+            })?;
             RecordBatch::try_new(stamped.clone(), batch.columns().to_vec())
                 .map_err(arrow_flight::error::FlightError::Arrow)
         });
@@ -222,7 +219,7 @@ impl FlightSqlServer {
         let flight = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batches)
-            .map_err(|e| Status::internal(format!("encoding flight data: {e}")));
+            .map_err(Status::from);
 
         Ok(Response::new(Box::pin(flight)))
     }
@@ -272,8 +269,8 @@ impl FlightSqlServer {
     /// # Why these do not go through `respond`
     ///
     /// `respond` stamps the tiering watermark and the tiers scanned onto the
-    /// schema, which is P1 — an answer carries the boundary it was computed
-    /// against — and exactly wrong here. A `GetTables` response is not an answer
+    /// schema — an answer carries the boundary it was computed against — and
+    /// that is exactly wrong here. A `GetTables` response is not an answer
     /// about readings; its schema is part of the wire contract, fixed field for
     /// field down to nullability, and a client is entitled to reject anything
     /// else. The ADBC driver does: extra schema metadata and a non-nullable
@@ -294,12 +291,13 @@ impl FlightSqlServer {
             .surface
             .stream_sql(sql, Vec::new())
             .await
-            .map_err(|e| Status::invalid_argument(format!("query failed: {e}")))?;
+            .map_err(status_of)?;
 
         let wire = schema.clone();
         let batches = rows.map(move |batch| {
-            let batch =
-                batch.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))?;
+            let batch = batch.map_err(|e| {
+                arrow_flight::error::FlightError::Tonic(Box::new(status_of(e.into())))
+            })?;
             RecordBatch::try_new(wire.clone(), batch.columns().to_vec())
                 .map_err(arrow_flight::error::FlightError::Arrow)
         });
@@ -307,7 +305,7 @@ impl FlightSqlServer {
         let flight = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batches)
-            .map_err(|e| Status::internal(format!("encoding flight data: {e}")));
+            .map_err(Status::from);
 
         Ok(Response::new(Box::pin(flight)))
     }
@@ -569,6 +567,28 @@ impl FlightSqlService for FlightSqlServer {
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 }
 
+/// The status a query's failure is answered with.
+///
+/// A Flight client decides from the code alone whether to retry, so the code
+/// carries what [`Error::is_retryable`](crate::Error::is_retryable) says:
+/// `UNAVAILABLE` is the one code client libraries retry by default.
+/// `INTERNAL` is reserved for a store whose own state is wrong — the thing an
+/// operator is paged for — and never for a statement the client got wrong.
+fn status_of(e: crate::Error) -> Status {
+    use crate::Error as E;
+    use datafusion::common::DataFusionError as Df;
+    let message = format!("query failed: {e}");
+    if e.is_retryable() {
+        return Status::unavailable(message);
+    }
+    match e {
+        E::InvariantViolated { .. } | E::DataFusion(Df::Internal(_)) => Status::internal(message),
+        E::Decode { .. } => Status::data_loss(message),
+        E::Quarantined { .. } => Status::failed_precondition(message),
+        _ => Status::invalid_argument(message),
+    }
+}
+
 /// What this server says about itself when a client asks.
 ///
 /// # Why this is not optional
@@ -695,6 +715,30 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_code_carries_whether_a_retry_helps() {
+        // A Flight client sees the code, not the variant. A boundary move raised
+        // mid-scan must reach it as the code clients retry, and a store fault as
+        // the one nobody retries past.
+        use datafusion::common::DataFusionError as Df;
+        let moved = crate::Error::BoundaryMoved {
+            table: "readings".into(),
+            detail: "reclaimed".into(),
+        };
+        let mid_scan = Df::External(Box::new(moved)).into();
+        assert_eq!(status_of(mid_scan).code(), tonic::Code::Unavailable);
+
+        let fault = crate::Error::InvariantViolated {
+            table: "readings".into(),
+            detail: "rows below the watermark".into(),
+        };
+        let mid_scan = Df::External(Box::new(fault)).into();
+        assert_eq!(status_of(mid_scan).code(), tonic::Code::Internal);
+
+        let typo = Df::Plan("table 'readngs' not found".into()).into();
+        assert_eq!(status_of(typo).code(), tonic::Code::InvalidArgument);
+    }
 
     #[test]
     fn the_refusal_names_what_it_would_break() {

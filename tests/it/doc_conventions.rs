@@ -1,8 +1,8 @@
-//! Two documentation conventions, enforced rather than reviewed.
+//! Three documentation conventions, enforced rather than reviewed.
 //!
-//! Both are about the same thing: what a reader of a *reference* doc is entitled
-//! to. They want to know what the thing does and why it is the way it is —
-//! neither a chapter nor a diff.
+//! All three are about the same thing: what a reader of a *reference* doc is
+//! entitled to. They want to know what the thing does and why it is the way it
+//! is — neither a chapter, nor a diff, nor a plan.
 //!
 //! Needs no database and no feature flag, so this module carries no `#![cfg]`
 //! gate.
@@ -271,5 +271,120 @@ fn the_published_docs_are_not_a_backlog() {
          which is not published — and a gap worth warning a reader about is a \
          limitation, stated as one.",
         offenders.join("\n  ")
+    );
+}
+
+#[test]
+fn no_message_carries_a_lost_line_continuation() {
+    // A long message is split across lines with a trailing `\`, which joins the
+    // next line and drops its indentation. A continuation lost in an edit still
+    // compiles — the string just carries the indentation as a run of spaces in
+    // the middle of a sentence, which `rustfmt` does not touch and only the
+    // reader of the error sees. The tell is a line whose quoted text, before it
+    // closes, holds a word, ten or more spaces, and another word.
+    let gap = |line: &str| -> bool {
+        let Some(open) = line.trim_start().strip_prefix('"') else {
+            return false;
+        };
+        let quoted = open.split('"').next().unwrap_or("");
+        let bytes = quoted.as_bytes();
+        let mut run = 0;
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b' ' {
+                run += 1;
+            } else {
+                // After an explicit `\n` the spaces are layout the string asks
+                // for — a DDL statement indented for the server log.
+                let after_newline = i >= run + 2 && &bytes[i - run - 2..i - run] == b"\\n";
+                if run >= 10 && i > run && bytes[i - run - 1] != b' ' && !after_newline {
+                    return true;
+                }
+                run = 0;
+            }
+        }
+        false
+    };
+    let sources: Vec<(std::path::PathBuf, String)> = documented_files()
+        .into_iter()
+        .filter(|(p, _)| {
+            p.extension().is_some_and(|e| e == "rs")
+                && p.starts_with(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+        })
+        .collect();
+    assert!(
+        sources.len() > 30,
+        "the scan read {} source files; a guard that reads nothing passes everything",
+        sources.len()
+    );
+    let offenders: Vec<String> = sources
+        .into_iter()
+        .flat_map(|(p, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, l)| gap(l))
+                .map(|(n, _)| format!("{}:{}", p.display(), n + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "a message lost a `\\` continuation: {offenders:#?}"
+    );
+}
+
+#[test]
+fn a_boundary_move_is_raised_through_the_constructor_that_counts_it() {
+    // `meterstore.tiering.boundary_moved` is recorded by `Error::boundary_moved`.
+    // A struct literal anywhere else raises the error without the count, and the
+    // instrument then reads low for exactly the site nobody remembered.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources: Vec<(std::path::PathBuf, String)> = documented_files()
+        .into_iter()
+        .filter(|(p, _)| {
+            p.starts_with(&root)
+                && p.extension().is_some_and(|e| e == "rs")
+                && !p.ends_with("error.rs")
+        })
+        .collect();
+    assert!(
+        sources.len() > 30,
+        "the scan read {} source files; a guard that reads nothing passes everything",
+        sources.len()
+    );
+    let offenders: Vec<String> = sources
+        .into_iter()
+        .flat_map(|(p, text)| {
+            // Only the code before a file's test module: a test may build the
+            // value it asserts about.
+            let code = text.split("#[cfg(test)]").next().unwrap_or("").to_string();
+            code.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("BoundaryMoved {") && !l.contains("{ .. }"))
+                .map(|(n, _)| format!("{}:{}", p.display(), n + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "raise it with Error::boundary_moved, which counts it: {offenders:#?}"
+    );
+
+    // The one uncounted form ends a retry loop whose rounds were each counted,
+    // and has exactly one caller; a second would raise a move nobody counts.
+    let uncounted: Vec<String> = documented_files()
+        .into_iter()
+        .filter(|(p, _)| p.starts_with(&root) && !p.ends_with("error.rs"))
+        .flat_map(|(p, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("boundary_moved_exhausted("))
+                .map(|(n, _)| format!("{}:{}", p.display(), n + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        uncounted.len(),
+        1,
+        "boundary_moved_exhausted is for the end of the append retry loop only: {uncounted:#?}"
     );
 }

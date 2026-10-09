@@ -24,8 +24,8 @@ use meterstore::tiering::store::HotStore;
 use meterstore::{ScopedVersion, Version, VersionScope};
 
 use datafusion::common::ScalarValue;
-use metering::interval::{MeterInterval, QualityFlag, Sparte};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::{MeterInterval, QualityFlag, Sparte};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -64,9 +64,10 @@ fn valid_of(scheme: ValueCheck) -> &'static str {
         ValueCheck::Eic(Some(EicType::TieLine)) => "11TBK0000000001T",
         ValueCheck::Eic(Some(EicType::Location)) => "11VBK00000000011",
         ValueCheck::Eic(Some(EicType::Substation)) => "11ABK0000000002Y",
+        ValueCheck::Eic(Some(other)) => panic!("no fixture for {other:?}"),
         ValueCheck::Malo => "41373559241",
         ValueCheck::Melo => "DE00056266802AO6G56M11SN51G21M24S",
-        ValueCheck::Bdew => "9900987654321",
+        ValueCheck::Bdew => "9900987654329",
     }
 }
 
@@ -116,21 +117,24 @@ async fn hot_with_checked_columns() -> (PostgresHot, TableConfig) {
 
 /// One quarter-hour delivery, optionally setting one checked column.
 fn delivery(column: Option<(&str, &str)>) -> StoredSeries {
-    let obis = "1-0:1.8.0".parse().ok();
+    let obis = "1-0:1.8.0".parse().expect("OBIS");
     let series = MeasurementSeries::new(
         "12345678905".parse().expect("MaLo-ID"),
-        obis,
-        vec![MeterInterval {
-            from: D20,
-            to: D20 + Duration::minutes(15),
-            value: "1.5".parse().expect("decimal"),
-            quality: QualityFlag::Measured,
-            obis_code: obis,
-        }],
+        Some(obis),
+        vec![
+            MeterInterval::new(
+                D20,
+                D20 + Duration::minutes(15),
+                "1.5".parse().expect("decimal"),
+                QualityFlag::Measured,
+            )
+            .expect("a non-empty interval")
+            .with_obis(obis),
+        ],
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("Marktpartner-ID"),
         },
         datetime!(2026-07-27 06:00 UTC),
     );
@@ -138,7 +142,7 @@ fn delivery(column: Option<(&str, &str)>) -> StoredSeries {
     let stored = StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", D20, Sparte::Strom).expect("scope"),
+            VersionScope::for_interval("9900000000003", D20, Sparte::Strom).expect("scope"),
             Version::new(20_260_727_000_001).expect("version"),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -228,18 +232,19 @@ async fn a_transposition_the_scheme_can_detect_never_reaches_the_database() {
     assert!(err.contains("X (Party)"), "{err}");
     assert!(err.contains("Y (Area or Domain)"), "{err}");
 
-    // And the honest edge. A Marktpartner-ID's thirteenth digit is *not*
-    // checked — BDEW §2.3 carves out GS1-issued GLNs — so a transposed one is
-    // accepted here and by the database. Asserted rather than left to be
-    // discovered, because "checked column" invites the opposite assumption.
-    to_record_batch_with(
+    // A Marktpartner-ID's thirteenth digit must satisfy BDEW's procedure or
+    // GS1's — the Bildungsvorschrift admits GS1-issued GLNs, not unchecked
+    // digits — so a transposed one is refused at the write.
+    let err = to_record_batch_with(
         &[delivery(Some((
             &column_of(ValueCheck::Bdew),
-            "9900987654312",
+            "9900987654392",
         )))],
         &config.extra_columns(),
     )
-    .expect("thirteen digits is the whole of the rule a Marktpartner-ID has");
+    .expect_err("a transposed Marktpartner-ID")
+    .to_string();
+    assert!(err.contains(&column_of(ValueCheck::Bdew)), "{err}");
 }
 
 #[tokio::test]
@@ -278,8 +283,9 @@ async fn the_database_carries_the_shape_and_says_so_in_its_own_regex_engine() {
         (ValueCheck::Melo, "de00056266802ao6g56m11sn51g21m24s", false),
         (ValueCheck::Melo, "DEX0056266802AO6G56M11SN51G21M24S", false), // 3–8 are digits
         (ValueCheck::Melo, "DE00056266802AO6G56M11SN51G21M24", false),  // 32 characters
-        (ValueCheck::Bdew, "9900987654321", true),
+        (ValueCheck::Bdew, "9900987654329", true),
         (ValueCheck::Bdew, "9900987654320", true), // a GS1 GLN fails BDEW's procedure and is valid
+        (ValueCheck::Bdew, "9900987654321", true), // the check digit is the write path's half
         (ValueCheck::Bdew, "990098765432", false), // twelve digits
         (ValueCheck::Bdew, "99009876543210", false), // fourteen
         (ValueCheck::Bdew, "99009876543A1", false),
@@ -357,7 +363,7 @@ async fn the_database_refuses_a_badly_shaped_value_from_a_writer_that_is_not_thi
                     source_kind, source_detail, version, version_scope, recorded_at,
                     balancing_day, "{column}")
                    VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.5,'KWH','MEASURED',
-                           'MSCONS','{{}}',$3,'9900000000001:2026-07',$4,DATE '2026-07-20',$5)"#
+                           'MSCONS','{{}}',$3,'9900000000003:2026-07',$4,DATE '2026-07-20',$5)"#
             ))
             .bind(D20)
             .bind(D20 + Duration::minutes(15))

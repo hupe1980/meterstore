@@ -28,7 +28,7 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use metering::measurement_series::MeasurementSource;
+use meterstore::delivery::MeasurementSource;
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -113,7 +113,7 @@ impl Harness {
         kwh: i64,
         version: i64,
     ) {
-        self.insert_scoped(malo, start, count, kwh, version, "9900000000001:2026-07")
+        self.insert_scoped(malo, start, count, kwh, version, "9900000000003:2026-07")
             .await
     }
 
@@ -145,7 +145,7 @@ impl Harness {
         let detail = serde_json::to_string(&MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         })
         .unwrap();
 
@@ -255,10 +255,10 @@ async fn a_plan_built_before_archival_still_reads_the_window_archival_moved() {
     // half — one day short, silently, on the settlement query most likely to be
     // long enough to overlap a maintenance cycle.
     //
-    // The fix is that archival does not reclaim the partition it just archived;
-    // `reader_grace` keeps it detached, and a detached partition is still read.
-    // This test is the regression, so it splits `plan` from `execute`
-    // deliberately — which is exactly what `DataFrame::collect` does in one step.
+    // Archival does not reclaim the partition it just archived: it stays
+    // detached, and a detached partition is still read. The test splits `plan`
+    // from `execute` deliberately — the two steps `DataFrame::collect` takes in
+    // one.
     let h = Harness::start().await;
     h.hot
         .ensure_partitions(TABLE, D18, D21, Duration::DAY)
@@ -308,11 +308,11 @@ async fn a_plan_built_before_archival_still_reads_the_window_archival_moved() {
 
 #[tokio::test]
 async fn a_live_plan_holds_the_window_archival_is_about_to_reclaim() {
-    // The grace's successor. `reader_grace` is a clock, and a clock cannot know
-    // whether anybody is still reading — so past it the partition goes and a
-    // plan that outran it loses its window, loudly since D41 but still lost.
+    // `reader_grace` is a clock, and a clock cannot know whether anybody is
+    // still reading: past it the partition goes and a plan that outran it
+    // loses its window — loudly, but lost.
     //
-    // A plan now registers the boundary it was cut at, and reclamation asks
+    // A plan registers the boundary it was cut at, and reclamation asks
     // that registry in the same transaction as the drop. This test runs the
     // whole path: plan at one boundary, archive past it, then try to reclaim
     // the window that moved — with no grace involved, because the drop is
@@ -422,14 +422,10 @@ async fn a_cold_only_plan_holds_nothing() {
 
 #[tokio::test]
 async fn the_reported_boundary_is_the_one_the_plan_was_built_against() {
-    // P1 says correctness is observable rather than assumed, and the observable
-    // is this label. It was read separately from the split that used it — once
-    // before planning for the report, once during planning by each provider — so
-    // an archival commit in between made the label name a boundary the answer was
-    // not computed against. Over several tables it compounded: every provider
-    // read its own, at its own moment.
-    //
-    // The boundary now travels with the plan, so the two cannot differ. The
+    // Correctness is observable rather than assumed, and the observable is this
+    // label. The boundary travels with the plan: read once for the report and
+    // again by each provider, an archival commit in between would make the
+    // label name a boundary the answer was not computed against. The
     // observable property is that a query reports the split it actually used:
     // rows below the reported watermark came from Iceberg, rows at or above it
     // from PostgreSQL, and the counts add up.
@@ -753,36 +749,37 @@ fn correction(
     let intervals = (0..count)
         .map(|i| {
             let from = start + Duration::minutes(15 * i);
-            metering::interval::MeterInterval {
+            metering::series::interval::MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                value: rust_decimal::Decimal::new(kwh, 0),
-                quality: metering::QualityFlag::Corrected,
-                obis_code: "1-0:1.8.0".parse().ok(),
-            }
+                from + Duration::minutes(15),
+                rust_decimal::Decimal::new(kwh, 0),
+                metering::QualityFlag::Corrected,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap())
         })
         .collect();
 
-    let mut series = metering::measurement_series::MeasurementSeries::new(
+    let mut series = meterstore::delivery::MeasurementSeries::new(
         malo.parse().expect("a valid MaLo-ID"),
         "1-0:1.8.0".parse().ok(),
         intervals,
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         datetime!(2026-07-26 06:00 UTC),
     );
-    series.resolution = Some(metering::IntervalResolution::QuarterHour);
+    series.resolution = Some(metering::Resolution::QUARTER_HOUR);
 
     meterstore::encode::StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
             meterstore::VersionScope::for_interval(
-                "9900000000001",
+                "9900000000003",
                 start,
-                metering::interval::Sparte::Strom,
+                metering::series::interval::Sparte::Strom,
             )
             .unwrap(),
             meterstore::Version::new(version).unwrap(),
@@ -1209,7 +1206,7 @@ async fn a_correction_delivered_in_a_later_month_still_supersedes() {
         2,
         10,
         20_260_720_000_001,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
     h.insert_scoped(
@@ -1218,7 +1215,7 @@ async fn a_correction_delivered_in_a_later_month_still_supersedes() {
         2,
         40,
         20_260_820_000_002,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
 
@@ -1254,7 +1251,7 @@ async fn versions_in_different_scopes_do_not_resolve_against_each_other() {
         2,
         10,
         20_260_720_000_001,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
     h.insert_scoped(
@@ -1263,7 +1260,7 @@ async fn versions_in_different_scopes_do_not_resolve_against_each_other() {
         2,
         40,
         20_260_820_000_002,
-        "9900000000001:2026-08",
+        "9900000000003:2026-08",
     )
     .await;
 
@@ -1603,9 +1600,9 @@ async fn eliding_returns_the_same_rows_as_resolving() {
 async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
     // The embedded topology: one process both archives and answers
     // queries. A cold provider that froze its snapshot at construction would
-    // make every archived row vanish — gone from PostgreSQL because the
-    // partition was dropped, invisible in Iceberg because the provider still
-    // pointed at the snapshot from before the commit — until the process
+    // make every archived row vanish — below the watermark, so no longer read
+    // from PostgreSQL, and invisible in Iceberg because the provider still
+    // points at the snapshot from before the commit — until the process
     // restarted. Nothing would report it; the totals would simply shrink.
     let h = Harness::start().await;
     h.hot
@@ -1761,7 +1758,7 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
         2,
         10,
         20_260_720_000_001,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
 
@@ -1773,7 +1770,7 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
             2,
             40,
             20_260_720_000_002,
-            "9900000000002:2026-07",
+            "9900000000029:2026-07",
         )
         .await;
 
@@ -1807,7 +1804,7 @@ async fn a_duplicated_scope_that_got_past_the_constraint_is_refused_at_the_read(
         2,
         10,
         20_260_720_000_001,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
 
@@ -1824,7 +1821,7 @@ async fn a_duplicated_scope_that_got_past_the_constraint_is_refused_at_the_read(
         2,
         40,
         20_260_720_000_002,
-        "9900000000002:2026-07",
+        "9900000000029:2026-07",
     )
     .await;
 
@@ -1878,7 +1875,7 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
         2,
         10,
         20_260_718_000_001,
-        "9900000000001:2026-07",
+        "9900000000003:2026-07",
     )
     .await;
     h.archive_through(ARCHIVE_AS_OF).await;
@@ -1896,9 +1893,9 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
     let mut other = correction("11111111115", D18, 2, 40, 20_260_718_000_002);
     other.version = meterstore::ScopedVersion::new(
         meterstore::VersionScope::for_interval(
-            "9900000000002",
+            "9900000000029",
             D18,
-            metering::interval::Sparte::Strom,
+            metering::series::interval::Sparte::Strom,
         )
         .unwrap(),
         meterstore::Version::new(20_260_718_000_002).unwrap(),
@@ -1916,7 +1913,7 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
     let msg = err.to_string();
     assert!(msg.contains("network operator"), "{msg}");
     assert!(
-        msg.contains("9900000000001") && msg.contains("9900000000002"),
+        msg.contains("9900000000003") && msg.contains("9900000000029"),
         "the message must name both operators so the caller can tell which is wrong, \
          and as Marktpartner-IDs rather than as a Debug struct: {msg}"
     );

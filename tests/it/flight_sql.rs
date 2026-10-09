@@ -14,7 +14,7 @@
 //!
 //! The rest checks the two properties that make the surface safe rather than
 //! merely present: it refuses to write, and results carry the boundary they were
-//! computed against (P1) even over a socket.
+//! computed against even over a socket.
 
 #![cfg(all(feature = "testkit", feature = "flight"))]
 
@@ -174,7 +174,7 @@ async fn a_flight_client_gets_the_unified_view() {
 
 #[tokio::test]
 async fn results_carry_the_boundary_they_were_computed_against() {
-    // P1 over a socket. Without this a figure pulled by a BI tool is
+    // Provenance over a socket. Without this a figure pulled by a BI tool is
     // indistinguishable from one pulled a minute later against a different
     // boundary — which is exactly the confusion provenance exists to prevent.
     let (_h, store, _oracle) = split_store().await;

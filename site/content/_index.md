@@ -8,8 +8,7 @@ sort_by = "weight"
 ## The wall this exists for
 
 An intelligent measuring system produces one value per measuring point, per OBIS
-code, per interval. Fifteen minutes is the German settlement grain, and iMSys
-already delivers finer:
+code, per interval, and fifteen minutes is the German settlement grain:
 
 | Scale | Rows / day | Rows / year |
 |---|---|---|
@@ -17,15 +16,12 @@ already delivers finer:
 | 100 k (mid-size utility) | ~9.6 M | ~3.5 B |
 | 1 M (metering operator) | ~96 M | ~35 B |
 
-Retention is regulatory — years to decades for the settlement record. PostgreSQL
-handles the first row of that table comfortably, the second with care, and the
-third not at all without becoming a full-time job.
-
-But the operational workload genuinely needs Postgres: recent data is written
-continuously, corrected, and read transactionally by billing and market
-communication. Meanwhile settlement, forecasting and grid analysis scan years
-across hundreds of thousands of meters — an object-storage-and-columnar-format
-problem, and why analytical queries in legacy EDM systems take minutes.
+Retention runs to years or decades for the settlement record. PostgreSQL handles
+the first row of that table comfortably, the second with care, and the third not
+without becoming a full-time job. Yet recent data is written continuously,
+corrected, and read transactionally — a PostgreSQL workload — while settlement,
+forecasting and grid analysis scan years across hundreds of thousands of meters,
+an object-storage-and-columnar problem.
 
 > The data has a natural split most systems refuse to exploit: recent intervals
 > are hot and still being corrected; historical intervals are cold and settled.
@@ -36,26 +32,23 @@ problem, and why analytical queries in legacy EDM systems take minutes.
 **The watermark lives inside the Iceberg snapshot.** Archival writes the tier
 boundary into the snapshot summary, in the same commit as the data it describes.
 Iceberg commits are a compare-and-swap, so the rows and the boundary become
-durable together or not at all. There is no external checkpoint store to fall out
-of sync, and recovery is just reading the watermark back.
+durable together or not at all, with no external checkpoint store to fall out of
+sync.
 
 **Purge is `DROP TABLE`, never `DELETE`.** The hot table is time-partitioned, so
-an archived window is exactly one partition: detached when it is read, dropped a
-cycle later once no query planned against the old boundary can still need it —
-an O(1) catalogue operation either way. Deleting a day of readings for 100 k
-meters row by row would leave ~9.6 M dead tuples for autovacuum to clean up,
-competing with the very workload the tiering exists to protect.
+an archived window is exactly one partition: detached for archival, dropped a
+cycle later once no query planned against the old boundary can still need it.
+Deleting a day for 100 k meters row by row would leave ~9.6 M dead tuples for
+autovacuum.
 
-**Corrections are versions, not overwrites.** The MSCONS application handbook
-specifies that a correction is made by *versioning* the value. Nothing is updated
-in place, so the store needs only Iceberg's `append` — no tombstones, no equality
-deletes, no deletion vectors — and a past settlement stays reproducible because
-the value it used is still there.
+**Corrections are versions, not overwrites.** In MSCONS a correction *versions*
+the value `[MSCONS AHB 3.2 Kap. 5.1]`. Nothing is updated in place, so the store needs only Iceberg's
+`append`, and a past settlement stays reproducible because the value it used is
+still there.
 
-**Nothing on the archival path holds a window.** A day at 100 k measuring points
-is ~9.6 M rows. The detached partition is paged by keyset, the Parquet writer
-consumes the stream, and rows are counted as they pass rather than collected to
-count. Peak memory is the chunk size, not the window.
+**Nothing on the archival path holds a window.** The detached partition is paged
+by keyset into the Parquet writer, so peak memory is the chunk size, not the
+~9.6 M rows of a day at 100 k measuring points.
 
 ## One statement, both tiers
 
@@ -75,48 +68,38 @@ result.touched_hot_tier();  // whether the answer is only valid for now
 ```
 
 The range is cut at the watermark, each half is read from the tier that holds it,
-and the halves are concatenated. Not merged, not deduplicated — they are disjoint
-by construction, which is the entire payoff of tiering on a timestamp.
+and the halves are concatenated — not merged, not deduplicated, because they are
+disjoint by construction.
 
-`meter_local_day` is not a convenience. `Europe/Berlin` observes daylight saving,
-so the UTC day boundary sits at 01:00 or 02:00 local: grouping on UTC days
-produces wrong daily sums *every day of the year*, not only at the two
-transitions. The calendar arithmetic is
-[`metering`](https://crates.io/crates/metering)'s, so there is exactly one
-implementation of it.
+`meter_local_day` matters: the UTC day boundary sits at 01:00 or 02:00 in Berlin,
+so grouping on UTC days is wrong *every day*, not only at the DST transitions. The
+calendar arithmetic is [`metering`](https://crates.io/crates/metering)'s.
 
-And for **gas it is the wrong function**, because the German gas market does not
-balance on the calendar day. A *Gastag* runs 06:00 to 06:00 local, so a gas
-Lastgang grouped by the calendar day books six hours a day into the neighbouring
-Bilanzierungstag. `meter_balancing_day("from", sparte)` reads the commodity per
-row and picks the day that commodity is actually settled on.
-
-An external engine has neither function, and the Gastag has no single portable
-SQL spelling, so every row also stores its `balancing_day`. Reading the Iceberg
-files directly needs a `GROUP BY` and no calendar arithmetic — and because a
-Bilanzierungsmonat is a whole number of balancing days,
-`date_trunc('month', balancing_day)` gives the settlement month too.
+For **gas** it is the wrong function: a *Gastag* runs 06:00 to 06:00 local, so
+`meter_balancing_day("from", sparte)` picks the day each row's commodity is
+settled on. An external engine has neither function, so every row also stores its
+`balancing_day`, and `date_trunc('month', balancing_day)` gives the
+Bilanzierungsmonat too.
 
 ## What you get that a general lakehouse does not
 
 **An open format for regulated data.** Standard Iceberg v2 on object storage,
 readable by Spark, Trino, DuckDB, Snowflake and PyIceberg with MeterStore nowhere
-in the data path. For data under a decade-long retention obligation, avoiding
-format lock-in is the whole procurement argument — and the output is
-[read back by DuckDB and PyIceberg](@/docs/interop.md) in the test suite, not
-asserted.
+in the data path — and [read back by DuckDB and PyIceberg](@/docs/interop.md) in
+the test suite.
 
 **Time travel as compliance.** MaBiS settlement must be reproducible. Pin an
 Iceberg snapshot plus a version ceiling to reconstruct what was known at a point
 in time, or pin the row-level transaction-time axis and reproduce across *both*
-tiers. Incumbent EDM systems build this by hand with versioned shadow tables.
+tiers.
 
 **A correct domain model, stored correctly.** Readings are `metering`'s types:
-DST-correct calendars, exact decimals, quality flags, all four Sparten. The
-contribution here is storing them at 35-billion-row scale without losing a
-decimal, a quality flag or an interval boundary.
+DST-correct calendars, exact decimals, quality flags, all four Sparten, stored at
+35-billion-row scale without losing a decimal, a quality flag or an interval
+boundary.
 
-**No extension, no server configuration.** A library, not a PostgreSQL extension.
-It needs `SELECT` plus ownership of its own tables — no `shared_preload_libraries`,
-no restart, no `CREATE EXTENSION` for the core path — so it deploys on RDS, Cloud
-SQL and Azure Postgres unchanged.
+**No server extension, no server configuration.** A library, not a PostgreSQL
+extension. No `shared_preload_libraries`, no restart and no superuser: the one
+extension it creates, `btree_gist`, ships in contrib and is trusted, so it deploys
+on RDS, Cloud SQL and Azure Postgres unchanged. [Getting started](@/docs/getting-started.md#requirements) lists the
+privileges.

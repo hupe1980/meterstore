@@ -168,8 +168,8 @@ impl TestHarness {
     /// The warehouse root on disk.
     ///
     /// Exposed so a test can open the written files with something **other than**
-    /// this crate — which is the only way to check the claim in P2 that the
-    /// output is standard rather than merely self-consistent.
+    /// this crate — the only way to check that the output is standard rather
+    /// than merely self-consistent.
     pub fn warehouse(&self) -> &std::path::Path {
         self._warehouse.path()
     }

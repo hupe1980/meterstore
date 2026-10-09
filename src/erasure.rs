@@ -31,7 +31,7 @@
 //! location outlives its occupants, so keying by measuring point alone would
 //! erase a previous tenant's data along with the requester's.
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tracing::{info, warn};
@@ -574,8 +574,8 @@ impl SubjectRegistry {
     ///
     /// Nothing else can see this. A tombstone whose key is gone is still in the
     /// table and simply stops matching, which is exactly what a tombstone that
-    /// does not apply looks like — so the failure had no symptom short of the
-    /// subject reappearing (R6, R25). The key's name, stored beside the tag,
+    /// does not apply looks like — so the failure has no symptom short of the
+    /// subject reappearing. The key's name, stored beside the tag,
     /// is the whole of what makes it visible.
     ///
     /// Lifted suppressions are excluded: lifting clears the tag and its key
@@ -826,7 +826,7 @@ impl SubjectRegistry {
     /// does not exist` at the first erasure — a compliance operation, from a
     /// stack trace that says nothing about what to do.
     ///
-    /// The crate is unpublished and its schema changes in place rather than
+    /// The crate is pre-1.0 and its schema changes in place rather than
     /// through migrations, so the answer really is *drop these two tables and
     /// call this again*. This is what says so, at the setup step where it can be
     /// acted on rather than at the request it would otherwise fail.
@@ -879,7 +879,7 @@ impl SubjectRegistry {
                 return Err(Error::config(format!(
                     "{table} is missing {missing:?}, so it was created by an earlier \
                      version of this crate. The registry schema changes in place \
-                     rather than through migrations — the crate is unpublished — so \
+                     rather than through migrations — the crate is pre-1.0 — so \
                      drop `meterstore_subject_map` and `meterstore_erasures` and call \
                      `create_tables` again. Both hold compliance state: the mapping is \
                      rebuilt by re-registering, and the audit trail is not, so export \
@@ -1126,6 +1126,15 @@ impl SubjectRegistry {
     ///
     /// [`erase_all`](Self::erase_all) is the same operation entered from the
     /// identifier instead, which is what a request actually names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SubjectUnresolvable`] for a reference the retention sweep has
+    /// expired, with nothing written. The identifier behind it is gone by design
+    /// — that is what the sweep is for — so its subject's later years cannot be
+    /// found through it; enter the request by identifier. A reference already
+    /// erased by a request, or never registered, is recorded as a repeat, and
+    /// the record returned is the one the trail holds.
     ///
     /// Irreversible by construction: the mapping row is deleted rather than
     /// flagged, so there is no recovery path to disclose. The audit row that
@@ -1398,13 +1407,31 @@ impl SubjectRegistry {
             None => Vec::new(),
         };
 
-        // An unmapped *reference*: already erased, or never registered. Audit
-        // the request against the reference given, so a repeat stays provable.
-        // An unmapped *identifier* has no reference to audit against and is
-        // handled below, because what it needs is a tombstone rather than a row.
+        // An unmapped *reference*: expired by the sweep, erased by a request, or
+        // never registered. Expired is refused, before anything is written: the
+        // person may have later years still linked, and the identifier that
+        // would find them is what the sweep destroyed. The other two are
+        // audited against the reference given, so a repeat stays provable. An
+        // unmapped *identifier* has no reference to audit against and is handled
+        // below, because what it needs is a tombstone rather than a row.
         if targets.is_empty()
             && let Subject::Reference(reference) = subject
         {
+            let expired = sqlx::query_scalar::<_, OffsetDateTime>(
+                "SELECT erased_at FROM meterstore_erasures \
+                  WHERE subject_ref = $1 AND trigger = $2",
+            )
+            .bind(reference.as_str())
+            .bind(ErasureTrigger::Retention.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(pg)?;
+            if let Some(expired_at) = expired {
+                return Err(Error::SubjectUnresolvable {
+                    reference: reference.as_str().to_string(),
+                    expired_at,
+                });
+            }
             targets.push(reference.clone());
         }
 
@@ -1423,10 +1450,28 @@ impl SubjectRegistry {
 
         // A repeat request keeps the first erasure's timestamp — that is when
         // the linkage actually died — but must not blank an existing tombstone,
-        // which would quietly re-open re-registration.
+        // which would quietly re-open re-registration. The record handed back is
+        // the row as stored, so the return value and the trail never disagree.
         let mut records = Vec::with_capacity(targets.len());
         for target in targets {
-            sqlx::query(
+            #[allow(clippy::type_complexity)]
+            let (
+                erased_at,
+                stored_reason,
+                stored_actor,
+                stored_trigger,
+                lifted_at,
+                lifted_by,
+                lift_reason,
+            ): (
+                OffsetDateTime,
+                String,
+                String,
+                String,
+                Option<OffsetDateTime>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
                 r#"INSERT INTO meterstore_erasures
                        (subject_ref, erased_at, reason, actor, trigger, natural_id_hmac,
                         hmac_key_id)
@@ -1435,7 +1480,9 @@ impl SubjectRegistry {
                        SET natural_id_hmac =
                            COALESCE(meterstore_erasures.natural_id_hmac, EXCLUDED.natural_id_hmac),
                            hmac_key_id =
-                           COALESCE(meterstore_erasures.hmac_key_id, EXCLUDED.hmac_key_id)"#,
+                           COALESCE(meterstore_erasures.hmac_key_id, EXCLUDED.hmac_key_id)
+                   RETURNING erased_at, reason, actor, trigger,
+                             lifted_at, lifted_by, lift_reason"#,
             )
             .bind(target.as_str())
             .bind(now)
@@ -1444,17 +1491,21 @@ impl SubjectRegistry {
             .bind(trigger.as_str())
             .bind(tombstone.as_deref())
             .bind(writing_key.as_deref())
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(pg)?;
 
             records.push(ErasureRecord {
                 subject: Some(target),
-                erased_at: now,
-                reason: reason.to_string(),
-                actor: actor.to_string(),
-                trigger,
-                lifted: None,
+                erased_at,
+                reason: stored_reason,
+                actor: stored_actor,
+                trigger: stored_trigger.parse()?,
+                lifted: lifted_at.map(|at| SuppressionLift {
+                    at,
+                    actor: lifted_by.unwrap_or_default(),
+                    reason: lift_reason.unwrap_or_default(),
+                }),
             });
         }
 
@@ -2096,33 +2147,49 @@ impl Retention {
         match self {
             Self::CalendarYears(years) => {
                 // Saturating in the direction that keeps data, and clamped to a
-                // year the calendar can answer for. `Date::MIN` is `-9999-01-01`,
-                // whose Berlin midnight is an hour *before* it in UTC — out of
-                // range, and `metering::calendar::year_start_utc` panics rather
-                // than folding it away. One year in is the earliest that
-                // converts.
-                let year = metering::calendar::local_year(now)
+                // year the calendar can answer for.
+                let year = berlin_year(now)
                     .saturating_sub(i32::try_from(years).unwrap_or(i32::MAX))
                     .max(EARLIEST_CUTOFF_YEAR);
-                metering::calendar::year_start_utc(year)
+                berlin_year_start(year)
             }
             // `checked_sub` for the same reason, onto the same floor, so both
             // arms of an unrepresentable period give the same answer.
             Self::Rolling(window) => now
                 .checked_sub(window)
-                .unwrap_or_else(|| metering::calendar::year_start_utc(EARLIEST_CUTOFF_YEAR)),
+                .unwrap_or_else(|| berlin_year_start(EARLIEST_CUTOFF_YEAR)),
         }
     }
 }
 
-/// The earliest year [`Retention::cutoff`] will name.
+/// The earliest year [`Retention::cutoff`] will name: the first the calendar
+/// has rules for, and far enough before any metering value that a cutoff here
+/// means nothing is due.
+const EARLIEST_CUTOFF_YEAR: i32 = metering::time::calendar::FIRST_YEAR;
+
+/// The Berlin calendar year of `at`, clamped into the years the calendar covers.
 ///
-/// `time::Date::MIN` is `-9999-01-01`, and Berlin's midnight on it is an hour
-/// earlier still in UTC — outside what `OffsetDateTime` can hold, which
-/// `metering::calendar::year_start_utc` surfaces as a panic rather than folding
-/// away. One year in converts, and is far enough before any metering value that
-/// a cutoff here means nothing is due.
-const EARLIEST_CUTOFF_YEAR: i32 = -9998;
+/// Clamped rather than refused: a cutoff is computed from the wall clock or a
+/// caller's instant, and an instant past either end means "everything" or
+/// "nothing" is due — which the clamp answers in the direction that keeps data
+/// at the low end and is unreachable at the high one.
+fn berlin_year(at: OffsetDateTime) -> i32 {
+    use metering::time::calendar::{FIRST_YEAR, LAST_YEAR};
+    match metering::DayBoundary::Strom.day_of(at) {
+        Some(day) => day.year(),
+        None if at.year() < FIRST_YEAR => FIRST_YEAR,
+        None => LAST_YEAR,
+    }
+}
+
+/// Berlin midnight on 1 January of `year`, clamped into the calendar's years.
+fn berlin_year_start(year: i32) -> OffsetDateTime {
+    use metering::time::calendar::{FIRST_YEAR, LAST_YEAR};
+    metering::DayBoundary::Strom
+        .year(year.clamp(FIRST_YEAR, LAST_YEAR))
+        .expect("a year inside the calendar's range has a start")
+        .start()
+}
 
 /// The retention epoch a reading falls in: the **balancing year** of the day it
 /// is settled on.
@@ -2152,7 +2219,7 @@ const EARLIEST_CUTOFF_YEAR: i32 = -9998;
 ///
 /// ```rust
 /// use meterstore::erasure::retention_epoch;
-/// use metering::interval::Sparte;
+/// use metering::series::interval::Sparte;
 /// use time::macros::datetime;
 ///
 /// // 01:00 Berlin on New Year's Day: 2026 on the calendar, and still the
@@ -2163,7 +2230,9 @@ const EARLIEST_CUTOFF_YEAR: i32 = -9998;
 /// ```
 #[must_use]
 pub fn retention_epoch(at: OffsetDateTime, sparte: Sparte) -> i32 {
-    crate::planner::balancing_day(at, sparte).year()
+    // Outside the calendar's years there is no tz rule to shift by, and no
+    // metering value; the instant's own year is the only answer left.
+    crate::planner::balancing_day(at, sparte).map_or(at.year(), |day| day.year())
 }
 
 /// The first epoch a sweep at `cutoff` must still keep: everything strictly
@@ -2180,7 +2249,7 @@ pub fn retention_epoch(at: OffsetDateTime, sparte: Sparte) -> i32 {
 /// *every* epoch — electricity included — a whole year later, which is the
 /// direction that keeps personal data past its ceiling.
 fn sweep_boundary(cutoff: OffsetDateTime) -> i32 {
-    metering::calendar::local_year(cutoff)
+    berlin_year(cutoff)
 }
 
 /// Refuse an identifier that names nobody.
@@ -2568,7 +2637,7 @@ mod tests {
         for window_days in [1i64, 30, 90, 365, 400, 1_000] {
             let now = datetime!(2028-06-15 12:00 UTC);
             let cutoff = Retention::Rolling(time::Duration::days(window_days)).cutoff(now);
-            let newest_swept = metering::calendar::year_start_utc(sweep_boundary(cutoff));
+            let newest_swept = berlin_year_start(sweep_boundary(cutoff));
             assert!(
                 newest_swept <= cutoff,
                 "Rolling({window_days}d) would erase a value newer than the window"

@@ -8,51 +8,45 @@ weight = 1
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.94 | Set by the dependency floor (`metering`, `iceberg`), not by this crate's own syntax |
+| Rust | 1.94 | Set by `iceberg` 0.10's floor, not by this crate's own syntax or by `metering`, which need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18, and whole again on 15 |
-| `metering` | **0.24 or later** | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | **0.25** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
-MeterStore needs only `SELECT` plus ownership of its own tables. No server
-configuration, no restart, no `CREATE EXTENSION` for the core path — which is what
-makes it deployable on RDS, Cloud SQL and Azure Postgres, where an
-extension-based approach is not.
+MeterStore needs no server configuration, no restart and no superuser — which is
+what makes it deployable on RDS, Cloud SQL and Azure Postgres. It does need more
+than `SELECT`:
+
+- **`CREATE` on the schema**, for the relations `create` and `create_tables` make.
+- **`CREATE` on the database**, because the integrity constraints — on by
+  default — run `CREATE EXTENSION IF NOT EXISTS btree_gist`. It ships in contrib
+  and is a *trusted* extension, which a non-superuser holding that privilege may
+  install. `PostgresHot::integrity_constraints(false)` drops the need, and the
+  constraints with it.
+- **`INSERT` and `DELETE` on `meterstore_pins`** for every role that queries:
+  each plan with a hot half registers the boundary it was cut at there. A
+  read-only role or a hot standby therefore cannot query the unified view.
 
 ### Why 15, when the SQL runs on 12
 
-Two different claims, and they are worth keeping apart.
+**The design needs 12.** `CREATE TABLE … PARTITION OF` takes `ACCESS EXCLUSIVE`
+on the parent, and PostgreSQL queues locks in arrival order, so on the write path
+one long query would stall every insert behind it. MeterStore builds the partition
+standalone and *attaches* it, which from 12 takes only `SHARE UPDATE EXCLUSIVE`
+and conflicts with no read and no write.
+[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) covers the detach, which
+does need the strong lock.
 
-**What the design needs is 12**, because of a lock. `CREATE TABLE … PARTITION OF`
-takes `ACCESS EXCLUSIVE` on the parent, and PostgreSQL grants locks in arrival
-order — so a statement waiting for it blocks every reader and writer behind it.
-Partition creation runs on the **write path**, so that spelling lets one long
-query stall every subsequent insert. MeterStore builds the relation standalone and
-*attaches* it, which from 12 takes only `SHARE UPDATE EXCLUSIVE`, conflicting with
-no read and no write. (Range partitioning arrived in 10 and a partitioned primary
-key in 11; neither is the constraint.)
-[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) covers the other half —
-the detach that does need the strong lock.
+**The support floor is 15**, the oldest release still receiving fixes into 2027
+and still under standard support on RDS, Cloud SQL and Azure Database (12 and 13
+are end-of-life; 14 follows in November 2026). CI runs the whole integration suite
+on 15 and on 18. An older server will very likely work, but nothing demonstrates
+it and no security fix is coming for it.
 
-**What is supported is 15**, because a floor is a promise and a promise has to be
-about versions somebody still patches. 12 went end-of-life in November 2024 and 13
-in November 2025; RDS ended standard support for 12 in February 2025 and for 13 in
-February 2026; 14 goes in November 2026. 15 is the oldest release still receiving
-fixes into 2027 and the oldest offered under standard support by RDS, Cloud SQL
-and Azure Database.
-
-It is checked rather than promised: CI runs the entire integration suite against
-15 as well as against 18. An older server will very likely work — nothing here
-needs anything past 12 — but nothing demonstrates it and no security fix is coming
-for it.
-
-### Why the suite runs on 18
-
-Three changes land there that the design's own arguments rest on: fast-path lock
-slots are sized from `max_locks_per_transaction` instead of being sixteen per
-backend, a prepared statement no longer locks every partition while its plan is
-validated, and `btree_gist` gained sortsupport — the index behind the
-`EXCLUDE USING gist` integrity constraints. A suite on an older server would be
-demonstrating the design on the last version with none of them.
+On 18, fast-path lock slots are sized from `max_locks_per_transaction` rather than
+fixed at sixteen per backend, which raises the ceiling for a deployment's own
+statements that reach many partitions through the parent. MeterStore's hot scan
+reads one partition per statement and does not approach it.
 
 ## Install
 
@@ -60,7 +54,8 @@ demonstrating the design on the last version with none of them.
 cargo add meterstore
 ```
 
-Optional features, all off unless you need them:
+Features. The two catalogue features are on by default; everything else is off
+unless you need it:
 
 | Feature | What it adds |
 |---|---|
@@ -116,11 +111,11 @@ let store = deployment.store().await?;
 let catalog = deployment.catalog().await?;
 ```
 
-`connect` stops at the tiers and `store`/`catalog` go the last step, because that
-step is not field access: a cold table provider cannot be opened over a table the
-catalogue does not hold yet. `deployment.table(config)` returns the builder if you
-want to add what a file cannot name — a subject registry, a read mode, a session
-you already own.
+`connect` stops at the tiers; `store`/`catalog` create the tables, because a cold
+table provider cannot be opened over a table the catalogue does not hold yet.
+`deployment.table(config).await?` returns the builder instead, to add what a file
+cannot name — a subject registry, a read mode, a session you already own — and
+`open_table` does the same without DDL, for a role that may only read.
 
 The longer path is the same thing spelled out, and it is what an application that
 owns its own pool writes:
@@ -173,8 +168,8 @@ store.admin().create_tables().await?;
 The cold tier is an Iceberg catalogue plus an object store. `IcebergSqlCatalog`
 builds the common one for you — a `SqlCatalog` on the same PostgreSQL that backs
 the hot tier — but `IcebergCold::new` takes **any** `Arc<dyn Catalog>`, so a
-deployment can bring its own. That extension point is exercised end to end in the
-test suite against a catalogue MeterStore did not build, not merely asserted.
+deployment can bring its own; the test suite exercises one MeterStore did not
+build.
 
 | Catalogue | Status |
 |---|---|
@@ -190,8 +185,7 @@ test suite against a catalogue MeterStore did not build, not merely asserted.
 | `gs://` | `object-store-gcs` |
 | `abfss://` | `object-store-azure` |
 
-A warehouse whose scheme needs a backend that was not compiled in is a clear
-error at construction, not a silent fallback.
+A warehouse scheme whose backend was not compiled in is an error at construction.
 
 #### AWS S3 Tables
 
@@ -208,19 +202,13 @@ let cold_tier = S3TablesCatalog {
 ```
 
 Credentials come from the ambient AWS chain — environment, profile, instance
-metadata, IRSA — so there is deliberately no credential field: a store that
-accepted an access key would be a second place for one to live.
+metadata, IRSA — so there is no credential field. The warehouse is the table
+bucket, named by ARN because S3 Tables owns the object layout; everything
+downstream is unchanged.
 
-The warehouse is the table bucket itself, identified by ARN rather than by URI,
-because S3 Tables owns the object layout. Everything downstream — archival,
-watermark, resolution, queries — is unchanged; a catalogue is a catalogue.
-
-S3 Tables has two front doors, and searching for it finds the wrong one. Its *Iceberg REST endpoint* authenticates with
-SigV4, and `iceberg-catalog-rest` cannot sign — `with_client` takes a concrete
-`reqwest::Client`, which has no per-request interceptor, and a static
-`Authorization` header cannot carry a per-request signature. Its *native API*
-goes through the AWS SDK, which signs for itself. This uses the second. The REST
-route being closed says nothing about the target.
+This goes through S3 Tables' native API, not its Iceberg REST endpoint: that
+endpoint authenticates with SigV4, which `iceberg-catalog-rest` cannot sign, so
+`IcebergRestCatalog` cannot reach it.
 
 ### Why the table is called `readings_versions`
 
@@ -235,10 +223,9 @@ So the store registers two relations:
 | `readings` | Version-resolved. One row per reading, the value currently in force. **Query this.** |
 | `readings_versions` | Every version. The audit trail. |
 
-The name is load-bearing rather than cosmetic: the relation that looks like the
-obvious thing to query must not be the one that returns wrong answers. See
-[External engines](@/docs/interop.md#the-version-resolution-trap) for why this
-matters most outside Rust.
+The relation that looks like the obvious thing to query must not be the one that
+returns wrong answers. [External engines](@/docs/interop.md#the-version-resolution-trap)
+covers why this matters most outside Rust.
 
 ## Write and read
 

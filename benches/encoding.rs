@@ -27,9 +27,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use metering::interval::Sparte;
-use metering::interval::{MeterInterval, QualityFlag};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
+use metering::series::interval::Sparte;
+use metering::series::interval::{MeterInterval, QualityFlag};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use meterstore::encode::{StoredSeries, from_record_batch, to_record_batch};
 use meterstore::planner::{TimeRange, split};
 use meterstore::watermark::TieringWatermark;
@@ -50,15 +50,17 @@ fn delivery(meter: usize) -> StoredSeries {
     let intervals: Vec<MeterInterval> = (0..INTERVALS_PER_DAY)
         .map(|i| {
             let from = START + Duration::minutes(15 * i as i64);
-            MeterInterval {
+            // Values that vary, so delta encoding and decimal handling do
+            // realistic work rather than compressing a constant away.
+            let value = Decimal::new(100 + (i as i64 * 7) % 500, 2);
+            MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                // Values that vary, so delta encoding and decimal handling do
-                // realistic work rather than compressing a constant away.
-                value: Decimal::new(100 + (i as i64 * 7) % 500, 2),
-                quality: QualityFlag::Measured,
-                obis_code: "1-0:1.8.0".parse().ok(),
-            }
+                from + Duration::minutes(15),
+                value,
+                QualityFlag::Measured,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap())
         })
         .collect();
 
@@ -74,7 +76,7 @@ fn delivery(meter: usize) -> StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         START,
     );
@@ -82,7 +84,7 @@ fn delivery(meter: usize) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", START, Sparte::Strom).expect("scope"),
+            VersionScope::for_interval("9900000000003", START, Sparte::Strom).expect("scope"),
             Version::new(20_260_701_000_001).expect("version"),
         ),
         START,

@@ -14,11 +14,12 @@ use crate::arrow::array::{
     Array, ArrayRef, Decimal128Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use crate::arrow::datatypes::Field;
+use crate::delivery::{MeasurementSeries, MeasurementSource, ProvenanceEntry};
 use datafusion::common::ScalarValue;
+use metering::Resolution;
+use metering::ids::obis::ObisCode;
 use metering::ids::{MaloId, MeloId};
-use metering::interval::{MeasurementUnit, MeterInterval, Sparte};
-use metering::measurement_series::{MeasurementSeries, MeasurementSource, ProvenanceEntry};
-use metering::obis::ObisCode;
+use metering::series::interval::{MeterInterval, Sparte, Unit};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
@@ -46,7 +47,7 @@ pub struct StoredSeries {
     /// [`billing_unit`](Sparte::billing_unit), which coincide for every Sparte
     /// but gas. Defaults to the billing unit; anything else is rejected when the
     /// series is encoded.
-    pub unit: MeasurementUnit,
+    pub unit: Unit,
     /// MSCONS correction version and the scope it is comparable within.
     pub version: ScopedVersion,
     /// Transaction time — when this delivery was recorded.
@@ -99,7 +100,7 @@ impl StoredSeries {
     }
 
     /// Override the unit — for gas held as unconverted m³.
-    pub fn in_unit(mut self, unit: MeasurementUnit) -> Self {
+    pub fn in_unit(mut self, unit: Unit) -> Self {
         self.unit = unit;
         self
     }
@@ -118,8 +119,8 @@ impl StoredSeries {
 /// over `[from, to)` — this carries its
 /// [`MeterReading`]s: a cumulative register value at an instant.
 ///
-/// [`MeterInterval`]: metering::interval::MeterInterval
-/// [`MeterReading`]: metering::reading::MeterReading
+/// [`MeterInterval`]: metering::series::interval::MeterInterval
+/// [`MeterReading`]: metering::series::reading::MeterReading
 ///
 /// A separate type rather than a flag, because `value` means two different
 /// things and no aggregate can tell them apart — summing Zählerstände gives a
@@ -142,14 +143,14 @@ pub struct StoredReadings {
     /// history, and a reading with no register named is not attributable to one.
     pub obis_code: ObisCode,
     /// The register values, ascending.
-    pub readings: Vec<metering::reading::MeterReading>,
+    pub readings: Vec<metering::series::reading::MeterReading>,
     /// How often the register is read.
     ///
-    /// `metering::reading::detect_reading_cadence` derives it from the
+    /// `metering::series::reading::detect_reading_cadence` derives it from the
     /// timestamps. Stored in the same column an interval series' resolution is,
     /// and read the same way by completeness: "how many values a day should
     /// there be" is one question for both.
-    pub cadence: Option<metering::resolution::IntervalResolution>,
+    pub cadence: Option<metering::Resolution>,
     /// Where the delivery came from.
     pub source: MeasurementSource,
     /// The delivery's audit trail.
@@ -157,7 +158,7 @@ pub struct StoredReadings {
     /// The commodity this register meters.
     pub sparte: Sparte,
     /// The dimension of every value.
-    pub unit: MeasurementUnit,
+    pub unit: Unit,
     /// MSCONS correction version and the scope it is comparable within.
     pub version: ScopedVersion,
     /// Transaction time — when this delivery was recorded.
@@ -175,7 +176,7 @@ impl StoredReadings {
         malo_id: MaloId,
         obis_code: ObisCode,
         sparte: Sparte,
-        readings: Vec<metering::reading::MeterReading>,
+        readings: Vec<metering::series::reading::MeterReading>,
         source: MeasurementSource,
         version: ScopedVersion,
         recorded_at: OffsetDateTime,
@@ -205,17 +206,17 @@ impl StoredReadings {
 
     /// Override the unit — for gas held as unconverted m³.
     #[must_use]
-    pub fn in_unit(mut self, unit: MeasurementUnit) -> Self {
+    pub fn in_unit(mut self, unit: Unit) -> Self {
         self.unit = unit;
         self
     }
 
     /// Declare how often the register is read.
     ///
-    /// Pair with `metering::reading::detect_reading_cadence`, which derives it
+    /// Pair with `metering::series::reading::detect_reading_cadence`, which derives it
     /// from the timestamps rather than assuming a quarter-hour.
     #[must_use]
-    pub fn at_cadence(mut self, cadence: metering::resolution::IntervalResolution) -> Self {
+    pub fn at_cadence(mut self, cadence: metering::Resolution) -> Self {
         self.cadence = Some(cadence);
         self
     }
@@ -238,8 +239,8 @@ impl StoredReadings {
 /// This is the check that makes [`col::UNIT`] worth reading. Without it the
 /// column records whatever the caller believed, and a water series labelled `KWH`
 /// would sum straight into an electricity total with nothing to notice it. The
-/// rule itself lives in `metering` (P5) — this only enforces it.
-fn check_unit(sparte: Sparte, unit: MeasurementUnit, malo_id: &MaloId) -> Result<()> {
+/// rule itself lives in `metering` — this only enforces it.
+fn check_unit(sparte: Sparte, unit: Unit, malo_id: &MaloId) -> Result<()> {
     if unit == sparte.measured_unit() || unit == sparte.billing_unit() {
         return Ok(());
     }
@@ -332,30 +333,13 @@ where
 /// Parse a stored `resolution`, refusing a spelling storage does not write.
 ///
 /// [`decode_code`]'s rule over an ISO 8601 duration rather than a code list.
-/// `IntervalResolution` normalises on the way in — `PT900S` parses back as
-/// `QuarterHour`, which writes `PT15M` — so without this one interval grid could
-/// sit in the column under two spellings, and completeness, which groups by it,
-/// would report the meter twice.
-///
-/// It has no `Display` of its own, so the comparison is against
-/// [`to_iso8601`](IntervalResolution::to_iso8601), which is what the encoder
-/// writes.
-fn decode_resolution(raw: &str) -> Result<metering::resolution::IntervalResolution> {
-    let parsed: metering::resolution::IntervalResolution = raw
-        .parse()
-        .map_err(|e| Error::decode(col::RESOLUTION, format!("{raw:?}: {e}")))?;
-    let canonical = parsed.to_iso8601();
-    if canonical != raw {
-        return Err(Error::decode(
-            col::RESOLUTION,
-            format!(
-                "{raw:?} is an accepted spelling of {canonical:?} but not the canonical one — \
-                 storage holds one spelling per grid, because completeness groups by this \
-                 column and two spellings are two rows"
-            ),
-        ));
-    }
-    Ok(parsed)
+/// `Resolution` normalises on the way in — `PT900S` and `PT60S` parse as
+/// `PT15M` and `PT1M` — so without this one grid could sit in the column under
+/// two spellings, and completeness, which groups by it, would report the meter
+/// twice. A grid `Resolution` cannot represent (a step that does not divide the
+/// hour, or one under a minute) does not parse at all.
+fn decode_resolution(raw: &str) -> Result<Resolution> {
+    decode_code(col::RESOLUTION, raw)
 }
 
 /// Scale a [`Decimal`] into the fixed-point representation of `value`.
@@ -408,16 +392,16 @@ fn from_scaled_i128(raw: i128) -> Decimal {
 ///
 /// # The discriminant is read off the payload, not written out here
 ///
-/// A hand-written `match` would be a second spelling of a vocabulary the domain
-/// owns. `MeasurementSource` is externally tagged and renamed
+/// A hand-written `match` would be a second spelling of the vocabulary the
+/// payload already spells. `MeasurementSource` is externally tagged and renamed
 /// `SCREAMING_SNAKE_CASE`, so the payload in the very next column reads
 /// `{"MSCONS": {…}}` — and an external engine filtering
 /// `source_kind = 'MSCONS'`, the only spelling it can see, would find the two
 /// columns disagreeing.
 ///
-/// Taking the tag *from* the serialised form means a variant renamed upstream
-/// moves both columns together and a variant added upstream needs no edit here.
-/// The domain's vocabulary has one spelling, and it is the domain's.
+/// Taking the tag *from* the serialised form means a renamed variant moves both
+/// columns together and an added one needs no edit here. The vocabulary has one
+/// spelling, and it is the payload's.
 fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
     let payload = serde_json::to_value(source)?;
     let kind = match &payload {
@@ -426,7 +410,7 @@ fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
             fields.keys().next().expect("length checked").clone()
         }
         // A unit variant serialises to its bare tag. None exist today; handling
-        // it costs a line and means one added upstream does not need one here.
+        // it costs a line and means one added later does not need one here.
         serde_json::Value::String(tag) => tag.clone(),
         other => {
             return Err(Error::encode(
@@ -444,11 +428,11 @@ fn encode_source(source: &MeasurementSource) -> Result<(String, String)> {
 
 /// Encode a series' audit trail for the `provenance` column.
 ///
-/// `metering`'s own `serde`, like [`encode_source`], so the stored vocabulary has
-/// one spelling and it is the domain's. The instant lands as RFC 3339 because
-/// `metering::wire` says so — `time`'s own impl is feature-conditional, which
-/// would leave the on-disk shape of a decades-long audit trail to Cargo feature
-/// unification.
+/// [`ProvenanceEntry`]'s own `serde`, like [`encode_source`], so the stored
+/// vocabulary has one spelling. The instant lands as RFC 3339 because
+/// [`delivery`](crate::delivery) formats it — `time`'s own impl is
+/// feature-conditional, which would leave the on-disk shape of a decades-long
+/// audit trail to Cargo feature unification.
 fn encode_provenance(trail: &[ProvenanceEntry]) -> Result<String> {
     serde_json::to_string(trail).map_err(|e| Error::encode(col::PROVENANCE, e.to_string()))
 }
@@ -480,7 +464,8 @@ fn decode_source(kind: &str, detail: Option<&str>) -> Result<MeasurementSource> 
             format!("missing payload for kind {kind:?}"),
         )
     })?;
-    let source: MeasurementSource = serde_json::from_str(detail)?;
+    let source: MeasurementSource = serde_json::from_str(detail)
+        .map_err(|e| Error::decode(col::SOURCE_DETAIL, format!("{detail:?}: {e}")))?;
     let (round_tripped, _) = encode_source(&source)?;
     if round_tripped != kind {
         return Err(Error::decode(
@@ -491,13 +476,29 @@ fn decode_source(kind: &str, detail: Option<&str>) -> Result<MeasurementSource> 
     Ok(source)
 }
 
+/// The day a row is balanced on, or a write error naming the column.
+///
+/// `None` from the calendar means an instant outside the years it has rules
+/// for. Storing a guessed day would put the row in a `GROUP BY` bucket nothing
+/// can correct later, so the write refuses instead.
+fn balancing_day(at: OffsetDateTime, sparte: Sparte) -> Result<time::Date> {
+    crate::planner::balancing_day(at, sparte).ok_or_else(|| {
+        Error::encode(
+            col::BALANCING_DAY,
+            format!(
+                "{at} is outside the years the calendar covers, so it has no {sparte} balancing day"
+            ),
+        )
+    })
+}
+
 /// Resolve the OBIS code for an interval.
 ///
 /// The interval wins when present, since a series may carry mixed channels.
 /// Both are `Option<ObisCode>`, so this is a choice between validated values
 /// rather than a parse that could fail on data already accepted.
 fn obis_for(series: &MeasurementSeries, interval: &MeterInterval) -> Result<ObisCode> {
-    interval.obis_code.or(series.obis_code).ok_or_else(|| {
+    interval.obis().or(series.obis_code).ok_or_else(|| {
         Error::encode(
             col::OBIS_CODE,
             format!(
@@ -805,7 +806,7 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
             melo: s.series.melo_id.as_ref().map(MeloId::to_string),
             sparte: s.sparte.as_str(),
             unit: s.unit.as_str(),
-            resolution: s.series.resolution.map(|r| r.to_iso8601()),
+            resolution: s.series.resolution.map(|r| r.to_string()),
             source_kind: kind,
             source_detail: detail,
             provenance: encode_provenance(&s.series.provenance)?,
@@ -816,30 +817,21 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
         };
 
         for interval in &s.series.intervals {
-            check_scope(&s.version, interval.from, s.sparte)?;
-
-            if interval.to <= interval.from {
-                return Err(Error::encode(
-                    col::TO,
-                    format!(
-                        "interval end {} is not after start {} for {}",
-                        interval.to, interval.from, s.series.malo_id
-                    ),
-                ));
-            }
+            // An empty span is unrepresentable: `MeterInterval::new` refuses one.
+            check_scope(&s.version, interval.from(), s.sparte)?;
 
             columns.push(
                 &fields,
                 obis_for(&s.series, interval)?.to_string(),
-                schema::micros(interval.from),
-                Some(schema::micros(interval.to)),
-                to_scaled_i128(interval.value)?,
-                interval.quality.as_str(),
+                schema::micros(interval.from()),
+                Some(schema::micros(interval.to())),
+                to_scaled_i128(interval.value())?,
+                interval.quality().as_str(),
                 // The one place the balancing day is derived. Asked of the
                 // calendar per row rather than per delivery, because a delivery
                 // may span the 06:00 Gastag boundary — or a midnight — and every
                 // row of it does not share a day.
-                schema::date32(crate::planner::balancing_day(interval.from, s.sparte)),
+                schema::date32(balancing_day(interval.from(), s.sparte)?),
             );
         }
     }
@@ -887,7 +879,7 @@ pub fn readings_to_record_batch_with(
             melo: s.melo_id.as_ref().map(MeloId::to_string),
             sparte: s.sparte.as_str(),
             unit: s.unit.as_str(),
-            resolution: s.cadence.map(|r| r.to_iso8601()),
+            resolution: s.cadence.map(|r| r.to_string()),
             source_kind: kind,
             source_detail: detail,
             provenance: encode_provenance(&s.provenance)?,
@@ -911,7 +903,7 @@ pub fn readings_to_record_batch_with(
                 None,
                 to_scaled_i128(reading.value)?,
                 reading.quality.as_str(),
-                schema::date32(crate::planner::balancing_day(reading.at, s.sparte)),
+                schema::date32(balancing_day(reading.at, s.sparte)?),
             );
         }
     }
@@ -1097,8 +1089,8 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
                 source_kind.value(i),
                 (!source_detail.is_null(i)).then(|| source_detail.value(i)),
             )?;
-            // `IntervalResolution` normalises on parse — `PT900S` reads back as
-            // `QuarterHour`, which writes `PT15M` — so the canonical check is
+            // `Resolution` normalises on parse — `PT900S` reads back as
+            // `Resolution::QUARTER_HOUR`, which writes `PT15M` — so the canonical check is
             // what stops one grid being stored under two ISO 8601 spellings.
             let res = match resolution.is_null(i) {
                 true => None,
@@ -1120,7 +1112,7 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
             }
 
             let sparte: Sparte = decode_code(col::SPARTE, sparte.value(i))?;
-            let unit: MeasurementUnit = decode_code(col::UNIT, unit.value(i))?;
+            let unit: Unit = decode_code(col::UNIT, unit.value(i))?;
             let malo_id = decode_malo(malo.value(i))?;
             let melo_id = match melo.is_null(i) {
                 true => None,
@@ -1173,13 +1165,18 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
         }
 
         let series = out.last_mut().expect("pushed above");
-        series.series.intervals.push(MeterInterval {
-            from: schema::instant(from.value(i))?,
-            to: schema::instant(to.value(i))?,
-            value: from_scaled_i128(value.value(i)),
-            quality: decode_code(col::QUALITY, quality.value(i))?,
-            obis_code: Some(decode_code(col::OBIS_CODE, obis.value(i))?),
-        });
+        // `MeterInterval::new` refuses an empty span. The writer refuses one too,
+        // so a stored row that trips it was written by something else, and it is
+        // a decode error naming the column rather than an interval of no length.
+        let interval = MeterInterval::new(
+            schema::instant(from.value(i))?,
+            schema::instant(to.value(i))?,
+            from_scaled_i128(value.value(i)),
+            decode_code(col::QUALITY, quality.value(i))?,
+        )
+        .map_err(|e| Error::decode(col::TO, format!("row {i}: {e}")))?
+        .with_obis(decode_code(col::OBIS_CODE, obis.value(i))?);
+        series.series.intervals.push(interval);
     }
 
     Ok(out)
@@ -1279,7 +1276,7 @@ pub fn readings_from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredReadi
             }
 
             let sparte: Sparte = decode_code(col::SPARTE, sparte.value(i))?;
-            let unit: MeasurementUnit = decode_code(col::UNIT, unit.value(i))?;
+            let unit: Unit = decode_code(col::UNIT, unit.value(i))?;
             let malo_id = decode_malo(malo.value(i))?;
             check_unit(sparte, unit, &malo_id)?;
 
@@ -1306,12 +1303,14 @@ pub fn readings_from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredReadi
         }
 
         let delivery = out.last_mut().expect("pushed above");
-        delivery.readings.push(metering::reading::MeterReading {
-            at: schema::instant(from.value(i))?,
-            value: from_scaled_i128(value.value(i)),
-            quality: decode_code(col::QUALITY, quality.value(i))?,
-            obis_code: Some(decode_code(col::OBIS_CODE, obis.value(i))?),
-        });
+        delivery
+            .readings
+            .push(metering::series::reading::MeterReading {
+                at: schema::instant(from.value(i))?,
+                value: from_scaled_i128(value.value(i)),
+                quality: decode_code(col::QUALITY, quality.value(i))?,
+                obis_code: Some(decode_code(col::OBIS_CODE, obis.value(i))?),
+            });
     }
 
     Ok(out)
@@ -1323,12 +1322,15 @@ pub fn readings_from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredReadi
 /// is part of the merge key, so two spellings of one channel would mean a
 /// correction could not supersede the value it corrects.
 ///
-/// Thin wrapper over [`ObisCode::normalize`], kept because applications writing
-/// to the hot tier directly need it and should not have to reach past this crate
-/// to find it. The hot table also enforces the canonical shape with a
-/// constraint, so a mistake fails at the write.
+/// Parses with [`ObisCode`]'s lenient `FromStr` and writes its `Display`, which
+/// is the one canonical spelling. Kept because applications writing to the hot
+/// tier directly need it and should not have to reach past this crate to find
+/// it. The hot table also enforces the canonical shape with a constraint, so a
+/// mistake fails at the write.
 pub fn canonical_obis(code: &str) -> Result<String> {
-    ObisCode::normalize(code).map_err(|e| Error::encode(col::OBIS_CODE, format!("{code:?}: {e}")))
+    code.parse::<ObisCode>()
+        .map(|c| c.to_string())
+        .map_err(|e| Error::encode(col::OBIS_CODE, format!("{code:?}: {e}")))
 }
 
 /// Parse a caller-supplied MaLo-ID.
@@ -1383,7 +1385,7 @@ mod tests {
     use crate::arrow::datatypes::DataType;
     use crate::config::ValueCheck;
     use metering::QualityFlag;
-    use metering::resolution::IntervalResolution;
+    use metering::Resolution;
     use time::macros::datetime;
 
     /// A batch whose `malo_id` column carries the given values.
@@ -1476,7 +1478,7 @@ mod tests {
 
     /// The scope an interval belongs to — always derived, never guessed.
     fn scope_for(interval: OffsetDateTime) -> VersionScope {
-        VersionScope::for_interval("9900000000001", interval, Sparte::Strom).unwrap()
+        VersionScope::for_interval("9900000000003", interval, Sparte::Strom).unwrap()
     }
 
     /// A MaLo-ID from its canonical spelling — the check digit is real, so the
@@ -1489,16 +1491,16 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSG-1".to_string()),
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
     fn series(intervals: Vec<MeterInterval>) -> StoredSeries {
-        let first_start = intervals.first().map(|i| i.from).unwrap_or(INGESTED_AT);
+        let first_start = intervals.first().map(|i| i.from()).unwrap_or(INGESTED_AT);
         StoredSeries {
             extra: BTreeMap::new(),
             sparte: Sparte::Strom,
-            unit: MeasurementUnit::KiloWattHour,
+            unit: Unit::KiloWattHour,
             series: {
                 let mut s = MeasurementSeries::new(
                     malo("12345678905"),
@@ -1510,7 +1512,7 @@ mod tests {
                     INGESTED_AT,
                 )
                 .with_melo_id("DE0001234567890123456789012345678".parse().unwrap());
-                s.resolution = Some(IntervalResolution::QuarterHour);
+                s.resolution = Some(Resolution::QUARTER_HOUR);
                 s
             },
             version: ScopedVersion::new(
@@ -1731,13 +1733,14 @@ mod tests {
     }
 
     fn quarter(from: OffsetDateTime, kwh: &str, q: QualityFlag) -> MeterInterval {
-        MeterInterval {
+        MeterInterval::new(
             from,
-            to: from + time::Duration::minutes(15),
-            value: kwh.parse().unwrap(),
-            quality: q,
-            obis_code: "1-0:1.8.0".parse().ok(),
-        }
+            from + time::Duration::minutes(15),
+            kwh.parse().unwrap(),
+            q,
+        )
+        .expect("a non-empty interval")
+        .with_obis("1-0:1.8.0".parse().unwrap())
     }
 
     #[test]
@@ -1813,7 +1816,7 @@ mod tests {
             let input = series(vec![quarter(base, raw, QualityFlag::Measured)]);
             let batch = to_record_batch(std::slice::from_ref(&input)).unwrap();
             let out = from_record_batch(&batch).unwrap();
-            let got = out[0].series.intervals[0].value;
+            let got = out[0].series.intervals[0].value();
             assert_eq!(
                 got,
                 raw.parse::<Decimal>().unwrap(),
@@ -1856,7 +1859,12 @@ mod tests {
         let batch = to_record_batch(&[series(intervals)]).unwrap();
         let out = from_record_batch(&batch).unwrap();
 
-        let got: Vec<_> = out[0].series.intervals.iter().map(|i| i.quality).collect();
+        let got: Vec<_> = out[0]
+            .series
+            .intervals
+            .iter()
+            .map(|i| i.quality())
+            .collect();
         assert_eq!(got, flags);
     }
 
@@ -1866,21 +1874,23 @@ mod tests {
         // boundaries intact, because `to` is stored rather than recomputed as
         // `from + resolution`.
         let dst_back = datetime!(2026-10-25 00:00 UTC);
-        let odd = MeterInterval {
-            from: dst_back,
-            to: dst_back + time::Duration::minutes(37), // deliberately not 15
-            value: "2.5".parse().unwrap(),
-            quality: QualityFlag::Measured,
-            obis_code: "1-0:1.8.0".parse().ok(),
-        };
+        // Deliberately not 15 minutes.
+        let odd = MeterInterval::new(
+            dst_back,
+            dst_back + time::Duration::minutes(37),
+            "2.5".parse().unwrap(),
+            QualityFlag::Measured,
+        )
+        .expect("a non-empty interval")
+        .with_obis("1-0:1.8.0".parse().unwrap());
 
         let batch = to_record_batch(&[series(vec![odd.clone()])]).unwrap();
         let out = from_record_batch(&batch).unwrap();
 
-        assert_eq!(out[0].series.intervals[0].from, odd.from);
-        assert_eq!(out[0].series.intervals[0].to, odd.to);
+        assert_eq!(out[0].series.intervals[0].from(), odd.from());
+        assert_eq!(out[0].series.intervals[0].to(), odd.to());
         assert_eq!(
-            out[0].series.intervals[0].to - out[0].series.intervals[0].from,
+            out[0].series.intervals[0].to() - out[0].series.intervals[0].from(),
             time::Duration::minutes(37)
         );
     }
@@ -1896,7 +1906,7 @@ mod tests {
         // Force the mistake this guards against: a scope keyed to the month the
         // correction was *delivered* rather than the month it describes.
         input.version = ScopedVersion::new(
-            VersionScope::new("9900000000001", 2026, 7).unwrap(),
+            VersionScope::new("9900000000003", 2026, 7).unwrap(),
             Version::new(20_260_715_000_002).unwrap(),
         );
         assert!(matches!(
@@ -1906,7 +1916,7 @@ mod tests {
 
         // Derived from the interval, it encodes.
         input.version = ScopedVersion::new(
-            VersionScope::for_interval("9900000000001", january, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", january, Sparte::Strom).unwrap(),
             Version::new(20_260_115_000_001).unwrap(),
         );
         assert!(to_record_batch(&[input]).is_ok());
@@ -1917,7 +1927,7 @@ mod tests {
         // Delivered later, but scoped to the interval — so the two are
         // comparable and the correction can win.
         let interval = datetime!(2026-03-01 00:00 UTC);
-        let scope = VersionScope::for_interval("9900000000001", interval, Sparte::Strom).unwrap();
+        let scope = VersionScope::for_interval("9900000000003", interval, Sparte::Strom).unwrap();
 
         let original = ScopedVersion::new(scope.clone(), Version::new(20_260_301_000_001).unwrap());
         let correction = ScopedVersion::new(scope, Version::new(20_260_415_000_002).unwrap());
@@ -1926,16 +1936,14 @@ mod tests {
     }
 
     #[test]
-    fn encoding_rejects_non_positive_intervals() {
+    fn a_non_positive_interval_cannot_reach_the_encoder() {
+        // The encoder has no check of its own: `MeterInterval::new` refuses an
+        // empty or inverted span, so one cannot be built to hand it. Pinned here
+        // because the encoder relies on it.
         let base = datetime!(2026-03-01 00:00 UTC);
-        let bad = MeterInterval {
-            from: base,
-            to: base,
-            value: Decimal::ONE,
-            quality: QualityFlag::Measured,
-            obis_code: "1-0:1.8.0".parse().ok(),
-        };
-        assert!(to_record_batch(&[series(vec![bad])]).is_err());
+        for to in [base, base - time::Duration::minutes(15)] {
+            assert!(MeterInterval::new(base, to, Decimal::ONE, QualityFlag::Measured).is_err());
+        }
     }
 
     #[test]
@@ -1975,7 +1983,7 @@ mod tests {
         mscons.series.source = MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         };
 
         let mut gateway = series(vec![quarter(
@@ -2013,11 +2021,15 @@ mod tests {
         let base = datetime!(2026-03-01 00:00 UTC);
         let mut a = series(vec![quarter(base, "1.0", QualityFlag::Measured)]);
         a.series.obis_code = "1-0:1.8.0".parse().ok();
-        a.series.intervals[0].obis_code = "1-0:1.8.0".parse().ok();
+        a.series.intervals[0] = a.series.intervals[0]
+            .clone()
+            .with_obis("1-0:1.8.0".parse().unwrap());
 
         let mut b = series(vec![quarter(base, "2.0", QualityFlag::Measured)]);
         b.series.obis_code = "1-0:2.8.0".parse().ok();
-        b.series.intervals[0].obis_code = "1-0:2.8.0".parse().ok();
+        b.series.intervals[0] = b.series.intervals[0]
+            .clone()
+            .with_obis("1-0:2.8.0".parse().unwrap());
 
         let batch = to_record_batch(&[a, b]).unwrap();
         let out = from_record_batch(&batch).unwrap();
@@ -2030,7 +2042,7 @@ mod tests {
                     .series
                     .intervals
                     .iter()
-                    .all(|i| i.obis_code == Some(channel)),
+                    .all(|i| i.obis() == Some(channel)),
                 "every interval must be on the channel the series names"
             );
         }
@@ -2078,29 +2090,30 @@ mod tests {
         // is a change to data already written.
         //
         // Nothing else here would catch that. Every other test round-trips
-        // through the *current* serde impl, so an upstream retag, a renamed
-        // variant, or a `time` feature flipped on by some unrelated crate in the
+        // through the *current* serde impl, so a retagged or renamed variant —
+        // here or in a nested `metering` code — or a `time` feature flipped on by
+        // some unrelated crate in the
         // graph would pass all of them and break every stored row. This is the
         // one that fails instead, here, with the reason attached.
         let (kind, detail) = encode_source(&source()).unwrap();
         assert_eq!(kind, "MSCONS");
         assert_eq!(
             detail,
-            r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000001"}}"#,
+            r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000003"}}"#,
             "the stored shape of MeasurementSource changed. Rows already in \
              source_detail are in the old shape and will not decode — this is a \
              stored-data break, not a serialisation detail"
         );
 
-        // The variant that embeds a *second* upstream vocabulary, which is the
-        // one this test exists for. `MeasurementSource::VirtualMeter` carries a
-        // `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is a `metering` tag stored
-        // inside a `metering` payload inside this column — and if it is ever
-        // retagged, `source_kind` stays `VIRTUAL_METER` and agrees with itself
-        // while the payload silently stops decoding. The discriminant check in
-        // `decode_source` cannot see that; only this can.
+        // The variant that embeds a *second* vocabulary, which is the one this
+        // test exists for. `MeasurementSource::VirtualMeter` carries a
+        // `VirtualMeterKind`, so `PV_SELF_CONSUMPTION` is a tag stored inside a
+        // payload inside this column — and if it is ever retagged, `source_kind`
+        // stays `VIRTUAL_METER` and agrees with itself while the payload silently
+        // stops decoding. The discriminant check in `decode_source` cannot see
+        // that; only this can.
         let (kind, detail) = encode_source(&MeasurementSource::VirtualMeter {
-            rule: metering::aggregation_rule::VirtualMeterKind::PvSelfConsumption,
+            rule: crate::delivery::VirtualMeterKind::PvSelfConsumption,
             source_ids: vec!["12345678905".to_string()],
         })
         .unwrap();
@@ -2116,10 +2129,10 @@ mod tests {
         // The audit trail, and its timestamp above all. `time`'s own serde impl
         // is feature-conditional — `occurred_at` lands as
         // `[2026,60,0,0,0,0,0,0,0]` wherever `serde-human-readable` is off — so
-        // this pins `metering::wire`'s decision to write RFC 3339 instead.
+        // this pins `delivery`'s decision to write RFC 3339 instead.
         let entry = ProvenanceEntry {
             occurred_at: datetime!(2026-03-01 00:00 UTC),
-            event_type: metering::measurement_series::ProvenanceEventType::Ingested,
+            event_type: crate::delivery::ProvenanceEventType::Ingested,
             actor: "MSCONS".to_string(),
             note: None,
         };
@@ -2129,7 +2142,7 @@ mod tests {
             "the stored shape of a provenance entry changed. Rows already in the \
              provenance column are in the old shape — this is a stored-data \
              break, and an audit trail is the one column that must stay readable. \
-             An `occurred_at` that is not RFC 3339 means `metering::wire` changed"
+             An `occurred_at` that is not RFC 3339 means `delivery`'s formatter changed"
         );
 
         // And it decodes back, which is the half that matters on the read path.
@@ -2141,9 +2154,9 @@ mod tests {
 
     #[test]
     fn a_provenance_trail_survives_every_event_type_and_a_note() {
-        // Derived from `metering`'s own list, so an event type added upstream is
-        // covered without an edit here — the same rule the source tags follow.
-        use metering::measurement_series::ProvenanceEventType;
+        // Derived from the type's own list, so an added event type is covered
+        // without an edit here — the same rule the source tags follow.
+        use crate::delivery::ProvenanceEventType;
 
         let trail: Vec<ProvenanceEntry> = ProvenanceEventType::ALL
             .iter()
@@ -2186,19 +2199,19 @@ mod tests {
 
     /// One value of **every** [`MeasurementSource`] variant.
     ///
-    /// `encode_source` needs no edit for a variant added upstream — it reads the
+    /// `encode_source` needs no edit for an added variant — it reads the
     /// tag off the payload — and that is exactly why the *tests* need one: a
     /// variant nothing here constructs is a shape of `source_detail` this crate
     /// has never written down, in a column under a decades-long retention
     /// obligation.
     ///
     /// The `match` below is what keeps the list honest. `MeasurementSource` is
-    /// not `#[non_exhaustive]`, so a variant added upstream makes it
+    /// not `#[non_exhaustive]`, so a variant added to it makes the match
     /// non-exhaustive and **fails to compile** — which is the difference between
     /// a list that is complete and one that was complete when it was written.
     fn every_source_variant() -> Vec<MeasurementSource> {
-        use metering::aggregation_rule::VirtualMeterKind;
-        use metering::substitute::{SubstituteMethod, SubstitutionReason};
+        use crate::delivery::VirtualMeterKind;
+        use metering::vee::substitute::{Method, SubstitutionReason};
 
         let all = vec![
             source(),
@@ -2211,7 +2224,7 @@ mod tests {
                 reason: "dispute".into(),
             },
             MeasurementSource::AutoSubstitute {
-                method: SubstituteMethod::ZeroFill,
+                method: Method::Zero,
                 reason: SubstitutionReason::CommunicationFailure,
             },
             MeasurementSource::RetroactiveCorrection {
@@ -2281,7 +2294,7 @@ mod tests {
         // The tags themselves, because `source_kind` is a `GROUP BY` key and a
         // `WHERE` literal in every external engine reading the warehouse — the
         // one column of the pair a reader outside this process can see. A retag
-        // upstream keeps both columns agreeing with each other and stops old
+        // keeps both columns agreeing with each other and stops old
         // rows decoding, and every round-trip test above would still pass: they
         // all read and write through the *same* impl.
         assert_eq!(
@@ -2307,15 +2320,17 @@ mod tests {
     /// The **whole** stored payload, spelled out.
     ///
     /// The tag assertion above covers the one column an external engine reads,
-    /// and stops there. `source_detail` holds a *nested* upstream vocabulary —
-    /// `AutoSubstitute` carries a `SubstitutionReason`, `VirtualMeter` a
-    /// `VirtualMeterKind` — and a rename inside one keeps both columns agreeing
+    /// and stops there. `source_detail` holds *nested* vocabularies —
+    /// `AutoSubstitute` carries `metering`'s `Method` and `SubstitutionReason`,
+    /// `VirtualMeter` this crate's `VirtualMeterKind` — and a rename inside one
+    /// keeps both columns agreeing
     /// with each other while stopping every stored row from decoding. Neither
     /// the round-trip tests nor the tag test can see that: the first read and
     /// write through the same impl, the second watches only the outer tag.
     ///
-    /// So the literals are here, and an upstream rename fails with a diff
-    /// naming it.
+    /// So the literals are here, and a rename fails with a diff naming it.
+    /// They pin what *this* build writes; what earlier releases wrote is the
+    /// stored-form corpus's to hold.
     #[test]
     fn every_source_payload_has_the_shape_already_on_disk() {
         let stored: Vec<String> = every_source_variant()
@@ -2326,10 +2341,10 @@ mod tests {
         assert_eq!(
             stored,
             [
-                r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000001"}}"#,
+                r#"{"MSCONS":{"message_ref":"MSG-1","pid":13005,"sender_mp_id":"9900000000003"}}"#,
                 r#"{"SMGW_DIRECT_PUSH":{"device_id":"d","session_id":"s"}}"#,
                 r#"{"MANUAL_ENTRY":{"operator_id":"op","reason":"dispute"}}"#,
-                r#"{"AUTO_SUBSTITUTE":{"method":"ZERO_FILL","reason":"COMMUNICATION_FAILURE"}}"#,
+                r#"{"AUTO_SUBSTITUTE":{"method":"ZERO","reason":"COMMUNICATION_FAILURE"}}"#,
                 r#"{"RETROACTIVE_CORRECTION":{"corrected_by":"clearing","correction_ref":"COR-42"}}"#,
                 r#"{"VIRTUAL_METER":{"rule":"PV_SELF_CONSUMPTION","source_ids":["12345678905"]}}"#,
                 r#"{"REDISPATCH_IMPORT":{"activation_ref":"ACT-7","pid":13020}}"#,
@@ -2382,7 +2397,7 @@ mod tests {
                 &mut found,
             );
         }
-        let trail: Vec<ProvenanceEntry> = metering::measurement_series::ProvenanceEventType::ALL
+        let trail: Vec<ProvenanceEntry> = crate::delivery::ProvenanceEventType::ALL
             .iter()
             .map(|event_type| ProvenanceEntry {
                 occurred_at: datetime!(2026-03-01 00:00 UTC),
@@ -2412,7 +2427,7 @@ mod tests {
         // these columns are `GROUP BY` keys, so two spellings of one commodity
         // are two rows in a completeness report. The hot tier's CHECK refuses
         // them; Iceberg has no constraints, so this is the read-side half.
-        use metering::interval::Sparte;
+        use metering::series::interval::Sparte;
 
         assert_eq!(
             decode_code::<Sparte>(col::SPARTE, "WAERME").unwrap(),
@@ -2427,8 +2442,8 @@ mod tests {
         }
 
         // The same for the other two coded columns.
-        assert!(decode_code::<MeasurementUnit>(col::UNIT, "KWH").is_ok());
-        assert!(decode_code::<MeasurementUnit>(col::UNIT, "kwh").is_err());
+        assert!(decode_code::<Unit>(col::UNIT, "KWH").is_ok());
+        assert!(decode_code::<Unit>(col::UNIT, "kwh").is_err());
         assert!(decode_code::<QualityFlag>(col::QUALITY, "MEASURED").is_ok());
         assert!(decode_code::<QualityFlag>(col::QUALITY, "measured").is_err());
 
@@ -2441,16 +2456,13 @@ mod tests {
         // The other half: the guard must not refuse anything the encoder emits.
         // Driven from `CODES` so a variant added upstream is covered without an
         // edit here.
-        use metering::interval::Sparte;
+        use metering::series::interval::Sparte;
 
         for code in Sparte::CODES {
             assert!(decode_code::<Sparte>(col::SPARTE, code).is_ok(), "{code}");
         }
-        for code in MeasurementUnit::CODES {
-            assert!(
-                decode_code::<MeasurementUnit>(col::UNIT, code).is_ok(),
-                "{code}"
-            );
+        for code in Unit::CODES {
+            assert!(decode_code::<Unit>(col::UNIT, code).is_ok(), "{code}");
         }
         for code in QualityFlag::CODES {
             assert!(
@@ -2462,28 +2474,33 @@ mod tests {
 
     #[test]
     fn a_resolution_is_stored_under_one_iso8601_spelling() {
-        use metering::resolution::IntervalResolution;
+        use metering::Resolution;
 
-        // `PT900S` and `PT15M` are the same grid, and `IntervalResolution`
+        // `PT900S` and `PT15M` are the same grid, and `Resolution`
         // normalises the first to the second on parse — so without the check a
         // foreign writer could split one meter across two completeness rows.
         assert_eq!(
             decode_resolution("PT15M").unwrap(),
-            IntervalResolution::QuarterHour
+            Resolution::QUARTER_HOUR
         );
         let err = decode_resolution("PT900S").unwrap_err().to_string();
         assert!(err.contains("PT15M"), "{err}");
 
         // Everything the encoder writes reads back.
         for r in [
-            IntervalResolution::QuarterHour,
-            IntervalResolution::Hour,
-            IntervalResolution::Day,
-            IntervalResolution::Month,
-            IntervalResolution::from_seconds(60).unwrap(),
+            Resolution::QUARTER_HOUR,
+            Resolution::Hour,
+            Resolution::Day,
+            Resolution::Month,
+            Resolution::from_seconds(60).unwrap(),
         ] {
-            assert_eq!(decode_resolution(&r.to_iso8601()).unwrap(), r, "{r:?}");
+            assert_eq!(decode_resolution(&r.to_string()).unwrap(), r, "{r:?}");
         }
+
+        // A grid is spelled in minutes. The seconds spelling is not a second name
+        // for it, and a grid finer than a minute is not a grid storage holds.
+        assert!(decode_resolution("PT60S").is_err());
+        assert!(decode_resolution("PT1S").is_err());
     }
 
     #[test]
@@ -2495,7 +2512,7 @@ mod tests {
             )
             .is_err()
         );
-        // And the pre-0.5.0 spelling is a mismatch now, not a silent accept.
+        // A lowercase discriminant is a mismatch, not a silent accept.
         assert!(decode_source("mscons", Some(&serde_json::to_string(&source()).unwrap())).is_err());
     }
 
@@ -2550,7 +2567,7 @@ mod tests {
     fn round_trip_preserves_provenance() {
         // Provenance is not derivable, so dropping it would be silent data loss
         // in a store that claims regulatory audit value.
-        use metering::measurement_series::ProvenanceEventType;
+        use crate::delivery::ProvenanceEventType;
 
         let base = datetime!(2026-03-01 00:00 UTC);
         let mut input = series(vec![quarter(base, "1.0", QualityFlag::Measured)]);
@@ -2666,7 +2683,7 @@ mod tests {
             s.unit = sparte.billing_unit();
             // October, so the scope the encoder demands is October's.
             s.version = ScopedVersion::new(
-                scope_for(intervals[0].from),
+                scope_for(intervals[0].from()),
                 Version::new(20_261_024_000_001).unwrap(),
             );
 
@@ -2676,9 +2693,9 @@ mod tests {
             for (interval, day) in intervals.iter().zip(got) {
                 assert_eq!(
                     day,
-                    crate::planner::balancing_day(interval.from, sparte),
+                    crate::planner::balancing_day(interval.from(), sparte).unwrap(),
                     "{sparte} at {}",
-                    interval.from
+                    interval.from()
                 );
             }
         }

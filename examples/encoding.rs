@@ -6,14 +6,14 @@
 //! correction versioning, and the tiering boundary. The hot and cold stores are
 //! not wired up yet, so nothing here touches a database.
 
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use meterstore::encode::{StoredSeries, from_record_batch, to_record_batch};
 use meterstore::watermark::{Tier, next_window};
 use meterstore::{TieringWatermark, Version, VersionScope};
 
-use metering::interval::MeterInterval;
-use metering::measurement_series::{MeasurementSeries, MeasurementSource};
-use metering::{QualityFlag, resolution::IntervalResolution};
+use metering::series::interval::MeterInterval;
+use metering::{QualityFlag, Resolution};
+use meterstore::delivery::{MeasurementSeries, MeasurementSource};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -22,14 +22,16 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
     let intervals: Vec<MeterInterval> = (0..96)
         .map(|i| {
             let from = start + Duration::minutes(15 * i);
-            MeterInterval {
+            // Deliberately six decimal places: this must survive exactly.
+            let value = format!("0.2{:05}", i).parse().unwrap();
+            MeterInterval::new(
                 from,
-                to: from + Duration::minutes(15),
-                // Deliberately six decimal places: this must survive exactly.
-                value: format!("0.2{:05}", i).parse().unwrap(),
-                quality: QualityFlag::Measured,
-                obis_code: "1-0:1.8.0".parse().ok(),
-            }
+                from + Duration::minutes(15),
+                value,
+                QualityFlag::Measured,
+            )
+            .expect("a non-empty interval")
+            .with_obis("1-0:1.8.0".parse().unwrap())
         })
         .collect();
 
@@ -43,18 +45,18 @@ fn day_of_readings(start: OffsetDateTime, version: u128) -> StoredSeries {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: Some("MSCONS-2026-07-20-001".to_string()),
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         },
         // Ingestion time is injected, so this example is reproducible.
         datetime!(2026-07-27 06:00 UTC),
     );
-    series.resolution = Some(IntervalResolution::QuarterHour);
+    series.resolution = Some(Resolution::QUARTER_HOUR);
 
     StoredSeries::new(
         series,
         meterstore::ScopedVersion::new(
             // Derived from the interval, never from the delivery month.
-            VersionScope::for_interval("9900000000001", start, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", start, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -90,10 +92,10 @@ fn main() -> meterstore::Result<()> {
     assert_eq!(back.series.intervals.len(), 96);
     assert_eq!(back.series.malo_id, original.series.malo_id);
     for (a, b) in original.series.intervals.iter().zip(&back.series.intervals) {
-        assert_eq!(a.value, b.value, "decimal must round-trip exactly");
-        assert_eq!(a.from, b.from);
-        assert_eq!(a.to, b.to, "interval end is stored, never recomputed");
-        assert_eq!(a.quality, b.quality);
+        assert_eq!(a.value(), b.value(), "decimal must round-trip exactly");
+        assert_eq!(a.from(), b.from());
+        assert_eq!(a.to(), b.to(), "interval end is stored, never recomputed");
+        assert_eq!(a.quality(), b.quality());
     }
     println!("round-trip exact: 96 intervals, decimals and boundaries preserved");
 
@@ -117,7 +119,7 @@ fn main() -> meterstore::Result<()> {
 
     // Across scopes the comparison is refused rather than answered wrongly.
     let other_operator = meterstore::ScopedVersion::new(
-        VersionScope::new("9900000000002", 2026, 7)?,
+        VersionScope::new("9900000000029", 2026, 7)?,
         Version::new(99_999_999_999_999)?,
     );
     match other_operator.supersedes(&original.version) {

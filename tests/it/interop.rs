@@ -1,6 +1,6 @@
 //! Can anything **other than MeterStore** read what MeterStore wrote?
 //!
-//! P2 says the durable state is an open format, and that is the project's main
+//! The durable state is an open format, and that is the project's main
 //! procurement argument: twenty years of regulated history that any Iceberg
 //! engine can read without this crate. An argument nobody tests is a hope.
 //!
@@ -20,12 +20,10 @@
 //!   rows into the same answer MeterStore gives**.
 //!
 //! It does *not* start a container. The suites that do are siblings —
-//! `interop_duckdb` and `interop_pyiceberg` run the real engines, and
-//! `interop_trino` pins the SQL semantics that decided how the balancing day is
-//! stored. This one is the hermetic floor beneath them: it needs no Docker, so
-//! it still rules out the failure mode that matters most — output only this
-//! crate's own reader can make sense of — on a machine that cannot run the rest.
-//! Spark remains open.
+//! `interop_duckdb` and `interop_pyiceberg` run the real engines. This one is
+//! the hermetic floor beneath them: it needs no Docker, so it still rules out
+//! the failure mode that matters most — output only this crate's own reader can
+//! make sense of — on a machine that cannot run the rest.
 //!
 //! # Why the naive query is asserted to be *wrong*
 //!
@@ -163,7 +161,7 @@ async fn total(ctx: &SessionContext, sql: &str) -> Decimal {
 
 #[tokio::test]
 async fn the_files_are_readable_without_meterstore_or_iceberg() {
-    // The floor P2 rests on: if this fails, nothing else in the argument stands.
+    // The floor the open-format claim rests on: if this fails, nothing else in the argument stands.
     let workload = MeteringWorkload::new(START)
         .seed(0x09E4)
         .malo_ids(4)

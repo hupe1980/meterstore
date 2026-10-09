@@ -26,13 +26,13 @@
 //!    short with nothing reporting it.
 //! 3. **Reclaim on a later cycle.** Orphan reclamation drops a detached partition
 //!    once its committing snapshot is older than
-//!    [`reader_grace`](crate::config::TableConfig::reader_grace), by which time
-//!    no live plan can still be holding the older boundary.
+//!    [`reader_grace`](crate::config::TableConfig::reader_grace) and no reader is
+//!    pinned below it. The pin registry, consulted in the dropping transaction,
+//!    is what keeps a live plan whole; the grace is hysteresis.
 //!
-//! The third step is therefore the *normal* path rather than a repair, which is
-//! the point: the crash-recovery route is exercised on every run instead of only
-//! after a crash. The reverse order — drop before commit — still loses data
-//! permanently, and is what the ordering above rules out.
+//! The third step is the *normal* path rather than a repair, so the
+//! crash-recovery route is exercised on every run instead of only after a
+//! crash. The reverse order — drop before commit — loses data permanently.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,7 +72,7 @@ pub struct ArchivalOutcome {
     /// The watermark after the run.
     pub watermark: TieringWatermark,
     /// Orphaned partitions reclaimed before the run.
-    pub orphans_reclaimed: usize,
+    pub partitions_reclaimed: usize,
     /// Hot partitions pre-created for future writes.
     pub partitions_created: usize,
     /// Whether another process held the archive lease, so this run did nothing.
@@ -128,7 +128,7 @@ impl ArchivalOutcome {
             window: None,
             rows: 0,
             watermark,
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 0,
             lease_contended: true,
             deferred: false,
@@ -142,7 +142,7 @@ impl ArchivalOutcome {
             window: None,
             rows: 0,
             watermark,
-            orphans_reclaimed: 0,
+            partitions_reclaimed: 0,
             partitions_created: 0,
             lease_contended: false,
             deferred: true,
@@ -185,13 +185,33 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // invariant is relaxed, and it is only safe because one process owns it.
         // Two archivers would both target the window above the same watermark,
         // and one would commit rows the other had already taken.
-        let Some(lease) = self.hot.try_archive_lease(self.config.name()).await? else {
-            let watermark = self.cold.watermark(self.config.name()).await?;
-            debug!(
-                table = self.config.name(),
-                "archive lease held elsewhere; skipping"
-            );
-            return Ok(ArchivalOutcome::contended(watermark));
+        //
+        // Every exit records the gauges and counts a failure, the ones before
+        // the lease included: a hot tier that cannot hand out a lease is an
+        // outage, and its lag has to keep rising through it.
+        let lease = match self.hot.try_archive_lease(self.config.name()).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                debug!(
+                    table = self.config.name(),
+                    "archive lease held elsewhere; skipping"
+                );
+                self.record_gauges(now).await;
+                let contended = self
+                    .cold
+                    .watermark(self.config.name())
+                    .await
+                    .map(ArchivalOutcome::contended);
+                if contended.is_err() {
+                    metrics.archival_failures.add(1, &attrs);
+                }
+                return contended;
+            }
+            Err(e) => {
+                metrics.archival_failures.add(1, &attrs);
+                self.record_gauges(now).await;
+                return Err(e);
+            }
         };
 
         // A statement that declined to wait for a lock changed nothing, so the
@@ -209,8 +229,13 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                     relation, operation, waited_ms, "archival deferred: lock not available"
                 );
                 metrics.archival_deferred.add(1, &attrs);
-                let watermark = self.cold.watermark(self.config.name()).await?;
-                Ok(ArchivalOutcome::deferred(watermark))
+                // No `?`: the lease below is released on every path, and an
+                // early return here would put its connection back in the pool
+                // still holding the session lock.
+                self.cold
+                    .watermark(self.config.name())
+                    .await
+                    .map(ArchivalOutcome::deferred)
             }
             other => other,
         };
@@ -218,9 +243,9 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // Released whether or not the run succeeded. A failed run must not keep
         // the table locked against the next attempt.
         if let Err(e) = lease.release().await {
-            // Not "it dies with this session", which is what this said and is
-            // false: the lease holds a **pooled** connection, so a failed release
-            // returns it to the pool alive and still holding the session lock.
+            // The lease does not die with this session: it holds a **pooled**
+            // connection, so a failed release returns it to the pool alive and
+            // still holding the session lock.
             // Every later `pg_try_advisory_lock` on a different connection then
             // refuses, archival is wedged, and it is reported as
             // `lease_contended` — which operators are told not to alert on. It
@@ -229,7 +254,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             //
             // The pool-level remedy is an `after_release` hook running
             // `pg_advisory_unlock_all()`; `Settings` installs one, and a
-            // deployment that builds its own pool has to (R22).
+            // deployment that builds its own pool has to.
             warn!(
                 table = self.config.name(),
                 error = %e,
@@ -244,20 +269,49 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         if let Ok(ref o) = outcome {
             metrics.archival_rows.add(o.rows, &attrs);
             metrics
-                .orphans_reclaimed
-                .add(o.orphans_reclaimed as u64, &attrs);
+                .partitions_reclaimed
+                .add(o.partitions_reclaimed as u64, &attrs);
             if o.archived_anything() {
-                metrics.partitions_dropped.add(1, &attrs);
+                metrics.windows_archived.add(1, &attrs);
                 metrics
                     .archival_duration
                     .record(started.elapsed().as_secs_f64(), &attrs);
             }
+        }
+        self.record_gauges(now).await;
+        outcome
+    }
+
+    /// Record the two gauges an operator alerts on, whatever the run did.
+    ///
+    /// Both exist to show an outage while it happens: a failing archiver, a
+    /// quarantined table and a replica that lost the lease all leave the
+    /// boundary where it was, and lag has to keep rising through that.
+    /// Recorded only after a successful run, a gauge would hold its last
+    /// healthy value for exactly as long as the outage it is meant to show.
+    /// Best effort: a tier that cannot answer leaves the gauge as it is, and
+    /// the run's own error reports why.
+    async fn record_gauges(&self, now: OffsetDateTime) {
+        let table = self.config.name();
+        let attrs = crate::observe::table(table);
+        let metrics = crate::observe::metrics();
+        if let Ok(watermark) = self.cold.watermark(table).await {
             metrics.watermark_lag.record(
-                (now - o.watermark.get()).whole_seconds().max(0) as u64,
+                (now - watermark.get()).whole_seconds().max(0) as u64,
                 &attrs,
             );
         }
-        outcome
+        // Counted from the partitions that exist, never from configuration: a
+        // configured expectation is a constant, unaffected by an archiver that
+        // stopped creating partitions, and so could never reach the zero it is
+        // alerted on.
+        if let Ok(Some(starts)) = self.hot.partition_starts(table).await {
+            metrics.hot_partitions_ahead.record(
+                crate::tiering::store::partitions_ahead(&starts, now, self.config.archival_step())
+                    as u64,
+                &attrs,
+            );
+        }
     }
 
     /// The archival cycle itself, wrapped by `run_once` for instrumentation.
@@ -266,16 +320,16 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
 
         // 0. Refuse to archive into a layout nobody agreed on. Checked
         //    every run rather than at construction, because the cold table can be
-        //    changed out of band — by an operator running compaction with Spark,
-        //    or by a second deployment on an older configuration. Failing here
+        //    changed out of band — by a maintenance tool this crate does not
+        //    control, or by a second deployment on an older configuration. Failing here
         //    freezes the watermark, which is the point: the rows stay in
         //    PostgreSQL, where they can still be corrected.
-        self.verify_schema(table).await?;
+        let spec = self.verify_schema(table).await?;
         self.verify_archival_step(table).await?;
 
         // 1. Reclaim the partitions earlier runs archived, once no query
         //    planned against the older boundary can still be reading them.
-        let orphans_reclaimed = self.reclaim_orphans(table, now).await?;
+        let partitions_reclaimed = self.reclaim_orphans(table, now).await?;
 
         // 2. Keep the write frontier supplied with partitions. Done before
         //    archiving so a failure here surfaces even on an idle cycle —
@@ -291,20 +345,6 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             .await?
             .len();
 
-        // Not the count created, and **not** the configured expectation — the
-        // partitions that actually exist ahead of the write frontier. This was
-        // `expected_hot_partitions()`, which is a pure function of configuration:
-        // a constant, unaffected by an archiver that stopped creating partitions,
-        // and therefore a gauge that could never reach the zero it is alerted on.
-        // Reaching zero stops writes, so it has to be counted from reality.
-        if let Some(starts) = self.hot.partition_starts(table).await? {
-            crate::observe::metrics().hot_partitions_ahead.record(
-                crate::tiering::store::partitions_ahead(&starts, now, self.config.archival_step())
-                    as u64,
-                &crate::observe::table(table),
-            );
-        }
-
         // 3. Pick a closed window, if one is due.
         let watermark = self.cold.watermark(table).await?;
         let Some(window) = next_window(
@@ -319,7 +359,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                 window: None,
                 rows: 0,
                 watermark,
-                orphans_reclaimed,
+                partitions_reclaimed,
                 partitions_created,
                 lease_contended: false,
                 deferred: false,
@@ -332,7 +372,17 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         //    commit rather than one per step.
         let window = self.widen_over_empty(table, window, now).await?;
 
-        let (rows, added) = self.archive_window(table, window, now).await?;
+        let (rows, added) = match self.archive_window(table, window, &spec, now).await {
+            // Another writer archived this window — a lost lease is the only way
+            // two get here, and the commit guard is what stopped the second. The
+            // partition this run detached is covered by the boundary now, so a
+            // later run reclaims it as it reclaims any other.
+            Err(Error::AlreadyArchived { .. }) => {
+                let watermark = self.cold.watermark(table).await?;
+                return Ok(ArchivalOutcome::contended(watermark));
+            }
+            other => other?,
+        };
         let watermark = watermark.advance_to(table, window.resulting_watermark())?;
 
         info!(
@@ -348,7 +398,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             window: Some(window),
             rows,
             watermark,
-            orphans_reclaimed,
+            partitions_reclaimed,
             partitions_created,
             lease_contended: false,
             deferred: false,
@@ -358,32 +408,17 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
 
     /// Extend a window that holds no partition over the whole empty stretch.
     ///
-    /// # The problem this solves is the first run, not a rare one
+    /// A table that has never been archived has its watermark at the **Unix
+    /// epoch**, and [`next_window`] starts from the watermark — so without this
+    /// a deployment created in 2026 commits one empty Iceberg snapshot per day
+    /// since 1970 before it reaches a real row, and retains every one of them.
+    /// The same shape recurs whenever a table is idle for a stretch.
     ///
-    /// A table that has never been archived has no snapshot, so its watermark is
-    /// the **Unix epoch** — and [`next_window`] starts from the watermark. Left
-    /// one step at a time, a deployment created in 2026 therefore commits one
-    /// empty Iceberg snapshot per day since 1970 before it reaches a single real
-    /// row: some twenty thousand commits, capped at a few dozen per maintenance
-    /// cycle, and twenty thousand snapshots retained for the ten years snapshot
-    /// keeps them. The store is unusable for days and its metadata never
-    /// recovers.
-    ///
-    /// The same shape recurs whenever a table is idle for a stretch — a
-    /// deployment that stops receiving one commodity, a backfill that starts in
-    /// the middle of the history.
-    ///
-    /// # Why widening is safe
-    ///
-    /// Rows live in partitions. A range with no partition therefore holds no
-    /// rows, so a window covering it archives nothing and the watermark may pass
-    /// over it in one move: the tiering invariant is about *which tier owns a range*
-    /// and both tiers own nothing here.
-    ///
-    /// The widened window still stops at the archival horizon, so it never
-    /// reaches into the settlement lag, and it stays a whole multiple of
-    /// `archival_step`, so a window still maps to exactly one partition when
-    /// there is one.
+    /// Widening is safe because rows live in partitions: a range with no
+    /// partition holds no rows, so the watermark may pass over it in one move.
+    /// The widened window still stops at the archival horizon and stays a whole
+    /// multiple of `archival_step`, so a window still maps to exactly one
+    /// partition when there is one.
     ///
     /// A store that cannot enumerate its partitions
     /// ([`HotStore::partition_starts`] returning `None`) keeps the
@@ -440,6 +475,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         &self,
         table: &str,
         window: ArchivalWindow,
+        spec: &crate::tiering::store::ScanSpec,
         now: OffsetDateTime,
     ) -> Result<(u64, Option<crate::tiering::store::AddedFiles>)> {
         let partition = PartitionId::for_window(table, window);
@@ -478,10 +514,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             distinct_malo_ids: self.hot.distinct_malo_ids(&partition).await?,
         };
 
-        let batches = self
-            .hot
-            .scan_detached(&partition, &self.config.scan_spec())
-            .await?;
+        let batches = self.hot.scan_detached(&partition, spec).await?;
 
         // The rows are counted **as they stream**, not collected. Materialising
         // a partition to count it would put archival's peak memory in
@@ -567,69 +600,50 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         Ok((rows, commit.added))
     }
 
-    /// Halt the table if the cold schema cannot hold what we are about to write.
+    /// Halt the table if the cold schema cannot hold what we are about to write,
+    /// and say which columns the archival scan carries.
+    ///
+    /// Those are the declared deployment columns **and every nullable one the
+    /// cold table still holds that is no longer declared**. Both tiers keep such
+    /// a column, and rows written before the declaration was withdrawn carry
+    /// values in it; a scan of the declared columns alone would archive them as
+    /// null, and dropping the partition would then destroy the values.
     ///
     /// A store whose cold store cannot report its schema is not quarantined; it
-    /// simply cannot be checked, and pretending otherwise would be the lie P6
-    /// forbids in the other direction.
-    async fn verify_schema(&self, table: &str) -> Result<()> {
+    /// simply cannot be checked, and quarantining it would claim a mismatch
+    /// nobody observed.
+    async fn verify_schema(&self, table: &str) -> Result<crate::tiering::store::ScanSpec> {
+        let mut spec = self.config.scan_spec();
         let Some(stored) = self.cold.stored_schema(table).await? else {
-            return Ok(());
+            return Ok(spec);
         };
         let configured = crate::encode::schema::storage_schema(&self.config.extra_columns());
-        crate::evolution::compare(&configured, &stored).require_safe(table)
+        let compatibility = crate::evolution::compare(&configured, &stored);
+        compatibility.require_safe(table)?;
+        compatibility.require_applied(table)?;
+        for change in &compatibility.changes {
+            if let crate::evolution::SchemaChange::Dropped { name, safe: true } = change {
+                spec = spec.with_extra_column(name.clone());
+            }
+        }
+        Ok(spec)
     }
 
-    /// Reclaim detached partitions whose windows are durable in the cold tier
-    /// and old enough that no live query can still be reading them.
-    ///
-    /// Two conditions, and they answer different questions:
-    ///
-    /// * **Covered by the watermark** — is the data durable? A partition is
-    ///   detached before its scan and the watermark advances only when the cold
-    ///   commit lands, so anything wholly below the boundary is committed and
-    ///   dropping it destroys nothing.
-    /// * **Older than [`reader_grace`]** — can anything still be reading it? A
-    ///   query planned before the boundary moved still asks the hot tier for the
-    ///   range this partition holds. The clock for that is the *commit* that
-    ///   moved the boundary, which is durably recorded as the Iceberg snapshot's
-    ///   own timestamp — so this needs no bookkeeping of its own and survives a
-    ///   restart.
-    ///
-    /// A cold store that reports no snapshots cannot date an orphan. Such a
-    /// deployment gets no grace rather than an unbounded partition leak, and the
-    /// trade is documented on [`reader_grace`].
-    ///
-    /// [`reader_grace`]: crate::config::TableConfig::reader_grace
     /// Refuse a run whose configured step differs from the one the table's
     /// committed windows were cut on.
     ///
-    /// # Why the alignment guard is not enough
-    ///
-    /// `next_window` refuses a watermark that is not on the configured grid, and
-    /// its error says the step of a table that has already archived cannot be
-    /// changed in place. That guard checks the *watermark*, and the watermark is
-    /// a single instant — so it passes whenever the new grid happens to contain
-    /// it, which for a doubled daily step is every other day.
-    ///
-    /// Then the window is twice as wide, `PartitionId::for_window` names only the
-    /// relation at its lower bound, and exactly one of the two partitions is
-    /// archived. The watermark advances past both. The second partition's rows
-    /// are now below the boundary, still attached, in a relation no plan will
-    /// scan again — `invariant_violations` counts them, and nothing else does.
-    ///
-    /// Halving is quieter still and the alignment guard cannot see it at all: a
-    /// day-aligned watermark is also twelve-hour-aligned, so the window becomes
-    /// half a partition, the whole partition is scanned and committed under a
-    /// summary claiming half of it, and the rows in the upper half sit in Iceberg
-    /// while the boundary says they are hot.
-    ///
-    /// Comparing against what was actually committed catches both.
+    /// `next_window`'s alignment guard checks only the watermark, a single
+    /// instant, so it passes whenever the new grid happens to contain it. A
+    /// doubled step then archives one of the window's two partitions and moves
+    /// the watermark past both, stranding the second's rows below the boundary
+    /// in a relation no plan scans — only `invariant_violations` counts them. A
+    /// halved step is invisible to the guard altogether: the whole partition is
+    /// committed under a summary claiming half of it. Comparing against what was
+    /// actually committed catches both.
     ///
     /// **Absent is not a mismatch.** A table with no history, or one whose
     /// snapshots predate the recorded step, has nothing to compare — the next
-    /// commit establishes it. A check that cannot run must not become a check
-    /// that fails.
+    /// commit establishes it.
     async fn verify_archival_step(&self, table: &str) -> Result<()> {
         let configured = self.config.archival_step();
         let Some(committed) = self.cold.archival_step(table).await? else {
@@ -648,6 +662,23 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         )))
     }
 
+    /// Reclaim detached partitions whose windows are durable in the cold tier
+    /// and that no live query can still be reading.
+    ///
+    /// * **Covered by the watermark** — the data is durable. A partition is
+    ///   detached before its scan and the watermark advances only when the cold
+    ///   commit lands, so anything wholly below the boundary is committed.
+    /// * **Older than [`reader_grace`]**, dated from the Iceberg snapshot that
+    ///   first covered it, so it needs no bookkeeping and survives a restart.
+    /// * **No reader pinned below it** — where the hot store keeps a pin
+    ///   registry, the drop consults it in its own transaction
+    ///   ([`Reclamation::HeldByReader`]). The grace is hysteresis; the registry
+    ///   is what keeps a live plan whole.
+    ///
+    /// A cold store that reports no snapshots cannot date an orphan, so such a
+    /// deployment gets no grace rather than an unbounded partition leak.
+    ///
+    /// [`reader_grace`]: crate::config::TableConfig::reader_grace
     async fn reclaim_orphans(&self, table: &str, now: OffsetDateTime) -> Result<usize> {
         let orphans = self.hot.orphaned_partitions(table).await?;
         if orphans.is_empty() {
@@ -712,11 +743,16 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                     // says it is old enough and the registry says somebody is
                     // reading it, and the registry is the term that knows —
                     // so the space stays and the next cycle asks again.
-                    Ok(Reclamation::HeldByReader) => debug!(
-                        table,
-                        partition = %partition.relation_name()?,
-                        "a live reader is pinned below this window; keeping it"
-                    ),
+                    Ok(Reclamation::HeldByReader) => {
+                        crate::observe::metrics()
+                            .reclaim_held
+                            .add(1, &crate::observe::table(table));
+                        debug!(
+                            table,
+                            partition = %partition.relation_name()?,
+                            "a live reader is pinned below this window; keeping it"
+                        )
+                    }
                     Err(Error::LockTimeout { .. }) => warn!(
                         table,
                         partition = %partition.relation_name()?,
@@ -734,11 +770,11 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
                 // which is why `detach_partition` is idempotent. Leaving it for
                 // step 4 is the recovery.
                 //
-                // Refusing here instead is what stopped archival for the table
+                // Refusing here instead would stop archival for the table
                 // permanently: this runs *before* the window is picked, so the
-                // error aborted every subsequent cycle at step 1, and
+                // error would abort every subsequent cycle at step 1, and
                 // `Maintenance::run_once` reports it per table and carries on —
-                // so the deployment reads healthy while one hot tier grows
+                // so the deployment would read healthy while one hot tier grows
                 // without bound.
                 debug!(
                     table,
@@ -1386,13 +1422,13 @@ mod tests {
             .run_once(commit_at + grace - Duration::seconds(1))
             .await
             .unwrap();
-        assert_eq!(out.orphans_reclaimed, 0);
+        assert_eq!(out.partitions_reclaimed, 0);
         assert!(archiver.hot.dropped().is_empty());
         assert_eq!(archiver.hot.detached_starts(), vec![D20]);
 
         // Past it, and with nothing registered as reading: the space goes.
         let out = archiver.run_once(commit_at + grace).await.unwrap();
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert_eq!(archiver.hot.dropped(), vec![D20]);
         assert!(archiver.hot.detached_starts().is_empty());
     }
@@ -1419,7 +1455,7 @@ mod tests {
 
         let past_grace = commit_at + config().reader_grace() + Duration::hours(1);
         let out = archiver.run_once(past_grace).await.unwrap();
-        assert_eq!(out.orphans_reclaimed, 0);
+        assert_eq!(out.partitions_reclaimed, 0);
         assert!(archiver.hot.dropped().is_empty());
         assert_eq!(archiver.hot.detached_starts(), vec![D20]);
 
@@ -1427,7 +1463,7 @@ mod tests {
         // second grace: the hysteresis was already satisfied.
         archiver.hot.release_pin(pin).await.unwrap();
         let out = archiver.run_once(past_grace).await.unwrap();
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert_eq!(archiver.hot.dropped(), vec![D20]);
     }
 
@@ -1455,7 +1491,7 @@ mod tests {
             .run_once(commit_at + config().reader_grace())
             .await
             .unwrap();
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert_eq!(archiver.hot.dropped(), vec![D20]);
     }
 
@@ -1521,7 +1557,7 @@ mod tests {
         archiver.run_once(at).await.unwrap();
         // Reclaimed on the very next cycle, however soon it runs.
         let out = archiver.run_once(at + Duration::seconds(1)).await.unwrap();
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert_eq!(archiver.hot.dropped(), vec![D20]);
     }
 
@@ -1604,7 +1640,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert!(archiver.hot.dropped().contains(&D20));
         assert!(archiver.hot.detached_starts().is_empty());
     }
@@ -1972,7 +2008,7 @@ mod tests {
             .run_once(datetime!(2026-07-30 00:00 UTC))
             .await
             .unwrap();
-        assert_eq!(out.orphans_reclaimed, 1);
+        assert_eq!(out.partitions_reclaimed, 1);
         assert!(archiver.hot.detached_starts().is_empty());
     }
 

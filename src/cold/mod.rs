@@ -1,6 +1,7 @@
 //! The cold tier: settled history, in Apache Iceberg.
 
 pub mod catalog;
+mod conditional;
 pub mod iceberg;
 pub mod parquet;
 

@@ -22,7 +22,7 @@
 //! either. On the table this module exists for — the one that grows without bound
 //! and that `[AO § 146 Abs. 4]` forbids discarding — an unbounded `latest` is a
 //! full scan of the history, not a point lookup. Bounding it to the recent window
-//! is what makes it cheap (R24).
+//! is what makes it cheap.
 //!
 //! # It refuses to fold two registers, and says which
 //!
@@ -32,12 +32,12 @@
 //! differencing the result produces advances that alternate between two meters
 //! and mean nothing at all.
 
+use crate::delivery::{MeasurementSource, ProvenanceEntry};
 use metering::QualityFlag;
+use metering::Resolution;
+use metering::ids::obis::ObisCode;
 use metering::ids::{MaloId, MeloId};
-use metering::measurement_series::{MeasurementSource, ProvenanceEntry};
-use metering::obis::ObisCode;
-use metering::reading::MeterReading;
-use metering::resolution::IntervalResolution;
+use metering::series::reading::MeterReading;
 use time::OffsetDateTime;
 
 use std::collections::BTreeMap;
@@ -216,7 +216,7 @@ impl<'a> ReadingsQuery<'a> {
     /// the consequences compound: the split keeps both tiers, the cold half is
     /// every row ever archived, and a hot half in range forces version resolution
     /// over the lot. Four registers then cost four full scans, not four point
-    /// lookups. `range` is what makes the claim in this sentence true (R24).
+    /// lookups. Bounding `range` is what makes it cheap.
     pub async fn latest(mut self) -> Result<Option<MeterReading>> {
         self.latest_only = true;
         Ok(self
@@ -568,7 +568,7 @@ fn merge(
 
     let mut readings: Vec<MeterReading> = Vec::new();
     let mut melo_id: Option<MeloId> = None;
-    let mut cadence: Option<IntervalResolution> = None;
+    let mut cadence: Option<Resolution> = None;
     let mut provenance: Vec<ProvenanceEntry> = Vec::new();
     let mut source: Option<MeasurementSource> = None;
     let mut recorded_at: Option<OffsetDateTime> = None;
@@ -648,7 +648,7 @@ fn merge(
 /// `refuse_repeated_instants` for why.
 fn refuse_repeated_instants(
     malo_id: MaloId,
-    readings: &[metering::reading::MeterReading],
+    readings: &[metering::series::reading::MeterReading],
 ) -> Result<()> {
     // Sorted by `at` on the way in, so a repeat is adjacent.
     for pair in readings.windows(2) {
@@ -722,8 +722,8 @@ fn render(values: &[(String, String)]) -> String {
 mod tests {
     use super::*;
     use crate::version::{ScopedVersion, Version, VersionScope};
-    use metering::interval::Sparte;
-    use metering::reading::MeterReading;
+    use metering::series::interval::Sparte;
+    use metering::series::reading::MeterReading;
     use rust_decimal::Decimal;
     use time::macros::datetime;
 
@@ -735,7 +735,7 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         }
     }
 
@@ -759,7 +759,7 @@ mod tests {
             }],
             source(),
             ScopedVersion::new(
-                VersionScope::for_interval("9900000000001", at, Sparte::Strom).unwrap(),
+                VersionScope::for_interval("9900000000003", at, Sparte::Strom).unwrap(),
                 Version::new(20_260_720_000_001).unwrap(),
             ),
             at,

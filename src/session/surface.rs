@@ -45,8 +45,7 @@ pub trait SqlSurface: Send + Sync + 'static {
     /// Plan a statement, then stream its rows.
     ///
     /// The [`QueryDescription`] comes back **before** the first batch, because a
-    /// caller putting the boundary on the wire needs it before it starts writing
-    /// (P1).
+    /// caller putting the boundary on the wire needs it before it starts writing.
     async fn stream_sql(
         &self,
         sql: &str,

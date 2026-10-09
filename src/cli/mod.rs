@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use metering::interval::Sparte;
+use metering::series::interval::Sparte;
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -135,8 +135,9 @@ pub enum Command {
         /// is what makes a past settlement reproducible.
         #[arg(long)]
         expire_snapshots: bool,
-        /// Also anonymise subjects whose readings have all passed a retention
-        /// ceiling, given as full calendar years after the year of collection.
+        /// Also destroy every subject linkage whose collection year has passed a
+        /// retention ceiling, given as full calendar years after that year —
+        /// whether or not the subject is still metered.
         ///
         /// `--anonymise-after-years 3` is § 60 Abs. 6 MsbG's ceiling: erase or
         /// anonymise *"spätestens nach drei Jahren ab dem Schluss des
@@ -144,8 +145,9 @@ pub enum Command {
         /// `now - 3 years`, which would erase a January value a year early.
         ///
         /// Off by default, and irreversible when on: destroying a linkage is a
-        /// compliance decision, and turning this on is that decision. Requires a
-        /// table declaring `subject_column`.
+        /// compliance decision, and turning this on is that decision. Requires the
+        /// deployment's subject registry: a table declaring `subject_column`, or
+        /// a subject map already in the database.
         #[arg(long, value_name = "YEARS")]
         anonymise_after_years: Option<u32>,
         /// Who the audit trail records as having run the sweep.
@@ -155,12 +157,12 @@ pub enum Command {
 
     /// Put the tiering boundary back on the cold table's current snapshot.
     ///
-    /// **Run this after any out-of-band maintenance** — the compaction or orphan
-    /// cleanup this crate does not perform itself, done with Spark, PyIceberg or
-    /// a catalogue that maintains the table unasked. Those produce valid Iceberg
-    /// commits carrying no boundary, and the boundary is then findable only by
-    /// walking back the parent chain — which snapshot expiry can punch a hole in,
-    /// and a hole there fails *every* query on the table at once.
+    /// **Run this at the head of any out-of-band maintenance**, before a foreign
+    /// tool — or a catalogue that maintains the table unasked — expires
+    /// anything. A foreign commit carries no boundary, and the boundary is then
+    /// findable only by walking back the parent chain — which snapshot expiry can
+    /// punch a hole in, and a hole there fails *every* query on the table at
+    /// once.
     ///
     /// It republishes what the history already says, so it **cannot move the
     /// boundary**, and it does nothing when the current snapshot already carries
@@ -406,14 +408,24 @@ pub fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("meterstore: {e}");
-            // A retryable failure is one a supervisor should try again on, and a
-            // distinct code is how a shell script tells the two apart without
-            // matching on the message.
-            match e.is_retryable() {
-                true => ExitCode::from(75), // EX_TEMPFAIL
-                false => ExitCode::FAILURE,
-            }
+            ExitCode::from(exit_code(&e))
         }
+    }
+}
+
+/// `EX_TEMPFAIL`: failed, and worth trying again.
+const EX_TEMPFAIL: u8 = 75;
+
+/// The process exit code for a failed command.
+///
+/// A retryable failure is one a supervisor should try again on, and a distinct
+/// code is how a shell script tells the two apart without matching on the
+/// message. It follows [`Error::is_retryable`] exactly, so a boundary move
+/// raised under the query engine exits 75 like a lost connection does.
+fn exit_code(e: &Error) -> u8 {
+    match e.is_retryable() {
+        true => EX_TEMPFAIL,
+        false => 1,
     }
 }
 
@@ -576,7 +588,7 @@ async fn create(cli: &Cli) -> Result<()> {
 }
 
 async fn status(cli: &Cli) -> Result<()> {
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let now = OffsetDateTime::now_utc();
 
     let mut rows = Vec::with_capacity(catalog.len());
@@ -697,7 +709,7 @@ async fn reassert_watermark(cli: &Cli, only: Option<&str>) -> Result<()> {
 
 async fn query(cli: &Cli, sql: &str, historical: bool, operational: bool) -> Result<()> {
     let sql = read_sql(sql)?;
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
 
     let mode = match (historical, operational) {
         (true, _) => Some(crate::ReadMode::Historical),
@@ -737,7 +749,12 @@ fn completeness_range(period: Period<'_>) -> Result<(OffsetDateTime, OffsetDateT
             ))
         })?;
         let (year, month) = parse_year_month(month)?;
-        return Ok(crate::planner::bilanzierungsmonat(year, month, sparte));
+        return crate::planner::bilanzierungsmonat(year, month, sparte).ok_or_else(|| {
+            Error::config(format!(
+                "{year}-{:02} is outside the years the calendar covers",
+                u8::from(month)
+            ))
+        });
     }
     let (Some(from), Some(to)) = (from, to) else {
         // clap enforces this, so reaching it means the argument declaration and
@@ -834,7 +851,7 @@ async fn completeness(
         }
     };
 
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let mut rows = Vec::new();
     for store in selected(&catalog, only)? {
         let mut query = store.completeness(from, to);
@@ -854,12 +871,7 @@ async fn completeness(
             query = query.obis(obis)?;
         }
         for row in query.await? {
-            // `is_silent` is not implied by `!is_complete`. A channel with no
-            // declared resolution has no expectation, so it reports `missing =
-            // 0` and calls itself complete — including when it delivered
-            // nothing at all. Dropping that row from a `--gaps-only` run would
-            // hide the strongest finding the report can make.
-            if gaps_only && row.is_complete() && !row.is_silent() {
+            if gaps_only && !row.needs_attention() {
                 continue;
             }
             rows.push((store.table().to_string(), row));
@@ -870,13 +882,13 @@ async fn completeness(
 
 async fn explain(cli: &Cli, sql: &str) -> Result<()> {
     let sql = read_sql(sql)?;
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let described = catalog.describe(&sql).await?;
     render::describe(&described, cli.format)
 }
 
 async fn snapshots(cli: &Cli, only: Option<&str>) -> Result<()> {
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let mut rows = Vec::new();
     for store in selected(&catalog, only)? {
         for snapshot in store.admin().snapshots().await? {
@@ -887,7 +899,7 @@ async fn snapshots(cli: &Cli, only: Option<&str>) -> Result<()> {
 }
 
 async fn audit(cli: &Cli, only: Option<&str>, column: Option<&str>) -> Result<()> {
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let mut rows = Vec::new();
     for store in selected(&catalog, only)? {
         let found = match column {
@@ -930,7 +942,7 @@ async fn serve(cli: &Cli, addr: &str, catalog_addr: Option<&str>) -> Result<()> 
 
     let deployment = Settings::from_path(&cli.config)?.connect().await?;
     let facade = deployment.cold.catalog_facade();
-    let catalog = deployment.catalog().await?;
+    let catalog = deployment.open().await?;
 
     let flight_addr = bind_address(addr)?;
     tracing::warn!(
@@ -1029,19 +1041,19 @@ async fn erasures(
         query = query.trigger(text.parse()?);
     }
 
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     if catalog.subject_registry().is_none() {
         return Err(Error::config(
-            "no table in this configuration declares a subject_column, so this \
-             deployment holds no subject mapping and there is nothing to erase or \
-             to report. See the privacy documentation",
+            "this deployment has no subject registry — no table declares a \
+             subject_column and the database holds no subject map — so there is \
+             nothing to erase or to report. See the privacy documentation",
         ));
     }
     render::erasures(&catalog.erasures(&query).await?, cli.format)
 }
 
 async fn purge(cli: &Cli, table: &str, confirm: &str) -> Result<()> {
-    let catalog = load(cli).await?;
+    let catalog = open(cli).await?;
     let [store] = selected(&catalog, Some(table))?[..] else {
         unreachable!("a named selection is exactly one table")
     };
@@ -1054,6 +1066,17 @@ async fn purge(cli: &Cli, table: &str, confirm: &str) -> Result<()> {
 ///
 /// Always a catalog, even for one table: the subcommands all iterate, and a
 /// single-table deployment is a catalog of one rather than a different shape.
+/// Every declared table, **creating nothing** — what a verb that only reads
+/// opens, so it runs no DDL and works on a read-only role.
+async fn open(cli: &Cli) -> Result<crate::MeterCatalog> {
+    Settings::from_path(&cli.config)?
+        .connect()
+        .await?
+        .open()
+        .await
+}
+
+/// Every declared table, created where missing — the verbs that write.
 async fn load(cli: &Cli) -> Result<crate::MeterCatalog> {
     Settings::from_path(&cli.config)?
         .connect()
@@ -1095,6 +1118,28 @@ fn fmt_duration(d: time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_exit_code_says_whether_a_retry_helps() {
+        use datafusion::common::DataFusionError as Df;
+        let moved = Error::BoundaryMoved {
+            table: "readings".into(),
+            detail: "reclaimed".into(),
+        };
+        assert_eq!(exit_code(&moved), EX_TEMPFAIL);
+        // Raised under the engine, it keeps its meaning and its code.
+        let through_engine = Error::from(Df::External(Box::new(Error::BoundaryMoved {
+            table: "readings".into(),
+            detail: "reclaimed".into(),
+        })));
+        assert_eq!(exit_code(&through_engine), EX_TEMPFAIL);
+        let fault = Error::from(Df::External(Box::new(Error::InvariantViolated {
+            table: "readings".into(),
+            detail: "rows below the watermark".into(),
+        })));
+        assert_eq!(exit_code(&fault), 1);
+        assert_eq!(exit_code(&Error::config("bad")), 1);
+    }
+
     use super::*;
     use clap::CommandFactory;
 

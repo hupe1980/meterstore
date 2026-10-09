@@ -10,8 +10,8 @@ touching code.
 
 ## Ground rules
 
-- **Breaking changes are fine.** The crate is unpublished: hard cuts, no
-  deprecation shims, the SQL schema edited in place with no migration.
+- **Breaking changes are fine.** The crate is published and pre-1.0: hard cuts,
+  no deprecation shims, the SQL schema edited in place with no migration.
 - **Docs and comments state current truth only** — no changelogs, no "used to",
   no backlog pointers. `CHANGELOG.md` is the one place history belongs, and
   `doc_conventions.rs` enforces the rule over `src/`, `tests/`, `site/` and
@@ -94,11 +94,14 @@ majors are two incompatible `RecordBatch` types and two `TableProvider` traits;
 two `sqlx` majors are two incompatible `PgPool` types. The error is a trait-bound
 mismatch on a type whose name reads identically in both halves.
 
-Arrow is reached **through DataFusion** (`crate::arrow`), never depended on
-directly, so a single `use` cannot introduce skew.
+Arrow is reached **through DataFusion** (`crate::arrow`), never by a direct
+`arrow::` path, so a single `use` cannot introduce skew. `Cargo.toml` does
+declare `arrow` — the copy DataFusion already pulls, for the `json` feature
+`QueryResult::to_json` needs — and `just deps` fails the build if it diverges.
 
 **`iceberg-rust` sets the ceiling.** `iceberg-datafusion` requires
-`datafusion = "53.1.0"` exactly and `iceberg` requires `arrow-array = "58"`, and
+`datafusion = "53.1.0"` (a caret requirement, so 53.x and nothing past it) and
+`iceberg` requires `arrow-array = "58"`, and
 single-sourcing makes both binding on the whole crate. DataFusion 55 and Arrow 60
 exist and are unreachable. That is not a maintenance lag — do not "update" it.
 
@@ -112,8 +115,11 @@ exist and are unreachable. That is not a maintenance lag — do not "update" it.
 | Primary sources | `just references` fetches them; not committed |
 
 A working set of design notes may also be present and is **not** part of the
-repository. Treat anything it says as context, never as the contract: the
-contract is the rustdoc, the site and this file.
+repository: `concepts/`, whose roadmap is the one list of open work, and the
+Spec Kit specifications each roadmap item names (`specs/`, `.specify/`). Treat
+anything they say as context, never as the contract: the contract is the
+rustdoc, the site and this file. Nothing tracked cites a specification —
+`just concepts` checks it.
 
 ## Counts
 
@@ -153,7 +159,12 @@ Things that look like bugs and are not, and things that look fine and are not.
   file spanning thirty versions, and the planner can no longer prove what is still
   true. Read the maintenance contract before recommending any tool that rewrites
   data files.
-- **`reader_grace` is a wall-clock guess protecting a correctness property**, and
-  its failure is silent: a query whose plan outlives `reader_grace` can come back
-  one window short with no error. Known and tracked, not yet fixed. Do not assume
-  it is sound because the surrounding design is.
+- **`reader_grace` is hysteresis, not the safety argument.** What keeps a live
+  plan whole is the reader-pin registry (`meterstore_pins`, D43): reclamation
+  consults it in the transaction that drops, a pin taken during the drop is
+  caught on the reader's side by re-reading `meterstore_reclaimed`, and a query
+  that outlives `max_pin_age` fails naming the window it lost. A `HotStore` that
+  cannot register a pin (the trait's default) has only the grace, and there the
+  failure is silent: a plan that outlives `reader_grace` comes back one window
+  short with no error. Pinning also writes on every hot-half plan, so a read-only
+  role cannot query.

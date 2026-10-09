@@ -14,14 +14,21 @@
 //!   that means query results may be incorrect. Everything else is degradation.
 //! - **Will something be wrong soon?** `watermark_lag` and
 //!   `hot_partitions_ahead` both trend toward failure before they cause one —
-//!   running out of partitions stops writes outright.
+//!   running out of partitions stops writes outright. Both are recorded at
+//!   every exit of an archival run, failed and contended ones included; while
+//!   the cold tier cannot be read the lag holds its last value, and
+//!   `archival.failures` is the alert.
 //! - **How much of the history is settled?** `merge_elided` over
-//!   `merge_elision_decisions` says how often a historical scan skipped version
-//!   resolution. It falls as corrections accumulate in the ranges being queried
-//!   — which is the *data* changing, not the layout degrading. Compaction would
-//!   not recover it and would cost some of it: a corrected reading has two
-//!   versions stored however the bytes are arranged, and a coarser file makes
-//!   more uncorrected keys share one with it.
+//!   `merge_elision_decisions` says how often a scan of the resolved table
+//!   skipped version resolution — every such scan is a decision, and one that
+//!   reaches the hot tier or carries a version ceiling always resolves, so the
+//!   ratio moves with the query mix as well as with the data. Over settled
+//!   history it falls for two reasons that read alike. Corrections
+//!   accumulating in the ranges being queried are the *data* changing. A drop
+//!   with no corrections behind it is the *layout* degrading: a compacted file
+//!   whose version statistics span several versions cannot be proved free of a
+//!   superseded row, so one compacted month forces resolution over data holding
+//!   no correction at all.
 
 use std::sync::OnceLock;
 
@@ -48,10 +55,28 @@ pub struct Metrics {
     /// transaction — rather than here. Alert on
     /// [`watermark_lag`](Self::watermark_lag); read this to explain it.
     pub archival_deferred: Counter<u64>,
-    /// Partitions dropped after a successful commit.
-    pub partitions_dropped: Counter<u64>,
-    /// Partitions reclaimed from an interrupted run.
-    pub orphans_reclaimed: Counter<u64>,
+    /// Archival runs that committed a window to the cold tier.
+    ///
+    /// One per committed window, however many partitions it spans, and no
+    /// partition is dropped at that point: the window's partition stays
+    /// detached for readers planned against the older boundary.
+    /// [`partitions_reclaimed`](Self::partitions_reclaimed) counts the drop.
+    pub windows_archived: Counter<u64>,
+    /// Archived hot partitions dropped: detached, below the watermark, past
+    /// `reader_grace`, and pinned by no live reader.
+    pub partitions_reclaimed: Counter<u64>,
+    /// Reclamations a live query's reader pin deferred.
+    pub reclaim_held: Counter<u64>,
+    /// Plans, scans and writes that met the boundary mid-move, by `where`.
+    ///
+    /// Archival makes a trickle of these, so zero is not the healthy reading; a
+    /// rate that falls back is. The store retries a `write` itself, counting
+    /// each round that found no partition; a `plan` or `scan` succeeds only
+    /// when the caller retries,
+    /// which Flight's `UNAVAILABLE` and the CLI's exit 75 tell it to. A rate
+    /// that does not fall is a query outliving `max_pin_age` or a writer acting
+    /// on a boundary it read long ago.
+    pub boundary_moved: Counter<u64>,
 
     /// Rows written to the hot tier.
     pub rows_written: Counter<u64>,
@@ -101,8 +126,8 @@ pub struct Metrics {
     ///
     /// Distinct from [`Metrics::scan_duration`] on purpose. Planning is a
     /// catalog round trip plus, for the resolved table, a manifest read; scanning
-    /// is the data. Sharing one instrument made a slow catalog look like a slow
-    /// query and hid a slow scan behind fast planning.
+    /// is the data. One shared instrument would make a slow catalog look like a
+    /// slow query and hide a slow scan behind fast planning.
     pub plan_duration: Histogram<f64>,
     /// How long a tier's scan took to drain, by tier.
     pub scan_duration: Histogram<f64>,
@@ -112,12 +137,19 @@ pub struct Metrics {
     ///
     /// Divided by `merge_elision_decisions` this is the elided ratio: how much
     /// of the queried history is settled enough to read without ranking. See the
-    /// module documentation for why compaction is not the lever it looks like.
+    /// module documentation for why compaction lowers it rather than raising it.
     pub merge_elided: Counter<u64>,
 
     /// Seconds between the watermark and wall clock.
+    ///
+    /// Recorded at every exit of an archival run, failed and contended ones
+    /// included, from the watermark read fresh. While the cold tier cannot be
+    /// read it holds its last value, so `archival.failures` is the alert then.
     pub watermark_lag: Gauge<u64>,
     /// Hot partitions left before inserts start failing.
+    ///
+    /// Recorded at every exit of an archival run, counted from the partitions
+    /// that exist rather than from configuration.
     pub hot_partitions_ahead: Gauge<u64>,
     /// **Non-zero means query results may be wrong.** The alert.
     pub invariant_violations: Gauge<u64>,
@@ -165,13 +197,35 @@ impl Metrics {
                      still needs fixing upstream",
                 )
                 .build(),
-            partitions_dropped: meter
-                .u64_counter("meterstore.partitions.dropped")
-                .with_description("Hot partitions dropped after a durable cold commit")
+            windows_archived: meter
+                .u64_counter("meterstore.archival.windows")
+                .with_description(
+                    "Windows committed to the cold tier; each window's hot partition \
+                     stays detached and is counted by partitions.reclaimed when dropped",
+                )
                 .build(),
-            orphans_reclaimed: meter
-                .u64_counter("meterstore.partitions.orphans_reclaimed")
-                .with_description("Detached partitions reclaimed from an interrupted run")
+            reclaim_held: meter
+                .u64_counter("meterstore.partitions.reclaim_held")
+                .with_description(
+                    "Reclamations deferred because a live query's pin still holds the \
+                     window. Not a failure: the partition is reclaimed on a later cycle",
+                )
+                .build(),
+            boundary_moved: meter
+                .u64_counter("meterstore.tiering.boundary_moved")
+                .with_description(
+                    "Plans, scans and writes that met the tiering boundary mid-move, by \
+                     where. Writes are retried by the store; plans and scans by the \
+                     caller. A rate that does not fall is a query outliving \
+                     max_pin_age or a writer holding a stale boundary",
+                )
+                .build(),
+            partitions_reclaimed: meter
+                .u64_counter("meterstore.partitions.reclaimed")
+                .with_description(
+                    "Archived hot partitions dropped once below the watermark, past \
+                     reader_grace and pinned by no live reader",
+                )
                 .build(),
 
             rows_written: meter
@@ -241,6 +295,14 @@ impl Metrics {
 pub fn metrics() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(|| Metrics::new(&global::meter(SCOPE)))
+}
+
+/// The attributes of a [`Metrics::boundary_moved`] count.
+pub fn boundary_moved_at(table: &str, at: &'static str) -> [KeyValue; 2] {
+    [
+        KeyValue::new("table", table.to_string()),
+        KeyValue::new("where", at),
+    ]
 }
 
 /// The attribute every instrument carries.

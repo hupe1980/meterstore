@@ -4,15 +4,20 @@
 //! ours. These are chosen for this data shape rather than left at library
 //! defaults, and each one earns its place:
 //!
-//! * A **bloom filter on `malo_id`** is the decisive pruning layer for the
-//!   dominant read ("one meter, one year"). Without it, a single-meter query
-//!   reads every row group in the partition; with it, the question "is this
-//!   meter in this row group?" is answered from a few KiB of metadata.
+//! * A **bloom filter on `malo_id`** answers the dominant read ("one meter, one
+//!   year") for an engine that reads it: the question "is this meter in this row
+//!   group?" is answered from a few KiB of metadata instead of the row group.
 //! * **Delta encoding** on the timestamp and value columns stores small
 //!   increments instead of full-width values. Interval starts are sorted and
 //!   evenly spaced, which is close to the best case for it.
-//! * **Page-level statistics** enable page pruning inside a surviving row group.
-//!   Row-group-only statistics silently disable that layer.
+//! * **Page-level statistics** enable page pruning inside a surviving row group,
+//!   again for an engine that reads them. Row-group-only statistics would
+//!   disable that layer for every reader.
+//!
+//! The bloom filters and page indexes are written for the files' other readers.
+//! This crate's own cold scan goes through `iceberg` 0.10.1, which has no
+//! bloom-filter reader and leaves page-index row selection off, so its pruning
+//! stops at partitions, manifests and row-group statistics.
 
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};

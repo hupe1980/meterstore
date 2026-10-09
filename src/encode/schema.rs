@@ -83,6 +83,26 @@ pub const VERSION_SCALE: i8 = 0;
 /// components from upstream systems.
 pub const TS_UNIT: TimeUnit = TimeUnit::Microsecond;
 
+/// The units a stored value may be in: what some commodity is measured or
+/// billed in.
+///
+/// Derived from the commodities rather than taken from the unit vocabulary,
+/// because the vocabulary also names power, reactive power and dimensionless
+/// quantities, and `value` is energy or volume. The hot tier's `CHECK` is
+/// rendered from this, so the database refuses what the encoder refuses.
+#[must_use]
+pub fn stored_unit_codes() -> Vec<&'static str> {
+    let mut codes: Vec<&'static str> = Vec::new();
+    for sparte in metering::Sparte::ALL {
+        for unit in [sparte.measured_unit(), sparte.billing_unit()] {
+            if !codes.contains(&unit.as_str()) {
+                codes.push(unit.as_str());
+            }
+        }
+    }
+    codes
+}
+
 /// Column names, in schema order.
 pub mod col {
     /// 11-digit Marktlokations-ID.
@@ -108,7 +128,7 @@ pub mod col {
     /// Never named for a unit: water is m³ and gas may be either side of the
     /// Brennwert conversion. See the module docs.
     pub const VALUE: &str = "value";
-    /// The dimension of [`VALUE`], as `metering::MeasurementUnit`'s stable code:
+    /// The dimension of [`VALUE`], as `metering::Unit`'s stable code:
     /// `KWH` or `M3`.
     ///
     /// Stored per row rather than derived from [`SPARTE`], because gas has two
@@ -272,7 +292,8 @@ pub const MERGE_KEY: [&str; 3] = [col::MALO_ID, col::OBIS_CODE, col::FROM];
 /// Columns that should carry a Parquet bloom filter.
 ///
 /// These are the equality-predicate columns in the dominant read pattern
-/// ("one meter, one year"), where the bloom filter is the decisive pruning layer.
+/// ("one meter, one year"), where the bloom filter is the decisive pruning layer
+/// for an engine that reads it.
 pub const BLOOM_FILTER_COLUMNS: [&str; 2] = [col::MALO_ID, col::OBIS_CODE];
 
 /// Columns that benefit from `DELTA_BINARY_PACKED`: sorted timestamps and the

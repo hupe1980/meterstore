@@ -19,28 +19,25 @@
 //! 3. **The tiering boundary** — [`watermark`].
 //!
 //! Everything else — DST calendars, unit conversion, quality semantics,
-//! validation, Ersatzwertbildung — belongs to [`metering`]. Duplicating any of
-//! it here would create a second implementation to keep correct, and it would
-//! drift.
+//! validation, Ersatzwertbildung — belongs to [`metering`], and is not
+//! duplicated here.
 //!
-//! [`planner`] re-exports `metering::calendar` for convenience, so callers get
-//! DST-correct local days without depending on both crates directly. The
-//! implementation is upstream and there is only one of it. The *choice* between
-//! the two calendars is upstream too, as
-//! [`DayBoundary`](metering::calendar::DayBoundary) — so the one thing
-//! [`planner::calendar`] adds is neither arithmetic nor the choice, but a
-//! storage fact: a stored row carries its `sparte`, so the store knows which
-//! boundary applies to it. That mapping is [`planner::day_boundary`], written
-//! once.
+//! [`planner`] re-exports `metering`'s calendar types, so callers get
+//! DST-correct local days without depending on both crates. The arithmetic and
+//! the choice of calendar
+//! ([`DayBoundary`](metering::time::calendar::DayBoundary)) are upstream; what
+//! [`planner::calendar`] adds is a storage fact — a stored row carries its
+//! `sparte`, so the store knows which boundary applies to it. That mapping is
+//! [`planner::day_boundary`].
 //!
 //! ## The five things a caller usually wants
 //!
 //! - [`MeterStore::sql`] — DataFusion's own `DataFrame` over a table that spans
 //!   both tiers. [`MeterStore::query`] returns the same rows plus the boundary
-//!   they were computed against (P1), and [`MeterStore::stream`] returns that
+//!   they were computed against, and [`MeterStore::stream`] returns that
 //!   boundary *before* the rows, for a result too large to hold.
-//! - [`MeterStore::series`] — one measuring point as a `metering`
-//!   `MeasurementSeries`, version-resolved and tier-split. `collect` describes
+//! - [`MeterStore::series`] — one measuring point as a
+//!   [`MeasurementSeries`], version-resolved and tier-split. `collect` describes
 //!   **one channel**, because a `MeasurementSeries` holds one `obis_code`;
 //!   [`collect_by_channel`] describes the whole measuring point, splitting one
 //!   scan into a series per channel rather than reading each in turn.
@@ -57,10 +54,9 @@
 //! Three more that a service exposing SQL will want: [`MeterStore::scoped`]
 //! confines a session to one identity value, [`MeterCatalog::isolated`] confines
 //! it to one table, and [`MeterCatalog::scoped`] confines **every** table of a
-//! catalog to one identity value — which is what a multi-tenant deployment
-//! putting a whole catalog on a socket needs, since the first two together force
-//! a choice between the cross-table join and the tenant boundary. All three
-//! inject into the plan, so caller-supplied SQL cannot step past them.
+//! catalog to one identity value — a multi-tenant deployment putting a whole
+//! catalog on a socket. All three inject into the plan, so caller-supplied SQL
+//! cannot step past them.
 //! [`MeterStore::append_authoritative`] is the write path for a value the
 //! operator authors rather than receives.
 //!
@@ -128,16 +124,12 @@
 //!
 //! Each scheme stops somewhere different, and [`ValueCheck`] says where: the EIC
 //! check character and the MaLo check digit are enforced, a MeLo has no check
-//! digit to enforce, and a Marktpartner-ID's thirteenth digit is deliberately
-//! *not* checked — BDEW's Bildungsvorschrift carves out GS1-issued GLNs, which
-//! is the same reason [`VersionScope`] does not check it either.
-//!
-//! An EIC column may name the **object type** it holds —
+//! digit to enforce, and a Marktpartner-ID's thirteenth digit must satisfy
+//! BDEW's procedure or GS1's, which [`VersionScope`] enforces for its operator
+//! too. An EIC column may also name the **object type** it holds —
 //! `ValueCheck::Eic(Some(EicType::Party))` for a Bilanzkreis, `Area` for a
-//! Bilanzierungsgebiet. The two share the alphabet, the length and the check
-//! character, so position 3 is the only thing that tells them apart — and unlike
-//! the check character it is expressible as a regular expression, so declaring it
-//! strengthens the hot table's `CHECK` as well as the write path.
+//! Bilanzierungsgebiet — which strengthens the hot table's `CHECK` as well as
+//! the write path.
 //!
 //! [`MaloId`]: metering::ids::MaloId
 //! [`MeloId`]: metering::ids::MeloId
@@ -174,9 +166,8 @@
 //! [`Error`] is `#[non_exhaustive]` and callers match on variants rather than
 //! parsing strings. [`Error::is_retryable`] is the split that matters most: a
 //! lost connection and a lock a statement declined to wait for are worth
-//! retrying, and a refused delivery, an invalid configuration and a statement
-//! that will not plan are not — retrying those is a loop on a message that will
-//! never change.
+//! retrying; a refused delivery, an invalid configuration and a statement that
+//! will not plan are not.
 //!
 //! Two are deliberately distinct and are the pair most often conflated.
 //! [`Error::IntegrityViolation`] means the store **stopped something from
@@ -193,9 +184,8 @@
 //!
 //! ## Status
 //!
-//! Pre-alpha, and **unpublished on purpose**: the API is still settling, and
-//! integrating against a real workload is what settles it. What is implemented,
-//! what is measured and what is not yet done are in the
+//! Pre-alpha, and **pre-1.0 on purpose**: the API is still settling. What is
+//! implemented and what is measured are in the
 //! [repository README](https://github.com/hupe1980/meterstore#status);
 //! [`testkit`] is the reference the store is checked against, and is public so a
 //! deployment can run it over its own configuration.
@@ -239,6 +229,7 @@ pub use datafusion::arrow;
 pub mod cli;
 pub mod cold;
 pub mod config;
+pub mod delivery;
 pub mod encode;
 pub mod erasure;
 pub mod error;
@@ -252,6 +243,7 @@ pub mod settings;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod tiering;
+mod tls;
 pub mod version;
 pub mod watermark;
 
@@ -265,6 +257,9 @@ pub use cold::{ColdTier, IcebergCold, WarehouseAuth};
 pub use config::{
     CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
     ValueCheck, checked_column, coded_column, declared_value_check,
+};
+pub use delivery::{
+    MeasurementSeries, MeasurementSource, ProvenanceEntry, ProvenanceEventType, VirtualMeterKind,
 };
 pub use encode::{StoredReadings, canonical_obis, parse_malo, parse_melo};
 pub use erasure::{
@@ -314,6 +309,7 @@ pub mod prelude {
         EicType, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck, checked_column,
         coded_column,
     };
+    pub use crate::delivery::{MeasurementSeries, MeasurementSource};
     pub use crate::encode::{StoredReadings, StoredSeries};
     pub use crate::erasure::{ErasureQuery, Retention, SubjectRef, SubjectRegistry};
     pub use crate::error::{Error, Result};

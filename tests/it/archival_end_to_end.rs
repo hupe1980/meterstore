@@ -24,7 +24,7 @@ use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
-use metering::measurement_series::MeasurementSource;
+use meterstore::delivery::MeasurementSource;
 use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -94,7 +94,7 @@ impl Harness {
         let source = MeasurementSource::Mscons {
             pid: 13_005,
             message_ref: None,
-            sender_mp_id: "9900000000001".parse().expect("a valid Marktpartner-ID"),
+            sender_mp_id: "9900000000003".parse().expect("a valid Marktpartner-ID"),
         };
         let detail = serde_json::to_string(&source).unwrap();
 
@@ -120,7 +120,7 @@ impl Harness {
             .bind(Some(detail.as_str()))
             .bind(Some("[]"))
             .bind(rust_decimal::Decimal::new(version, 0))
-            .bind("9900000000001:2026-07")
+            .bind("9900000000003:2026-07")
             .bind(datetime!(2026-07-27 06:00 UTC))
             .execute(self.hot.pool())
             .await
@@ -420,7 +420,7 @@ async fn an_orphan_from_an_interrupted_run_is_reclaimed() {
     // The data is durable in the cold tier, so the next run may reclaim it.
     let outcome = h.archiver().run_once(NOW).await.unwrap();
 
-    assert_eq!(outcome.orphans_reclaimed, 1);
+    assert_eq!(outcome.partitions_reclaimed, 1);
     assert!(h.hot.orphaned_partitions(TABLE).await.unwrap().is_empty());
 }
 
