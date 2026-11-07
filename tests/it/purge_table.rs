@@ -80,7 +80,7 @@ async fn a_purge_removes_the_hot_table_and_every_partition() {
 
     let partitions_before: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_class WHERE relname LIKE 'readings_versions%'")
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("count relations");
     assert!(partitions_before > 1, "parent plus at least one partition");
@@ -93,7 +93,7 @@ async fn a_purge_removes_the_hot_table_and_every_partition() {
 
     let partitions_after: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_class WHERE relname LIKE 'readings_versions%'")
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("count relations");
     assert_eq!(
@@ -122,7 +122,7 @@ async fn a_detached_orphan_does_not_survive_the_purge() {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)")
             .bind(&name)
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("lookup");
     assert!(exists, "the detached partition must exist before the purge");
@@ -136,7 +136,7 @@ async fn a_detached_orphan_does_not_survive_the_purge() {
     let survives: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)")
             .bind(&name)
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("lookup");
     assert!(!survives, "a detached orphan must not outlive its table");
@@ -255,7 +255,7 @@ async fn a_purged_table_leaves_no_reclaimed_mark_for_its_successor() {
     )
     .bind(TestHarness::TABLE)
     .bind(START + Duration::days(2))
-    .execute(harness.hot().pool())
+    .execute(&crate::fixture_pool(harness.url()))
     .await
     .expect("mark");
 
@@ -268,7 +268,7 @@ async fn a_purged_table_leaves_no_reclaimed_mark_for_its_successor() {
     let marks: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM meterstore_reclaimed WHERE "table" = $1"#)
             .bind(TestHarness::TABLE)
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("count marks");
     assert_eq!(marks, 0, "the purged table's reclaimed mark survived it");
@@ -383,7 +383,7 @@ async fn a_purge_interrupted_or_repeated_finishes_the_job() {
     )
     .bind(TestHarness::TABLE)
     .bind(START + Duration::days(1))
-    .execute(harness.hot().pool())
+    .execute(&crate::fixture_pool(harness.url()))
     .await
     .expect("mark");
     store
@@ -407,13 +407,13 @@ async fn a_purge_interrupted_or_repeated_finishes_the_job() {
     let marks: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM meterstore_reclaimed WHERE "table" = $1"#)
             .bind(TestHarness::TABLE)
-            .fetch_one(harness.hot().pool())
+            .fetch_one(&crate::fixture_pool(harness.url()))
             .await
             .expect("count marks");
     assert_eq!(marks, 0, "the bookkeeping went with the hot half");
     let hot_table: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(TestHarness::TABLE)
-        .fetch_one(harness.hot().pool())
+        .fetch_one(&crate::fixture_pool(harness.url()))
         .await
         .expect("lookup");
     assert!(!hot_table, "the hot half was finished");

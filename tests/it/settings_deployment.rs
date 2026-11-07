@@ -125,9 +125,9 @@ async fn a_configuration_file_builds_a_working_store() {
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].value(), rust_decimal::Decimal::new(42, 0));
 
-    // The pool comes back too, because the subject registry and the
-    // application's own tables belong in the same database.
-    assert!(!deployment.pool.is_closed());
+    // The store's pool comes back too, shared by the hot tier and the subject
+    // registry, which live in the same database.
+    let _shared: meterstore::Database = deployment.database.clone();
 }
 
 #[tokio::test]
@@ -394,8 +394,9 @@ async fn a_file_that_stopped_declaring_a_subject_column_still_reaches_its_regist
         .await
         .expect("postgres");
     let warehouse = tempfile::tempdir().expect("temp warehouse");
-    let registry =
-        meterstore::SubjectRegistry::new(sqlx::PgPool::connect(&url).await.expect("connect"));
+    let registry = meterstore::SubjectRegistry::new(
+        meterstore::Database::connect(&url).await.expect("connect"),
+    );
     registry.create_tables().await.expect("registry tables");
 
     let deployment = Settings::from_toml(&file(&url, warehouse.path()))

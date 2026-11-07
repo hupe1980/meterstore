@@ -143,9 +143,9 @@ catalogue's `[cold] uri` — is **verified TLS unless the URL says otherwise**:
 
 A managed service's certificate chains to its provider's CA, which a host may not
 trust: name it with `sslrootcert=/path/to/ca.pem`. A Unix-socket URL
-(`?host=/var/run/postgresql`) never crosses a network and is left alone. A pool
-your application builds itself is yours, with whatever `sslmode` it chose —
-`sqlx`'s own default is `prefer`.
+(`?host=/var/run/postgresql`) never crosses a network and is left alone. The rule
+holds for every connection the store makes, from a file or from code: the store
+opens its own pool (`Database`), so there is no pool built elsewhere to escape it.
 
 ## `ddl_lock_timeout`
 
@@ -203,17 +203,19 @@ land below the watermark. `system.config` shows the two side by side.
 
 ## Six decisions the file format makes
 
-**It can open the tiers, and does not have to.** `connect()` builds both and hands
-the pool back for the rest of the service to share:
+**It can open the tiers, and does not have to.** `connect()` builds both, over a
+`Database` it opens from `[hot]`:
 
 ```rust
 let deployment = Settings::from_path("meterstore.toml")?.connect().await?;
-// deployment.hot, deployment.pool, deployment.cold, deployment.registry,
+// deployment.hot, deployment.database, deployment.cold, deployment.registry,
 // deployment.tables
 ```
 
-An application that owns its pool reads `settings.hot` and `settings.cold` and
-wires them itself instead.
+An application assembling the tiers in code reads `settings.hot` and
+`settings.cold` and wires them itself instead. Either way the store's connections
+are its own: `[hot] max_connections` is this process's share of the server's
+`max_connections`, counted beside the application's own pool.
 
 `connect` stops short of a `MeterStore`, which needs the table to exist. The
 `Deployment` finishes the job, creating the tables it touches: `store()` for a

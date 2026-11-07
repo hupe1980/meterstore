@@ -308,11 +308,11 @@ with who did it and why.
 
 ## No `meterstore erase`
 
-An Article 17 request usually reaches an application's own tables too, which must
-succeed or fail **together** with the mapping. A CLI invocation cannot enclose
-them in its transaction; `SubjectRegistry::erase_in` and `erase_all_in` take one
-the caller owns. [Privacy and retention →](@/docs/privacy.md) The retention duty
-the CLI does run: `meterstore maintain --anonymise-after-years 3`.
+An erasure is a library call — `SubjectRegistry::erase` and `erase_all` — which
+runs the deployment's `[privacy] erasure_cascade` statements in the transaction
+that destroys the mapping, so the application's own rows go with it or not at
+all. [Privacy and retention →](@/docs/privacy.md) The retention duty the CLI does
+run: `meterstore maintain --anonymise-after-years 3`.
 
 ## No `meterstore append`
 

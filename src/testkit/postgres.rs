@@ -198,10 +198,13 @@ pub async fn fresh_database() -> Result<String> {
     let mut admin = connect_ready(&shared.admin_url).await?;
     // Not parameterisable — an identifier never is — and not user input: the
     // name is this module's own counter.
-    sqlx::query(&format!(r#"CREATE DATABASE "{name}""#))
-        .execute(&mut admin)
-        .await
-        .map_err(|e| Error::Storage(format!("creating test database {name}: {e}")))?;
+    sqlx::query(crate::hot::postgres::checked(
+        format!(r#"CREATE DATABASE "{name}""#),
+        [name.as_str()],
+    )?)
+    .execute(&mut admin)
+    .await
+    .map_err(|e| Error::Storage(format!("creating test database {name}: {e}")))?;
     admin.close().await.ok();
 
     let (path, query) = shared

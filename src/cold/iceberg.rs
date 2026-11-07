@@ -481,7 +481,6 @@ impl IcebergCold {
             return Ok(vec![FileStats::unknown()]);
         };
 
-        let file_io = loaded.file_io();
         let manifest_list = loaded
             .manifest_list_reader(snapshot)
             .load()
@@ -490,7 +489,11 @@ impl IcebergCold {
 
         let mut stats = Vec::new();
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io).await.map_err(ice)?;
+            let manifest = loaded
+                .manifest_reader()
+                .read(manifest_file)
+                .await
+                .map_err(ice)?;
             for entry in manifest.entries() {
                 // Deleted entries still appear in a manifest; only live data
                 // files can contribute a version to a scan.
@@ -1141,7 +1144,6 @@ impl IcebergCold {
             return Ok(HashSet::new());
         };
 
-        let file_io = loaded.file_io();
         let manifest_list = loaded
             .manifest_list_reader(snapshot)
             .load()
@@ -1150,7 +1152,11 @@ impl IcebergCold {
 
         let mut paths = HashSet::new();
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io).await.map_err(ice)?;
+            let manifest = loaded
+                .manifest_reader()
+                .read(manifest_file)
+                .await
+                .map_err(ice)?;
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     paths.insert(entry.data_file().file_path().to_string());
@@ -1399,10 +1405,6 @@ impl std::fmt::Debug for RefreshingProvider {
 
 #[async_trait]
 impl datafusion::catalog::TableProvider for RefreshingProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> crate::arrow::datatypes::SchemaRef {
         self.schema.clone()
     }
@@ -1536,10 +1538,6 @@ struct PushdownGuard {
 
 #[async_trait]
 impl datafusion::catalog::TableProvider for PushdownGuard {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> crate::arrow::datatypes::SchemaRef {
         self.inner.schema()
     }

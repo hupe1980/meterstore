@@ -27,7 +27,6 @@ use iceberg_catalog_sql::{
     SqlCatalogBuilder,
 };
 use meterstore::delivery::{MeasurementSeries, MeasurementSource};
-use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -57,8 +56,8 @@ async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
         .await
         .expect("postgres");
 
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool.clone()));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database.clone()));
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()
@@ -123,7 +122,7 @@ async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
             cold.table_provider(TABLE).await.expect("provider"),
         )
         .table(config)
-        .subject_registry(SubjectRegistry::with_erasure_secret(pool, SECRET).expect("secret"))
+        .subject_registry(SubjectRegistry::with_erasure_secret(database, SECRET).expect("secret"))
         .build()
         .await
         .expect("store");
@@ -149,8 +148,8 @@ async fn catalog_with_subjects() -> (meterstore::MeterCatalog, tempfile::TempDir
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool.clone()));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database.clone()));
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()
@@ -176,7 +175,7 @@ async fn catalog_with_subjects() -> (meterstore::MeterCatalog, tempfile::TempDir
         NamespaceIdent::new("metering".to_string()),
         8 * 1024 * 1024,
     ));
-    let registry = SubjectRegistry::with_erasure_secret(pool, SECRET).expect("secret");
+    let registry = SubjectRegistry::with_erasure_secret(database, SECRET).expect("secret");
     registry.create_tables().await.expect("registry tables");
 
     let mut builder = meterstore::MeterCatalog::builder();
@@ -1006,8 +1005,8 @@ async fn the_sweep_runs_for_a_deployment_that_no_longer_declares_a_subject_colum
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool.clone()));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database.clone()));
     let warehouse = tempfile::tempdir().expect("warehouse");
     let iceberg_catalog = SqlCatalogBuilder::default()
         .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
@@ -1032,7 +1031,7 @@ async fn the_sweep_runs_for_a_deployment_that_no_longer_declares_a_subject_colum
         NamespaceIdent::new("metering".to_string()),
         8 * 1024 * 1024,
     ));
-    let registry = SubjectRegistry::new(pool);
+    let registry = SubjectRegistry::new(database);
     registry.create_tables().await.expect("registry tables");
     // A mapping row from a year long past the ceiling.
     registry

@@ -229,6 +229,7 @@ pub use datafusion::arrow;
 pub mod cli;
 pub mod cold;
 pub mod config;
+pub mod database;
 pub mod delivery;
 pub mod encode;
 pub mod erasure;
@@ -258,14 +259,15 @@ pub use config::{
     CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
     ValueCheck, checked_column, coded_column, declared_value_check,
 };
+pub use database::{Database, DatabaseOptions};
 pub use delivery::{
     MeasurementSeries, MeasurementSource, ProvenanceEntry, ProvenanceEventType, VirtualMeterKind,
 };
 pub use encode::{StoredReadings, canonical_obis, parse_malo, parse_melo};
 pub use erasure::{
-    DEFAULT_ERASURE_LIMIT, ErasureQuery, ErasureRecord, ErasureTrigger, MIN_ERASURE_SECRET_BYTES,
-    MIN_REFERENCE_TOKEN_CHARS, OrphanedSuppressions, Retention, SubjectRef, SubjectRegistration,
-    SubjectRegistry, SuppressionLift, retention_epoch,
+    DEFAULT_ERASURE_LIMIT, ErasureCascade, ErasureQuery, ErasureRecord, ErasureTrigger,
+    MIN_ERASURE_SECRET_BYTES, MIN_REFERENCE_TOKEN_CHARS, OrphanedSuppressions, Retention,
+    SubjectRef, SubjectRegistration, SubjectRegistry, SuppressionLift, retention_epoch,
 };
 pub use error::{Error, Result};
 pub use evolution::{Compatibility, SchemaChange};
@@ -309,9 +311,12 @@ pub mod prelude {
         EicType, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck, checked_column,
         coded_column,
     };
+    pub use crate::database::{Database, DatabaseOptions};
     pub use crate::delivery::{MeasurementSeries, MeasurementSource};
     pub use crate::encode::{StoredReadings, StoredSeries};
-    pub use crate::erasure::{ErasureQuery, Retention, SubjectRef, SubjectRegistry};
+    pub use crate::erasure::{
+        ErasureCascade, ErasureQuery, Retention, SubjectRef, SubjectRegistry,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::hot::PostgresHot;
     pub use crate::planner::{ReadMode, SnapshotSelector, TimeRange};

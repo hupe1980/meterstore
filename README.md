@@ -105,7 +105,9 @@ use meterstore::prelude::*;
 use std::sync::Arc;
 use time::Duration;
 
-let hot = Arc::new(PostgresHot::new(pool));   // a pool you already own
+// The store opens its own pool, TLS by default; no `sqlx` type is in the API.
+let database = Database::connect_with(&db_url, &DatabaseOptions::new().max_connections(16)).await?;
+let hot = Arc::new(PostgresHot::new(database));
 
 let cold = IcebergSqlCatalog {
     database_url: &db_url,
@@ -164,7 +166,7 @@ below rather than repeated here.
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.94 | Set by `iceberg` 0.10's floor; `metering` and this crate's own syntax need 1.88 |
+| Rust | 1.95 | Set by `iceberg` 0.11's floor; `metering` and this crate's own syntax need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18 and whole again on 15 |
 | `metering` | **0.25** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
@@ -187,7 +189,8 @@ Three are built for you: a PostgreSQL-backed SQL catalogue on the same database 
 the hot tier (`sql-catalog`, on by default), a REST catalogue (`rest-catalog`, on
 by default), and AWS S3 Tables behind the `s3tables` feature. A configuration file
 builds whichever it names — all three, by `catalog = "sql" | "rest" | "s3tables"` —
-and `Settings::connect()` returns the pool, both tiers and every validated table.
+and `Settings::connect()` returns the store's `Database`, both tiers and every
+validated table.
 [Details](https://hupe1980.github.io/meterstore/docs/getting-started/).
 
 MeterStore needs no server configuration, no restart, no superuser and no
@@ -240,7 +243,7 @@ Everything the documentation describes works end to end against real
 infrastructure — both tiers, streaming archival, tier-split queries, reproducible
 reads, completeness, multi-table sessions and both serving surfaces.
 
-**1057 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+**1066 tests** — unit, property, doc and integration against real PostgreSQL 18 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle
 over generated workloads:
 
@@ -298,8 +301,9 @@ wall clock of a database per test, for the same isolation.
 `datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`,
 `sqlx` and `sqlx-postgres` must each appear exactly once in the dependency graph;
 `just deps` fails the build otherwise. Two versions of `arrow` mean two incompatible
-`RecordBatch` types, and two of `sqlx` mean two incompatible `PgPool` types —
-neither fails obviously.
+`RecordBatch` types, which does not fail obviously. The one admitted duplicate is
+the `sqlx` 0.8 `iceberg-catalog-sql` uses for its own metadata pool. `sqlx` is
+private — the store opens its own pool — so its version never constrains yours.
 
 ## ⚖️ License
 

@@ -11,7 +11,9 @@
 #![cfg(feature = "testkit")]
 
 use metering::series::interval::Sparte;
-use meterstore::{ErasureQuery, ErasureRecord, ErasureTrigger, SubjectRef, SubjectRegistry};
+use meterstore::{
+    ErasureCascade, ErasureQuery, ErasureRecord, ErasureTrigger, SubjectRef, SubjectRegistry,
+};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -26,24 +28,29 @@ const IN_2026: OffsetDateTime = datetime!(2026-06-01 00:00 UTC);
 /// secret manager, and losing it silently disables suppression.
 const SECRET: &[u8] = b"test-suppression-key-32-bytes!!!";
 
-async fn pool() -> PgPool {
+/// A fixture pool for the test's own SQL, and the store's [`Database`] on the
+/// same database.
+async fn pool() -> (PgPool, meterstore::Database) {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    PgPool::connect(&url).await.expect("connect")
+    (
+        PgPool::connect(&url).await.expect("connect"),
+        meterstore::Database::connect(&url).await.expect("database"),
+    )
 }
 
 async fn registry() -> SubjectRegistry {
-    let pool = pool().await;
-    let registry = SubjectRegistry::new(pool);
+    let (_, database) = pool().await;
+    let registry = SubjectRegistry::new(database);
     registry.create_tables().await.expect("tables");
     registry
 }
 
 /// A registry that enforces a suppression list.
 async fn suppressing() -> SubjectRegistry {
-    let pool = pool().await;
-    let registry = SubjectRegistry::with_erasure_secret(pool, SECRET).expect("secret");
+    let (_, database) = pool().await;
+    let registry = SubjectRegistry::with_erasure_secret(database, SECRET).expect("secret");
     registry.create_tables().await.expect("tables");
     registry
 }
@@ -309,8 +316,8 @@ async fn a_suppression_key_makes_erasure_stick() {
 async fn the_suppression_list_does_not_retain_the_identifier() {
     // The tombstone outlives the mapping, so anything reversible in it would
     // survive the erasure it documents.
-    let pool = pool().await;
-    let r = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
+    let (pool, database) = pool().await;
+    let r = SubjectRegistry::with_erasure_secret(database.clone(), SECRET).expect("secret");
     r.create_tables().await.expect("tables");
 
     let subject = r
@@ -397,9 +404,9 @@ async fn a_mistaken_erasure_can_be_lifted_without_restoring_the_old_link() {
 
 #[tokio::test]
 async fn a_short_suppression_key_is_refused() {
-    let pool = pool().await;
+    let (_, database) = pool().await;
     assert!(
-        SubjectRegistry::with_erasure_secret(pool, b"too-short").is_err(),
+        SubjectRegistry::with_erasure_secret(database, b"too-short").is_err(),
         "a brute-forceable key would leak the identifiers it exists to forget"
     );
 }
@@ -432,21 +439,23 @@ async fn a_registry_debug_does_not_print_its_key() {
 }
 
 #[tokio::test]
-async fn erasure_can_be_enclosed_in_a_caller_s_transaction() {
+async fn a_cascade_goes_with_the_mapping_or_not_at_all() {
     // An Article 17 request reaches an application's own tables too, and those
     // must succeed or fail *with* the mapping. Two transactions cannot give that,
     // and the failure mode is the worst kind: a subject reported as erased whose
-    // derived rows survived.
-    let pool = pool().await;
-    let registry = SubjectRegistry::new(pool.clone());
-    registry.create_tables().await.expect("tables");
-
+    // derived rows survived. A declared cascade runs in the erasure's own
+    // transaction, so a failing one leaves both in place.
+    let (pool, database) = pool().await;
     sqlx::query("CREATE TABLE downstream (subject_ref TEXT PRIMARY KEY)")
         .execute(&pool)
         .await
-        .expect("a stand-in for the caller's own tables");
+        .expect("a stand-in for the application's own tables");
 
-    let subject = registry
+    let failing = SubjectRegistry::new(database.clone()).with_cascade(
+        ErasureCascade::new("DELETE FROM no_such_table WHERE subject_ref = $1").expect("shape"),
+    );
+    failing.create_tables().await.expect("tables");
+    let subject = failing
         .register("DE-METER-1", IN_2026, Sparte::Strom)
         .await
         .expect("register");
@@ -456,61 +465,39 @@ async fn erasure_can_be_enclosed_in_a_caller_s_transaction() {
         .await
         .expect("derived row");
 
-    // Roll back: neither the mapping nor the derived row may be gone.
-    let mut tx = pool.begin().await.expect("begin");
-    registry
-        .erase_in(
-            &mut tx,
+    let err = failing
+        .erase(
             &subject,
             "rehearsal",
             "dpo",
             datetime!(2026-07-28 09:00 UTC),
         )
         .await
-        .expect("erase step");
-    sqlx::query("DELETE FROM downstream WHERE subject_ref = $1")
-        .bind(subject.as_str())
-        .execute(&mut *tx)
-        .await
-        .expect("cascade");
-    tx.rollback().await.expect("rollback");
-
+        .expect_err("a failing cascade fails the erasure");
+    assert!(err.to_string().contains("nothing was erased"), "{err}");
     assert!(
-        registry.resolve(&subject).await.expect("resolve").is_some(),
-        "a rolled-back erasure must leave the mapping intact"
-    );
-    let survivors: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM downstream WHERE subject_ref = $1")
-            .bind(subject.as_str())
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-    assert_eq!(
-        survivors, 1,
-        "and the caller's cascade must roll back with it"
+        failing.resolve(&subject).await.expect("resolve").is_some(),
+        "a failed cascade must leave the mapping intact"
     );
 
-    // Commit: both go together.
-    let mut tx = pool.begin().await.expect("begin");
-    registry
-        .erase_in(
-            &mut tx,
+    let cascading = SubjectRegistry::new(database).with_cascade(
+        ErasureCascade::new("DELETE FROM downstream WHERE subject_ref = $1").expect("shape"),
+    );
+    cascading
+        .erase(
             &subject,
             "Art. 17 request",
             "dpo",
             datetime!(2026-07-28 09:00 UTC),
         )
         .await
-        .expect("erase step");
-    sqlx::query("DELETE FROM downstream WHERE subject_ref = $1")
-        .bind(subject.as_str())
-        .execute(&mut *tx)
-        .await
-        .expect("cascade");
-    tx.commit().await.expect("commit");
-
+        .expect("erase");
     assert!(
-        registry.resolve(&subject).await.expect("resolve").is_none(),
+        cascading
+            .resolve(&subject)
+            .await
+            .expect("resolve")
+            .is_none(),
         "the mapping is gone"
     );
     let survivors: i64 =
@@ -520,6 +507,21 @@ async fn erasure_can_be_enclosed_in_a_caller_s_transaction() {
             .await
             .expect("count");
     assert_eq!(survivors, 0, "and so are the rows that referenced it");
+}
+
+#[test]
+fn a_cascade_is_one_statement_binding_only_the_reference() {
+    for bad in [
+        "",
+        "DELETE FROM t",
+        "DELETE FROM t WHERE a = $1 AND b = $2",
+        "DELETE FROM t WHERE a = $1; DROP TABLE t",
+        "DELETE FROM t WHERE a = $10",
+    ] {
+        assert!(ErasureCascade::new(bad).is_err(), "{bad:?} must be refused");
+    }
+    let ok = ErasureCascade::new("DELETE FROM t WHERE a = $1;").expect("one trailing ; is fine");
+    assert_eq!(ok.statement(), "DELETE FROM t WHERE a = $1");
 }
 
 #[tokio::test]
@@ -745,49 +747,49 @@ async fn resolvable_answers_for_a_whole_batch_in_one_round_trip() {
 }
 
 #[tokio::test]
-async fn erase_all_can_be_enclosed_in_a_caller_s_transaction() {
-    // The pairing `erase_in` has, for the entry point a request actually names.
-    let pool = pool().await;
-    let registry = SubjectRegistry::new(pool.clone());
+async fn erase_all_runs_the_cascade_for_every_epoch() {
+    // The entry point a request actually names reaches every year's reference,
+    // and the cascade with it: a row keyed by last year's reference is as
+    // attributable as this year's.
+    let (pool, database) = pool().await;
+    sqlx::query("CREATE TABLE downstream (subject_ref TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("a stand-in for the application's own tables");
+    let registry = SubjectRegistry::new(database).with_cascade(
+        ErasureCascade::new("DELETE FROM downstream WHERE subject_ref = $1").expect("shape"),
+    );
     registry.create_tables().await.expect("tables");
 
-    let subject = registry
-        .register("DE-METER-1", IN_2026, Sparte::Strom)
-        .await
-        .expect("register");
+    let mut subjects = Vec::new();
+    for when in [datetime!(2025-07-20 00:00 UTC), IN_2026] {
+        let subject = registry
+            .register("DE-METER-1", when, Sparte::Strom)
+            .await
+            .expect("register");
+        sqlx::query("INSERT INTO downstream (subject_ref) VALUES ($1)")
+            .bind(subject.as_str())
+            .execute(&pool)
+            .await
+            .expect("derived row");
+        subjects.push(subject);
+    }
+    assert_ne!(subjects[0], subjects[1], "two epochs, two references");
 
-    let mut tx = pool.begin().await.expect("begin");
     registry
-        .erase_all_in(
-            &mut tx,
-            "DE-METER-1",
-            "rehearsal",
-            "dpo",
-            datetime!(2026-07-28 09:00 UTC),
-        )
-        .await
-        .expect("erase step");
-    tx.rollback().await.expect("rollback");
-
-    assert!(
-        registry.resolve(&subject).await.expect("resolve").is_some(),
-        "a rolled-back erasure must leave the mapping intact"
-    );
-
-    let mut tx = pool.begin().await.expect("begin");
-    registry
-        .erase_all_in(
-            &mut tx,
+        .erase_all(
             "DE-METER-1",
             "Art. 17 request",
             "dpo",
             datetime!(2026-07-28 09:00 UTC),
         )
         .await
-        .expect("erase step");
-    tx.commit().await.expect("commit");
-
-    assert!(registry.resolve(&subject).await.expect("resolve").is_none());
+        .expect("erase");
+    let survivors: i64 = sqlx::query_scalar("SELECT count(*) FROM downstream")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(survivors, 0, "every epoch's rows went with its mapping");
 }
 
 #[tokio::test]
@@ -954,8 +956,8 @@ async fn a_retired_key_still_recognises_the_erasures_it_recorded() {
     const OLD_KEY: &[u8] = b"retired-suppression-key-32-bytes";
     const NEW_KEY: &[u8] = b"current-suppression-key-32-bytes";
 
-    let pool = pool().await;
-    let old = SubjectRegistry::with_erasure_secret(pool.clone(), OLD_KEY).expect("secret");
+    let (_, database) = pool().await;
+    let old = SubjectRegistry::with_erasure_secret(database.clone(), OLD_KEY).expect("secret");
     old.create_tables().await.expect("tables");
 
     let subject = old
@@ -973,7 +975,7 @@ async fn a_retired_key_still_recognises_the_erasures_it_recorded() {
 
     // Rotated: the new key writes, the old one is kept for reading.
     let rotated =
-        SubjectRegistry::with_erasure_keys(pool.clone(), &[NEW_KEY, OLD_KEY]).expect("ring");
+        SubjectRegistry::with_erasure_keys(database.clone(), &[NEW_KEY, OLD_KEY]).expect("ring");
     assert_eq!(rotated.erasure_key_count(), 2);
     assert!(rotated.is_suppressed("customer-4821").await.unwrap());
     assert!(
@@ -1031,8 +1033,8 @@ async fn dropping_the_old_key_on_rotation_re_opens_registration_and_says_so() {
     const OLD_KEY: &[u8] = b"retired-suppression-key-32-bytes";
     const NEW_KEY: &[u8] = b"current-suppression-key-32-bytes";
 
-    let pool = pool().await;
-    let old = SubjectRegistry::with_erasure_secret(pool.clone(), OLD_KEY).expect("secret");
+    let (_, database) = pool().await;
+    let old = SubjectRegistry::with_erasure_secret(database.clone(), OLD_KEY).expect("secret");
     old.create_tables().await.expect("tables");
 
     let subject = old
@@ -1048,7 +1050,7 @@ async fn dropping_the_old_key_on_rotation_re_opens_registration_and_says_so() {
     .await
     .unwrap();
 
-    let replaced = SubjectRegistry::with_erasure_secret(pool.clone(), NEW_KEY).expect("secret");
+    let replaced = SubjectRegistry::with_erasure_secret(database.clone(), NEW_KEY).expect("secret");
 
     let orphaned = replaced.orphaned_suppressions().await.expect("report");
     assert_eq!(orphaned.len(), 1, "one missing key: {orphaned:?}");
@@ -1069,7 +1071,7 @@ async fn dropping_the_old_key_on_rotation_re_opens_registration_and_says_so() {
 
     // Putting the key back is the whole repair, and the report is how an
     // operator knows it worked.
-    let restored = SubjectRegistry::with_erasure_keys(pool, &[NEW_KEY, OLD_KEY]).expect("ring");
+    let restored = SubjectRegistry::with_erasure_keys(database, &[NEW_KEY, OLD_KEY]).expect("ring");
     assert!(
         restored
             .orphaned_suppressions()
@@ -1090,8 +1092,8 @@ async fn a_lifted_suppression_is_not_reported_as_orphaned() {
     const OLD_KEY: &[u8] = b"retired-suppression-key-32-bytes";
     const NEW_KEY: &[u8] = b"current-suppression-key-32-bytes";
 
-    let pool = pool().await;
-    let old = SubjectRegistry::with_erasure_secret(pool.clone(), OLD_KEY).expect("secret");
+    let (_, database) = pool().await;
+    let old = SubjectRegistry::with_erasure_secret(database.clone(), OLD_KEY).expect("secret");
     old.create_tables().await.expect("tables");
 
     let subject = old
@@ -1117,7 +1119,7 @@ async fn a_lifted_suppression_is_not_reported_as_orphaned() {
         .unwrap()
     );
 
-    let replaced = SubjectRegistry::with_erasure_secret(pool, NEW_KEY).expect("secret");
+    let replaced = SubjectRegistry::with_erasure_secret(database, NEW_KEY).expect("secret");
     assert!(
         replaced
             .orphaned_suppressions()
@@ -1134,8 +1136,8 @@ async fn a_registry_that_lost_its_only_key_reports_every_live_suppression() {
     // registry has no ring, so it cannot check anything — and that is exactly
     // when the trail's own record of which key wrote what is the only thing
     // that can speak.
-    let pool = pool().await;
-    let keyed = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
+    let (_, database) = pool().await;
+    let keyed = SubjectRegistry::with_erasure_secret(database.clone(), SECRET).expect("secret");
     keyed.create_tables().await.expect("tables");
 
     for id in ["customer-1", "customer-2"] {
@@ -1151,7 +1153,7 @@ async fn a_registry_that_lost_its_only_key_reports_every_live_suppression() {
             .unwrap();
     }
 
-    let keyless = SubjectRegistry::new(pool);
+    let keyless = SubjectRegistry::new(database);
     let orphaned = keyless.orphaned_suppressions().await.expect("report");
     assert_eq!(orphaned.len(), 1, "one key wrote them: {orphaned:?}");
     assert_eq!(orphaned[0].suppressions, 2);
@@ -1163,8 +1165,8 @@ async fn a_tombstone_cannot_be_written_without_naming_its_key() {
     // the state this column exists to remove — so the database refuses the row
     // rather than leaving a statement that forgot one to be found later by a
     // report that had quietly stopped being trustworthy.
-    let pool = pool().await;
-    let r = SubjectRegistry::with_erasure_secret(pool.clone(), SECRET).expect("secret");
+    let (pool, database) = pool().await;
+    let r = SubjectRegistry::with_erasure_secret(database.clone(), SECRET).expect("secret");
     r.create_tables().await.expect("tables");
 
     let half = sqlx::query(
@@ -1199,8 +1201,8 @@ async fn the_mapping_row_cannot_disagree_with_the_reference_about_its_epoch() {
     // the reference the write path parses. A row where they disagreed would be
     // swept on one year while refusing readings from the other, and both halves
     // would look well formed.
-    let pool = pool().await;
-    let r = SubjectRegistry::new(pool.clone());
+    let (pool, database) = pool().await;
+    let r = SubjectRegistry::new(database.clone());
     r.create_tables().await.expect("tables");
 
     let refused = sqlx::query(
@@ -1239,7 +1241,7 @@ async fn a_registry_carrying_an_earlier_schema_says_so_at_setup() {
     // the divergence surfaces as `column "trigger" does not exist` at the first
     // erasure — a compliance operation, from an error that says nothing about
     // what to do.
-    let pool = pool().await;
+    let (pool, database) = pool().await;
     sqlx::query(
         "CREATE TABLE meterstore_erasures (
              subject_ref TEXT PRIMARY KEY,
@@ -1252,7 +1254,7 @@ async fn a_registry_carrying_an_earlier_schema_says_so_at_setup() {
     .await
     .expect("a table of the shape an earlier version created");
 
-    let err = SubjectRegistry::new(pool)
+    let err = SubjectRegistry::new(database)
         .create_tables()
         .await
         .expect_err("the drift must be reported at setup")
@@ -1271,8 +1273,8 @@ async fn erasure_through_an_expired_reference_is_refused() {
     // Article 17 request arrives through it. The identifier behind it is gone by
     // design, so 2022 cannot be found through it — and reporting the request
     // honoured would leave 2022 attributable.
-    let pool = pool().await;
-    let r = SubjectRegistry::new(pool.clone());
+    let (_, database) = pool().await;
+    let r = SubjectRegistry::new(database.clone());
     r.create_tables().await.expect("tables");
     let old = r.register_in_epoch("customer-4821", 2021).await.unwrap();
     let later = r.register_in_epoch("customer-4821", 2022).await.unwrap();
@@ -1303,19 +1305,6 @@ async fn erasure_through_an_expired_reference_is_refused() {
         err.to_string().contains("erase_all"),
         "names the remedy: {err}"
     );
-
-    // Inside a caller's transaction too, with nothing written to it.
-    let mut tx = pool.begin().await.expect("begin");
-    r.erase_in(
-        &mut tx,
-        &old,
-        "DSAR-2026-0042",
-        "dpo",
-        datetime!(2026-08-01 09:00 UTC),
-    )
-    .await
-    .expect_err("refused identically");
-    tx.rollback().await.expect("rollback");
 
     // The refusal is not an erasure: the trail is the sweep's, and 2022 resolves.
     assert_eq!(r.erasures(&ErasureQuery::new()).await.unwrap(), swept);

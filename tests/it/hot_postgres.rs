@@ -35,6 +35,10 @@ const D22: OffsetDateTime = datetime!(2026-07-22 00:00 UTC);
 /// A running Postgres plus a prepared hot table.
 struct Harness {
     hot: PostgresHot,
+    /// The store's pool, for a second `PostgresHot` over the same database.
+    database: meterstore::Database,
+    /// The test's own connection, for SQL the store does not issue.
+    pool: PgPool,
 }
 
 impl Harness {
@@ -44,14 +48,20 @@ impl Harness {
             .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
-        let hot = PostgresHot::new(pool);
+
+        let database = meterstore::Database::connect(&url).await.expect("database");
+        let hot = PostgresHot::new(database.clone());
         hot.create_table(TABLE).await.expect("create table");
 
-        Self { hot }
+        Self {
+            hot,
+            database,
+            pool,
+        }
     }
 
     fn pool(&self) -> &PgPool {
-        self.hot.pool()
+        &self.pool
     }
 
     /// Insert `count` quarter-hour readings starting at `start`.
@@ -534,10 +544,12 @@ impl HoldingAccessShare {
         // Leaked so the transaction can outlive this call; released on `drop`.
         let leaked: &'static PgPool = Box::leak(Box::new(pool.clone()));
         let mut tx = leaked.begin().await.expect("begin");
-        sqlx::query(&format!(r#"SELECT count(*) FROM "{table}""#))
-            .fetch_one(&mut *tx)
-            .await
-            .expect("read the parent, taking ACCESS SHARE");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"SELECT count(*) FROM "{table}""#
+        )))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read the parent, taking ACCESS SHARE");
         Self {
             _pool: pool,
             tx: Some(tx),
@@ -565,8 +577,8 @@ async fn creating_a_partition_does_not_block_on_a_reader() {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = PostgresHot::new(pool).ddl_lock_timeout(Duration::seconds(2));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = PostgresHot::new(database).ddl_lock_timeout(Duration::seconds(2));
     hot.create_table(TABLE).await.expect("create table");
 
     let reader = HoldingAccessShare::on(&url, TABLE).await;
@@ -598,10 +610,10 @@ async fn creating_a_partition_does_not_block_on_a_reader() {
         .execute(&mut *blocking)
         .await
         .expect("set");
-    let naive = sqlx::query(&format!(
+    let naive = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"CREATE TABLE "{TABLE}_naive" PARTITION OF "{TABLE}"
                FOR VALUES FROM ('2026-07-21 00:00:00+00') TO ('2026-07-22 00:00:00+00')"#
-    ))
+    )))
     .execute(&mut *blocking)
     .await;
     let err = naive
@@ -626,8 +638,8 @@ async fn a_detach_that_cannot_get_its_lock_reports_a_lock_timeout() {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = PostgresHot::new(pool).ddl_lock_timeout(Duration::milliseconds(250));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = PostgresHot::new(database).ddl_lock_timeout(Duration::milliseconds(250));
     hot.create_table(TABLE).await.expect("create table");
     hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
@@ -1174,7 +1186,7 @@ async fn a_range_scan_streams_in_bounded_chunks() {
         .unwrap();
     h.insert_readings(D20, 25).await;
 
-    let hot = PostgresHot::new(h.pool().clone()).scan_chunk_rows(10);
+    let hot = PostgresHot::new(h.database.clone()).scan_chunk_rows(10);
     let mut stream = hot
         .scan_range(
             TABLE,
@@ -1221,7 +1233,7 @@ async fn a_streamed_scan_resumes_at_the_right_place() {
         .unwrap();
     h.insert_readings(D20, 30).await;
 
-    let hot = PostgresHot::new(h.pool().clone()).scan_chunk_rows(7);
+    let hot = PostgresHot::new(h.database.clone()).scan_chunk_rows(7);
     let mut stream = hot
         .scan_range(
             TABLE,
@@ -1368,7 +1380,7 @@ async fn a_chunk_boundary_inside_a_tie_does_not_drop_rows() {
     }
 
     // A chunk size of two guarantees the boundary lands inside the tie.
-    let paged = PostgresHot::new(h.pool().clone()).scan_chunk_rows(2);
+    let paged = PostgresHot::new(h.database.clone()).scan_chunk_rows(2);
     let batches = collect_stream(
         paged
             .scan_range(
@@ -1397,7 +1409,7 @@ async fn a_chunked_scan_returns_rows_in_the_declared_sort_order() {
         .unwrap();
     h.insert_readings(D20, 20).await;
 
-    let paged = PostgresHot::new(h.pool().clone()).scan_chunk_rows(3);
+    let paged = PostgresHot::new(h.database.clone()).scan_chunk_rows(3);
     let batches = collect_stream(
         paged
             .scan_range(

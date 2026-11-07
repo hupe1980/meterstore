@@ -148,10 +148,11 @@ times cannot date an orphan, and gets no grace.
 
 The detach window is only safe because one process owns it. `PostgresHot` holds
 a session-scoped advisory lock as an RAII lease on a connection checked out for
-the run, and unlocks explicitly on it. If that unlock fails, the pooled connection
-keeps every other archiver out until the pool recycles it or the `after_release`
-hook `Settings` installs — `pg_advisory_unlock_all()` — clears it. **A deployment
-building its own pool installs that hook itself.**
+the run, and unlocks explicitly on it. A lease dropped without that unlock — a
+task aborted mid-run, a `timeout` around maintenance — still frees the lock when
+its connection is checked in: every pool `Database` opens runs
+`pg_advisory_unlock_all()` on release. The store opens its own pool for exactly
+this reason; a pool built elsewhere could not be made to carry the hook.
 
 Every replica can run the same schedule: one wins, the others report
 `lease_contended` and stop. That is not a failure; alert on watermark lag, which

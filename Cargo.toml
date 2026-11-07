@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -13,7 +13,7 @@ categories = ["database", "data-structures"]
 readme = "README.md"
 # Set by the highest dependency floor (`iceberg` 0.10 wants 1.94), not by this
 # crate's own syntax or by `metering` 0.25, both of which need only 1.88.
-rust-version = "1.94"
+rust-version = "1.95"
 
 # The crate documentation describes Flight SQL, the façade and the testkit, none
 # of which are default features.
@@ -44,45 +44,54 @@ linker_messages = "allow"
 # Single-sourced: every DataFusion-dependent crate must track this same major.
 # A duplicate `datafusion` in `cargo tree -d` is a build failure, not a warning:
 # two majors give mutually incompatible `TableProvider` and `RecordBatch` types.
-datafusion = "53.1"
+# 54 because `iceberg-datafusion` 0.11 requires `^54`; 55 is out of reach while
+# it is in the graph.
+datafusion = "54.1"
 async-trait = "0.1"
 # The `arrow` DataFusion already pulls, declared only for the `json` feature that
 # `QueryResult::to_json` needs. The duplicate gate catches any divergence.
 arrow = { version = "58.4", default-features = false, features = ["json"] }
 
 # --- Cold Tier: Apache Iceberg ---
-iceberg = "0.10"
-iceberg-datafusion = "0.10"
+iceberg = "0.11"
+iceberg-datafusion = "0.11"
 # `IcebergSqlCatalog`. Optional despite being in `default`, because it reaches
 # `sqlx`'s SQLite driver and `libsqlite3-sys` declares `links = "sqlite3"` —
 # enforced over the whole resolve graph, feature on or not. A workspace that also
 # links an embedded SQLite cannot resolve until this is off.
-iceberg-catalog-sql = { version = "0.10", optional = true }
+iceberg-catalog-sql = { version = "0.11", optional = true }
+# The SQL catalogue's own `sqlx` 0.8: `iceberg-catalog-sql` names it with `any`
+# alone, so the PostgreSQL driver, runtime and rustls backend are declared here
+# (`the_sql_catalogue_sqlx_speaks_postgres_and_asks_for_tls`). In no public
+# signature; the one duplicate `just deps` admits.
+sqlx-catalog = { package = "sqlx", version = "0.8", default-features = false, features = ["any", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"], optional = true }
 # The cloud object stores only; `file://` and `memory://` use `iceberg`'s own
 # factories. Optional because `opendal-core` pulls `quick-xml`, a second `reqwest`
 # and a second rustls — an HTTP stack a warehouse on local disk has no use for.
-iceberg-storage-opendal = { version = "0.10", default-features = false, optional = true }
+iceberg-storage-opendal = { version = "0.11", default-features = false, optional = true }
 # `IcebergRestCatalog`: Polaris, Lakekeeper, Nessie, Gravitino. Unrelated to
 # `catalog-facade`, which *serves* the REST protocol over whatever catalogue is in
 # use.
-iceberg-catalog-rest = { version = "0.10", optional = true }
+iceberg-catalog-rest = { version = "0.11", optional = true }
 # AWS S3 Tables through its native API. Not the Iceberg REST endpoint, which
 # authenticates with SigV4 that `iceberg-catalog-rest` cannot sign.
-iceberg-catalog-s3tables = { version = "0.10", optional = true }
+iceberg-catalog-s3tables = { version = "0.11", optional = true }
 
 # --- Hot Tier: PostgreSQL ---
+# Private: the store opens its own pool (`meterstore::Database`) and no `sqlx`
+# type is in its API (`no_published_signature_names_sqlx`), so a caller's own
+# `sqlx` upgrades alone.
 # The defaults (`any`, `macros`, `migrate`, `json`) are unused — every statement
 # is a runtime `sqlx::query` — and carry the optional SQLite driver.
 # `tls-rustls-aws-lc-rs`: without a TLS backend every connection is plaintext,
 # and `sslmode=require` cannot be satisfied at all. aws-lc-rs because it is the
 # one rustls provider already in the graph — `reqwest`, `bollard` and the AWS
 # SDK use it — and two providers with neither installed as the process default
-# is a `rustls` panic. Feature unification gives the SQL catalogue's `sqlx` the
-# same backend.
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
+# is a `rustls` panic. The SQL catalogue's `sqlx` names the same backend above.
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 # Asked of the driver, not the facade: `sqlx/time` names `sqlx-sqlite?/time`, and
 # naming an optional dependency is enough to put it in the resolve graph.
-sqlx-postgres = { version = "0.8", default-features = false, features = ["time", "rust_decimal"] }
+sqlx-postgres = { version = "0.9", default-features = false, features = ["time", "rust_decimal"] }
 
 # --- Domain Layer ---
 # The domain layer (hupe1980/metering): every quantity, calendar, unit, quality flag
@@ -203,7 +212,7 @@ object-store-all = ["object-store-s3", "object-store-gcs", "object-store-azure"]
 rest-catalog = ["dep:iceberg-catalog-rest", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier"]
 # The cold tier on a PostgreSQL-backed Iceberg SQL catalogue: one database to
 # operate. Default; turn it off in a workspace that also links SQLite.
-sql-catalog = ["dep:iceberg-catalog-sql"]
+sql-catalog = ["dep:iceberg-catalog-sql", "dep:sqlx-catalog"]
 # Read-only Iceberg REST endpoint, for deployments on the SQL catalogue.
 catalog-facade = ["dep:axum"]
 # AWS S3 Tables as the cold-tier catalogue. The `object-store-s3` implication is

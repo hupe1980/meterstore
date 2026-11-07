@@ -1264,7 +1264,7 @@ const LONGEST_CONSTRAINT_SUFFIX: usize = "_one_operator".len();
 /// Iceberg, but it has to survive DDL, Parquet field names, a `CHECK` rendered
 /// into a string, and whatever engine an operator later points at the warehouse —
 /// and the first place it goes wrong is the one nobody is watching.
-fn is_plain_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()

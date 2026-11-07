@@ -34,7 +34,7 @@ settlement's inputs.
 **The ceiling is enforced, not offered.** It is injected by the tiered provider,
 which the engine does not know about, so it is applied as an explicit filter below
 the projection rather than as an advisory pushed-down filter. It is offered to the
-cold scan too, but `iceberg-datafusion` 0.10.1 does not translate decimals, so it
+cold scan too, but `iceberg-datafusion` 0.11.0 does not translate decimals, so it
 prunes no files.
 
 An unknown snapshot, or an instant predating the table's history, is an

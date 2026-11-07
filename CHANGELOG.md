@@ -12,6 +12,75 @@ in place rather than through a migration.
 This is the only file in the repository that carries history. Reference
 documentation says what is true now; a test enforces it.
 
+## [0.16.0] — 2026-11-07
+
+### Upgrading from 0.15
+
+1. Open the store's pool with `meterstore::Database::connect(url)` or
+   `Database::connect_with(url, &DatabaseOptions::new().max_connections(n))`,
+   and pass it where a `sqlx::PgPool` went: `PostgresHot::new`,
+   `SubjectRegistry::{new, with_erasure_secret, with_erasure_keys}`,
+   `HotSettings::hot`, `PrivacySettings::registry`. `HotSettings::connect`
+   returns a `Database`, and `Deployment.pool` is `Deployment.database`. The
+   application's own tables use a pool of the application's own; count both
+   against the server's `max_connections`.
+2. Replace `SubjectRegistry::erase_in` / `erase_all_in` and the statements they
+   enclosed with declared cascades: `registry.with_cascade(ErasureCascade::new(
+   "DELETE FROM billing_periods WHERE subject_ref = $1")?)`, or
+   `[privacy] erasure_cascade = [...]`, then call `erase` / `erase_all`.
+3. Move to DataFusion 54 wherever the application names a DataFusion type
+   (`TableProvider`, `ExecutionPlan`, `ScalarUDFImpl` no longer have `as_any`;
+   downcast with `<dyn ExecutionPlan>::downcast_ref::<T>()`), and to `iceberg`
+   0.11 for a catalogue it builds itself. Arrow stays at 58.
+4. Rust 1.95.
+
+### Changed — breaking
+
+- **The store owns its PostgreSQL pool, and `sqlx` is private.** `Database`
+  is the one way a connection is opened: every pool applies the TLS rule
+  (`verify-full` by default; `prefer` and `allow` refused) and runs
+  `pg_advisory_unlock_all()` when a connection is checked in, so a lease dropped
+  without its release frees its lock at check-in instead of wedging archival
+  until the connection is reused. No published signature names a `sqlx` type, so
+  a caller's `sqlx` upgrades alone. `PostgresHot::pool()` is gone.
+- **Erasure cascades replace caller-owned transactions.** `ErasureCascade`
+  (one statement binding the erased reference as `$1`) runs in the transaction
+  that destroys the mapping, for every request-triggered erasure and once per
+  reference destroyed; a failing cascade fails the erasure. The retention sweep
+  runs none. `erase_in` and `erase_all_in` are removed.
+- `iceberg`, `iceberg-datafusion`, `iceberg-catalog-{sql,rest,s3tables}` and
+  `iceberg-storage-opendal` 0.11; DataFusion 54; `sqlx` 0.9; `opendal` 0.58;
+  MSRV 1.95.
+
+### Fixed
+
+- `iceberg-catalog-sql` 0.11 returns a failed `COMMIT` of a catalogue update;
+  0.10.1 discarded it and reported the update as applied. It reaches the
+  conditional commit as an ambiguous outcome, which is re-read.
+- A table, partition or column name that is not a plain identifier is refused
+  before it reaches SQL (`Error::Config`), wherever it comes from: `HotStore`
+  and `PartitionId` are public and take any string, and a name carrying `"`
+  would have closed its quotes and continued as SQL.
+- The SQL catalogue's `sqlx` declares its PostgreSQL driver, runtime and TLS
+  backend itself rather than receiving them from the hot tier's.
+
+### Changed
+
+- `just deps` reads the `--all-features` graph including every `arrow-*`
+  crate, fails when `cargo tree` fails, admits exactly the SQL catalogue's
+  `sqlx` 0.8 by name, and is what CI runs.
+- `quick-xml` is on a patched release through `opendal` 0.58; RUSTSEC-2026-0194
+  and -0195 are no longer ignored. RUSTSEC-2026-0440 (`astral-tokio-tar`,
+  unmaintained, `testkit` only) is.
+
+### Tests
+
+- 1066 tests: 592 unit, 445 integration (a second binary reads metrics back from an in-memory meter provider), 29 doc.
+- New: `Database`'s option and TLS refusals; `checked`'s identifier refusal and the
+  scan that keeps it the only way a built statement reaches `sqlx`; the SQL
+  catalogue's driver-and-TLS probe; `no_published_signature_names_sqlx`;
+  `a_dropped_lease_is_free_at_checkin`; the erasure-cascade tests.
+
 ## [0.15.0] — 2026-10-09
 
 ### Upgrading from 0.14

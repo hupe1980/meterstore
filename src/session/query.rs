@@ -467,19 +467,16 @@ pub(crate) fn tiers_of(plan: &Arc<dyn ExecutionPlan>) -> Vec<Tier> {
     tiers
 }
 
+/// Identity is asked of the node, never of the `Arc` holding it: `&arc as &dyn
+/// Any` compiles, asks whether the `Arc` is the type, and answers `None` for
+/// every plan — a cold tier that vanishes from `tiers_scanned` without an error.
 fn walk(plan: &Arc<dyn ExecutionPlan>, found: &mut Vec<Tier>) {
-    let any = plan.as_any();
-    if any
-        .downcast_ref::<crate::planner::provider::HotScanExec>()
-        .is_some()
-    {
+    let node: &dyn ExecutionPlan = plan.as_ref();
+    if node.is::<crate::planner::provider::HotScanExec>() {
         found.push(Tier::Hot);
-    } else if any
-        .downcast_ref::<iceberg_datafusion::physical_plan::IcebergTableScan>()
-        .is_some()
-    {
+    } else if node.is::<iceberg_datafusion::physical_plan::IcebergTableScan>() {
         found.push(Tier::Cold);
-    } else if let Some(report) = any.downcast_ref::<super::completeness::CompletenessExec>() {
+    } else if let Some(report) = node.downcast_ref::<super::completeness::CompletenessExec>() {
         found.extend(report.tiers.iter().copied());
     }
     for child in plan.children() {

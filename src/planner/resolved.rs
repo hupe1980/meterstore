@@ -44,7 +44,6 @@
 //! window is one settlement lag wide and is where corrections actually arrive,
 //! so it always resolves — and it is small enough that this does not matter.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -191,10 +190,6 @@ impl ResolvedTableProvider {
 
 #[async_trait]
 impl TableProvider for ResolvedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

@@ -143,7 +143,7 @@ impl Settings {
     /// built from, and what a deployment assembling its own takes instead.
     pub async fn connect(&self) -> Result<Deployment> {
         let tables = self.validate_all()?;
-        let pool = self.hot.connect().await?;
+        let database = self.hot.connect().await?;
         let cold = self.cold.build().await?;
         // One registry for the deployment, not one per table: the mapping lives
         // in a single `meterstore_subject_map` keyed by natural identifier, and
@@ -155,13 +155,13 @@ impl Settings {
         let declares = tables
             .iter()
             .any(|t| crate::config::ValidatedTableConfig::subject_column(t).is_some());
-        let registry = match declares || subject_map_exists(&pool).await? {
-            true => Some(self.privacy.registry(pool.clone())?),
+        let registry = match declares || subject_map_exists(database.pool()).await? {
+            true => Some(self.privacy.registry(database.clone())?),
             false => None,
         };
         Ok(Deployment {
-            hot: std::sync::Arc::new(self.hot.hot(pool.clone())),
-            pool,
+            hot: std::sync::Arc::new(self.hot.hot(database.clone())),
+            database,
             cold,
             registry,
             tables,
@@ -244,6 +244,20 @@ pub struct PrivacySettings {
     /// ```
     #[serde(default)]
     pub retired_erasure_secrets: Vec<String>,
+
+    /// Statements an Article 17 erasure also runs, in the transaction that
+    /// destroys the mapping, with the erased subject reference bound as `$1`.
+    ///
+    /// Where the application's own tables hold rows a request must reach —
+    /// billing periods, substitute-value logs — so they go with the mapping or
+    /// not at all. See [`ErasureCascade`](crate::ErasureCascade).
+    ///
+    /// ```toml
+    /// [privacy]
+    /// erasure_cascade = ["DELETE FROM billing_periods WHERE subject_ref = $1"]
+    /// ```
+    #[serde(default)]
+    pub erasure_cascade: Vec<String>,
 }
 
 impl std::fmt::Debug for PrivacySettings {
@@ -257,33 +271,40 @@ impl std::fmt::Debug for PrivacySettings {
                 "retired_erasure_secrets",
                 &self.retired_erasure_secrets.len(),
             )
+            .field("erasure_cascade", &self.erasure_cascade)
             .finish()
     }
 }
 
 impl PrivacySettings {
-    /// The registry these settings describe, over `pool`.
+    /// The registry these settings describe, over `database`.
     ///
-    /// The pool is the hot tier's, deliberately: erasure needs storage where
-    /// deletion is real, and the registry has to live in the same database as
-    /// the application's own tables so an Article 17 cascade can be one
-    /// transaction.
-    pub fn registry(&self, pool: sqlx::PgPool) -> Result<crate::erasure::SubjectRegistry> {
+    /// The hot tier's [`Database`](crate::Database), deliberately: erasure needs
+    /// storage where deletion is real, and the mapping belongs in the database
+    /// that holds the rows it pseudonymises.
+    pub fn registry(&self, database: crate::Database) -> Result<crate::erasure::SubjectRegistry> {
         // Checked here as well as at `meterstore check`, so a caller building a
         // registry straight from a file gets the message that names the setting
         // rather than the one that names a ring position.
         self.validate()?;
-        let Some(secret) = &self.erasure_secret else {
+        let registry = match &self.erasure_secret {
             // Retired keys without a current one would be a ring that cannot
             // write — caught by `validate`, so reaching here means suppression
             // is genuinely off.
-            return Ok(crate::erasure::SubjectRegistry::new(pool));
+            None => crate::erasure::SubjectRegistry::new(database),
+            Some(secret) => {
+                // The current key first: it is the one new tombstones are
+                // written under, and the rest are read-only.
+                let mut ring: Vec<&[u8]> = vec![secret.as_bytes()];
+                ring.extend(self.retired_erasure_secrets.iter().map(String::as_bytes));
+                crate::erasure::SubjectRegistry::with_erasure_keys(database, &ring)?
+            }
         };
-        // The current key first: it is the one new tombstones are written under,
-        // and the rest are read-only.
-        let mut ring: Vec<&[u8]> = vec![secret.as_bytes()];
-        ring.extend(self.retired_erasure_secrets.iter().map(String::as_bytes));
-        crate::erasure::SubjectRegistry::with_erasure_keys(pool, &ring)
+        self.erasure_cascade
+            .iter()
+            .try_fold(registry, |registry, statement| {
+                Ok(registry.with_cascade(crate::ErasureCascade::new(statement.as_str())?))
+            })
     }
 
     /// Whatever can be checked without a database.
@@ -293,6 +314,9 @@ impl PrivacySettings {
     /// thing it exists to prevent, and discovering that at the first process
     /// start means discovering it in a deploy rather than in CI.
     pub fn validate(&self) -> Result<()> {
+        for statement in &self.erasure_cascade {
+            crate::ErasureCascade::new(statement.as_str())?;
+        }
         let Some(secret) = &self.erasure_secret else {
             // A ring of retired keys with nothing to write with enforces the
             // list it looks configured for and records no new tombstone, which
@@ -390,61 +414,24 @@ impl HotSettings {
         crate::tls::require_tls(&self.url, std::env::var("PGSSLMODE").ok().as_deref())
     }
 
-    /// Build the hot tier this section describes, over an existing pool.
+    /// Build the hot tier this section describes, over a [`Database`].
     ///
-    /// Separate from [`connect`](Self::connect) because a deployment almost
-    /// always brings its own pool — MeterStore never owns a connection — and
-    /// this is what carries the file's settings onto it.
-    pub fn hot(&self, pool: sqlx::PgPool) -> crate::hot::PostgresHot {
-        crate::hot::PostgresHot::new(pool).ddl_lock_timeout(self.ddl_lock_timeout.0)
+    /// Separate from [`connect`](Self::connect) so one [`Database`] can serve
+    /// the hot tier and the subject registry, which live in the same database.
+    ///
+    /// [`Database`]: crate::Database
+    pub fn hot(&self, database: crate::Database) -> crate::hot::PostgresHot {
+        crate::hot::PostgresHot::new(database).ddl_lock_timeout(self.ddl_lock_timeout.0)
     }
 
     /// Open the pool this section describes.
-    pub async fn connect(&self) -> Result<sqlx::PgPool> {
+    pub async fn connect(&self) -> Result<crate::Database> {
         self.validate()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(self.max_connections)
-            // The archive lease is a **session** advisory lock held on a pooled
-            // connection as an RAII claim. That claim is only true if the lock
-            // cannot outlive the checkout: a future cancelled at an await point —
-            // a task abort, a `timeout` around maintenance, shutdown — drops the
-            // lease without running its release, and the connection goes back to
-            // the pool still holding the lock. Archival is then wedged, reported
-            // as the one outcome operators are told not to alert on, until
-            // `max_lifetime` recycles the connection.
-            //
-            // One statement per checkin closes it. A deployment that builds its
-            // own pool — the normal case — needs the same hook, or a leaked
-            // archive lease wedges archival.
-            .after_release(|conn, _| {
-                Box::pin(async move {
-                    sqlx::query("SELECT pg_advisory_unlock_all()")
-                        .execute(conn)
-                        .await?;
-                    Ok(true)
-                })
-            })
-            .connect(&self.tls_url()?)
-            .await
-            .map_err(|e| {
-                Error::Storage(format!(
-                    "connecting to {}: {e}{}",
-                    crate::error::redacted(&self.url),
-                    tls_hint(&e),
-                ))
-            })
-    }
-}
-
-/// What to tell an operator when a connection failed over TLS.
-fn tls_hint(e: &sqlx::Error) -> &'static str {
-    let text = e.to_string().to_ascii_lowercase();
-    if text.contains("tls") || text.contains("ssl") || text.contains("certificate") {
-        " — the connection is TLS by default (sslmode=verify-full): a server offering \
-         no TLS, or a certificate this host cannot verify, fails here. Set sslrootcert= \
-         for a private CA, or choose sslmode explicitly"
-    } else {
-        ""
+        crate::Database::connect_with(
+            &self.url,
+            &crate::DatabaseOptions::new().max_connections(self.max_connections),
+        )
+        .await
     }
 }
 
@@ -703,9 +690,9 @@ impl ColdSettings {
 pub struct Deployment {
     /// The hot tier, ready for `MeterStoreBuilder::hot`.
     pub hot: std::sync::Arc<crate::hot::PostgresHot>,
-    /// The pool behind it, for the subject registry and the application's own
-    /// tables — both of which belong in the same database.
-    pub pool: sqlx::PgPool,
+    /// The store's connection pool, shared by the hot tier and the subject
+    /// registry. An application's own tables use a pool of its own.
+    pub database: crate::Database,
     /// The cold tier, and the catalogue façade over it.
     pub cold: crate::cold::ColdTier,
     /// The deployment's subject registry, present when a table declares a
@@ -2033,8 +2020,12 @@ subject_column = "subject_ref"
         //
         // The pool is lazy and never connects — the length check runs before the
         // registry touches it — so this needs no database, only a runtime for
-        // `PgPool` to be constructed in.
-        let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
+        // the lazy pool to be constructed in.
+        let pool = crate::Database::connect_lazy_with(
+            "postgresql://localhost/unused",
+            &crate::DatabaseOptions::new(),
+        )
+        .expect("lazy pool");
         let err = PrivacySettings {
             erasure_secret: Some("too short".to_string()),
             ..PrivacySettings::default()
@@ -2088,7 +2079,11 @@ subject_column = "subject_ref"
         // without retiring the old one stops every earlier erasure from being
         // recognised, and no ring can undo that — only report it — so the file
         // has to be able to say both.
-        let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").expect("lazy pool");
+        let pool = crate::Database::connect_lazy_with(
+            "postgresql://localhost/unused",
+            &crate::DatabaseOptions::new(),
+        )
+        .expect("lazy pool");
         let settings = Settings::from_toml(
             r#"
 [privacy]

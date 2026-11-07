@@ -1,0 +1,1430 @@
+{
+  "readings": [
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":null,\"pid\":13008,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"SMGW_DIRECT_PUSH\":{\"device_id\":\"d\",\"session_id\":\"s\"}}",
+      "source_kind": "SMGW_DIRECT_PUSH",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MANUAL_ENTRY\":{\"operator_id\":\"op\",\"reason\":\"dispute\"}}",
+      "source_kind": "MANUAL_ENTRY",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"RETROACTIVE_CORRECTION\":{\"corrected_by\":\"clearing\",\"correction_ref\":\"COR-42\"}}",
+      "source_kind": "RETROACTIVE_CORRECTION",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"REDISPATCH_IMPORT\":{\"activation_ref\":\"ACT-7\",\"pid\":13020}}",
+      "source_kind": "REDISPATCH_IMPORT",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"CHARGE_DETAIL_RECORD\":{\"cdr_id\":\"CDR-1\",\"evse_id\":\"DE*ABC*E1234*1\"}}",
+      "source_kind": "CHARGE_DETAIL_RECORD",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"CLOCK_ALIGNED_METER_VALUE\":{\"evse_id\":null,\"transaction_id\":\"TX-9\"}}",
+      "source_kind": "CLOCK_ALIGNED_METER_VALUE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"DEVICE_LOG\":{\"device_id\":\"wallbox-7\",\"register\":\"1-0:1.8.0\"}}",
+      "source_kind": "DEVICE_LOG",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"VERGLEICHSWERT\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"HOLD\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"ZERO\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"NO_ACCESS\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"GRID_OUTAGE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"VOLTAGE_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DEVICE_EXCHANGE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CALIBRATION\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"OUTSIDE_OPERATING_CONDITIONS\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_EQUIPMENT_FAULT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MEASUREMENT_UNCERTAIN\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"FAULT_REGISTER_USED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CONVERSION_INCOMPLETE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CLOCK_ADJUSTED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"IMPLAUSIBLE_VALUE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"WRONG_TRANSFORMER_RATIO\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"FAULTY_READING\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CALCULATION_CHANGED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_POINT_REBUILT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DATA_PROCESSING_ERROR\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_EQUIPMENT_DEFECT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"TARIFF_TIMES_CHANGED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"TARIFF_SWITCH_DEVICE_DEFECT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"INSUFFICIENT_PULSE_WEIGHT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MAINTENANCE_CALIBRATED_DEVICE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DEVICE_REPORTS_DISTURBED_VALUES\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MAINTENANCE_CONFORMANT_DEVICE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CONSISTENCY_CHECK_FAILED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"STATED_PER_METERING_POINT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"RETROSPECTIVE_REQUEST\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"SUM\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"RESIDUAL\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"PV_SELF_CONSUMPTION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"GGV_CONSTANT_ALLOCATION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"GGV_PROPORTIONAL_ALLOCATION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[{\"occurred_at\":\"2026-07-16T06:00:00Z\",\"event_type\":\"INGESTED\",\"actor\":\"actor-0\",\"note\":\"note 0\"},{\"occurred_at\":\"2026-07-16T06:00:01Z\",\"event_type\":\"QUALITY_ASSESSED\",\"actor\":\"actor-1\",\"note\":null},{\"occurred_at\":\"2026-07-16T06:00:02Z\",\"event_type\":\"SUBSTITUTE_GENERATED\",\"actor\":\"actor-2\",\"note\":\"note 2\"},{\"occurred_at\":\"2026-07-16T06:00:03Z\",\"event_type\":\"CORRECTED\",\"actor\":\"actor-3\",\"note\":null},{\"occurred_at\":\"2026-07-16T06:00:04Z\",\"event_type\":\"ARCHIVED\",\"actor\":\"actor-4\",\"note\":\"note 4\"},{\"occurred_at\":\"2026-07-16T06:00:05Z\",\"event_type\":\"ANONYMISED\",\"actor\":\"actor-5\",\"note\":null}]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "GAS",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "GAS",
+      "unit": "M3",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "WAERME",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "WASSER",
+      "unit": "M3",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "ESTIMATED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "SUBSTITUTED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "CALCULATED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "CORRECTED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "PRELIMINARY",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "FAULTY",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "UNKNOWN",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT30M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT1H",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1D",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1Y",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT1M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT5M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": null,
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900987654320:2026-07"
+    }
+  ],
+  "releases": [
+    "0.16.0"
+  ],
+  "series": [
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":null,\"pid\":13008,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"SMGW_DIRECT_PUSH\":{\"device_id\":\"d\",\"session_id\":\"s\"}}",
+      "source_kind": "SMGW_DIRECT_PUSH",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MANUAL_ENTRY\":{\"operator_id\":\"op\",\"reason\":\"dispute\"}}",
+      "source_kind": "MANUAL_ENTRY",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"RETROACTIVE_CORRECTION\":{\"corrected_by\":\"clearing\",\"correction_ref\":\"COR-42\"}}",
+      "source_kind": "RETROACTIVE_CORRECTION",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"REDISPATCH_IMPORT\":{\"activation_ref\":\"ACT-7\",\"pid\":13020}}",
+      "source_kind": "REDISPATCH_IMPORT",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"CHARGE_DETAIL_RECORD\":{\"cdr_id\":\"CDR-1\",\"evse_id\":\"DE*ABC*E1234*1\"}}",
+      "source_kind": "CHARGE_DETAIL_RECORD",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"CLOCK_ALIGNED_METER_VALUE\":{\"evse_id\":null,\"transaction_id\":\"TX-9\"}}",
+      "source_kind": "CLOCK_ALIGNED_METER_VALUE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"DEVICE_LOG\":{\"device_id\":\"wallbox-7\",\"register\":\"1-0:1.8.0\"}}",
+      "source_kind": "DEVICE_LOG",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"VERGLEICHSWERT\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"HOLD\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"ZERO\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"NO_ACCESS\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"COMMUNICATION_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"GRID_OUTAGE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"VOLTAGE_FAILURE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DEVICE_EXCHANGE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CALIBRATION\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"OUTSIDE_OPERATING_CONDITIONS\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_EQUIPMENT_FAULT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MEASUREMENT_UNCERTAIN\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"FAULT_REGISTER_USED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CONVERSION_INCOMPLETE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CLOCK_ADJUSTED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"IMPLAUSIBLE_VALUE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"WRONG_TRANSFORMER_RATIO\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"FAULTY_READING\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CALCULATION_CHANGED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_POINT_REBUILT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DATA_PROCESSING_ERROR\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"METERING_EQUIPMENT_DEFECT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"TARIFF_TIMES_CHANGED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"TARIFF_SWITCH_DEVICE_DEFECT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"INSUFFICIENT_PULSE_WEIGHT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MAINTENANCE_CALIBRATED_DEVICE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"DEVICE_REPORTS_DISTURBED_VALUES\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"MAINTENANCE_CONFORMANT_DEVICE\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"CONSISTENCY_CHECK_FAILED\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"STATED_PER_METERING_POINT\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"AUTO_SUBSTITUTE\":{\"method\":\"INTERPOLATION\",\"reason\":\"RETROSPECTIVE_REQUEST\"}}",
+      "source_kind": "AUTO_SUBSTITUTE",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"SUM\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"RESIDUAL\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"PV_SELF_CONSUMPTION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"GGV_CONSTANT_ALLOCATION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"VIRTUAL_METER\":{\"rule\":\"GGV_PROPORTIONAL_ALLOCATION\",\"source_ids\":[\"12345678905\"]}}",
+      "source_kind": "VIRTUAL_METER",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[{\"occurred_at\":\"2026-07-16T06:00:00Z\",\"event_type\":\"INGESTED\",\"actor\":\"actor-0\",\"note\":\"note 0\"},{\"occurred_at\":\"2026-07-16T06:00:01Z\",\"event_type\":\"QUALITY_ASSESSED\",\"actor\":\"actor-1\",\"note\":null},{\"occurred_at\":\"2026-07-16T06:00:02Z\",\"event_type\":\"SUBSTITUTE_GENERATED\",\"actor\":\"actor-2\",\"note\":\"note 2\"},{\"occurred_at\":\"2026-07-16T06:00:03Z\",\"event_type\":\"CORRECTED\",\"actor\":\"actor-3\",\"note\":null},{\"occurred_at\":\"2026-07-16T06:00:04Z\",\"event_type\":\"ARCHIVED\",\"actor\":\"actor-4\",\"note\":\"note 4\"},{\"occurred_at\":\"2026-07-16T06:00:05Z\",\"event_type\":\"ANONYMISED\",\"actor\":\"actor-5\",\"note\":null}]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "GAS",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "GAS",
+      "unit": "M3",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "WAERME",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "WASSER",
+      "unit": "M3",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "ESTIMATED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "SUBSTITUTED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "CALCULATED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "CORRECTED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "PRELIMINARY",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "FAULTY",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "UNKNOWN",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT30M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT1H",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1D",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "P1Y",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT1M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT5M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": null,
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900000000003:2026-07"
+    },
+    {
+      "provenance": "[]",
+      "quality": "MEASURED",
+      "resolution": "PT15M",
+      "source_detail": "{\"MSCONS\":{\"message_ref\":\"MSG-1\",\"pid\":13005,\"sender_mp_id\":\"9900000000003\"}}",
+      "source_kind": "MSCONS",
+      "sparte": "STROM",
+      "unit": "KWH",
+      "version_scope": "9900987654320:2026-07"
+    }
+  ],
+  "written_by": "just stored-form"
+}

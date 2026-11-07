@@ -252,14 +252,13 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             // self-heals only when the pool's `max_lifetime` recycles the
             // connection.
             //
-            // The pool-level remedy is an `after_release` hook running
-            // `pg_advisory_unlock_all()`; `Settings` installs one, and a
-            // deployment that builds its own pool has to.
+            // Every pool `Database` opens runs `pg_advisory_unlock_all()` in
+            // its `after_release` hook, which clears it at check-in.
             warn!(
                 table = self.config.name(),
                 error = %e,
-                "could not release the archive lease; the pooled connection still \
-                 holds it until the pool recycles or an after_release hook clears it"
+                "could not release the archive lease; the pool's after_release hook \
+                 clears it when the connection is checked in"
             );
         }
 

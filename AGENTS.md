@@ -87,23 +87,35 @@ just features     # every feature set a published crate's users can select
 
 ## The dependency graph is load-bearing
 
-`datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`,
-`sqlx` and `sqlx-postgres` must each appear **exactly once**. `just deps` fails
-the build otherwise, because the failure is otherwise invisible: two `arrow`
-majors are two incompatible `RecordBatch` types and two `TableProvider` traits;
-two `sqlx` majors are two incompatible `PgPool` types. The error is a trait-bound
-mismatch on a type whose name reads identically in both halves.
+`datafusion`, `arrow` (and every `arrow-*`), `iceberg`, `parquet`, `metering`,
+`time`, `rust_decimal`, `sqlx` and `sqlx-postgres` must each appear **exactly
+once** in the `--all-features` graph. `just deps` fails the build otherwise, and
+fails when `cargo tree` cannot resolve, because the failure is otherwise
+invisible: two `arrow` majors are two incompatible `RecordBatch` types and two
+`TableProvider` traits. The error is a trait-bound mismatch on a type whose name
+reads identically in both halves. CI runs the same recipe.
+
+**One duplicate is admitted, by name:** the `sqlx` 0.8 `iceberg-catalog-sql`
+requires for its own pool. `Cargo.toml` declares it as `sqlx-catalog`, because
+its driver, runtime and TLS backend come from nowhere else; a unit test fails if
+one is missing.
+
+**The store owns its pool; `sqlx` is private.** `Database` is the only way a
+connection is opened — TLS by the crate's rule, advisory locks cleared at
+check-in — and no published signature names a `sqlx` type
+(`no_published_signature_names_sqlx`). Work that must share an erasure's
+transaction is an `ErasureCascade`, never the caller's transaction.
 
 Arrow is reached **through DataFusion** (`crate::arrow`), never by a direct
 `arrow::` path, so a single `use` cannot introduce skew. `Cargo.toml` does
 declare `arrow` — the copy DataFusion already pulls, for the `json` feature
 `QueryResult::to_json` needs — and `just deps` fails the build if it diverges.
 
-**`iceberg-rust` sets the ceiling.** `iceberg-datafusion` requires
-`datafusion = "53.1.0"` (a caret requirement, so 53.x and nothing past it) and
-`iceberg` requires `arrow-array = "58"`, and
-single-sourcing makes both binding on the whole crate. DataFusion 55 and Arrow 60
-exist and are unreachable. That is not a maintenance lag — do not "update" it.
+**`iceberg-rust` sets the ceiling.** `iceberg-datafusion` 0.11 requires
+`datafusion = "^54"` and `iceberg` 0.11 requires `arrow-array = "^58.4"`, and
+single-sourcing makes both binding on the whole crate. DataFusion 55 and Arrow
+59–60 exist and are unreachable while `iceberg-datafusion` is in the graph. That
+is not a maintenance lag — do not "update" it.
 
 ## Where things are
 

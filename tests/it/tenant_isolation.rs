@@ -29,7 +29,6 @@ use iceberg_catalog_sql::{
     SqlCatalogBuilder,
 };
 use meterstore::delivery::{MeasurementSeries, MeasurementSource};
-use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -43,8 +42,8 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
         .await
         .expect("postgres");
 
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database));
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()

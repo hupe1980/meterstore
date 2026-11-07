@@ -51,12 +51,12 @@ fn cold_bytes(harness: &TestHarness) -> u64 {
 /// alone returns zero — which would make the lake look infinitely better than
 /// the thing it is being compared against.
 async fn hot_bytes(harness: &TestHarness) -> u64 {
-    let size: i64 = sqlx::query_scalar(&format!(
+    let size: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0)::bigint \
          FROM pg_partition_tree('\"{}\"')",
         TestHarness::TABLE
-    ))
-    .fetch_one(harness.hot().pool())
+    )))
+    .fetch_one(&crate::fixture_pool(harness.url()))
     .await
     .expect("partition tree size");
     size.max(0) as u64
@@ -87,15 +87,21 @@ async fn the_cold_tier_compresses_against_postgres_row_storage() {
 
     // Give PostgreSQL its best case: statistics current and pages compacted, so
     // the comparison is not flattered by transient bloat from the load.
-    sqlx::query(&format!("VACUUM ANALYZE \"{}\"", TestHarness::TABLE))
-        .execute(harness.hot().pool())
-        .await
-        .expect("vacuum");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "VACUUM ANALYZE \"{}\"",
+        TestHarness::TABLE
+    )))
+    .execute(&crate::fixture_pool(harness.url()))
+    .await
+    .expect("vacuum");
 
-    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", TestHarness::TABLE))
-        .fetch_one(harness.hot().pool())
-        .await
-        .expect("count");
+    let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{}\"",
+        TestHarness::TABLE
+    )))
+    .fetch_one(&crate::fixture_pool(harness.url()))
+    .await
+    .expect("count");
     let postgres = hot_bytes(&harness).await;
 
     // Everything to the cold tier, then measure what it cost.

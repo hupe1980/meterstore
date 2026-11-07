@@ -197,8 +197,12 @@ fn next_stored_instant(t: OffsetDateTime) -> Option<OffsetDateTime> {
 fn is_from_column(expr: &Expr) -> bool {
     match expr {
         Expr::Column(c) => c.name == col::FROM,
-        Expr::Cast(cast) if is_lossless_target(&cast.data_type) => is_from_column(&cast.expr),
-        Expr::TryCast(cast) if is_lossless_target(&cast.data_type) => is_from_column(&cast.expr),
+        Expr::Cast(cast) if is_lossless_target(cast.field.data_type()) => {
+            is_from_column(&cast.expr)
+        }
+        Expr::TryCast(cast) if is_lossless_target(cast.field.data_type()) => {
+            is_from_column(&cast.expr)
+        }
         _ => false,
     }
 }
@@ -229,10 +233,10 @@ fn is_lossless_target(ty: &crate::arrow::datatypes::DataType) -> bool {
 fn as_timestamp(expr: &Expr) -> Option<OffsetDateTime> {
     let scalar = match expr {
         Expr::Literal(v, _) => v,
-        Expr::Cast(cast) if is_lossless_target(&cast.data_type) => {
+        Expr::Cast(cast) if is_lossless_target(cast.field.data_type()) => {
             return as_timestamp(&cast.expr);
         }
-        Expr::TryCast(cast) if is_lossless_target(&cast.data_type) => {
+        Expr::TryCast(cast) if is_lossless_target(cast.field.data_type()) => {
             return as_timestamp(&cast.expr);
         }
         _ => return None,

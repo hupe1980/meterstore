@@ -421,38 +421,37 @@ async fn corrections_landing_during_a_scan_are_never_double_counted() {
 /// cannot reach — which is the whole of what is being tested. Sharing the
 /// harness's pool would make the lock re-entrant and the test vacuous.
 async fn second_replica(harness: &TestHarness) -> Arc<meterstore::PostgresHot> {
-    let pool = sqlx::PgPool::connect(harness.url())
+    let database = meterstore::Database::connect(harness.url())
         .await
         .expect("second replica pool");
-    Arc::new(meterstore::PostgresHot::new(pool))
+    Arc::new(meterstore::PostgresHot::new(database))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_leaked_lease_is_cleared_when_its_connection_is_next_used() {
+async fn a_dropped_lease_is_free_at_checkin() {
     // A lease is a *session* advisory lock on a connection the lease owns. A
     // future dropped at an await point — a task abort, a `timeout`, shutdown —
-    // skips the release, and the connection goes back to the pool still holding
-    // it. Every other session is then refused, and it is reported as
-    // `lease_contended`: the one outcome operators are told not to alert on.
+    // skips the release, and the connection goes back to the pool. Every pool a
+    // `Database` opens clears advisory locks on check-in, so the lock dies with
+    // the checkout instead of riding the connection back into the pool, where
+    // every other replica would read it as `lease_contended` — the one outcome
+    // operators are told not to alert on.
     //
-    // The re-entrancy is what made it permanent. Advisory locks nest per session,
-    // so handing the connection back out let `pg_try_advisory_lock` succeed —
-    // count two — and the single unlock on release left it at one. The lock was
-    // then held forever by a connection nobody was using.
-    //
-    // Asserted from a **second session**, because that is the only place the
-    // difference shows: on the leaking connection itself the re-entrancy makes
-    // every attempt succeed whether or not anything was cleared.
+    // Asserted from a **second session**, without touching the first pool
+    // again: on the leaking connection itself re-entrancy makes every attempt
+    // succeed whether or not anything was cleared, and reusing it would also
+    // clear it on the next lease.
     use meterstore::tiering::HotStore;
 
     let (harness, _store) = seeded().await;
     let table = harness.config().name();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(harness.url())
-        .await
-        .expect("single-connection pool");
-    let leaky = meterstore::PostgresHot::new(pool);
+    let database = meterstore::Database::connect_with(
+        harness.url(),
+        &meterstore::DatabaseOptions::new().max_connections(1),
+    )
+    .await
+    .expect("single-connection pool");
+    let leaky = meterstore::PostgresHot::new(database);
     let observer = second_replica(&harness).await;
 
     // Leak it: take the lease and drop it without releasing.
@@ -463,35 +462,26 @@ async fn a_leaked_lease_is_cleared_when_its_connection_is_next_used() {
             .expect("lease query")
             .expect("an uncontended lease is granted"),
     );
-    assert!(
-        observer
+
+    // Check-in runs on the pool's own task, so the lock is free shortly after
+    // the drop rather than at it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let lease = loop {
+        if let Some(lease) = observer
             .try_archive_lease(table)
             .await
             .expect("lease query")
-            .is_none(),
-        "the leaked lock really is still held, or this test proves nothing"
-    );
-
-    // The leaking pool has one connection, so the next lease gets it back —
-    // clears what was leaked, takes the lock cleanly, and releases it.
-    leaky
-        .try_archive_lease(table)
-        .await
-        .expect("lease query")
-        .expect("the leaking pool must be able to lease its own table")
-        .release()
-        .await
-        .expect("release");
-
-    assert!(
-        observer
-            .try_archive_lease(table)
-            .await
-            .expect("lease query")
-            .is_some(),
-        "the lock is still held after a clean acquire-and-release: the leaked \
-         count was decremented rather than cleared, so archival stays wedged"
-    );
+        {
+            break lease;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped lease still holds its lock after check-in: archival is wedged \
+             until the leaking connection happens to be reused or recycled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    lease.release().await.expect("release");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

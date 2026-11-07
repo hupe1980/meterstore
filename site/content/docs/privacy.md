@@ -69,7 +69,11 @@ decided.
 ```rust
 let readings = MeterStore::builder()
     .table(TableConfig::new("readings_versions").subject_column("subject_ref").build()?)
-    .subject_registry(SubjectRegistry::with_erasure_secret(pool.clone(), &secret)?);
+    .subject_registry(
+        SubjectRegistry::with_erasure_secret(database.clone(), &secret)?
+            // The application's own rows go with the mapping, in its transaction.
+            .with_cascade(ErasureCascade::new("DELETE FROM billing_periods WHERE subject_ref = $1")?),
+    );
     // … hot, cold
 
 let catalog = MeterCatalog::builder().table(readings).build().await?;
@@ -305,9 +309,19 @@ an earlier shape of these tables is refused there — naming what to drop — ra
 than at the first erasure, as a missing-column error.
 
 `Settings::connect()` builds **one** registry for the whole deployment, over the
-hot tier's pool, so erasure can share a transaction with the application's own
-tables (`SubjectRegistry::erase_in`). A configuration with no subject column and
-no existing `meterstore_subject_map` gets no registry and creates none of its
+hot tier's `Database`. The application's own rows that a request must reach —
+billing periods, substitute-value logs — are declared as cascades, which every
+request-triggered erasure runs in the transaction that destroys the mapping, with
+the erased reference bound as `$1`; a failing cascade fails the erasure:
+
+```toml
+[privacy]
+erasure_cascade = ["DELETE FROM billing_periods WHERE subject_ref = $1"]
+```
+
+The retention sweep runs none: it pseudonymises, and rows keyed by the reference
+may carry retention duties of their own. A configuration with no subject column
+and no existing `meterstore_subject_map` gets no registry and creates none of its
 tables.
 
 `erasure_secret`, which turns the suppression list on, is optional because a lost

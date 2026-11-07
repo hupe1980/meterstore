@@ -52,6 +52,8 @@ const V2: i64 = 20_260_715_000_002;
 
 struct Harness {
     hot: Arc<PostgresHot>,
+    /// The test's own connection, for SQL the store does not issue.
+    pool: PgPool,
     cold: Arc<IcebergCold>,
     /// Kept so a test can open a **second** session — an advisory lock is
     /// session-scoped, so genuine contention needs a separate pool.
@@ -66,7 +68,9 @@ impl Harness {
             .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
-        let hot = Arc::new(PostgresHot::new(pool));
+
+        let database = meterstore::Database::connect(&url).await.expect("database");
+        let hot = Arc::new(PostgresHot::new(database));
         hot.create_table(TABLE).await.expect("create hot table");
 
         let warehouse = tempfile::tempdir().expect("temp warehouse");
@@ -98,6 +102,7 @@ impl Harness {
 
         Self {
             hot,
+            pool,
             cold,
             url,
             _warehouse: warehouse,
@@ -135,7 +140,7 @@ impl Harness {
 
         for i in 0..count {
             let from = start + step * i as i32;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit,
                     quality, resolution, source_kind, source_detail, provenance,
@@ -143,7 +148,7 @@ impl Harness {
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH',$9,$10,'MSCONS',
                            $6,'[]',$7,'9900000000003:2026-07',$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
-            ))
+            )))
             .bind(malo)
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
             .bind(from)
@@ -154,7 +159,7 @@ impl Harness {
             .bind(datetime!(2026-07-27 06:00 UTC))
             .bind(quality)
             .bind(resolution)
-            .execute(self.hot.pool())
+            .execute(&self.pool)
             .await
             .expect("insert");
         }
@@ -812,10 +817,12 @@ async fn a_contended_archiver_does_nothing_rather_than_racing() {
         "the boundary must not have moved"
     );
 
-    let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-        .fetch_one(h.hot.pool())
-        .await
-        .unwrap();
+    let still_hot: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "{TABLE}""#
+    )))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
     assert_eq!(still_hot, 96, "no partition may have been detached");
 
     held.release().await.unwrap();
@@ -1000,8 +1007,8 @@ async fn a_store_can_be_built_before_its_tables_exist() {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database));
 
     let warehouse = tempfile::tempdir().expect("temp warehouse");
     let catalog = SqlCatalogBuilder::default()
@@ -1173,8 +1180,10 @@ async fn two_archivers_racing_produce_one_archival_and_no_lost_rows() {
 
     // A second, independent pool: a different session, and therefore a real
     // competitor for the lock.
-    let second_pool = PgPool::connect(&h.url).await.expect("second pool");
-    let second_hot = Arc::new(PostgresHot::new(second_pool));
+    let second_database = meterstore::Database::connect(&h.url)
+        .await
+        .expect("database");
+    let second_hot = Arc::new(PostgresHot::new(second_database));
 
     let first = Archiver::new(Arc::clone(&h.hot), Arc::clone(&h.cold), h.config());
     let second = Archiver::new(second_hot, Arc::clone(&h.cold), h.config());

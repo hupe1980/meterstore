@@ -56,17 +56,14 @@ impl PostgresHot {
     /// forgotten `BEGIN` does not take the write path down with it.
     const DEFAULT_DDL_LOCK_TIMEOUT: Duration = Duration::seconds(3);
 
-    /// Wrap an existing connection pool.
+    /// The hot tier over a [`Database`](crate::Database).
     ///
-    /// The pool is the caller's, and so is its transport: its `sslmode`
-    /// governs, and `sqlx`'s own default is `prefer`, which falls back to
-    /// plaintext without saying so. [`HotSettings::connect`] opens one with
-    /// verified TLS by default.
-    ///
-    /// [`HotSettings::connect`]: crate::settings::HotSettings::connect
-    pub fn new(pool: PgPool) -> Self {
+    /// The pool is the store's own: every connection in it is TLS by the
+    /// crate's rule and is cleared of advisory locks when it is checked in,
+    /// which is what keeps a cancelled archive lease from wedging archival.
+    pub fn new(database: crate::Database) -> Self {
         Self {
-            pool,
+            pool: database.pool().clone(),
             scan_chunk_rows: Self::DEFAULT_SCAN_CHUNK_ROWS,
             integrity_constraints: true,
             ddl_lock_timeout: Self::DEFAULT_DDL_LOCK_TIMEOUT,
@@ -141,11 +138,6 @@ impl PostgresHot {
     pub fn scan_chunk_rows(mut self, rows: usize) -> Self {
         self.scan_chunk_rows = rows.max(1);
         self
-    }
-
-    /// The underlying pool, for callers that also write through it.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
     }
 
     /// Create the partitioned parent table if it does not exist.
@@ -286,7 +278,13 @@ impl PostgresHot {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        sqlx::query(&ddl).execute(&self.pool).await.map_err(pg)?;
+        let identifiers = std::iter::once(table)
+            .chain(merge_key.iter().map(String::as_str))
+            .chain(extra.iter().map(|f| f.name().as_str()));
+        sqlx::query(checked(ddl, identifiers)?)
+            .execute(&self.pool)
+            .await
+            .map_err(pg)?;
 
         // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, which is
         // what makes `create_tables` safe to call on every start — and what
@@ -300,7 +298,10 @@ impl PostgresHot {
         let idx = format!(
             r#"CREATE INDEX IF NOT EXISTS "{table}_malo_from_idx" ON "{table}" (malo_id, "from")"#
         );
-        sqlx::query(&idx).execute(&self.pool).await.map_err(pg)?;
+        sqlx::query(checked(idx, [table])?)
+            .execute(&self.pool)
+            .await
+            .map_err(pg)?;
 
         // One row per table, written by `drop_partition` and read by every hot
         // scan. `IF NOT EXISTS` so the second table created in a deployment
@@ -485,7 +486,8 @@ async fn add_integrity_constraints(
                    EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
             equality.join(", "),
         );
-        sqlx::query(&ddl)
+        let identifiers = std::iter::once(partition).chain(key.iter().map(String::as_str));
+        sqlx::query(checked(ddl, identifiers)?)
             .execute(&mut *conn)
             .await
             .map_err(|e| pg_ddl(partition, "add overlap exclusion", lock_timeout, e))?;
@@ -521,7 +523,8 @@ async fn add_integrity_constraints(
                EXCLUDE USING gist ({}, split_part(version_scope, ':', 1) WITH <>)"#,
         merge_key.join(", "),
     );
-    sqlx::query(&ddl)
+    let identifiers = std::iter::once(partition).chain(key.iter().map(String::as_str));
+    sqlx::query(checked(ddl, identifiers)?)
         .execute(&mut *conn)
         .await
         .map_err(|e| pg_ddl(partition, "add operator exclusion", lock_timeout, e))?;
@@ -677,7 +680,8 @@ impl PostgresHot {
                 AND s.obis_code = k.obis_code
                 AND s."from" = k."from""#
         );
-        let stored = sqlx::query(&sql)
+        let identifiers = std::iter::once(table).chain(identity.iter().map(String::as_str));
+        let stored = sqlx::query(checked(sql, identifiers)?)
             .bind(&malo)
             .bind(&obis)
             .bind(&from)
@@ -906,7 +910,10 @@ impl PostgresHot {
             core_cols = scan_columns(),
         );
 
-        let mut query = sqlx::query(&sql)
+        let identifiers = std::iter::once(table)
+            .chain(merge_key.iter().map(String::as_str))
+            .chain(extra.iter().map(String::as_str));
+        let mut query = sqlx::query(checked(sql, identifiers)?)
             .bind(&malo)
             .bind(&melo)
             .bind(&obis)
@@ -1007,7 +1014,8 @@ impl PostgresHot {
                    ) AS incoming(malo_id, obis_code, "from", version, value, melo_id{identity_cols})
                    JOIN "{table}" stored ON {join}"#
             );
-            let mut query = sqlx::query_as::<_, (i64, i64)>(&sql)
+            let identifiers = std::iter::once(table).chain(merge_key.iter().map(String::as_str));
+            let mut query = sqlx::query_as::<_, (i64, i64)>(checked(sql, identifiers)?)
                 .bind(&malo)
                 .bind(&obis)
                 .bind(&from)
@@ -1170,7 +1178,10 @@ impl PostgresHot {
                 }
                 sql.push_str(&format!(r#" ORDER BY {order_by} LIMIT {chunk}"#));
 
-                let mut query = sqlx::query(&sql);
+                let identifiers = std::iter::once(relation.as_str())
+                    .chain(cursor_columns.iter().map(String::as_str))
+                    .chain(extra.iter().map(String::as_str));
+                let mut query = sqlx::query(checked(sql, identifiers)?);
                 if let Some(start) = range.start() {
                     query = query.bind(start);
                 }
@@ -1293,7 +1304,7 @@ impl PostgresHot {
                 ),
             ),
         ] {
-            sqlx::query(&sql)
+            sqlx::query(checked(sql, [name.as_str(), table])?)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| pg_ddl(&name, operation, timeout, e))?;
@@ -1306,10 +1317,13 @@ impl PostgresHot {
             add_integrity_constraints(&mut tx, table, &name, timeout).await?;
         }
 
-        sqlx::query(&format!(
-            r#"ALTER TABLE "{table}" ATTACH PARTITION "{name}"
+        sqlx::query(checked(
+            format!(
+                r#"ALTER TABLE "{table}" ATTACH PARTITION "{name}"
                    FOR VALUES FROM ('{lower}') TO ('{upper}')"#
-        ))
+            ),
+            [table, name.as_str()],
+        )?)
         .execute(&mut *tx)
         .await
         .map_err(|e| pg_ddl(table, "attach partition", timeout, e))?;
@@ -1317,9 +1331,10 @@ impl PostgresHot {
         // Now redundant with the partition constraint the attach installed, and
         // no longer free: left in place it is a second predicate evaluated on
         // every one of the ~9.6 M rows a day at metering volume puts here.
-        sqlx::query(&format!(
-            r#"ALTER TABLE "{name}" DROP CONSTRAINT "{name}_bound""#
-        ))
+        sqlx::query(checked(
+            format!(r#"ALTER TABLE "{name}" DROP CONSTRAINT "{name}_bound""#),
+            [name.as_str()],
+        )?)
         .execute(&mut *tx)
         .await
         .map_err(|e| pg_ddl(&name, "drop bound constraint", timeout, e))?;
@@ -1354,10 +1369,13 @@ impl PostgresHot {
         let mut tx = self.begin_ddl().await?;
         for relation in &relations {
             for f in &nullable {
-                sqlx::query(&format!(
-                    r#"ALTER TABLE "{relation}" ADD COLUMN IF NOT EXISTS {}"#,
-                    column_ddl(f)?
-                ))
+                sqlx::query(checked(
+                    format!(
+                        r#"ALTER TABLE "{relation}" ADD COLUMN IF NOT EXISTS {}"#,
+                        column_ddl(f)?
+                    ),
+                    [relation.as_str(), f.name().as_str()],
+                )?)
                 .execute(&mut *tx)
                 .await
                 .map_err(pg)?;
@@ -1379,7 +1397,7 @@ impl PostgresHot {
             // Interpolated rather than bound: `SET` takes no parameters, and the
             // value is an integer this crate computed from its own configuration.
             let ms = self.ddl_lock_timeout.whole_milliseconds().max(1);
-            sqlx::query(&format!("SET LOCAL lock_timeout = {ms}"))
+            sqlx::query(checked(format!("SET LOCAL lock_timeout = {ms}"), [""; 0])?)
                 .execute(&mut *tx)
                 .await
                 .map_err(pg)?;
@@ -1580,6 +1598,39 @@ fn value_check_pattern(kind: &str) -> &'static str {
 /// of rejecting rows the domain considers valid. The codes are compile-time
 /// constants of this crate's own dependency, so there is no injection surface —
 /// but they are still quoted properly rather than pasted.
+/// Hand a built statement to `sqlx`, having checked every identifier in it.
+///
+/// An identifier cannot be bound, so a table, partition or column name reaches
+/// the statement as text, and a name carrying a `"` would close its quotes and
+/// continue as SQL. The names are checked here, where they meet the statement,
+/// rather than only where a table is declared: [`HotStore`] and
+/// [`PartitionId`] are public and take any string. Each caller names the
+/// identifiers its statement interpolates; everything else in the text is
+/// `$n` placeholders, crate constants, numbers this crate computed, and
+/// timestamps from [`pg_timestamp`].
+///
+/// Library code reaches `AssertSqlSafe` here and in
+/// [`ErasureCascade`](crate::ErasureCascade), whose statement is the
+/// deployment's own, and nowhere else (`only_checked_statements_reach_sqlx`),
+/// so a built statement that skipped the check does not compile.
+pub(crate) fn checked<I, S>(sql: String, identifiers: I) -> Result<sqlx::AssertSqlSafe<String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for id in identifiers {
+        let id = id.as_ref();
+        if !crate::config::is_plain_identifier(id) {
+            return Err(Error::config(format!(
+                "{id:?} is not a plain identifier — a letter or underscore followed \
+                 by letters, digits or underscores — and is written into SQL, where \
+                 an identifier cannot be bound"
+            )));
+        }
+    }
+    Ok(sqlx::AssertSqlSafe(sql))
+}
+
 fn sql_code_list(codes: &[&str]) -> String {
     codes
         .iter()
@@ -2157,7 +2208,7 @@ async fn partitions_of(
         },
     );
 
-    let rows = sqlx::query_scalar::<_, String>(&sql)
+    let rows = sqlx::query_scalar::<_, String>(checked(sql, [""; 0])?)
         .bind(format!("{}\\_%", table.replace('_', "\\_")))
         .fetch_all(pool)
         .await
@@ -2301,10 +2352,13 @@ impl HotStore for PostgresHot {
         // `CASCADE` because the partitions are dependent relations; without it
         // PostgreSQL refuses while any remains attached, and a detached orphan
         // from an interrupted run would survive as a table nobody owns.
-        sqlx::query(&format!(r#"DROP TABLE IF EXISTS "{table}" CASCADE"#))
-            .execute(&self.pool)
-            .await
-            .map_err(pg)?;
+        sqlx::query(checked(
+            format!(r#"DROP TABLE IF EXISTS "{table}" CASCADE"#),
+            [table],
+        )?)
+        .execute(&self.pool)
+        .await
+        .map_err(pg)?;
 
         // A detached partition is no longer a dependent relation, so `CASCADE`
         // above does not reach it. Left behind it would hold rows from a table
@@ -2315,10 +2369,13 @@ impl HotStore for PostgresHot {
         // parent is exactly the detached leftovers.
         for orphan in self.orphaned_partitions(table).await? {
             let name = orphan.relation_name()?;
-            sqlx::query(&format!(r#"DROP TABLE IF EXISTS "{name}""#))
-                .execute(&self.pool)
-                .await
-                .map_err(pg)?;
+            sqlx::query(checked(
+                format!(r#"DROP TABLE IF EXISTS "{name}""#),
+                [name.as_str()],
+            )?)
+            .execute(&self.pool)
+            .await
+            .map_err(pg)?;
         }
 
         // The table's rows in the shared bookkeeping go with it. A reclaimed mark
@@ -2327,11 +2384,14 @@ impl HotStore for PostgresHot {
         // them, until its own boundary passed it.
         for bookkeeping in ["meterstore_reclaimed", "meterstore_pins"] {
             if self.relation_exists(bookkeeping).await? {
-                sqlx::query(&format!(r#"DELETE FROM {bookkeeping} WHERE "table" = $1"#))
-                    .bind(table)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(pg)?;
+                sqlx::query(checked(
+                    format!(r#"DELETE FROM {bookkeeping} WHERE "table" = $1"#),
+                    [bookkeeping],
+                )?)
+                .bind(table)
+                .execute(&self.pool)
+                .await
+                .map_err(pg)?;
             }
         }
 
@@ -2391,9 +2451,10 @@ impl HotStore for PostgresHot {
             return Ok(());
         }
 
-        sqlx::query(&format!(
-            r#"ALTER TABLE "{table}" DETACH PARTITION "{name}""#
-        ))
+        sqlx::query(checked(
+            format!(r#"ALTER TABLE "{table}" DETACH PARTITION "{name}""#),
+            [table, name.as_str()],
+        )?)
         .execute(&mut *tx)
         .await
         .map_err(|e| pg_ddl(table, "detach partition", self.ddl_lock_timeout, e))?;
@@ -2548,9 +2609,10 @@ impl HotStore for PostgresHot {
         // so it touches no heap pages and evicts nothing the operational
         // workload is using — which is the same reason archival prefers a closed
         // partition for the archival read itself.
-        let count = sqlx::query_scalar::<_, i64>(&format!(
-            r#"SELECT count(DISTINCT malo_id) FROM "{name}""#
-        ))
+        let count = sqlx::query_scalar::<_, i64>(checked(
+            format!(r#"SELECT count(DISTINCT malo_id) FROM "{name}""#),
+            [name.as_str()],
+        )?)
         .fetch_one(&self.pool)
         .await
         .map_err(pg)?;
@@ -2618,10 +2680,13 @@ impl HotStore for PostgresHot {
             return Ok(Reclamation::HeldByReader);
         }
 
-        sqlx::query(&format!(r#"DROP TABLE IF EXISTS "{name}""#))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| pg_ddl(&name, "drop partition", self.ddl_lock_timeout, e))?;
+        sqlx::query(checked(
+            format!(r#"DROP TABLE IF EXISTS "{name}""#),
+            [name.as_str()],
+        )?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_ddl(&name, "drop partition", self.ddl_lock_timeout, e))?;
 
         // In the same transaction as the drop, and monotonic.
         //
@@ -2706,7 +2771,7 @@ impl HotStore for PostgresHot {
 
     async fn invariant_violations(&self, table: &str, watermark: TieringWatermark) -> Result<u64> {
         let sql = format!(r#"SELECT count(*) FROM "{table}" WHERE "from" < $1"#);
-        let count = sqlx::query_scalar::<_, i64>(&sql)
+        let count = sqlx::query_scalar::<_, i64>(checked(sql, [table])?)
             .bind(watermark.get())
             .fetch_one(&self.pool)
             .await
@@ -2792,6 +2857,71 @@ fn decimal_to_i128(value: Decimal, scale: i8, column: &str) -> Result<i128> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checked_refuses_an_identifier_that_could_end_its_quotes() {
+        // `"x"; DROP TABLE y; "z` balances its own quotes once interpolated into
+        // `"{table}"`, so only a check of the name itself can refuse it.
+        for bad in ["a\"b", "x\"; DROP TABLE y; \"z", "", "1st", "with space"] {
+            let Err(err) = super::checked("SELECT 1".to_string(), [bad]) else {
+                panic!("{bad:?} was accepted");
+            };
+            assert!(matches!(err, Error::Config(_)), "{bad:?}: {err}");
+        }
+        for good in ["readings", "readings_2026_07_20_0000", "_x9"] {
+            assert!(
+                super::checked("SELECT 1".to_string(), [good]).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_checked_statements_reach_sqlx() {
+        // A built statement reaches `sqlx` through `checked`, or through an
+        // `ErasureCascade`, which holds the deployment's own SQL. A third
+        // `AssertSqlSafe` would be a statement nothing checked.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(
+            files.len() > 20,
+            "read {} files: not the source tree",
+            files.len()
+        );
+        let needle = concat!("AssertSqlSafe", "(");
+        let mut sites = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read");
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(needle) && !line.trim_start().starts_with("//") {
+                    sites.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            2,
+            "AssertSqlSafe outside `checked` and `ErasureCascade::run`: {sites:#?}"
+        );
+        assert!(
+            sites.iter().any(|s| s.contains("hot/postgres.rs")),
+            "{sites:#?}"
+        );
+        assert!(sites.iter().any(|s| s.contains("erasure.rs")), "{sites:#?}");
+    }
+
     use super::*;
     use time::macros::datetime;
 

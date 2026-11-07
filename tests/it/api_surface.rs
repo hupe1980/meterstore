@@ -129,10 +129,94 @@ fn the_prelude_carries_only_what_a_caller_writes() {
         .sum::<usize>();
 
     assert_eq!(
-        names, 35,
+        names, 38,
         "the prelude exports {names} names. If the new one is something a caller \
          has to *write* — a builder argument, a struct literal, a trait bound — \
          update the number. If it only ever comes back from a method, leave it at \
          its own path: the name is inferred and the import buys nothing."
+    );
+}
+
+#[test]
+fn no_published_signature_names_sqlx() {
+    // The store owns its pool and keeps its driver private. A driver type in a
+    // signature binds every caller to this crate's driver major on every
+    // upgrade, and a re-export binds it just as tightly: a service on another
+    // `sqlx` could not construct the hot tier at all. Checked over every
+    // `pub fn`, `pub` field and `pub use` in `src/`, signatures across lines.
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    assert!(
+        files.len() > 20,
+        "read {} files: not the source tree",
+        files.len()
+    );
+
+    let driver = |text: &str| {
+        ["sqlx", "PgPool", "PgConnection"]
+            .iter()
+            .any(|t| text.contains(t))
+    };
+    let mut offenders = Vec::new();
+    let mut constructors = 0;
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read");
+        let code: String = text
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (at, _) in code.match_indices("pub ") {
+            let rest = &code[at..];
+            let item = if rest.starts_with("pub fn ") || rest.starts_with("pub async fn ") {
+                &rest[..rest.find(['{', ';']).unwrap_or(rest.len())]
+            } else if rest.starts_with("pub use ") {
+                &rest[..rest.find(';').unwrap_or(rest.len())]
+            } else if rest[4..].split_once(':').is_some_and(|(name, _)| {
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            }) {
+                &rest[..rest.find([',', '\n']).unwrap_or(rest.len())]
+            } else {
+                continue;
+            };
+            if item.contains("fn connect_with(") || item.contains("fn connect_lazy_with(") {
+                constructors += 1;
+            }
+            if driver(item) {
+                let line = code[..at].lines().count() + 1;
+                offenders.push(format!(
+                    "{}:{line}: {}",
+                    file.display(),
+                    item.split_whitespace().collect::<Vec<_>>().join(" ")
+                ));
+            }
+        }
+    }
+    assert_eq!(
+        constructors, 2,
+        "the scan did not see `Database`'s constructors"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a published signature names the driver; take or return a `meterstore::Database`: {offenders:#?}"
     );
 }

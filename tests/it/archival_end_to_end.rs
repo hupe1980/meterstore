@@ -39,6 +39,8 @@ const NOW: OffsetDateTime = datetime!(2026-07-30 00:00 UTC);
 
 struct Harness {
     hot: PostgresHot,
+    /// The test's own connection, for SQL the store does not issue.
+    pool: PgPool,
     cold: Arc<IcebergCold>,
     /// The raw catalogue, so a test can commit the way a *foreign* tool would.
     catalog: Arc<dyn Catalog>,
@@ -52,7 +54,9 @@ impl Harness {
             .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
-        let hot = PostgresHot::new(pool);
+
+        let database = meterstore::Database::connect(&url).await.expect("database");
+        let hot = PostgresHot::new(database);
         hot.create_table(TABLE).await.expect("create hot table");
 
         let warehouse = tempfile::tempdir().expect("temp warehouse");
@@ -84,6 +88,7 @@ impl Harness {
 
         Self {
             hot,
+            pool,
             cold,
             catalog,
             _warehouse: warehouse,
@@ -100,14 +105,14 @@ impl Harness {
 
         for i in 0..count {
             let from = start + Duration::minutes(15 * i);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     resolution, source_kind, source_detail, provenance,
                     version, version_scope, recorded_at, balancing_day)
                    VALUES ($1,$2,$3,'STROM',$4,$5,$6,'KWH',$7,$8,$9,$10,$11,$12,$13,$14,
                            CAST(($4 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
-            ))
+            )))
             .bind(format!("1234567890{}", i % 3))
             .bind(None::<String>)
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
@@ -122,17 +127,19 @@ impl Harness {
             .bind(rust_decimal::Decimal::new(version, 0))
             .bind("9900000000003:2026-07")
             .bind(datetime!(2026-07-27 06:00 UTC))
-            .execute(self.hot.pool())
+            .execute(&self.pool)
             .await
             .expect("insert");
         }
     }
 
     async fn hot_rows(&self) -> i64 {
-        sqlx::query_scalar::<_, i64>(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-            .fetch_one(self.hot.pool())
-            .await
-            .unwrap()
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            r#"SELECT count(*) FROM "{TABLE}""#
+        )))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
     }
 
     /// Commit a snapshot the way an out-of-band maintenance tool does: a valid

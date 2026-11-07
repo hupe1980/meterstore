@@ -30,7 +30,6 @@ use meterstore::encode::StoredReadings;
 use meterstore::hot::PostgresHot;
 use meterstore::tiering::store::{ColdStore, HotStore};
 use rust_decimal::Decimal;
-use sqlx::PgPool;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -56,8 +55,8 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
-    let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = Arc::new(PostgresHot::new(pool));
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = Arc::new(PostgresHot::new(database));
 
     let warehouse = tempfile::tempdir().expect("warehouse");
     let catalog = SqlCatalogBuilder::default()

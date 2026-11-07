@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 
 use crate::cold::{IcebergCold, IcebergSqlCatalog, WarehouseAuth};
@@ -89,10 +88,7 @@ impl TestHarness {
         // isolation for milliseconds instead of seconds.
         let url = super::postgres::fresh_database().await?;
 
-        let pool = PgPool::connect(&url)
-            .await
-            .map_err(|e| crate::Error::Storage(e.to_string()))?;
-        let hot = Arc::new(PostgresHot::new(pool));
+        let hot = Arc::new(PostgresHot::new(crate::Database::connect(&url).await?));
 
         let warehouse = tempfile::tempdir()
             .map_err(|e| crate::Error::Storage(format!("temp warehouse: {e}")))?;

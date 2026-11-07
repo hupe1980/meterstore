@@ -42,7 +42,6 @@
 //! right — that is `metering`'s suite's job, plus the contract test in
 //! `tests/it/calendar_delegation.rs`.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::common::{DataFusionError, Result as DfResult, ScalarValue};
@@ -238,9 +237,6 @@ impl ObisPredicate {
 }
 
 impl ScalarUDFImpl for ObisPredicate {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.name
     }
@@ -330,9 +326,6 @@ impl QualityPredicate {
 }
 
 impl ScalarUDFImpl for QualityPredicate {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.name
     }
@@ -382,9 +375,6 @@ impl Default for QualityMarketCode {
 }
 
 impl ScalarUDFImpl for QualityMarketCode {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "quality_market_code"
     }
@@ -425,9 +415,6 @@ impl Default for ObisTariffRegister {
 }
 
 impl ScalarUDFImpl for ObisTariffRegister {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "obis_tariff_register"
     }
@@ -466,9 +453,6 @@ impl Default for ObisNormalise {
 }
 
 impl ScalarUDFImpl for ObisNormalise {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "obis_normalise"
     }
@@ -524,9 +508,6 @@ impl Default for ObisDirection {
 }
 
 impl ScalarUDFImpl for ObisDirection {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "obis_direction"
     }
@@ -602,9 +583,6 @@ impl Default for EicRegelzone {
 }
 
 impl ScalarUDFImpl for EicRegelzone {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "eic_regelzone"
     }
@@ -674,9 +652,6 @@ impl Default for EicNormalise {
 }
 
 impl ScalarUDFImpl for EicNormalise {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "eic_normalise"
     }
@@ -742,9 +717,6 @@ impl Default for EicObjectType {
 }
 
 impl ScalarUDFImpl for EicObjectType {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "eic_object_type"
     }
@@ -779,9 +751,6 @@ impl Default for LocalDay {
 }
 
 impl ScalarUDFImpl for LocalDay {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_local_day"
     }
@@ -840,9 +809,6 @@ impl Default for GasDay {
 }
 
 impl ScalarUDFImpl for GasDay {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_gas_day"
     }
@@ -901,9 +867,6 @@ impl Default for BalancingDay {
 }
 
 impl ScalarUDFImpl for BalancingDay {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_balancing_day"
     }
@@ -956,9 +919,6 @@ impl Default for LocalMonth {
 }
 
 impl ScalarUDFImpl for LocalMonth {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_local_month"
     }
@@ -1026,9 +986,6 @@ impl Default for BalancingMonth {
 }
 
 impl ScalarUDFImpl for BalancingMonth {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_balancing_month"
     }
@@ -1107,9 +1064,6 @@ impl Default for ExpectedIntervals {
 }
 
 impl ScalarUDFImpl for ExpectedIntervals {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "meter_expected_intervals"
     }

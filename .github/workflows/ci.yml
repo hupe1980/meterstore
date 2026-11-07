@@ -93,28 +93,16 @@ jobs:
 
   # Two DataFusion majors in one graph give mutually incompatible
   # `TableProvider` types. This already happened once via
-  # `datafusion-table-providers`, so it is a hard gate, not a lint.
+  # `datafusion-table-providers`, so it is a hard gate, not a lint. The recipe
+  # is the one `just check` runs, so CI and a laptop check one list.
   single-sourced-deps:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: No duplicate datafusion / arrow / iceberg
-        run: |
-          # `cargo tree -d` also lists a package twice when it is built for both
-          # host and target (build-dependencies), at the *same* version. That is
-          # not a conflict. Only differing versions of a single-sourced crate are.
-          conflicts=$(cargo tree -d --edges normal 2>/dev/null \
-            | grep -oE '^(datafusion|arrow|iceberg|parquet|metering|time|rust_decimal) v[0-9.]+' \
-            | sort -u \
-            | awk '{ seen[$1]++ } END { for (n in seen) if (seen[n] > 1) print n }')
-          if [ -n "$conflicts" ]; then
-            echo "::error::multiple versions of a single-sourced dependency: $conflicts"
-            cargo tree -d --edges normal
-            exit 1
-          fi
-          echo "single-sourced dependencies OK"
-
+      - uses: extractions/setup-just@v2
+      - name: No duplicate datafusion / arrow / iceberg / sqlx
+        run: just deps
 
   # `--all-features` hides a broken feature combination entirely: an optional
   # dependency reached from non-optional code compiles fine as long as

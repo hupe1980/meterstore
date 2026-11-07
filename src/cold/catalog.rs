@@ -616,6 +616,57 @@ impl ColdTier {
 
 #[cfg(test)]
 mod tests {
+    /// The SQL catalogue's driver, runtime and TLS backend are this crate's
+    /// declaration (`sqlx-catalog` in `Cargo.toml`): `iceberg-catalog-sql`
+    /// names its `sqlx` with `any` alone and installs whatever drivers the build
+    /// enabled. With `sslmode=require` the PostgreSQL driver refuses before
+    /// writing a byte unless TLS is compiled in, so an SSLRequest reaching the
+    /// socket proves all three: the driver is registered, a runtime drives it,
+    /// and it can speak TLS.
+    #[cfg(feature = "sql-catalog")]
+    #[tokio::test]
+    async fn the_sql_catalogue_sqlx_speaks_postgres_and_asks_for_tls() {
+        use sqlx_catalog::Connection;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 8];
+            socket.read_exact(&mut request).await.expect("read");
+            // `N`: this server does not speak TLS, which ends the attempt.
+            socket.write_all(b"N").await.expect("write");
+            request
+        });
+
+        sqlx_catalog::any::install_default_drivers();
+        let url = format!("postgres://probe@127.0.0.1:{port}/probe?sslmode=require");
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx_catalog::AnyConnection::connect(&url),
+        )
+        .await
+        .expect("the client neither connected nor failed")
+        .expect_err("a server that declines TLS cannot satisfy sslmode=require");
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap_or_else(|_| panic!("no SSLRequest reached the socket: {client}"))
+            .expect("server task");
+        assert_eq!(
+            request,
+            [0, 0, 0, 8, 4, 210, 22, 47],
+            "the catalogue's driver sent no SSLRequest: {client}"
+        );
+        assert!(
+            client.to_string().contains("does not support TLS"),
+            "{client}"
+        );
+    }
+
     #[cfg(feature = "rest-catalog")]
     #[test]
     fn the_rest_client_speaks_tls_without_a_process_default_provider() {

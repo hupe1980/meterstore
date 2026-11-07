@@ -8,7 +8,7 @@ weight = 1
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.94 | Set by `iceberg` 0.10's floor, not by this crate's own syntax or by `metering`, which need 1.88 |
+| Rust | 1.95 | Set by `iceberg` 0.11's floor, not by this crate's own syntax or by `metering`, which need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18, and whole again on 15 |
 | `metering` | **0.25** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
@@ -117,8 +117,8 @@ table provider cannot be opened over a table the catalogue does not hold yet.
 cannot name — a subject registry, a read mode, a session you already own — and
 `open_table` does the same without DDL, for a role that may only read.
 
-The longer path is the same thing spelled out, and it is what an application that
-owns its own pool writes:
+The longer path is the same thing spelled out, for an application that builds
+the tiers in code:
 
 ```rust
 use meterstore::prelude::*;
@@ -126,9 +126,10 @@ use meterstore::hot::PostgresHot;
 use std::sync::Arc;
 use time::Duration;
 
-// The hot tier wraps a pool you already own — MeterStore never opens a
-// connection for you and never closes one.
-let hot = Arc::new(PostgresHot::new(pool));
+// The store opens its own pool, TLS by default; no `sqlx` type is in the API.
+// One `Database` serves the hot tier and the subject registry.
+let database = Database::connect_with(&db_url, &DatabaseOptions::new().max_connections(16)).await?;
+let hot = Arc::new(PostgresHot::new(database));
 
 // The cold tier. MeterStore builds the whole Iceberg catalog stack, so your
 // application depends on neither `iceberg-catalog-sql` nor the object-store

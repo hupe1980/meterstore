@@ -56,3 +56,10 @@ mod transaction_time;
 mod typed_reads;
 mod wire_format;
 mod zaehlerstandsgang;
+
+/// A connection pool of the test's own, for SQL the store does not issue —
+/// fixture setup and assertions about what PostgreSQL holds. The store opens
+/// its own through `meterstore::Database`; this one shares only the URL.
+fn fixture_pool(url: &str) -> sqlx::PgPool {
+    sqlx::PgPool::connect_lazy(url).expect("a well-formed URL")
+}

@@ -41,7 +41,6 @@
 //! rows: a `GROUP BY` yields no group for a day with nothing in it, and a day
 //! with no rows is a day whose whole expectation is missing.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1861,10 +1860,6 @@ impl std::fmt::Debug for CompletenessProvider {
 
 #[async_trait]
 impl TableProvider for CompletenessProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         completeness_schema(&self.discriminators)
     }
@@ -1920,7 +1915,6 @@ impl TableProvider for CompletenessProvider {
 /// boundary to it.
 pub(crate) fn reported_table(provider: &dyn TableProvider) -> Option<&str> {
     provider
-        .as_any()
         .downcast_ref::<CompletenessProvider>()
         .map(|p| p.table.as_str())
 }
@@ -1950,10 +1944,6 @@ impl datafusion::physical_plan::DisplayAs for CompletenessExec {
 impl ExecutionPlan for CompletenessExec {
     fn name(&self) -> &str {
         "CompletenessExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {

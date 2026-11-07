@@ -8,7 +8,6 @@
 //! `UNION ALL` is correct and no deduplication is needed. That is the whole
 //! payoff of the tiering design, and it is why this provider is short.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -846,10 +845,6 @@ impl ExecutionPlan for HotScanExec {
         "HotScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
@@ -1013,10 +1008,6 @@ fn external(e: crate::Error) -> DataFusionError {
 
 #[async_trait]
 impl TableProvider for TieredTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

@@ -151,21 +151,68 @@ features:
     echo "feature matrix OK"
 
 # Fail if a single-sourced crate appears at two versions.
+#
+# Over the `--all-features` graph, because an optional dependency's second
+# `arrow-array` is a split a default build never shows. `arrow-*` because
+# `iceberg` depends on the sub-crates, not on `arrow`. Fails when `cargo tree`
+# does: a graph the gate could not read is not a graph without duplicates.
+#
+# One duplicate is allowed, by name: the `sqlx` 0.8 `iceberg-catalog-sql` opens
+# its own pool with, reached through nothing else and named by no public
+# signature.
 deps:
     #!/usr/bin/env bash
-    # `cargo tree -d` also lists a package twice when it is built for both host
-    # and target at the same version. Only differing versions are a conflict.
-    set -uo pipefail
-    conflicts=$(cargo tree -d --edges normal 2>/dev/null \
-      | grep -oE "^({{SINGLE_SOURCED}}) v[0-9.]+" \
-      | sort -u \
-      | awk '{ seen[$1]++ } END { for (n in seen) if (seen[n] > 1) print n }')
-    if [ -n "$conflicts" ]; then
-      echo "error: multiple versions of a single-sourced dependency:" >&2
-      echo "$conflicts" >&2
-      cargo tree -d --edges normal
+    set -euo pipefail
+    if ! tree=$(cargo tree -d --edges normal --all-features --prefix none 2>&1); then
+      echo "error: cargo tree failed, so nothing was checked:" >&2
+      echo "$tree" >&2
       exit 1
     fi
+    # `cargo tree -d` also lists a package twice when it is built for both host
+    # and target at the same version. Only differing versions are a conflict.
+    versions=$(echo "$tree" | grep -oE "^({{SINGLE_SOURCED}}|arrow-[a-z-]+) v[0-9][0-9a-z.+-]*" | sort -u || true)
+    duplicated=$(echo "$versions" | awk 'NF { seen[$1]++ } END { for (n in seen) if (seen[n] > 1) print n }' | sort)
+    allowed() {
+      # The catalogue's private `sqlx`: exactly two versions, the older 0.8, and
+      # every direct dependent of the older one in the catalogue's own path.
+      local name=$1 older
+      [ "$name" = sqlx ] || [ "$name" = sqlx-postgres ] || return 1
+      [ "$(echo "$versions" | grep -c "^$name v")" -eq 2 ] || return 1
+      older=$(echo "$versions" | grep "^$name v0\.8\." | head -1 | cut -d' ' -f2) || return 1
+      [ -n "$older" ] || return 1
+      local parents
+      parents=$(cargo tree -i "$name@${older#v}" --all-features --edges normal --depth 1 --prefix none \
+        | tail -n +2 | awk '{ print $1 " " $2 }' | sort -u)
+      while read -r parent version; do
+        [ -n "$parent" ] || continue
+        case "$parent $version" in
+          "iceberg-catalog-sql "*|"sqlx v0.8."*|"sqlx-core v0.8."*) ;;
+          # This crate, only through the one declaration that supplies the
+          # catalogue's driver, runtime and TLS backend.
+          "meterstore "*)
+            [ "$(grep -cE '^[a-z0-9_-]+ = \{ package = "sqlx", version = "0\.8"' Cargo.toml)" -eq 1 ] \
+              && grep -qE '^sqlx-catalog = \{ package = "sqlx", version = "0\.8"' Cargo.toml \
+              || { echo "error: $name $older is declared by this crate other than as sqlx-catalog" >&2; return 1; } ;;
+          *) echo "error: $name $older is reached through $parent $version, not only the SQL catalogue" >&2; return 1 ;;
+        esac
+      done <<< "$parents"
+    }
+    conflicts=""
+    for name in $duplicated; do
+      allowed "$name" || conflicts="$conflicts $name"
+    done
+    if [ -n "$conflicts" ]; then
+      echo "error: multiple versions of a single-sourced dependency:$conflicts" >&2
+      echo "$versions" >&2
+      exit 1
+    fi
+    # It read the graph it expects: the catalogue's `sqlx` beside the hot tier's.
+    for expected in "sqlx v0.8." "sqlx v0.9."; do
+      if ! echo "$versions" | grep -q "^$expected"; then
+        echo "error: no $expected* in the all-features graph — the allowance above names a split that is not there; delete it" >&2
+        exit 1
+      fi
+    done
     echo "single-sourced dependencies OK"
 
 # Licence and advisory policy. Every exception in deny.toml carries a reason.

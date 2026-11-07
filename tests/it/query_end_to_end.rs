@@ -47,6 +47,8 @@ const NOW_FOR_STATUS: OffsetDateTime = datetime!(2026-07-21 00:00 UTC);
 
 struct Harness {
     hot: Arc<PostgresHot>,
+    /// The test's own connection, for SQL the store does not issue.
+    pool: PgPool,
     cold: Arc<IcebergCold>,
     _warehouse: tempfile::TempDir,
 }
@@ -58,7 +60,9 @@ impl Harness {
             .expect("postgres");
 
         let pool = PgPool::connect(&url).await.expect("connect");
-        let hot = Arc::new(PostgresHot::new(pool));
+
+        let database = meterstore::Database::connect(&url).await.expect("database");
+        let hot = Arc::new(PostgresHot::new(database));
         hot.create_table(TABLE).await.expect("create hot table");
 
         let warehouse = tempfile::tempdir().expect("temp warehouse");
@@ -90,6 +94,7 @@ impl Harness {
 
         Self {
             hot,
+            pool,
             cold,
             _warehouse: warehouse,
         }
@@ -151,7 +156,7 @@ impl Harness {
 
         for i in 0..count {
             let from = start + Duration::minutes(15 * i);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, melo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     resolution, source_kind, source_detail, provenance,
@@ -159,7 +164,7 @@ impl Harness {
                    VALUES ($1,NULL,$2,'STROM',$3,$4,$5,'KWH','MEASURED','PT15M','MSCONS',
                            $6,'[]',$7,$9,$8,
                            CAST(($3 AT TIME ZONE 'Europe/Berlin') AS DATE))"#
-            ))
+            )))
             .bind(malo)
             .bind(meterstore::canonical_obis("1-0:1.8.0").unwrap())
             .bind(from)
@@ -169,7 +174,7 @@ impl Harness {
             .bind(rust_decimal::Decimal::new(version, 0))
             .bind(datetime!(2026-07-27 06:00 UTC))
             .bind(scope)
-            .execute(self.hot.pool())
+            .execute(&self.pool)
             .await?;
         }
         Ok(())
@@ -283,10 +288,12 @@ async fn a_plan_built_before_archival_still_reads_the_window_archival_moved() {
 
     // Archival runs while the plan is held, moving two days out of PostgreSQL.
     h.archive_through(ARCHIVE_AS_OF).await;
-    let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-        .fetch_one(h.hot.pool())
-        .await
-        .unwrap();
+    let still_hot: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "{TABLE}""#
+    )))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
     assert_eq!(still_hot, 96, "two days should have left the parent table");
 
     // Execute the plan built against the older boundary.
@@ -414,7 +421,7 @@ async fn a_cold_only_plan_holds_nothing() {
         .expect("physical plan");
 
     let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM meterstore_pins")
-        .fetch_one(h.hot.pool())
+        .fetch_one(&h.pool)
         .await
         .unwrap();
     assert_eq!(pins, 0, "a cold-only plan registers no reclamation floor");
@@ -528,10 +535,12 @@ async fn a_query_spanning_the_watermark_counts_each_row_once() {
     h.archive_through(ARCHIVE_AS_OF).await;
 
     // Sanity: the split really did happen — some rows are gone from Postgres.
-    let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-        .fetch_one(h.hot.pool())
-        .await
-        .unwrap();
+    let still_hot: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "{TABLE}""#
+    )))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
     assert!(
         still_hot > 0 && still_hot < 288,
         "expected a real split, got {still_hot}"
@@ -808,10 +817,12 @@ async fn a_corrected_interval_is_counted_once_at_its_latest_version() {
         .await;
 
     // Both rows are present in storage.
-    let stored: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-        .fetch_one(h.hot.pool())
-        .await
-        .unwrap();
+    let stored: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "{TABLE}""#
+    )))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
     assert_eq!(
         stored, 8,
         "the original must be retained alongside the correction"
@@ -1642,10 +1653,12 @@ async fn a_long_lived_store_keeps_serving_rows_across_an_archival_run() {
         .expect("archive");
 
     // Rows really did move: the hot tier is now short.
-    let still_hot: i64 = sqlx::query_scalar(&format!(r#"SELECT count(*) FROM "{TABLE}""#))
-        .fetch_one(h.hot.pool())
-        .await
-        .unwrap();
+    let still_hot: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "{TABLE}""#
+    )))
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
     assert!(still_hot < 288, "expected a real split, got {still_hot}");
 
     let after = store
@@ -1808,10 +1821,10 @@ async fn a_duplicated_scope_that_got_past_the_constraint_is_refused_at_the_read(
     )
     .await;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"ALTER TABLE "{TABLE}_2026_07_20_0000" DROP CONSTRAINT "{TABLE}_2026_07_20_0000_one_operator""#
-    ))
-    .execute(h.hot.pool())
+    )))
+    .execute(&h.pool)
     .await
     .expect("the constraint is what a deployment turns off");
 

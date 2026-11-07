@@ -428,6 +428,8 @@ pub struct SubjectRegistration {
 #[derive(Clone)]
 pub struct SubjectRegistry {
     pool: PgPool,
+    /// What a request-triggered erasure also runs, in its transaction.
+    cascades: Vec<ErasureCascade>,
     /// The suppression list's keys, newest first, or empty for none.
     ///
     /// A ring rather than one key, because a tombstone cannot be re-keyed and a
@@ -452,6 +454,89 @@ pub struct SubjectRegistry {
     erasure_keys: Vec<Zeroizing<Vec<u8>>>,
 }
 
+/// A statement the deployment's own tables need run when a subject is erased.
+///
+/// An Article 17 request usually reaches the application's tables too —
+/// billing periods, substitute-value logs — and those rows must go with the
+/// mapping or not at all. Every request-triggered erasure runs its cascades in
+/// the transaction that destroys the mapping, once per reference destroyed,
+/// with that reference bound as `$1`; a failing cascade fails the erasure. The
+/// retention sweep runs none: it pseudonymises, and rows keyed by the reference
+/// may carry retention duties of their own.
+///
+/// The statement is the deployment's, trusted like a migration; only its shape
+/// is checked — one statement, `$1` and no other placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErasureCascade {
+    statement: String,
+}
+
+impl ErasureCascade {
+    /// A cascade over `statement`, which binds the erased reference as `$1`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] for an empty statement, one with no `$1` or with any
+    /// other placeholder, or more than one statement.
+    pub fn new(statement: impl Into<String>) -> Result<Self> {
+        let statement = statement.into();
+        let body = statement.trim().trim_end_matches(';').trim_end();
+        let refuse = |why: &str| {
+            Err(Error::config(format!(
+                "erasure cascade {statement:?} {why}: a cascade is one statement \
+                 binding the erased subject reference as $1"
+            )))
+        };
+        if body.is_empty() {
+            return refuse("is empty");
+        }
+        if body.contains(';') {
+            return refuse("holds more than one statement");
+        }
+        let placeholders: Vec<&str> = body
+            .match_indices('$')
+            .map(|(i, _)| {
+                body[i + 1..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .map_or(&body[i + 1..], |end| &body[i + 1..i + 1 + end])
+            })
+            .filter(|d| !d.is_empty())
+            .collect();
+        if !placeholders.contains(&"1") {
+            return refuse("does not bind $1");
+        }
+        if placeholders.iter().any(|d| *d != "1") {
+            return refuse("binds a placeholder other than $1");
+        }
+        Ok(Self {
+            statement: body.to_string(),
+        })
+    }
+
+    /// The statement as it will run.
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    /// Run it for one destroyed reference.
+    async fn run(&self, conn: &mut sqlx::PgConnection, reference: &SubjectRef) -> Result<u64> {
+        // The deployment's own SQL, validated for shape in `new`; the one value
+        // in it is bound. One of the two `AssertSqlSafe`s in this crate's
+        // library code (`only_checked_statements_reach_sqlx`).
+        sqlx::query(sqlx::AssertSqlSafe(self.statement.clone()))
+            .bind(reference.as_str())
+            .execute(conn)
+            .await
+            .map(|done| done.rows_affected())
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "erasure cascade {:?} failed, so nothing was erased: {e}",
+                    self.statement
+                ))
+            })
+    }
+}
+
 impl std::fmt::Debug for SubjectRegistry {
     /// Redacts the suppression key.
     ///
@@ -461,6 +546,7 @@ impl std::fmt::Debug for SubjectRegistry {
         f.debug_struct("SubjectRegistry")
             .field("suppression", &self.suppresses_reregistration())
             .field("erasure_keys", &self.erasure_keys.len())
+            .field("cascades", &self.cascades.len())
             .finish_non_exhaustive()
     }
 }
@@ -475,7 +561,9 @@ impl std::fmt::Debug for SubjectRegistry {
 pub const MIN_ERASURE_SECRET_BYTES: usize = 32;
 
 impl SubjectRegistry {
-    /// Wrap a connection pool, without a suppression list.
+    /// The registry over a [`Database`](crate::Database), without a suppression
+    /// list. Normally a clone of the one the hot tier uses: the mapping lives in
+    /// the same database.
     ///
     /// Erasure works; what is missing is the ability to *keep* a subject erased.
     /// Once the mapping is deleted nothing distinguishes an erased identifier
@@ -483,14 +571,16 @@ impl SubjectRegistry {
     /// registers a fresh reference and re-links the subject. Use
     /// [`with_erasure_secret`](Self::with_erasure_secret) where replay is
     /// possible, which is every deployment fed by a message broker.
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(database: crate::Database) -> Self {
         Self {
-            pool,
+            pool: database.pool().clone(),
+            cascades: Vec::new(),
             erasure_keys: Vec::new(),
         }
     }
 
-    /// Wrap a connection pool and enforce a suppression list.
+    /// The registry over a [`Database`](crate::Database), enforcing a
+    /// suppression list.
     ///
     /// Erasure then records a keyed hash of the identifier it erased, and
     /// [`register`](Self::register) refuses anything that matches. That is what
@@ -510,12 +600,12 @@ impl SubjectRegistry {
     /// identifier and the key — the minimum needed to honour a request that says
     /// *stop processing my data*, and the recognised practice for suppression
     /// lists.
-    pub fn with_erasure_secret(pool: PgPool, secret: &[u8]) -> Result<Self> {
-        Self::with_erasure_keys(pool, &[secret])
+    pub fn with_erasure_secret(database: crate::Database, secret: &[u8]) -> Result<Self> {
+        Self::with_erasure_keys(database, &[secret])
     }
 
-    /// Wrap a connection pool and enforce a suppression list under a **key
-    /// ring**.
+    /// The registry over a [`Database`](crate::Database), enforcing a
+    /// suppression list under a **key ring**.
     ///
     /// `keys[0]` writes every new tombstone; every key in the ring is checked
     /// when one is looked up. That is the whole of rotation, and the shape is
@@ -535,7 +625,7 @@ impl SubjectRegistry {
     ///
     /// The copies kept here are [`Zeroizing`]; see the field documentation for
     /// what that does and does not claim.
-    pub fn with_erasure_keys(pool: PgPool, keys: &[&[u8]]) -> Result<Self> {
+    pub fn with_erasure_keys(database: crate::Database, keys: &[&[u8]]) -> Result<Self> {
         if keys.is_empty() {
             return Err(Error::config(
                 "an erasure key ring must hold at least one key: an empty ring \
@@ -559,9 +649,23 @@ impl SubjectRegistry {
             }
         }
         Ok(Self {
-            pool,
+            pool: database.pool().clone(),
+            cascades: Vec::new(),
             erasure_keys: keys.iter().map(|k| Zeroizing::new(k.to_vec())).collect(),
         })
+    }
+
+    /// Run `cascade` in every request-triggered erasure's transaction. See
+    /// [`ErasureCascade`].
+    #[must_use]
+    pub fn with_cascade(mut self, cascade: ErasureCascade) -> Self {
+        self.cascades.push(cascade);
+        self
+    }
+
+    /// The cascades a request-triggered erasure runs, in declaration order.
+    pub fn cascades(&self) -> &[ErasureCascade] {
+        &self.cascades
     }
 
     /// Suppressions this registry can no longer recognise, by the key that
@@ -1225,107 +1329,6 @@ impl SubjectRegistry {
         Ok(records)
     }
 
-    /// Erase inside a transaction the **caller** owns.
-    ///
-    /// [`erase`](Self::erase) opens and commits its own, which is right when
-    /// destroying the mapping is the whole operation. It is wrong when it is one
-    /// step of a larger cascade: an Article 17 request usually reaches an
-    /// application's own tables too — billing periods, quality assessments,
-    /// substitute-value logs — and those must succeed or fail *together* with the
-    /// mapping. Two transactions cannot give that, and the failure mode is the
-    /// worst kind: a subject reported as erased whose derived rows survived.
-    ///
-    /// Pass a `&mut Transaction` (which derefs to a connection) to enclose this
-    /// step:
-    ///
-    /// ```no_run
-    /// # async fn example(
-    /// #     pool: &sqlx::PgPool,
-    /// #     registry: &meterstore::SubjectRegistry,
-    /// #     subject: &meterstore::SubjectRef,
-    /// # ) -> meterstore::Result<()> {
-    /// let mut tx = pool.begin().await.unwrap();
-    /// registry
-    ///     .erase_in(&mut tx, subject, "Art. 17 request", "dpo", now())
-    ///     .await?;
-    /// sqlx::query("DELETE FROM billing_periods WHERE subject_ref = $1")
-    ///     .bind(subject.as_str())
-    ///     .execute(&mut *tx)
-    ///     .await
-    ///     .unwrap();
-    /// tx.commit().await.unwrap();
-    /// # Ok(())
-    /// # }
-    /// # fn now() -> time::OffsetDateTime { time::OffsetDateTime::UNIX_EPOCH }
-    /// ```
-    ///
-    /// The registry's tables must live in the same database as the caller's for
-    /// this to mean anything — which they do, because the registry is
-    /// constructed from a `PgPool` the application already owns.
-    ///
-    /// **It must be a transaction, not a bare connection.** The lock that keeps
-    /// a concurrent [`register`](Self::register) from resurrecting the linkage
-    /// is transaction-scoped, so on a connection in autocommit it is released
-    /// before the delete it was taken for.
-    ///
-    /// **Cold-tier exclusion is not part of this transaction and cannot be.** It
-    /// is not a write at all: erasure destroys the *mapping*, which leaves every
-    /// archived row unattributable wherever it sits. There is nothing in
-    /// object storage to roll back, so sequencing is not a concern.
-    pub async fn erase_in(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        subject: &SubjectRef,
-        reason: &str,
-        actor: &str,
-        now: OffsetDateTime,
-    ) -> Result<Vec<ErasureRecord>> {
-        self.erase_in_owned(conn, Subject::Reference(subject), reason, actor, now)
-            .await
-    }
-
-    /// [`erase_all`](Self::erase_all) inside a transaction the caller owns.
-    ///
-    /// The pairing [`erase_in`](Self::erase_in) has, for the entry point a
-    /// request actually names. Everything `erase_in` documents applies.
-    pub async fn erase_all_in(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        natural_id: &str,
-        reason: &str,
-        actor: &str,
-        now: OffsetDateTime,
-    ) -> Result<Vec<ErasureRecord>> {
-        self.erase_in_owned(conn, Subject::Natural(natural_id), reason, actor, now)
-            .await
-    }
-
-    /// The shared body of the two caller-owned-transaction forms.
-    async fn erase_in_owned(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        subject: Subject<'_>,
-        reason: &str,
-        actor: &str,
-        now: OffsetDateTime,
-    ) -> Result<Vec<ErasureRecord>> {
-        let (records, destroyed) = self
-            .erase_linkage(conn, subject, reason, actor, now, ErasureTrigger::Request)
-            .await?;
-        // Counted as a *request*, which is what a caller-owned transaction is:
-        // the cascade it encloses — billing periods, quality assessments — is an
-        // Article 17 one. The retention sweep opens its own transaction and says
-        // so. Counted before the caller's commit, which is the honest cost of
-        // handing the transaction to them: a counter that only rose on commit
-        // would need this crate to know when that happened.
-        if destroyed {
-            crate::observe::metrics()
-                .subjects_erased
-                .add(1, &crate::observe::erasure_trigger(ErasureTrigger::Request));
-        }
-        Ok(records)
-    }
-
     /// The erasure itself, and whether a linkage was actually destroyed.
     ///
     /// The single mechanism under every public form, so the counting decision —
@@ -1446,6 +1449,18 @@ impl SubjectRegistry {
                 .await
                 .map_err(pg)?
                 .rows_affected();
+        }
+
+        // The deployment's cascades, in this transaction: a cascade that fails
+        // fails the erasure, so the mapping and the application's rows go
+        // together or not at all. Request-triggered only — see
+        // `ErasureCascade`.
+        if trigger == ErasureTrigger::Request {
+            for target in &targets {
+                for cascade in &self.cascades {
+                    cascade.run(&mut *tx, target).await?;
+                }
+            }
         }
 
         // A repeat request keeps the first erasure's timestamp — that is when
@@ -2678,8 +2693,12 @@ mod tests {
     }
 
     /// A pool that never connects — enough to construct a registry.
-    fn lazy_pool() -> PgPool {
-        PgPool::connect_lazy("postgresql://unused@localhost/unused").expect("a well-formed URL")
+    fn lazy_pool() -> crate::Database {
+        crate::Database::connect_lazy_with(
+            "postgresql://unused@localhost/unused",
+            &crate::DatabaseOptions::new(),
+        )
+        .expect("a well-formed URL")
     }
 
     #[tokio::test]

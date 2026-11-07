@@ -91,12 +91,15 @@ fn declared() -> TableConfig {
         })
 }
 
-async fn hot_with_checked_columns() -> (PostgresHot, TableConfig) {
+/// The hot tier, its declaration, and a pool of the test's own for SQL the
+/// store does not issue.
+async fn hot_with_checked_columns() -> (PostgresHot, TableConfig, PgPool) {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
     let pool = PgPool::connect(&url).await.expect("connect");
-    let hot = PostgresHot::new(pool);
+    let database = meterstore::Database::connect(&url).await.expect("database");
+    let hot = PostgresHot::new(database);
 
     let declared = declared();
     let config = declared.clone().build().expect("config");
@@ -112,7 +115,7 @@ async fn hot_with_checked_columns() -> (PostgresHot, TableConfig) {
         .await
         .expect("partitions");
 
-    (hot, declared)
+    (hot, declared, pool)
 }
 
 /// One quarter-hour delivery, optionally setting one checked column.
@@ -155,7 +158,7 @@ fn delivery(column: Option<(&str, &str)>) -> StoredSeries {
 
 #[tokio::test]
 async fn the_write_path_canonicalises_and_the_database_keeps_the_canonical_form() {
-    let (hot, declared) = hot_with_checked_columns().await;
+    let (hot, declared, pool) = hot_with_checked_columns().await;
     let config = declared.build().expect("config");
 
     for scheme in ValueCheck::ALL {
@@ -174,11 +177,12 @@ async fn the_write_path_canonicalises_and_the_database_keeps_the_canonical_form(
             .await
             .expect("append");
 
-        let stored: Option<String> =
-            sqlx::query_scalar(&format!(r#"SELECT "{column}" FROM "{TABLE}""#))
-                .fetch_one(hot.pool())
-                .await
-                .expect("read back");
+        let stored: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            r#"SELECT "{column}" FROM "{TABLE}""#
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
         assert_eq!(
             stored.as_deref(),
             Some(valid_of(scheme)),
@@ -186,8 +190,8 @@ async fn the_write_path_canonicalises_and_the_database_keeps_the_canonical_form(
              in the merge key cannot hold one identifier under two keys"
         );
 
-        sqlx::query(&format!(r#"DELETE FROM "{TABLE}""#))
-            .execute(hot.pool())
+        sqlx::query(sqlx::AssertSqlSafe(format!(r#"DELETE FROM "{TABLE}""#)))
+            .execute(&pool)
             .await
             .expect("clear");
     }
@@ -195,7 +199,7 @@ async fn the_write_path_canonicalises_and_the_database_keeps_the_canonical_form(
 
 #[tokio::test]
 async fn a_transposition_the_scheme_can_detect_never_reaches_the_database() {
-    let (_hot, declared) = hot_with_checked_columns().await;
+    let (_hot, declared, _pool) = hot_with_checked_columns().await;
     let config = declared.build().expect("config");
 
     // The two schemes that carry arithmetic. A transposition here is caught
@@ -249,7 +253,7 @@ async fn a_transposition_the_scheme_can_detect_never_reaches_the_database() {
 
 #[tokio::test]
 async fn the_database_carries_the_shape_and_says_so_in_its_own_regex_engine() {
-    let (hot, _) = hot_with_checked_columns().await;
+    let (_hot, _, pool) = hot_with_checked_columns().await;
 
     let party = ValueCheck::Eic(Some(EicType::Party));
 
@@ -318,7 +322,7 @@ async fn the_database_carries_the_shape_and_says_so_in_its_own_regex_engine() {
         )
         .bind(TABLE)
         .bind(format!("{column}_shape"))
-        .fetch_one(hot.pool())
+        .fetch_one(&pool)
         .await
         .unwrap_or_else(|e| panic!("{scheme} declares no shape constraint: {e}"));
         assert!(definition.contains('~'), "{definition}");
@@ -335,11 +339,12 @@ async fn the_database_carries_the_shape_and_says_so_in_its_own_regex_engine() {
         // runs it — which is the one place a dialect difference would show.
         let mut ran = 0;
         for (_, code, want) in cases.iter().filter(|(s, _, _)| *s == scheme) {
-            let matched: bool = sqlx::query_scalar(&format!("SELECT $1 {predicate}"))
-                .bind(code)
-                .fetch_one(hot.pool())
-                .await
-                .expect("evaluate the deployed pattern");
+            let matched: bool =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT $1 {predicate}")))
+                    .bind(code)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("evaluate the deployed pattern");
             assert_eq!(matched, *want, "{scheme}: {code}");
             ran += 1;
         }
@@ -352,19 +357,19 @@ async fn the_database_refuses_a_badly_shaped_value_from_a_writer_that_is_not_thi
     // The constraint's whole purpose: MeterStore's own write path already
     // parses, so the CHECK only ever fires on a row something else wrote — and
     // that is exactly when it is worth having.
-    let (hot, _) = hot_with_checked_columns().await;
+    let (_hot, _, pool) = hot_with_checked_columns().await;
 
     let insert = |column: String, code: &'static str| {
-        let pool = hot.pool().clone();
+        let pool = pool.clone();
         async move {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"INSERT INTO "{TABLE}"
                    (malo_id, obis_code, sparte, "from", "to", value, unit, quality,
                     source_kind, source_detail, version, version_scope, recorded_at,
                     balancing_day, "{column}")
                    VALUES ('12345678905','1-0:1.8.0','STROM',$1,$2,1.5,'KWH','MEASURED',
                            'MSCONS','{{}}',$3,'9900000000003:2026-07',$4,DATE '2026-07-20',$5)"#
-            ))
+            )))
             .bind(D20)
             .bind(D20 + Duration::minutes(15))
             .bind(rust_decimal::Decimal::new(20_260_727_000_001, 0))
@@ -420,7 +425,8 @@ async fn a_value_check_this_build_does_not_know_is_refused_by_both_halves() {
             .await
             .expect("postgres");
         let pool = PgPool::connect(&url).await.expect("connect");
-        let hot = PostgresHot::new(pool);
+        let database = meterstore::Database::connect(&url).await.expect("database");
+        let hot = PostgresHot::new(database);
 
         let odd = Field::new("odd", DataType::Utf8, true).with_metadata(
             std::collections::HashMap::from([(
@@ -462,7 +468,7 @@ async fn a_value_check_this_build_does_not_know_is_refused_by_both_halves() {
                   WHERE t.relname = $1 AND c.conname = 'odd_shape')",
         )
         .bind(TABLE)
-        .fetch_one(hot.pool())
+        .fetch_one(&pool)
         .await
         .expect("the unknown declaration still rendered a constraint");
         assert!(
