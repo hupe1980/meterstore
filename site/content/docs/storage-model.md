@@ -91,7 +91,7 @@ its Cargo features, and the on-disk shape must not.
 >
 > One break is recorded. Rows written by 0.12.0–0.14.0 in three shapes raise
 > `Error::Decode` under 0.15.0 and later: every `AUTO_SUBSTITUTE` payload (its
-> `method` is `metering` 0.25's procedure codes), every resolution spelled in
+> `method` predates `metering` 0.25's procedure codes), every resolution spelled in
 > seconds (`PT60S` rather than `PT1M`), and a Marktpartner-ID failing both
 > check-digit procedures. The rows stay on disk and in the lake, readable by a
 > 0.14 build and by any engine reading the columns as text.

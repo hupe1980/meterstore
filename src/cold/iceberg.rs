@@ -225,7 +225,7 @@ impl IcebergCold {
     ///
     /// Delegates the actual scan to `iceberg-datafusion`, so partition, manifest
     /// and row-group pruning apply without this crate reimplementing any of
-    /// them. Bloom filters and page indexes do not: `iceberg` 0.10.1 has no
+    /// them. Bloom filters and page indexes do not: `iceberg` 0.11 has no
     /// bloom-filter reader and leaves page-index row selection off. The result
     /// is the cold half of a [`TieredTableProvider`].
     ///
@@ -302,12 +302,10 @@ impl IcebergCold {
         // knows nothing about tiering, so it carries no watermark and the lookup
         // walks back the *parent chain* to find one.
         //
-        // Expiring by age alone breaks that walk — and not only by removing the
-        // snapshot that carries the boundary. Removing any **intermediate**
-        // ancestor is enough: the chain then has a hole, the walk stops at a
-        // parent id that no longer resolves, and no boundary is found. A
-        // maintenance job following this design's own advice would have bricked
-        // the table, and the symptom is that every query fails at once.
+        // Expiring by age alone breaks that walk: removing any **intermediate**
+        // ancestor, not only the one carrying the boundary, leaves a parent id
+        // that no longer resolves, no boundary is found, and every query on the
+        // table fails at once.
         //
         // The re-stamp above normally makes this path one snapshot long. It is
         // still computed, because `expire_snapshots` is public and a caller may
@@ -817,7 +815,7 @@ impl IcebergCold {
     ///
     /// # Why the retry cannot be left to the library
     ///
-    /// `iceberg` 0.10 retries a conflicting commit by reloading the table and
+    /// `iceberg` 0.11 retries a conflicting commit by reloading the table and
     /// re-applying the same action — including the snapshot summary the action
     /// was **built with**. Ours carries the tiering watermark, a property of the
     /// base the commit lands on, so re-publishing a stale one moves the boundary

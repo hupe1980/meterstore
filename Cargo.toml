@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -11,8 +11,8 @@ documentation = "https://docs.rs/meterstore"
 keywords = ["metering", "iceberg", "timeseries", "postgres"]
 categories = ["database", "data-structures"]
 readme = "README.md"
-# Set by the highest dependency floor (`iceberg` 0.10 wants 1.94), not by this
-# crate's own syntax or by `metering` 0.25, both of which need only 1.88.
+# Set by the highest dependency floor (`iceberg` 0.11 wants 1.95), not by this
+# crate's own syntax or by `metering` 0.26, both of which need only 1.88.
 rust-version = "1.95"
 
 # The crate documentation describes Flight SQL, the façade and the testkit, none
@@ -98,7 +98,7 @@ sqlx-postgres = { version = "0.9", default-features = false, features = ["time",
 # and identifier is its type, and this crate computes with none of them. A floor
 # rather than a preference — `ids::{BdewCode, Eic, MaloId, MeloId}` are what a
 # `check =` column parses with.
-metering = { version = "0.25", features = ["serde"] }
+metering = { version = "0.26", features = ["serde"] }
 
 # `metering`'s choice, not chrono: mixing the two would convert at every row.
 # Deliberately without `serde-human-readable` — `time`'s serde impl is

@@ -171,14 +171,8 @@ the row is not measurable (`is_measurable()`).
 
 Gas balances on the **Gastag** — 06:00 to 06:00 local — so both the bucketing and
 the expected count follow the row's `sparte` (`metering`'s `DayBoundary`, mapped
-in `planner::day_boundary`). The clocks change *before* 06:00, so the long and
-short gas days are named after the **Saturday**:
-
-| 2026 | Calendar day | Gastag |
-|---|---|---|
-| Sat 24 Oct | 96 | **100** |
-| Sun 25 Oct | **100** | 96 |
-
+in `planner::day_boundary`). The long and short gas days are named after the
+**Saturday** ([table](@/docs/querying.md#gas-is-balanced-on-a-different-day)).
 Heat and water stay on the calendar day.
 
 ## Four decisions this made concrete

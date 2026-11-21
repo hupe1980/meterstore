@@ -194,13 +194,9 @@ async fn archival_throughput_does_not_collapse() {
     // all of it. The number above is the useful output; what follows is only a
     // floor against pathology.
     //
-    // **The scan's round-trip shape is not guarded here.** A wall clock cannot
-    // distinguish a per-row round trip from a loaded machine: on this workload
-    // the two differ by a factor of a few, and an assertion tight enough to
-    // catch the first fires constantly on the second. That property is exact and
-    // belongs in an exact test — `a_range_scan_streams_in_bounded_chunks` pins
-    // the round-trip *count* against the chunk size, where 25 rows in chunks of
-    // ten is three statements and nothing else passes.
+    // The scan's round-trip shape is pinned exactly by
+    // `a_range_scan_streams_in_bounded_chunks`; a wall clock cannot tell a
+    // per-row round trip from a loaded machine.
     //
     // So this floor sits where only something catastrophic reaches it: ~2 600
     // rows/s unloaded on a developer machine, ~650 with three suites competing

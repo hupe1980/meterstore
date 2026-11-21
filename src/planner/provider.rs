@@ -233,7 +233,7 @@ impl TieredTableProvider {
     /// `cold_provider` supplies the cold half — normally an
     /// `IcebergStaticTableProvider`, so partition, manifest and row-group
     /// pruning apply without this crate reimplementing them. Bloom filters and
-    /// page indexes do not: `iceberg` 0.10.1 reads neither.
+    /// page indexes do not: `iceberg` 0.11 reads neither.
     ///
     /// **The schema is taken from the cold provider**, not from
     /// `encode::schema::storage_schema`. The two describe the same columns but
@@ -443,7 +443,7 @@ impl TieredTableProvider {
         let ceiling = max_version.map(predicate::version_ceiling);
         if let Some(expr) = &ceiling {
             // Also offered to the cold scan, which passes it on (its literal has
-            // the column's own decimal type). `iceberg-datafusion` 0.10.1 does not
+            // the column's own decimal type). `iceberg-datafusion` 0.11 does not
             // translate decimals, so today it prunes no file; the enforcement
             // below is what makes the read correct either way.
             all.push(expr.clone());
@@ -551,16 +551,9 @@ impl TieredTableProvider {
         // still asks for. A cold-only plan touches no partition and needs
         // nothing held.
         //
-        // Not narrowed to cross-tier plans, though those are where the exposure
-        // is longest — the hot child is enumerated on first poll and a
-        // `UNION ALL` drains cold-side-first, so the wait is the cold scan. A
-        // hot-only plan is exposed for however long its consumer takes to read
-        // it, which is not this layer's to bound.
-        //
-        // Two statements against a database the plan has not otherwise touched,
-        // against a watermark read that has already been to the Iceberg
-        // catalogue. The pin lives on the hot scan and dies with it, so a plan
-        // built and discarded releases it without executing.
+        // Not narrowed to cross-tier plans: a hot-only plan is exposed for as
+        // long as its consumer reads. The pin lives on the hot scan, so a plan
+        // dropped unexecuted releases it.
         let pin = match (self.max_pin_age, split.hot.is_some()) {
             (Some(age), true) => {
                 let now = OffsetDateTime::now_utc();
@@ -1032,26 +1025,14 @@ impl TableProvider for TieredTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // **Never `Exact`, even for filters this provider does evaluate in full.**
-        //
-        // `Exact` tells DataFusion to *delete* the filter from the plan, so the
-        // only thing standing between a caller and a wrong row is this
-        // provider's promise. The hot half keeps that promise — the range is a
-        // `WHERE` clause in the SQL. The cold half cannot: it hands the filters
-        // to `iceberg-datafusion`, which converts them with a `filter_map` and
-        // **silently discards whatever it cannot translate**. It translates the
-        // range; a version that did not would produce rows outside the
-        // requested window, with nothing above the scan to catch them and no
-        // error anywhere.
-        //
-        // That is a guarantee held by a third party's internals, and the store
-        // degrades rather than lies. `Inexact` costs one timestamp comparison per
-        // row on a scan that has already read them, and guards a **dropped**
-        // filter. It cannot guard a **strengthened** one — a pushed form that
-        // prunes files holding rows the filter accepts — so the cold scan is
-        // handed only the shapes `cold::iceberg::cold_pushable` admits, whose
-        // pushed form is implied by the filter. Skipping files is the
-        // optimisation that matters, and the range filter is always admitted.
+        // **Never `Exact`**: it deletes the filter from the plan. The cold half
+        // hands filters to `iceberg-datafusion`, which **silently discards what
+        // it cannot translate**, so correctness would rest on a third party's
+        // internals. `Inexact` keeps a re-check above the scan — one comparison
+        // per row — which guards a *dropped* filter. It cannot guard a
+        // *strengthened* one, so the cold scan gets only the shapes
+        // `cold::iceberg::cold_pushable` admits, whose pushed form the filter
+        // implies. The range filter is always among them.
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }

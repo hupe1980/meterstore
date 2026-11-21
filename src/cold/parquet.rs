@@ -15,7 +15,7 @@
 //!   disable that layer for every reader.
 //!
 //! The bloom filters and page indexes are written for the files' other readers.
-//! This crate's own cold scan goes through `iceberg` 0.10.1, which has no
+//! This crate's own cold scan goes through `iceberg` 0.11, which has no
 //! bloom-filter reader and leaves page-index row selection off, so its pruning
 //! stops at partitions, manifests and row-group statistics.
 

@@ -55,11 +55,9 @@ use crate::error::{Error, Result};
 /// not a syntax requirement. It is a **support** claim, and a support claim has
 /// to be about versions somebody supports.
 ///
-/// The earlier floor of 12 was justified by the managed services running it, and
-/// they no longer do: the community dropped 12 in November 2024 and 13 in
-/// November 2025, RDS ended standard support for 12 in February 2025 and for 13
-/// in February 2026, and 14 goes in November 2026. Naming 14 would be naming a
-/// version with weeks left. **15 is the oldest release still patched into 2027**
+/// The community ended 12 in November 2024, 13 in November 2025 and 14 in
+/// November 2026; RDS ended standard support for 12 and 13 in February 2025 and
+/// February 2026. **15 is the oldest release still patched into 2027**
 /// and the oldest offered under standard support by RDS, Cloud SQL and Azure
 /// Database.
 ///

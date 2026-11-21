@@ -42,16 +42,10 @@ integration:
 
 # The whole suite.
 #
-# Unbounded. The old cap existed because every test started its own PostgreSQL
-# container, so the limit was Docker's rather than the CPU's. The suites now share
-# one container and take a database each (`testkit::postgres`), and that server is
-# started with a raised `max_connections` — without which sharing simply moves the
-# ceiling from container slots to backend slots, and the failure looks like a
-# broken test rather than an exhausted resource.
-#
-# The foreign-engine suites (DuckDB, PyIceberg) do still start a container
-# each, and are bounded on their own in `tests/it/containers.rs` — which is why
-# this needs no cap.
+# Unbounded: the suites share one PostgreSQL container and take a database each
+# (`testkit::postgres`), on a server started with a raised `max_connections` so
+# the ceiling does not move to backend slots. The foreign-engine suites (DuckDB,
+# PyIceberg) start a container each and are bounded in `tests/it/containers.rs`.
 #
 # Set a number to pin the degree on a constrained machine: `just test-threads=4 test`.
 test-threads := "0"

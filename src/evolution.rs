@@ -42,7 +42,7 @@
 //!
 //! # What this crate applies
 //!
-//! An added nullable column, and nothing else. `iceberg` 0.10.1's public schema
+//! An added nullable column, and nothing else. `iceberg` 0.11's public schema
 //! update can add an optional field and delete one; it cannot make a field
 //! optional or promote a type. So a column widened to nullable quarantines like
 //! a narrowing does, with the steps for both tiers named; and a safe
@@ -110,7 +110,7 @@ pub enum SchemaChange {
     /// Neither is safe. Narrowing forbids nulls existing rows may hold, and no
     /// rewrite is available to find out. Widening is sound in principle and
     /// cannot be applied here: Iceberg's field stays required, so the first null
-    /// written fails, and `iceberg` 0.10.1 has no public action to relax it.
+    /// written fails, and `iceberg` 0.11 has no public action to relax it.
     Nullability {
         /// The column's name.
         name: String,

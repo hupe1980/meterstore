@@ -391,7 +391,6 @@ pub enum Command {
 /// Errors are rendered to stderr rather than returned: a `Result` from `main`
 /// prints the `Debug` form, which for this crate's error type is a struct dump
 /// rather than the message written for a human.
-#[must_use]
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     install_tracing(&cli.log);

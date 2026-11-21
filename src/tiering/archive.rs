@@ -574,8 +574,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
             });
         }
 
-        // The partition is **not** dropped here, and that is the whole of the
-        // reader-grace design.
+        // The partition is **not** dropped here.
         //
         // A query decides its tier split from the watermark it reads at *plan*
         // time and reads the tiers at *execute* time. The commit above has just
@@ -588,8 +587,9 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         // So the partition stays detached: invisible to writers, excluded by
         // predicate from every plan made *after* the advance, and still read by
         // any plan made before it (`HotStore::scan_range` includes detached
-        // relations). `reclaim_orphans` drops it a cycle later, once its
-        // committing snapshot is older than `reader_grace`.
+        // relations). `reclaim_orphans` drops it a cycle later, once no reader pin
+        // (`meterstore_pins`) covers it and its committing snapshot is older
+        // than `reader_grace`.
         debug!(
             table,
             partition = %partition.relation_name()?,
@@ -1708,9 +1708,9 @@ mod tests {
         // exactly the state `archive_window` wants it in, so the next run
         // finishes the job.
         //
-        // Reverting the fix restores the failure this replaces: `reclaim_orphans`
-        // runs *before* the window is picked, so refusing there aborted every
-        // later cycle at step 1 and archival for the table stopped for good.
+        // `reclaim_orphans` runs *before* the window is picked, so refusing this
+        // state there would abort every later cycle at step 1 and stop archival
+        // for the table for good.
         let hot = FakeHot::with_rows(&[(D20, 96)]).failing(FailAt::AfterDetach);
         let archiver = Archiver::new(hot, FakeCold::new(D20), config());
         let now = datetime!(2026-07-30 00:00 UTC);

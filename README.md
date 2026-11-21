@@ -12,8 +12,7 @@ both.
 
 > **Pre-alpha, and pre-1.0 on purpose.** Storage, tiering, archival,
 > querying, reproducible reads and completeness work end to end against real
-> PostgreSQL 18 and a real Iceberg warehouse. The API is still settling;
-> integrating against a real workload is what settles it.
+> PostgreSQL 18 and a real Iceberg warehouse. The API is still settling.
 
 ---
 
@@ -105,7 +104,7 @@ use meterstore::prelude::*;
 use std::sync::Arc;
 use time::Duration;
 
-// The store opens its own pool, TLS by default; no `sqlx` type is in the API.
+// The store opens its own pool; no `sqlx` type is in the API.
 let database = Database::connect_with(&db_url, &DatabaseOptions::new().max_connections(16)).await?;
 let hot = Arc::new(PostgresHot::new(database));
 
@@ -131,8 +130,7 @@ let store = MeterStore::builder()
     .build()
     .await?;
 
-// Setup, archival, maintenance and teardown live behind `admin()`, so the
-// surface you read and write through stays the size of that job.
+// Setup, archival, maintenance and teardown live behind `admin()`.
 store.admin().create_tables().await?;
 ```
 
@@ -155,10 +153,8 @@ result.watermark();        // where cold ended and hot began
 result.touched_hot_tier(); // whether the answer is only valid for now
 ```
 
-That is the quick start. Everything a deployment declares beyond it — the two
-record shapes, identity versus attribute columns, checked identifiers, scoping,
-completeness, erasure, settlement reruns — is on the documentation site, indexed
-below rather than repeated here.
+Record shapes, identity versus attribute columns, checked identifiers, scoping,
+completeness, erasure and settlement reruns are on the documentation site.
 
 [Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
@@ -168,20 +164,16 @@ below rather than repeated here.
 |---|---|---|
 | Rust | 1.95 | Set by `iceberg` 0.11's floor; `metering` and this crate's own syntax need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18 and whole again on 15 |
-| `metering` | **0.25** | The domain layer — MeterStore stores its types, it does not redefine them |
+| `metering` | **0.26** | The domain layer — MeterStore stores its types, it does not redefine them |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
-Nothing here needs a server newer than PostgreSQL 12 — partition creation runs on
-the write path, and building a partition standalone and *attaching* it takes only
-`SHARE UPDATE EXCLUSIVE` from 12, where `CREATE TABLE … PARTITION OF` would take
-`ACCESS EXCLUSIVE` on the parent and let one long query stall every subsequent
-insert.
-[Locks →](https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up)
-
-The floor is **15** anyway: it is a promise about where this crate may be
-deployed, and a promise has to name versions somebody still patches. ✅ CI runs
-the whole integration suite against 15 as well as against 18, so the floor is
-checked rather than claimed.
+Nothing here needs more than PostgreSQL 12: attaching a standalone-built
+partition takes only `SHARE UPDATE EXCLUSIVE`, where `CREATE TABLE … PARTITION OF`
+takes `ACCESS EXCLUSIVE` on the parent and would stall every insert behind one
+long query
+([Locks →](https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up)).
+The floor is **15** because a support promise must name versions still patched;
+CI runs the whole integration suite on 15 and 18.
 
 The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
 Glue — and that seam is driven end to end by the test suite rather than asserted.
@@ -269,7 +261,7 @@ destroys the file statistics merge elision proves itself from.
 - **The retention sweep is pseudonymisation.** Deleting the subject mapping leaves
   `malo_id` in clear on every row, so what remains is pseudonymised rather than
   anonymous data; whether that discharges `[MsbG § 60 Abs. 6]` is undecided.
-- **Rows written by 0.12.0–0.14.0 in three shapes do not decode** under 0.15:
+- **Rows written by 0.12.0–0.14.0 in three shapes do not decode** from 0.15 on:
   `AUTO_SUBSTITUTE` payloads, resolutions spelled in seconds, and
   Marktpartner-IDs failing both check-digit procedures.
 
@@ -295,8 +287,8 @@ The integration suites are **one test binary against one PostgreSQL container**.
 Cargo would otherwise compile each file under `tests/` into its own statically
 linked executable — twenty-odd full copies of DataFusion, Arrow, Iceberg, sqlx and
 tonic, about 9 GB, which exhausts a CI runner's disk and fails as a linker bus
-error rather than as "no space left". A container per test cost seven times the
-wall clock of a database per test, for the same isolation.
+error rather than as "no space left". A database per test gives the isolation of a
+container per test at a seventh of the wall clock.
 
 `datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`,
 `sqlx` and `sqlx-postgres` must each appear exactly once in the dependency graph;

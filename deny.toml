@@ -43,6 +43,16 @@ ignore = [
     # Revisit: when `testcontainers` replaces it.
     "RUSTSEC-2026-0440",
 
+    # `chrono` and `chrono-tz` are unmaintained, every version; `humantime` is
+    # flagged for wrapping `chrono`. Not vulnerabilities. Reached through
+    # `arrow-*` and `object_store`, held at Arrow 58 / DataFusion 54 by
+    # `iceberg-datafusion` — no version this crate can select drops them. This
+    # crate's own time arithmetic is `time`, through `metering`.
+    # Revisit: when Arrow and `object_store` leave `chrono`.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+    "RUSTSEC-2026-0542",
+
     # `rsa` 0.9 leaks private-key information through timing (the Marvin Attack).
     # **There is no patched version** — upstream says "no safe upgrade is
     # available" and the constant-time rewrite is unfinished — so this cannot be

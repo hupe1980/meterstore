@@ -4194,9 +4194,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metering"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1da563ccf392b1f489eff0cd949dfa98414c4f4535c24eb91134fd71c1e3e1e"
+checksum = "8b228d5aaf9630a880e08d8220ed812b784dfa8d3264a07ee3691162f9e57054"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "meterstore"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "arrow",
  "arrow-flight",

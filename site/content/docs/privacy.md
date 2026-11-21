@@ -47,24 +47,17 @@ PostgreSQL. Whether that reaches the second branch is discussed below.
 
 ## Pseudonymisation, not crypto-shredding
 
-Crypto-shredding — encrypt each subject's data under its own key, destroy the
-key — needs one key per data subject. Iceberg's envelope encryption keys data per
-*file*, and one Parquet file holds thousands of measuring points; one file per
-subject would be a directory listing rather than a table. Encrypting the value
-column per subject instead destroys delta encoding, min/max statistics and bloom
-filters.
+Crypto-shredding needs a key per data subject. Iceberg's envelope encryption
+keys per *file*, which holds thousands of measuring points, and encrypting the
+value column per subject destroys delta encoding, statistics and bloom filters.
 
-So the personal data in a metering series is treated as the **link** between a
-consumption pattern and a person, and the store holds that link as a mapping row
-it can delete. Deleting it leaves quantities attached to an opaque reference —
-**and to their `malo_id`**, which stays in clear on every row in both tiers, in
-the Iceberg column statistics and in the bloom filters. A utility holding the
-contract that links a Marktlokation to a customer can still attribute them, so
-what remains is **pseudonymised** data, not anonymous data under Recital 26 — the
-same reasoning [the first section](#is-a-load-profile-personal-data) applies to
-the MaLo. Whether deleting the mapping discharges § 60 Abs. 6's *anonymisieren*,
-or the measuring point needs an opaque per-year key in the lake as well, is not
-decided.
+So the store holds the personal **link** between a consumption pattern and a
+person as a mapping row it can delete. The quantities keep their `malo_id`, in
+clear on every row in both tiers and in the file statistics, so what erasure
+leaves is **pseudonymised**, not anonymous under Recital 26 — the reasoning
+[the first section](#is-a-load-profile-personal-data) applies to the MaLo.
+Whether that discharges § 60 Abs. 6's *anonymisieren* is for the deployment's
+counsel to judge.
 
 ```rust
 let readings = MeterStore::builder()
@@ -293,7 +286,7 @@ Deleting the mapping rewrites no byte of the lake; whether it suffices while
 
 A table declaring a `subject_column` needs a registry; `MeterStore::builder`
 refuses one without at `build`. A configuration file builds the registry itself,
-so `[privacy]` supplies only the key:
+so `[privacy]` supplies the keys and any cascades:
 
 ```toml
 [privacy]

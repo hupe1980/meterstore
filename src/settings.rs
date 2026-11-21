@@ -6,13 +6,11 @@
 //! in Rust pass through exactly the same cross-field checks, and no setting is
 //! reachable from one and not the other.
 //!
-//! # Why the file cannot construct the tiers
+//! # What the file builds
 //!
-//! It names them; it does not open them. A `hot.url` becomes a
-//! [`HotSettings`] the application uses to build its own `PgPool`, because the
-//! pool is usually shared with the rest of the service and MeterStore never owns
-//! a connection. The same goes for the catalog: the file records
-//! which one and where, and the application constructs it.
+//! [`Settings::connect`] opens the store's pool, builds the catalog and checks
+//! every table. It stops short of the serving surface: one [`Deployment::store`]
+//! or a [`Deployment::catalog`] is the application's choice, not the file's.
 //!
 //! # Environment interpolation
 //!

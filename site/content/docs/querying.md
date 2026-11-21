@@ -46,9 +46,7 @@ result.read_mode();
 ```
 
 Both are read off this query's **physical plan** before execution, not asked of
-the providers afterwards, which would race other queries. Nodes are matched by
-type rather than name, so a renamed node in a dependency fails to compile rather
-than silently misreporting the tiers.
+the providers afterwards, which would race other queries.
 
 ### Describing a statement without running it
 

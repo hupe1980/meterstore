@@ -84,17 +84,8 @@ GROUP BY 1;
 `date_trunc('month', "from")` is wrong for the same two reasons as the daily one.
 The test suite pins this to agree with `meter_balancing_month("from", sparte)`.
 
-At a DST transition the long and short gas days are the ones named after the
-**Saturday**, because the clocks change before the 06:00 boundary:
-
-| 2026 | Calendar day | Gastag |
-|---|---|---|
-| Sat 24 Oct | 96 | **100** |
-| Sun 25 Oct | **100** | 96 |
-
-The DuckDB suite groups a gas workload across that transition by the stored
-column, matches MeterStore's own histogram, and checks that the naive UTC
-grouping disagrees.
+At a DST transition the long and short gas days are named after the
+**Saturday** ([table](@/docs/querying.md#gas-is-balanced-on-a-different-day)).
 
 ## Decimals cross as strings
 

@@ -25,11 +25,13 @@ region = "eu-central-1"          # non-secret half of the S3 credentials
 
 # Optional. The deployment gets its subject registry either way — when a table
 # declares a `subject_column` or the database already holds the subject map;
-# this section supplies the key that turns on suppression.
+# this section supplies the keys and any erasure cascades.
 [privacy]
 erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes, turns on suppression
 # Keys that no longer write tombstones and must still recognise them.
 # retired_erasure_secrets = ["${METERSTORE_ERASURE_SECRET_2025}"]
+# Statements run in the erasure's transaction, the reference bound as $1.
+# erasure_cascade = ["DELETE FROM billing_periods WHERE subject_ref = $1"]
 
 [[tables]]
 name = "readings_versions"
@@ -91,17 +93,12 @@ For S3 Tables, `warehouse` holds `arn:aws:s3tables:<region>:<account>:bucket/<na
 anything else is refused at `meterstore check`. Naming a catalogue whose feature
 was not compiled in is an error that says so.
 
-Turn `sql-catalog` off in a workspace that also links an embedded SQLite:
-`libsqlite3-sys` declares `links = "sqlite3"`, which cargo enforces over the whole
-resolve graph.
-
-```bash
-cargo add meterstore --no-default-features --features rest-catalog
-```
+Turn `sql-catalog` off in a workspace that also links an embedded SQLite
+([why](@/docs/getting-started.md#install)).
 
 ## `[privacy]`
 
-Optional; it supplies only the erasure keys. `Settings::connect()` builds one
+Optional; it supplies the erasure keys and any `erasure_cascade` statements. `Settings::connect()` builds one
 subject registry for the whole deployment whenever a table declares a
 `subject_column` or the database already holds `meterstore_subject_map` (a
 deployment that stopped declaring one still owes the retention sweep). Two tables
@@ -149,11 +146,9 @@ opens its own pool (`Database`), so there is no pool built elsewhere to escape i
 
 ## `ddl_lock_timeout`
 
-A DDL statement that cannot get its lock within it gives up having changed
-nothing, and archival reports the cycle `deferred`; `"0s"` restores PostgreSQL's
-own behaviour, where the same condition is an ingest outage. Every second added is
-a second the table can stall for.
-[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) has the argument.
+How long DDL waits for its lock before giving up having changed nothing; the
+cycle reports `deferred`. `"0s"` disables it, which turns the same condition into
+an ingest outage. [Locks](@/docs/operations.md#locks-and-why-ddl-gives-up).
 
 ## Interval or point
 

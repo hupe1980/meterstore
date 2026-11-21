@@ -412,7 +412,7 @@ async fn corrections_landing_during_a_scan_are_never_double_counted() {
 // lock taken on a connection that then returns to the pool is released the moment
 // another caller checks it out.
 //
-// A second `PostgresHot` over its **own** `PgPool` is what a second replica
+// A second `PostgresHot` over its **own** `Database` is what a second replica
 // actually is: the same database, the same warehouse, no shared connection.
 
 /// A second replica over the same database and warehouse as the harness.

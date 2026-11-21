@@ -10,7 +10,7 @@ weight = 1
 |---|---|---|
 | Rust | 1.95 | Set by `iceberg` 0.11's floor, not by this crate's own syntax or by `metering`, which need 1.88 |
 | PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18, and whole again on 15 |
-| `metering` | **0.25** | The domain layer. MeterStore stores its types; it does not redefine them |
+| `metering` | **0.26** | The domain layer. MeterStore stores its types; it does not redefine them |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs no server configuration, no restart and no superuser — which is
@@ -38,15 +38,10 @@ and conflicts with no read and no write.
 does need the strong lock.
 
 **The support floor is 15**, the oldest release still receiving fixes into 2027
-and still under standard support on RDS, Cloud SQL and Azure Database (12 and 13
-are end-of-life; 14 follows in November 2026). CI runs the whole integration suite
+and still under standard support on RDS, Cloud SQL and Azure Database (12, 13 and 14
+are end-of-life). CI runs the whole integration suite
 on 15 and on 18. An older server will very likely work, but nothing demonstrates
 it and no security fix is coming for it.
-
-On 18, fast-path lock slots are sized from `max_locks_per_transaction` rather than
-fixed at sixteen per backend, which raises the ceiling for a deployment's own
-statements that reach many partitions through the parent. MeterStore's hot scan
-reads one partition per statement and does not approach it.
 
 ## Install
 

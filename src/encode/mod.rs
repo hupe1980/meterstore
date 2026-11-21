@@ -1525,9 +1525,9 @@ mod tests {
 
     #[test]
     fn a_nullable_extra_column_may_be_absent() {
-        // The config permits nullable attribute columns, so requiring a value
-        // for every one of them contradicted it: a Bilanzkreis not yet assigned,
-        // or a measuring point with no known occupant, is an ordinary state.
+        // Nullable attribute columns may be absent: a Bilanzkreis not yet
+        // assigned, or a measuring point with no known occupant, is an
+        // ordinary state.
         use crate::arrow::array::Array;
 
         let s = series(vec![quarter(

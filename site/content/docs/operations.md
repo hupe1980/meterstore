@@ -64,19 +64,10 @@ let handle = catalog.maintenance()
     .spawn();
 ```
 
-Off by default: destroying a linkage is irreversible, so turning it on is the
-compliance decision.
-
-`CalendarYears(3)` is **not** `now - 3 years`. The clock starts at the *Schluss
-des Kalenderjahres*, so a value collected on 2 January 2025 comes due on 31
-December 2028; the rolling spelling would erase it a year early.
-`Retention::Rolling(d)` covers the statute's other trigger — deletion as soon as
-storing is no longer necessary — which can fall before the year-end ceiling.
-
-**It reads no table.** What comes due is a `(subject, collection year)` pair
-recorded on the mapping row, so the sweep is one indexed `DELETE` against the
-registry, the same through any handle. See [Privacy and retention](@/docs/privacy.md).
-A failed sweep appears in `outcome.failures()` as `<retention>`.
+Off by default and irreversible. It reads no table — one indexed `DELETE`
+against the registry — and a failed sweep appears in `outcome.failures()` as
+`<retention>`. Why `CalendarYears(3)` is not `now - 3 years`:
+[Privacy and retention](@/docs/privacy.md#the-duty-on-a-clock).
 
 **A failing table does not end the cycle.** It becomes a row with a `failure` and
 the rest are still maintained, so one quarantined schema or unreachable catalogue
@@ -278,10 +269,9 @@ archived into a layout nobody agreed on.
 | Archival drops a window while a query is being planned | The plan re-reads the reclaimed mark after pinning and fails with a retryable `BoundaryMoved` (Flight `UNAVAILABLE`, CLI exit 75) | Retry |
 | `archival_step` changed on a table with archived windows | Archival refuses every run with a configuration error | Create a new table at the new step |
 | A write into a window archival is detaching | PostgreSQL finds no partition for the row, raised as retryable `BoundaryMoved`; `append` waits — 50 ms, doubling — reads the boundary again and routes the row to the cold tier, up to five rounds, then returns the retryable error; a `hot_writer` re-reads its boundary so the caller's retry lands or is refused by name | Automatic for `append`; retry for `hot_writer` |
-| Second archiver commits a window already committed | Its commit is refused as `AlreadyArchived` and reported as a contended run | Automatic |
 | A suppression key dropped from the key ring | Suppressions recorded under it stop matching, so an erased subject could be registered again; reported by `orphaned_suppressions` and a startup warning, never refused | Put the key back in the ring, or stop the replay upstream — see [the privacy page](@/docs/privacy.md) |
 | A stored row that no longer decodes | `Error::Decode` on read — see [the stored-data break](@/docs/storage-model.md#json-columns) | Read it with a build that decodes it, or as text from any engine |
-| Second archiver on the same table | Lease refused; the run is a reported no-op | Automatic; alert on lag, not on contention |
+| Second archiver on the same table | Lease refused, or its duplicate commit refused as `AlreadyArchived`; either way reported `lease_contended` | Automatic; alert on lag, not on contention |
 | A DDL lock held by a long query | Statement gives up; the run is a reported no-op (`deferred`) | Automatic; alert on lag, not on deferral |
 | Incompatible schema change | Table quarantined; rows stay correctable in PostgreSQL | Operator resolves |
 | A declared column not yet applied | Build, archival and writes refuse with a configuration error naming `create_tables` | Run `create_tables` (`meterstore create`) |
@@ -330,9 +320,7 @@ the portfolio (roughly 40 MB a day at 100 k measuring points); an archival run
 reports the bytes per file it wrote while nothing is declared.
 
 MeterStore removes its own orphan files only when the catalogue **refused** the
-commit. When the answer is unknown — a timeout, a reset connection, a 5xx — the
-files stay, since deleting one a landed snapshot references destroys settled
-history. Out-of-band orphan removal reclaims that space.
+commit; files from a commit with an unknown outcome stay (see the failure matrix).
 
 ## Snapshot expiry
 

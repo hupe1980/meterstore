@@ -12,6 +12,40 @@ in place rather than through a migration.
 This is the only file in the repository that carries history. Reference
 documentation says what is true now; a test enforces it.
 
+## [0.17.0] — 2026-11-21
+
+### Upgrading from 0.16
+
+1. Raise `metering` to 0.26. Its only breaking change is in `eeg::mispel`
+   (`Pauschaljahr.grenzen` → `kalenderjahr`), which MeterStore does not use;
+   nothing stored changes.
+
+### Changed — breaking
+
+- **`metering` 0.26.** Its types are in this crate's signatures, so the bump is
+  a breaking one here.
+
+### Fixed
+
+- `cli::main` drops a redundant `#[must_use]` (`ExitCode` already is one),
+  which clippy 1.100's `double_must_use` refuses.
+
+### Dependencies
+
+- RUSTSEC-2026-0542, -0543 and -0555 (`humantime`, `chrono`, `chrono-tz`
+  unmaintained) are ignored with a revisit condition: they arrive through Arrow
+  58 and `object_store`, which the `iceberg-datafusion` ceiling fixes.
+
+### Documentation
+
+- `[privacy]` documents `erasure_cascade` alongside the keys; the settings
+  module docs describe what `Settings::connect` opens.
+- PostgreSQL 14 is end-of-life; the support floor stays 15.
+- Comments name `iceberg` 0.11 and the reader-pin registry where they named
+  0.10.1 and the grace alone.
+- Duplicated passages (the gas DST table, the retention sweep, the SQLite
+  conflict, the archiver-contention rows) are kept once and linked.
+
 ## [0.16.0] — 2026-11-07
 
 ### Upgrading from 0.15

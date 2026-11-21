@@ -1531,12 +1531,11 @@ impl MeterStore {
     /// The registry this table's subject column resolves against.
     ///
     /// **The only subject operation on a table handle**, and deliberately so:
-    /// the registry is one `meterstore_subject_map` for the whole deployment
-    /// (D20), so every erasure it performs reaches every table that registered
-    /// the same identifier. A per-table `erase_subject` would name a scope the
-    /// data does not have, and one did — the guard on it was table-scoped while
-    /// its effect was not, so the same sweep succeeded through one handle and
-    /// was refused through another.
+    /// the registry is one `meterstore_subject_map` for the whole deployment,
+    /// so every erasure it performs reaches every table that registered the
+    /// same identifier. A per-table `erase_subject` would name a scope the data
+    /// does not have: a table-scoped guard over a deployment-wide effect lets
+    /// one sweep succeed through one handle and be refused through another.
     ///
     /// [`MeterCatalog`](crate::MeterCatalog) is the deployment handle and
     /// carries the operations. This is here for a deployment that builds one
