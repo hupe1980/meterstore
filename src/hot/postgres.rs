@@ -9,7 +9,6 @@
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use sqlx::{PgPool, Row};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, info, warn};
@@ -17,12 +16,12 @@ use tracing::{debug, info, warn};
 use crate::arrow::array::{
     Array, ArrayRef, Decimal128Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
-use crate::encode::schema::{
-    self, VALUE_PRECISION, VALUE_SCALE, VERSION_PRECISION, VERSION_SCALE, col,
-};
+use crate::encode::schema::{self, VALUE_PRECISION, VERSION_PRECISION, VERSION_SCALE, col};
 use crate::error::{Error, Result};
 use crate::planner::TimeRange;
-use crate::tiering::store::{BatchStream, HotStore, PartitionId, ReaderPin, Reclamation, ScanSpec};
+use crate::tiering::store::{
+    BatchStream, ColdStore, HotStore, PartitionId, ReaderPin, Reclamation, ScanSpec,
+};
 use crate::watermark::TieringWatermark;
 
 /// A PostgreSQL-backed hot tier.
@@ -142,36 +141,19 @@ impl PostgresHot {
 
     /// Create the partitioned parent table if it does not exist.
     ///
-    /// Note there is no primary key: a unique constraint on a partitioned table
-    /// must include the partition key, and `(malo_id, obis_code, "from",
-    /// version)` already does. Corrections are new rows with a higher `version`,
-    /// so uniqueness must not collapse them.
+    /// Uses the default interval shape, merge key, and measurement scale.
     pub async fn create_table(&self, table: &str) -> Result<()> {
-        self.create_table_with_key(
-            table,
-            &crate::encode::schema::MERGE_KEY
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<Vec<_>>(),
-            &[],
-            crate::config::TimeModel::Interval,
-        )
-        .await
+        self.create_table_for(&crate::TableConfig::new(table).build()?)
+            .await
     }
 
-    /// Create the table with an extended identity and extra columns.
-    ///
-    /// `merge_key` must match what resolution partitions by — it is the primary
-    /// key together with `version`, and the two must agree or a row can be
-    /// stored that resolution then treats as a competitor to a different
-    /// reading.
-    pub async fn create_table_with_key(
-        &self,
-        table: &str,
-        merge_key: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        time_model: crate::config::TimeModel,
-    ) -> Result<()> {
+    /// Create or verify the partitioned hot table for this configuration.
+    pub async fn create_table_for(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+        let table = config.name();
+        let merge_key = &config.merge_key();
+        let extra = &config.extra_columns();
+        let time_model = config.time_model();
+        let value_scale = config.value_scale();
         let mut extra_ddl = String::new();
         for f in extra {
             extra_ddl.push_str(&column_ddl(f)?);
@@ -226,7 +208,7 @@ impl PostgresHot {
                 -- is null and `to IS NULL` is what tells a reader that `value`
                 -- is a cumulative reading rather than energy over a span.
                 "to"          TIMESTAMPTZ{to_ddl},
-                value         NUMERIC({VALUE_PRECISION},{VALUE_SCALE}) NOT NULL,
+                value         NUMERIC({VALUE_PRECISION},{value_scale}) NOT NULL,
                 -- Water is m³ and gas may be either side of the Brennwert
                 -- conversion, so the number's dimension is stored, never implied
                 -- by the column name.
@@ -290,7 +272,7 @@ impl PostgresHot {
         // what makes `create_tables` safe to call on every start — and what
         // makes a *changed* declaration silent. Both of the things this DDL
         // encodes are therefore read back and compared.
-        self.verify_declaration(table, merge_key, time_model)
+        self.verify_declaration(table, merge_key, time_model, value_scale)
             .await?;
         self.add_declared_columns(table, extra).await?;
 
@@ -361,14 +343,15 @@ impl PostgresHot {
 
     /// Refuse a configuration the existing table cannot be reconciled with.
     ///
-    /// Two declarations are baked into the DDL and cannot be altered by
-    /// re-running it, and changing either in configuration fails quietly:
+    /// The declaration is baked into the DDL; creating an existing table is a no-op:
     ///
     /// * **The primary key**, which *is* the merge key. Resolution would
     ///   partition by the new one while the table enforced the old, so the
     ///   second reading a wider key exists to admit conflicts on the narrower
     ///   primary key and is skipped — invisible to the divergence check too,
     ///   which joins on the new key.
+    /// * **The measurement scale.** PostgreSQL rounds inputs to the stored scale.
+    ///   A mismatched writer could lose a fractional digit on a successful insert.
     /// * **Whether `to` carries a span end.** `value` is interval energy on one
     ///   model and a cumulative register reading on the other, and one table
     ///   holding both carries a column no aggregate can interpret.
@@ -381,6 +364,7 @@ impl PostgresHot {
         table: &str,
         merge_key: &[String],
         time_model: crate::config::TimeModel,
+        value_scale: i8,
     ) -> Result<()> {
         let mut conn = self.pool.acquire().await.map_err(pg)?;
 
@@ -400,6 +384,20 @@ impl PostgresHot {
                  reporting it. Restore the declaration, or create a new table",
                 stored.join(", "),
                 expected.join(", "),
+            )));
+        }
+
+        let stored_type: String = sqlx::query_scalar(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = $1::regclass AND attname = 'value' AND NOT attisdropped"
+        )
+        .bind(format!("\"{table}\""))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(pg)?;
+        let expected_type = format!("numeric({VALUE_PRECISION},{value_scale})");
+        if stored_type != expected_type {
+            return Err(Error::config(format!(
+                "hot table {table}.value has type {stored_type}, configured {expected_type}; create a new table to change value_scale"
             )));
         }
 
@@ -480,10 +478,13 @@ async fn add_integrity_constraints(
     // instants: `tstzrange` needs an end, and two instants cannot overlap at
     // all — the primary key already refuses two rows at one `(merge key,
     // version)`, which is the whole of what uniqueness means there.
+    // The primary key already resolves equal starts at one identity/version.
+    // Limiting the range exclusion to distinct starts keeps a concurrent
+    // exact replay on the unique index's ON CONFLICT path.
     if has_interval_end(&mut *conn, table).await? {
         let ddl = format!(
             r#"ALTER TABLE "{partition}" ADD CONSTRAINT "{partition}_no_overlap"
-                   EXCLUDE USING gist ({}, tstzrange("from", "to", '[)') WITH &&)"#,
+                   EXCLUDE USING gist ({}, "from" WITH <>, tstzrange("from", "to", '[)') WITH &&)"#,
             equality.join(", "),
         );
         let identifiers = std::iter::once(partition).chain(key.iter().map(String::as_str));
@@ -605,6 +606,29 @@ impl PostgresHot {
         table: &str,
         merge_key: &[String],
         batch: &RecordBatch,
+        guard: Option<(Duration, &dyn ColdStore)>,
+    ) -> Result<Vec<crate::session::Displacement>> {
+        // The reporting snapshot is valid only for a committed transaction.
+        // Both a serialization failure and a deadlock confirm a complete abort.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self
+                .insert_reporting_once(table, merge_key, batch, guard)
+                .await
+            {
+                Err(Error::ConcurrentWrite) if attempts < 3 => continue,
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn insert_reporting_once(
+        &self,
+        table: &str,
+        merge_key: &[String],
+        batch: &RecordBatch,
+        guard: Option<(Duration, &dyn ColdStore)>,
     ) -> Result<Vec<crate::session::Displacement>> {
         use crate::session::{Displacement, Effect, StoredValue};
 
@@ -623,10 +647,32 @@ impl PostgresHot {
             .cloned()
             .collect();
 
+        let schema = batch.schema();
+        let assertions: Vec<_> = schema
+            .fields()
+            .iter()
+            .filter(|field| crate::config::is_assertion_column(field))
+            .map(|field| field.name())
+            .collect();
         let value_of = |row: usize| -> Result<StoredValue> {
             let r = RowView::new(batch, row)?;
             Ok(StoredValue {
                 value: r.value,
+                assertion_attributes: assertions
+                    .iter()
+                    .map(|name| {
+                        let column = batch
+                            .column_by_name(name)
+                            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                            .ok_or_else(|| {
+                                Error::encode(name.as_str(), "expected a text assertion attribute")
+                            })?;
+                        Ok((
+                            (*name).clone(),
+                            (!column.is_null(row)).then(|| column.value(row).to_string()),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
                 unit: r
                     .unit
                     .parse()
@@ -657,17 +703,24 @@ impl PostgresHot {
             ));
         }
 
-        let mut tx = self.pool.begin().await.map_err(pg)?;
-
         // **Every** stored version for the affected readings, not just the
         // winner. The winner alone cannot say whether this exact version is
         // already present, which is what separates a replay from a backfill.
         let malo: Vec<String> = rows.iter().map(|(k, ..)| k.0.clone()).collect();
         let obis: Vec<String> = rows.iter().map(|(k, ..)| k.1.clone()).collect();
         let from: Vec<OffsetDateTime> = rows.iter().map(|(k, ..)| k.2).collect();
+        let mut tx = match guard {
+            Some((step, cold)) => self.begin_single_tier(table, step, cold, &from).await?,
+            None => self
+                .pool
+                .begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
+                .await
+                .map_err(pg)?,
+        };
 
         let ident_select = identity
             .iter()
+            .chain(assertions.iter().copied())
             .map(|c| format!(", s.{c:?}"))
             .collect::<String>();
         let sql = format!(
@@ -680,7 +733,12 @@ impl PostgresHot {
                 AND s.obis_code = k.obis_code
                 AND s."from" = k."from""#
         );
-        let identifiers = std::iter::once(table).chain(identity.iter().map(String::as_str));
+        let identifiers = std::iter::once(table).chain(
+            identity
+                .iter()
+                .chain(assertions.iter().copied())
+                .map(String::as_str),
+        );
         let stored = sqlx::query(checked(sql, identifiers)?)
             .bind(&malo)
             .bind(&obis)
@@ -710,6 +768,10 @@ impl PostgresHot {
             let scope: String = row.try_get(7).map_err(pg)?;
             let held = StoredValue {
                 value: row.try_get(3).map_err(pg)?,
+                assertion_attributes: assertions
+                    .iter()
+                    .map(|name| Ok(((*name).clone(), row.try_get(name.as_str()).map_err(pg)?)))
+                    .collect::<Result<_>>()?,
                 unit: unit
                     .parse()
                     .map_err(|e| Error::decode(col::UNIT, format!("{unit:?}: {e}")))?,
@@ -735,8 +797,7 @@ impl PostgresHot {
             }
         }
 
-        self.insert_rows(&mut tx, table, merge_key, batch).await?;
-        tx.commit().await.map_err(pg)?;
+        let inserted = self.insert_rows(&mut tx, table, merge_key, batch).await?;
 
         // Folded in ascending version order, so a batch carrying two versions of
         // one reading reports the second as superseding the first rather than
@@ -748,7 +809,7 @@ impl PostgresHot {
         for i in order {
             let (key, written, to) = &rows[i];
             let prior = current.get(key).cloned();
-            let replayed = seen.contains(&(key.clone(), written.version.version().get()));
+            let replayed = !seen.insert((key.clone(), written.version.version().get()));
 
             let effect = match &prior {
                 None => Effect::Inserted,
@@ -773,6 +834,8 @@ impl PostgresHot {
             });
         }
 
+        tx.commit().await.map_err(pg)?;
+        record_committed_rows(table, inserted, n);
         Ok(out.into_iter().flatten().collect())
     }
 
@@ -782,8 +845,11 @@ impl PostgresHot {
         merge_key: &[String],
         batch: &RecordBatch,
     ) -> Result<u64> {
-        let mut conn = self.pool.acquire().await.map_err(pg)?;
-        self.insert_rows(&mut conn, table, merge_key, batch).await
+        let mut tx = self.pool.begin().await.map_err(pg)?;
+        let inserted = self.insert_rows(&mut tx, table, merge_key, batch).await?;
+        tx.commit().await.map_err(pg)?;
+        record_committed_rows(table, inserted, batch.num_rows());
+        Ok(inserted)
     }
 
     /// The one insert implementation, so the plain and reporting paths cannot
@@ -898,22 +964,44 @@ impl PostgresHot {
             .map(|i| format!(", ${}::text[]", core_column_count() + 1 + i))
             .collect::<String>();
 
+        // PostgreSQL rounds numeric input to the destination scale. Check the
+        // actual destination type in the INSERT, including when the caller
+        // supplies a raw Arrow batch or another process recreates the table.
+        let batch_schema = batch.schema();
+        let crate::arrow::datatypes::DataType::Decimal128(VALUE_PRECISION, scale) =
+            batch_schema.field_with_name(col::VALUE)?.data_type()
+        else {
+            return Err(Error::encode(
+                col::VALUE,
+                format!("expected Decimal128 with precision {VALUE_PRECISION}"),
+            ));
+        };
+        let expected_type = format!("numeric({VALUE_PRECISION},{scale})");
         let sql = format!(
-            r#"INSERT INTO "{table}" ({core_cols}{extra_cols})
+            r#"WITH shape AS MATERIALIZED (
+                   SELECT format_type(atttypid, atttypmod) AS value_type
+                   FROM pg_attribute
+                   WHERE attrelid = '"{table}"'::regclass AND attname = 'value' AND NOT attisdropped
+               ), inserted AS (
+               INSERT INTO "{table}" ({core_cols}{extra_cols})
                SELECT * FROM unnest(
                    $1::text[], $2::text[], $3::text[], $4::text[],
                    $5::timestamptz[], $6::timestamptz[], $7::numeric[], $8::text[],
                    $9::text[], $10::text[], $11::text[], $12::text[], $13::text[],
                    $14::numeric[], $15::text[], $16::timestamptz[], $17::date[]{extra_params}
                )
-               ON CONFLICT ({conflict}) DO NOTHING"#,
+               WHERE (SELECT value_type FROM shape) = '{expected_type}'
+               ON CONFLICT ({conflict}) DO NOTHING
+               RETURNING 1
+               )
+               SELECT value_type, (SELECT count(*) FROM inserted) FROM shape"#,
             core_cols = scan_columns(),
         );
 
         let identifiers = std::iter::once(table)
             .chain(merge_key.iter().map(String::as_str))
             .chain(extra.iter().map(String::as_str));
-        let mut query = sqlx::query(checked(sql, identifiers)?)
+        let mut query = sqlx::query_as::<_, (String, i64)>(checked(sql, identifiers)?)
             .bind(&malo)
             .bind(&melo)
             .bind(&obis)
@@ -936,17 +1024,20 @@ impl PostgresHot {
             query = query.bind(values);
         }
 
-        let inserted = query.execute(&mut *conn).await.map_err(pg)?.rows_affected();
+        let (stored_type, inserted) = query.fetch_one(&mut *conn).await.map_err(pg)?;
+        if stored_type != expected_type {
+            return Err(Error::encode(
+                col::VALUE,
+                format!("hot table {table} expects {stored_type}; batch supplies {expected_type}"),
+            ));
+        }
+        let inserted = inserted as u64;
 
         // `saturating_sub`: `rows_affected` cannot exceed the rows sent, but the
         // difference is a subtraction on the write path and an underflow there
         // panics in a debug build and wraps to ~2^64 in a release one — two
         // different wrong answers to a question that only exists for a metric.
         let skipped = (n as u64).saturating_sub(inserted);
-        let metrics = crate::observe::metrics();
-        let attrs = crate::observe::table(table);
-        metrics.rows_written.add(inserted, &attrs);
-        metrics.rows_deduplicated.add(skipped, &attrs);
 
         if skipped > 0 {
             // Replay is fine; a changed value under the same version is not.
@@ -979,12 +1070,22 @@ impl PostgresHot {
                 .collect::<Vec<_>>()
                 .join(" AND ");
 
-            let identity_params = (0..identity.len())
-                .map(|i| format!(", ${}::text[]", 7 + i))
+            let schema = batch.schema();
+            let assertions = schema
+                .fields()
+                .iter()
+                .filter(|field| crate::config::is_assertion_column(field))
+                .map(|field| field.name());
+            let compared: Vec<_> = identity.iter().copied().chain(assertions.clone()).collect();
+            let compared_params = (0..compared.len())
+                .map(|i| format!(", ${}::text[]", 8 + i))
                 .collect::<String>();
-            let identity_cols = identity
+            let compared_cols = compared
                 .iter()
                 .map(|c| format!(", {c:?}"))
+                .collect::<String>();
+            let attribute_changes = assertions
+                .map(|c| format!(" WHEN stored.{c:?} IS DISTINCT FROM incoming.{c:?} THEN '{c}'"))
                 .collect::<String>();
 
             // Two questions of the same join, because a skipped row has exactly
@@ -1004,30 +1105,38 @@ impl PostgresHot {
             // configuration fix and a hunt.
             let sql = format!(
                 r#"SELECT
+                       min(CASE WHEN stored.value IS DISTINCT FROM incoming.value THEN 'value'
+                           {attribute_changes} END) AS restated_field,
                        count(*) FILTER (
-                           WHERE stored.value IS DISTINCT FROM incoming.value) AS restated,
-                       count(*) FILTER (
-                           WHERE stored.melo_id IS DISTINCT FROM incoming.melo_id) AS relocated
+                           WHERE stored.melo_id IS DISTINCT FROM incoming.melo_id) AS relocated,
+                       count(*) FILTER (WHERE stored.version_scope <> incoming.version_scope) AS rescoped
                    FROM unnest(
                        $1::text[], $2::text[], $3::timestamptz[],
-                       $4::numeric[], $5::numeric[], $6::text[]{identity_params}
-                   ) AS incoming(malo_id, obis_code, "from", version, value, melo_id{identity_cols})
+                       $4::numeric[], $5::numeric[], $6::text[], $7::text[]{compared_params}
+                   ) AS incoming(malo_id, obis_code, "from", version, value, melo_id, version_scope{compared_cols})
                    JOIN "{table}" stored ON {join}"#
             );
-            let identifiers = std::iter::once(table).chain(merge_key.iter().map(String::as_str));
-            let mut query = sqlx::query_as::<_, (i64, i64)>(checked(sql, identifiers)?)
-                .bind(&malo)
-                .bind(&obis)
-                .bind(&from)
-                .bind(&version)
-                .bind(&value)
-                .bind(&melo);
+            let identifiers = std::iter::once(table).chain(
+                merge_key
+                    .iter()
+                    .chain(compared.iter().copied())
+                    .map(String::as_str),
+            );
+            let mut query =
+                sqlx::query_as::<_, (Option<String>, i64, i64)>(checked(sql, identifiers)?)
+                    .bind(&malo)
+                    .bind(&obis)
+                    .bind(&from)
+                    .bind(&version)
+                    .bind(&value)
+                    .bind(&melo)
+                    .bind(&version_scope);
 
-            for name in &identity {
+            for name in compared {
                 let index = extra
                     .iter()
-                    .position(|e| e == *name)
-                    .ok_or_else(|| Error::encode(name.as_str(), "identity column missing"))?;
+                    .position(|e| e == name)
+                    .ok_or_else(|| Error::encode(name.as_str(), "comparison column missing"))?;
                 query = query.bind(&extra_values[index]);
             }
 
@@ -1046,7 +1155,17 @@ impl PostgresHot {
             // see the same snapshot as the insert it is checking, and a separate
             // connection sees neither the transaction's own rows nor a
             // consistent view of a concurrent writer's.
-            let (restated, relocated) = query.fetch_one(&mut *conn).await.map_err(pg)?;
+            let (restated_field, relocated, rescoped) =
+                query.fetch_one(&mut *conn).await.map_err(pg)?;
+            if rescoped > 0 {
+                return Err(Error::IntegrityViolation {
+                    table: table.to_string(),
+                    constraint: Some("one_operator_per_reading".to_string()),
+                    detail: format!(
+                        "{rescoped} row(s) assert another version scope for a stored reading"
+                    ),
+                });
+            }
 
             // `IntegrityViolation`, not `InvariantViolated`: both of these are a
             // *delivery* the store refused, exactly like the CHECK and exclusion
@@ -1054,14 +1173,12 @@ impl PostgresHot {
             // the tiers no longer partition the data and query results may be
             // wrong — it is the one condition on the alerting list, and a
             // malformed delivery must not raise it.
-            if restated > 0 {
+            if let Some(field) = restated_field {
                 return Err(Error::IntegrityViolation {
                     table: table.to_string(),
                     constraint: Some("version_identifies_one_assertion".to_string()),
                     detail: format!(
-                        "{restated} row(s) restate a different value under an existing \
-                         version — a version identifies one assertion, so a corrected \
-                         value needs a higher version"
+                        "a delivery restates {field:?} at an existing version. A corrected assertion needs a higher version"
                     ),
                 });
             }
@@ -1123,6 +1240,7 @@ impl PostgresHot {
     fn chunked_scan(&self, relation: &str, range: TimeRange, spec: &ScanSpec) -> BatchStream {
         let pool = self.pool.clone();
         let relation = relation.to_string();
+        let value_scale = spec.value_scale();
         let chunk = spec.chunk_rows().unwrap_or(self.scan_chunk_rows);
         let extra: Vec<String> = spec.extra().to_vec();
         let extra_select = extra.iter().map(|c| format!(", {c:?}")).collect::<String>();
@@ -1216,7 +1334,7 @@ impl PostgresHot {
                 );
                 let exhausted = rows.len() < chunk;
 
-                for batch in rows_to_batches(rows, &extra)? {
+                for batch in rows_to_batches(rows, &extra, value_scale)? {
                     yield batch;
                 }
                 if exhausted {
@@ -1263,15 +1381,29 @@ impl PostgresHot {
         }
 
         let mut tx = self.begin_ddl().await?;
+        let created = self.create_partition_in(&mut tx, table, id, step).await?;
+        tx.commit().await.map_err(pg)?;
+        Ok(created)
+    }
+
+    /// Create an absent partition using the caller's transaction.
+    async fn create_partition_in(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        table: &str,
+        id: &PartitionId,
+        step: Duration,
+    ) -> Result<bool> {
+        let name = id.relation_name()?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key("partition", &name))
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await
             .map_err(pg)?;
 
         // Whoever held the lock before us may have created it. Without this the
         // lock would only reorder the collision, not remove it.
-        if relation_exists_in(&mut tx, &name).await? {
+        if relation_exists_in(conn, &name).await? {
             return Ok(false);
         }
 
@@ -1305,7 +1437,7 @@ impl PostgresHot {
             ),
         ] {
             sqlx::query(checked(sql, [name.as_str(), table])?)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| pg_ddl(&name, operation, timeout, e))?;
         }
@@ -1314,7 +1446,7 @@ impl PostgresHot {
             // Before the attach, while the relation is still invisible to every
             // other session — and in the same transaction either way, or the
             // constraint would be added to a partition nobody else can see.
-            add_integrity_constraints(&mut tx, table, &name, timeout).await?;
+            add_integrity_constraints(conn, table, &name, timeout).await?;
         }
 
         sqlx::query(checked(
@@ -1324,7 +1456,7 @@ impl PostgresHot {
             ),
             [table, name.as_str()],
         )?)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|e| pg_ddl(table, "attach partition", timeout, e))?;
 
@@ -1335,11 +1467,9 @@ impl PostgresHot {
             format!(r#"ALTER TABLE "{name}" DROP CONSTRAINT "{name}_bound""#),
             [name.as_str()],
         )?)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|e| pg_ddl(&name, "drop bound constraint", timeout, e))?;
-
-        tx.commit().await.map_err(pg)?;
 
         debug!(table, partition = %name, "created hot partition");
         Ok(true)
@@ -1401,6 +1531,55 @@ impl PostgresHot {
                 .execute(&mut *tx)
                 .await
                 .map_err(pg)?;
+        }
+        Ok(tx)
+    }
+
+    /// The archive guard, partition DDL and insert use one connection. A second
+    /// pool checkout here could strand every writer behind its own guard.
+    async fn begin_single_tier(
+        &self,
+        table: &str,
+        step: Duration,
+        cold: &dyn ColdStore,
+        starts: &[OffsetDateTime],
+    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        let mut tx = self.begin_ddl().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .execute(&mut *tx)
+            .await
+            .map_err(pg)?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1)")
+            .bind(lock_key("archive", table))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(pg)?;
+        if !acquired {
+            return Err(Error::LockTimeout {
+                relation: table.to_string(),
+                operation: "single-tier append during archival".to_string(),
+                waited_ms: 0,
+            });
+        }
+
+        let first = *starts.iter().min().expect("nonempty batch");
+        let last = *starts.iter().max().expect("nonempty batch");
+        let watermark = cold.watermark(table).await?;
+        if first < watermark.get() {
+            return Err(Error::boundary_moved(
+                table,
+                "write",
+                format!("single-tier append starts at {first}, below {watermark}"),
+            ));
+        }
+
+        let mut start = crate::watermark::align_to_step(first, step)?;
+        while start <= last {
+            let id = PartitionId::new(table, start);
+            if !relation_exists_in(&mut tx, &id.relation_name()?).await? {
+                self.create_partition_in(&mut tx, table, &id, step).await?;
+            }
+            start += step;
         }
         Ok(tx)
     }
@@ -1518,6 +1697,10 @@ impl std::fmt::Debug for PgTableLease {
 
 #[async_trait]
 impl crate::tiering::store::TableLease for PgTableLease {
+    fn enforced(&self) -> bool {
+        true
+    }
+
     async fn release(mut self: Box<Self>) -> Result<()> {
         // The boolean matters. `pg_advisory_unlock` returns `false` when this
         // session does not in fact hold the lock, which means either a double
@@ -1576,6 +1759,16 @@ fn key_column<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Result<&'a 
         ));
     }
     Ok(column.value(row))
+}
+
+/// Record only accepted deliveries. A divergence check may roll back an insert.
+fn record_committed_rows(table: &str, inserted: u64, delivered: usize) {
+    let metrics = crate::observe::metrics();
+    let attrs = crate::observe::table(table);
+    metrics.rows_written.add(inserted, &attrs);
+    metrics
+        .rows_deduplicated
+        .add((delivered as u64).saturating_sub(inserted), &attrs);
 }
 
 /// The POSIX regular expression for a declared value check's *shape*.
@@ -1744,7 +1937,11 @@ fn scan_columns() -> String {
 }
 
 /// Convert Postgres rows into a single batch in the storage schema.
-fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result<Vec<RecordBatch>> {
+fn rows_to_batches(
+    rows: Vec<sqlx::postgres::PgRow>,
+    extra: &[String],
+    value_scale: i8,
+) -> Result<Vec<RecordBatch>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -1783,7 +1980,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
         );
         value.push(decimal_to_i128(
             row.try_get::<Decimal, _>(6).map_err(pg)?,
-            VALUE_SCALE,
+            value_scale,
             col::VALUE,
         )?);
         unit.push(row.try_get::<String, _>(7).map_err(pg)?);
@@ -1815,7 +2012,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
         std::sync::Arc::new(TimestampMicrosecondArray::from(from).with_timezone(tz.clone())),
         std::sync::Arc::new(TimestampMicrosecondArray::from(to).with_timezone(tz.clone())),
         std::sync::Arc::new(
-            Decimal128Array::from(value).with_precision_and_scale(VALUE_PRECISION, VALUE_SCALE)?,
+            Decimal128Array::from(value).with_precision_and_scale(VALUE_PRECISION, value_scale)?,
         ),
         std::sync::Arc::new(StringArray::from(unit)),
         std::sync::Arc::new(StringArray::from(quality)),
@@ -1849,7 +2046,7 @@ fn rows_to_batches(rows: Vec<sqlx::postgres::PgRow>, extra: &[String]) -> Result
     }
 
     Ok(vec![RecordBatch::try_new(
-        schema::storage_schema(&fields),
+        schema::storage_schema_at_scale(&fields, value_scale),
         columns,
     )?])
 }
@@ -1928,18 +2125,12 @@ impl<'a> RowView<'a> {
                 .value(row);
             schema::date_of(days)
         }
-        fn dec(batch: &RecordBatch, name: &str, row: usize, scale: i8) -> Result<Decimal> {
-            let raw = batch
+        fn dec(batch: &RecordBatch, name: &str, row: usize) -> Result<Decimal> {
+            let values = batch
                 .column_by_name(name)
                 .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
-                .ok_or_else(|| Error::encode(name, "expected a decimal column"))?
-                .value(row);
-            // `Decimal::new` takes an i64 and would reject the top of the
-            // `version` range: MSCONS labels are ≥14 digits and the column holds
-            // 20, which is three orders of magnitude past `i64::MAX`. The
-            // 96-bit path covers the whole column.
-            Decimal::try_from_i128_with_scale(raw, u32::try_from(scale).unwrap_or(0))
-                .map_err(|e| Error::encode(name, format!("{raw}: {e}")))
+                .ok_or_else(|| Error::encode(name, "expected a decimal column"))?;
+            crate::encode::decimal_at(values, row, name)
         }
 
         Ok(Self {
@@ -1949,14 +2140,14 @@ impl<'a> RowView<'a> {
             sparte: text(batch, col::SPARTE, row)?,
             from: ts(batch, col::FROM, row)?,
             to: ts_opt(batch, col::TO, row)?,
-            value: dec(batch, col::VALUE, row, VALUE_SCALE)?,
+            value: dec(batch, col::VALUE, row)?,
             unit: text(batch, col::UNIT, row)?,
             quality: text(batch, col::QUALITY, row)?,
             resolution: text_opt(batch, col::RESOLUTION, row),
             source_kind: text(batch, col::SOURCE_KIND, row)?,
             source_detail: text_opt(batch, col::SOURCE_DETAIL, row),
             provenance: text_opt(batch, col::PROVENANCE, row),
-            version: dec(batch, col::VERSION, row, VERSION_SCALE)?,
+            version: dec(batch, col::VERSION, row)?,
             version_scope: text(batch, col::VERSION_SCOPE, row)?,
             recorded_at: ts(batch, col::RECORDED_AT, row)?,
             balancing_day: date(batch, col::BALANCING_DAY, row)?,
@@ -2099,6 +2290,7 @@ fn pg(e: sqlx::Error) -> Error {
         return Error::Storage(e.to_string());
     };
     match db.code().as_deref() {
+        Some("40001" | "40P01") => Error::ConcurrentWrite,
         // A `check_violation` naming no constraint is PostgreSQL finding no
         // partition for the row: archival detached the window between the
         // write's routing and its insert. Every rule this crate declares is a
@@ -2148,6 +2340,18 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// so the one error it exists to produce is named rather than flattened into a
 /// storage failure whose message a caller would have to grep.
 fn pg_ddl(relation: &str, operation: &str, timeout: Duration, e: sqlx::Error) -> Error {
+    // The partition creation lock can outlive a serializable writer's
+    // snapshot: a competing creator has committed the relation, while this
+    // transaction still sees an empty catalogue. Retry with a fresh snapshot.
+    if operation == "create partition"
+        && e.as_database_error().is_some_and(|db| {
+            db.code().as_deref() == Some("42P07")
+                || (db.code().as_deref() == Some("23505")
+                    && db.constraint() == Some("pg_type_typname_nsp_index"))
+        })
+    {
+        return Error::ConcurrentWrite;
+    }
     let timed_out = e
         .as_database_error()
         .and_then(|db| db.code().map(|c| c == LOCK_NOT_AVAILABLE))
@@ -2463,15 +2667,23 @@ impl HotStore for PostgresHot {
         Ok(())
     }
 
-    async fn create_tables(
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+        self.create_table_for(config).await
+    }
+
+    async fn append_single_tier(
         &self,
-        table: &str,
-        merge_key: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        time_model: crate::config::TimeModel,
-    ) -> Result<()> {
-        self.create_table_with_key(table, merge_key, extra, time_model)
-            .await
+        config: &crate::ValidatedTableConfig,
+        batch: &RecordBatch,
+        cold: &dyn ColdStore,
+    ) -> Result<Vec<crate::session::Displacement>> {
+        self.insert_reporting(
+            config.name(),
+            &config.merge_key(),
+            batch,
+            Some((config.archival_step(), cold)),
+        )
+        .await
     }
 
     async fn append_reporting(
@@ -2482,7 +2694,7 @@ impl HotStore for PostgresHot {
     ) -> Result<Vec<crate::session::Displacement>> {
         let mut out = Vec::new();
         for batch in batches {
-            out.extend(self.insert_reporting(table, merge_key, batch).await?);
+            out.extend(self.insert_reporting(table, merge_key, batch, None).await?);
         }
         Ok(out)
     }
@@ -2842,16 +3054,15 @@ fn pg_timestamp(ts: OffsetDateTime) -> Result<String> {
 /// Convert a Postgres `NUMERIC` into the fixed-point column representation.
 fn decimal_to_i128(value: Decimal, scale: i8, column: &str) -> Result<i128> {
     let target = u32::try_from(scale).map_err(|_| Error::decode(column, "negative scale"))?;
-    let mut v = value.normalize();
+    let v = value.normalize();
     if v.scale() > target {
         return Err(Error::decode(
             column,
             format!("{value} has more than {scale} decimal places"),
         ));
     }
-    v.rescale(target);
     v.mantissa()
-        .to_i128()
+        .checked_mul(10i128.pow(target - v.scale()))
         .ok_or_else(|| Error::decode(column, format!("{value} does not fit i128")))
 }
 

@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # A tag that disagrees with Cargo.toml publishes the wrong version under the
@@ -27,16 +28,18 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Tag must match Cargo.toml version
         id: version
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           tag_version="${tag#v}"
           crate_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[0].version')
 
-          if [ "$tag_version" != "$crate_version" ]; then
+          if [ "$tag" != "v$crate_version" ]; then
             echo "::error::tag $tag implies version $tag_version, but Cargo.toml says $crate_version"
             exit 1
           fi
@@ -49,16 +52,8 @@ jobs:
       - name: The release's stored form is recorded
         run: |
           version="${{ steps.version.outputs.version }}"
-          if ! jq -e --arg v "$version" '.releases | index($v)' tests/stored-form/*.json > /dev/null; then
+          if ! jq -se --arg v "$version" 'any(.[]; .releases | index($v) != null)' tests/stored-form/*.json > /dev/null; then
             echo "::error::no file in tests/stored-form/ records $version — run \`just stored-form\` and commit it before tagging"
-            exit 1
-          fi
-
-      - name: Reject a pre-release version on a stable tag
-        run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          if [[ "${{ steps.version.outputs.version }}" == *-* && "$tag" != *-* ]]; then
-            echo "::error::Cargo.toml holds a pre-release version but the tag does not"
             exit 1
           fi
 
@@ -68,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
@@ -100,6 +97,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -117,24 +116,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Build release notes
         id: notes
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          previous=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+          tag="$RELEASE_TAG"
+          version="${tag#v}"
 
           {
             echo "## meterstore ${{ needs.verify.outputs.version }}"
             echo
-            if [ -n "$previous" ]; then
-              echo "### Changes since $previous"
-              echo
-              git log --no-merges --pretty='- %s (%h)' "$previous..$tag"
-            else
-              echo "First release."
-            fi
+            awk -v heading="## [$version]" '
+              /^## / { if (found) exit; found = index($0, heading) == 1; next }
+              found { print }
+              END { if (!found) exit 1 }
+            ' CHANGELOG.md
             echo
             echo '```toml'
             echo 'meterstore = "${{ needs.verify.outputs.version }}"'

@@ -97,7 +97,7 @@ impl IcebergCold {
     /// and sums `value` double-counts corrected intervals, so the name must
     /// not be the one that looks like the obvious thing to query.
     pub async fn create_table(&self, table: &str) -> Result<Table> {
-        self.create_table_with(table, &[], &[], &MaintenancePolicy::default())
+        self.create_table_for(&crate::TableConfig::new(table).build()?)
             .await
     }
 
@@ -106,18 +106,16 @@ impl IcebergCold {
     /// These must match the hot table's, or a row archived from one cannot be
     /// written to the other.
     ///
-    /// `identity` names the deployment's identity columns. They become the
+    /// The configured measurement scale is fixed for the table’s lifetime.
+    /// The identity columns become the
     /// **leading partition fields**, ahead of `month(from)`, because an identity
     /// column is by definition something every query filters on — so a scan
     /// scoped to one of them prunes at the manifest rather than by row filter.
     /// See the cold-tier layout.
-    pub async fn create_table_with(
-        &self,
-        table: &str,
-        extra: &[crate::arrow::datatypes::Field],
-        identity: &[String],
-        policy: &MaintenancePolicy,
-    ) -> Result<Table> {
+    pub async fn create_table_for(&self, config: &crate::ValidatedTableConfig) -> Result<Table> {
+        let table = config.name();
+        let identity = &config.identity_column_names();
+        let policy = &config.maintenance_policy();
         if !self
             .catalog
             .namespace_exists(&self.namespace)
@@ -134,11 +132,29 @@ impl IcebergCold {
         if self.catalog.table_exists(&ident).await.map_err(ice)? {
             let existing = self.catalog.load_table(&ident).await.map_err(ice)?;
             check_partition_spec(table, &existing, identity)?;
-            let existing = self.add_declared_columns(table, existing, extra).await?;
+            let current = existing.metadata().current_schema();
+            let expected = iceberg::arrow::arrow_type_to_type(
+                config
+                    .storage_schema()
+                    .field_with_name(schema::col::VALUE)?
+                    .data_type(),
+            )
+            .map_err(ice)?;
+            if current
+                .field_by_name(schema::col::VALUE)
+                .is_none_or(|field| field.field_type.as_ref() != &expected)
+            {
+                return Err(Error::config(format!(
+                    "cold table {table} requires value type {expected} for the configured value_scale; create a new table to change scale"
+                )));
+            }
+            let existing = self
+                .add_declared_columns(table, existing, &config.extra_columns())
+                .await?;
             return self.reconcile_properties(existing, policy).await;
         }
 
-        let arrow_schema = schema::storage_schema(extra);
+        let arrow_schema = config.storage_schema();
         let iceberg_schema =
             iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema.as_ref())
                 .map_err(ice)?;
@@ -1623,6 +1639,18 @@ fn align(
         .fields()
         .iter()
         .map(|field| match batch.column_by_name(field.name()) {
+            Some(array)
+                if field.name() == schema::col::VALUE && array.data_type() != field.data_type() =>
+            {
+                Err(Error::encode(
+                    schema::col::VALUE,
+                    format!(
+                        "cold table expects {}; batch supplies {}",
+                        field.data_type(),
+                        array.data_type()
+                    ),
+                ))
+            }
             Some(array) => {
                 crate::arrow::compute::cast(array, field.data_type()).map_err(Error::from)
             }
@@ -1782,16 +1810,8 @@ fn ice(e: iceberg::Error) -> Error {
 
 #[async_trait]
 impl ColdStore for IcebergCold {
-    async fn create_tables(
-        &self,
-        table: &str,
-        identity: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        policy: &MaintenancePolicy,
-    ) -> Result<()> {
-        self.create_table_with(table, extra, identity, policy)
-            .await
-            .map(|_| ())
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+        self.create_table_for(config).await.map(|_| ())
     }
 
     async fn purge_table(&self, table: &str) -> Result<()> {

@@ -119,24 +119,8 @@ impl TestHarness {
         // One entry point, exactly as a deployment should use: the hot
         // table's primary key, the cold schema and the resolution `PARTITION BY`
         // all have to agree, and creating them separately is where they drift.
-        harness
-            .hot
-            .create_tables(
-                harness.config.name(),
-                &harness.config.merge_key(),
-                &harness.config.extra_columns(),
-                harness.config.time_model(),
-            )
-            .await?;
-        harness
-            .cold
-            .create_tables(
-                harness.config.name(),
-                &harness.config.identity_column_names(),
-                &harness.config.extra_columns(),
-                &harness.config.maintenance_policy(),
-            )
-            .await?;
+        harness.hot.create_tables(&harness.config).await?;
+        harness.cold.create_tables(&harness.config).await?;
 
         Ok(harness)
     }
@@ -216,14 +200,7 @@ impl TestHarness {
         config: ValidatedTableConfig,
     ) -> Result<crate::MeterStoreBuilder> {
         // Created first because the provider needs a table to load a schema from.
-        self.cold
-            .create_table_with(
-                config.name(),
-                &config.extra_columns(),
-                &config.identity_column_names(),
-                &config.maintenance_policy(),
-            )
-            .await?;
+        self.cold.create_table_for(&config).await?;
 
         Ok(MeterStore::builder()
             .hot(Arc::clone(&self.hot) as Arc<dyn HotStore>)

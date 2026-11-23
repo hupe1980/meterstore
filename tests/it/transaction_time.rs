@@ -27,7 +27,7 @@ const T2: OffsetDateTime = datetime!(2026-07-27 06:00 UTC);
 /// One interval at `from`, at a value, version and transaction time.
 fn stored(
     from: OffsetDateTime,
-    kwh: i64,
+    kwh: impl Into<Decimal>,
     version: u128,
     recorded_at: OffsetDateTime,
 ) -> meterstore::encode::StoredSeries {
@@ -38,7 +38,7 @@ fn stored(
             MeterInterval::new(
                 from,
                 from + Duration::minutes(15),
-                Decimal::new(kwh, 0),
+                kwh.into(),
                 QualityFlag::Measured,
             )
             .expect("a non-empty interval")
@@ -240,4 +240,93 @@ async fn a_ceiling_before_any_delivery_is_empty() {
         None,
         "nothing had been recorded yet"
     );
+}
+
+#[tokio::test]
+async fn configured_value_scale_is_exact_across_archival_correction_and_as_of_reads() {
+    use meterstore::{ColdStore, Error, HotStore, TableConfig};
+    let config = TableConfig::new(TestHarness::TABLE)
+        .value_scale(7)
+        .settlement_lag(Duration::DAY)
+        .build()
+        .unwrap();
+    let harness = TestHarness::with_config(config).await.unwrap();
+    harness.seed_watermark(START).await.unwrap();
+    let store = harness.store().await.unwrap();
+    let original = Decimal::new(1, 7);
+    let corrected = Decimal::new(2, 7);
+    let too_precise = Decimal::new(1, 8);
+    assert!(
+        matches!(store.append(&[stored(START, too_precise, 1, T1)]).await,
+        Err(Error::Encode {what, ..}) if what == "value")
+    );
+    assert_eq!(
+        store
+            .append(&[stored(START, original, 1, T1)])
+            .await
+            .unwrap()
+            .hot_rows,
+        1
+    );
+    assert_eq!(value_at(&store, START).await, Some(original));
+
+    store
+        .admin()
+        .archive(START + Duration::days(2), 8)
+        .await
+        .unwrap();
+    assert!(store.watermark().await.unwrap().get() > START);
+    assert_eq!(value_at(&store, START).await, Some(original));
+    let update = stored(START, corrected, 2, T2);
+    let result = store.append(std::slice::from_ref(&update)).await.unwrap();
+    assert_eq!(result.cold_rows, 1);
+    assert_eq!(
+        result.displacements[0].superseded.as_ref().unwrap().value,
+        original
+    );
+    assert_eq!(store.append(&[update]).await.unwrap().cold_rows, 0);
+    assert!(
+        matches!(store.append(&[stored(START, too_precise, 3, T2)]).await,
+        Err(Error::Encode {what, ..}) if what == "value")
+    );
+    assert_eq!(
+        value_at(&store.as_known_at(T1).await.unwrap(), START).await,
+        Some(original)
+    );
+    assert_eq!(
+        value_at(&store.as_known_at(T2).await.unwrap(), START).await,
+        Some(corrected)
+    );
+
+    let other = TableConfig::new(TestHarness::TABLE)
+        .value_scale(8)
+        .build()
+        .unwrap();
+    let incompatible = meterstore::encode::to_record_batch_for(
+        &[stored(START + Duration::DAY, too_precise, 1, T2)],
+        &other,
+    )
+    .unwrap();
+    harness
+        .ensure_partitions(START + Duration::DAY, START + Duration::days(2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(harness.hot().append(other.name(), &other.merge_key(), std::slice::from_ref(&incompatible)).await,
+        Err(Error::Encode {what, ..}) if what == "value")
+    );
+    assert!(matches!(harness.cold().append_only(other.name(),
+        meterstore::tiering::store::stream_of(vec![incompatible]),
+        meterstore::tiering::store::WriteHints::default()).await,
+        Err(Error::Encode {what, ..}) if what == "value"));
+    assert!(value_at(&store, START + Duration::DAY).await.is_none());
+
+    assert!(matches!(
+        harness.hot().create_tables(&other).await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        harness.cold().create_tables(&other).await,
+        Err(Error::Config(_))
+    ));
 }

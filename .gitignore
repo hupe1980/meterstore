@@ -50,6 +50,7 @@ target
 # in the roadmap there, so neither half means anything without the other.
 /specs/
 /.specify/
+/.agents/skills/speckit-*/
 
 # The checker `just concepts` runs over `concepts/` and `specs/`. It tests the
 # design notes' own rules and nothing tracked, so it goes where they go.

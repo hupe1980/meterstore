@@ -9,7 +9,7 @@ weight = 4
 | | Use for | Cost |
 |---|---|---|
 | `store.append(&[…])` | A delivery that **might** contain a late correction, and any backfill | Reads the tier boundary before the write and again after it |
-| `store.hot_writer()` | Steady-state ingest of **current** data | Reads the boundary once per run, then reuses it |
+| `store.hot_writer()` | Steady-state ingest of **current** data | Caches the boundary by default. Single-tier policy verifies it on each batch |
 
 `append` routes each interval to the tier that owns it — the only safe way to
 record a correction for an already-archived interval, which in PostgreSQL would
@@ -24,7 +24,7 @@ outcome.had_late_corrections(); // whether any interval was below the boundary
 
 For a service landing MSCONS or iMSys batches continuously, that boundary read is
 per *batch* — one catalogue load per 96 values if a batch is one meter-day.
-`hot_writer` reads it once:
+With the default routing policy, `hot_writer` caches it:
 
 ```rust
 let writer = store.hot_writer().await?;
@@ -32,6 +32,43 @@ for batch in stream {
     writer.append(&batch).await?;
 }
 ```
+
+### Settlement ingestion
+
+A single delivery can contain current and archived readings. The default routed
+append commits its hot rows first. If the cold append subsequently fails, a
+fresh query can already see the hot rows. For a producer that treats a delivery
+as a unit, configure the table when you provision it:
+
+```toml
+[[tables]]
+name = "readings_versions"
+require_single_tier = true
+value_scale = 7
+extra_columns = [{ name = "spot", assertion = true }]
+```
+
+| Producer receives | What to do |
+|---|---|
+| `MixedTierBatch` | Both tiers retain their previous readings. Split the delivery at the reported watermark (`from < watermark` goes cold), then submit each part as a separate delivery. |
+| `LockTimeout` during archival | Retry the whole single-tier append after backoff. The hot write uses a shared transaction lock, so other hot writers can proceed together. |
+| `IntegrityViolation` with `version_identifies_one_assertion` | Reconcile the source version. Send an intended correction at a higher version. |
+| `Encode` for `value` | Inspect the value against the table’s fixed precision and scale. Supply an exactly representable value. |
+
+Use `append` for settlement deliveries with producer-assigned versions.
+A custom hot backend must implement guarded hot inserts and enforce the
+cold-append lease to support this policy. Configure every writer of the table
+with the same assertion fields. Inspect
+`require_single_tier`, `assertion_columns` and `value_scale` through
+`system.config` to check a running deployment.
+
+Routing and assertion equality serve different purposes. Single-tier routing
+controls where one delivery can commit. An assertion column controls which
+changes a producer must version. Here a retry at the same key and version with
+the same quantity and `spot` succeeds, while changing `spot` from null to
+`"0"` or from `"-1.25"` to `"0"` conflicts. The column stores text, so use one
+decimal spelling across producers. A higher version carries its own price and
+the earlier version remains available to an as-of query.
 
 ### The boundary can move under a write
 
@@ -54,6 +91,9 @@ keeps no reclaimed mark cannot refuse it.
 
 ### Why reusing a boundary is safe in `hot_writer`
 
+On a table with `require_single_tier`, the bulk writer also checks the current
+boundary under the archival guard for every batch.
+
 The writer **refuses** any interval below the boundary it was opened at, rather
 than routing it: routing on a stale boundary could place a row below the true
 watermark; refusing cannot. A refusal names the interval and points at `append`.
@@ -72,8 +112,7 @@ prior value stays readable, which is what makes a past settlement reproducible.
 
 ## Redelivery is ordinary traffic
 
-Transports deliver *at least* once. **A row already stored at the same `(merge key, version)` is skipped, in both
-tiers** — reported as `Duplicate`, never appended twice.
+Transports deliver *at least* once. **A replay of the same assertion at the same `(merge key, version)` is skipped in both tiers** — reported as `Duplicate`, never appended twice.
 
 | | How a replay is absorbed |
 |---|---|
@@ -85,7 +124,7 @@ A cold duplicate would be two winners at one version, and resolution is
 so the sum would be silently overstated.
 
 **A version identifies one assertion.** The same
-`(malo_id, obis_code, from, version)` must always carry the same value.
+`(malo_id, obis_code, from, version)` must always carry the same native value and the same declared assertion attributes.
 Redelivering an identical row is fine; restating a *different* value under an
 existing version is refused in both tiers. A corrected value needs a higher
 version.

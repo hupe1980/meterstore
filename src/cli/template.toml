@@ -87,6 +87,12 @@ name = "readings_versions"
 # total.
 time_model = "interval"
 
+# Refuse deliveries spanning the watermark before writing either tier.
+# require_single_tier = true
+# Fractional places in each energy or register value, from 0 through 18.
+# Higher scales leave fewer integer digits. The default is 6.
+# value_scale = 7
+
 [tables.hot]
 # How far ahead partitions are pre-created. Running out makes inserts fail
 # outright, so `partitions_ahead` in `meterstore status` is the number that
@@ -159,6 +165,12 @@ snapshot_retention = "10y"
 # name = "tenant"
 # type = "string"
 # identity = true
+#
+# A price can be part of assertion equality. Changing its text or nullness at
+# the same version conflicts. A higher version can carry a different price.
+# [[tables.extra_columns]]
+# name = "spot"
+# assertion = true
 #
 # `values` declares a closed vocabulary and renders a `CHECK ... IN (...)`;
 # `check` declares an identifier scheme, and the write path parses every value

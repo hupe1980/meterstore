@@ -403,3 +403,49 @@ async fn current_value(store: &meterstore::MeterStore) -> String {
         .expect("json");
     rows[0]["v"].to_string()
 }
+
+#[tokio::test]
+async fn single_tier_hot_writes_share_the_archival_guard_with_the_insert_transaction() {
+    use meterstore::tiering::store::HotStore;
+    use meterstore::{Database, DatabaseOptions, PostgresHot, TableConfig};
+
+    let cfg = TableConfig::new(TestHarness::TABLE)
+        .require_single_tier(true)
+        .build()
+        .unwrap();
+    let h = TestHarness::with_config(cfg).await.unwrap();
+    h.seed_watermark(START).await.unwrap();
+    let database = Database::connect_with(h.url(), &DatabaseOptions::new().max_connections(1))
+        .await
+        .unwrap();
+    let hot = PostgresHot::new(database);
+    let batch =
+        meterstore::encode::to_record_batch(&[reading(10, 1, QualityFlag::Measured)]).unwrap();
+    let write = || hot.append_single_tier(h.config(), &batch, h.cold().as_ref());
+
+    let lease = h
+        .hot()
+        .try_archive_lease(TestHarness::TABLE)
+        .await
+        .unwrap()
+        .unwrap();
+    let err = write().await.unwrap_err();
+    assert!(matches!(err, meterstore::Error::LockTimeout { .. }));
+    assert!(err.is_retryable());
+    lease.release().await.unwrap();
+
+    // The pool has one connection, including partition creation and validation.
+    assert_eq!(write().await.unwrap()[0].effect, Effect::Inserted);
+    h.store()
+        .await
+        .unwrap()
+        .admin()
+        .archive(START + Duration::weeks(2), 1)
+        .await
+        .unwrap();
+    // A caller routed against START. Revalidation under the insert lock sees the new owner.
+    assert!(matches!(
+        write().await.unwrap_err(),
+        meterstore::Error::BoundaryMoved { .. }
+    ));
+}

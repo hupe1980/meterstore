@@ -12,6 +12,37 @@ in place rather than through a migration.
 This is the only file in the repository that carries history. Reference
 documentation says what is true now; a test enforces it.
 
+## [0.18.0] — 2026-11-23
+
+### Added
+
+- Settlement writers can require each delivery to belong to one tier, declare
+  which attributes must agree on replay and select an exact scale for native
+  quantities. All three settings are available in the Rust builder and TOML.
+
+### Changed — breaking
+
+- Provision a tier with its validated table configuration. Both PostgreSQL and
+  Iceberg expose `create_table_for(&config)`; their storage traits take the same
+  configuration in `create_tables`. The physical decimal scale is fixed at creation.
+- PostgreSQL’s overlap exclusion handles intersecting spans with different
+  starts. The primary key handles equal starts within a reading and version.
+
+### Fixed
+
+- Concurrent hot writers report displacements in a consistent serial order. A rejected
+  bulk write rolls back the entire insert. Authored retries preserve the declared
+  assertion attributes, canonical identity and original transaction time of each
+  reading. A redelivery under a different version scope is refused on both tiers.
+
+### Dependencies
+
+- Updated the locked `url` dependency to 2.5.9, the patched release for RUSTSEC-2026-0592.
+
+### Verification
+
+- 1075 tests pass (595 unit, 451 integration and 29 doc).
+
 ## [0.17.0] — 2026-11-21
 
 ### Upgrading from 0.16

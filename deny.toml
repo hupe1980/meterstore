@@ -89,11 +89,7 @@ deny = [
     # credential signers, where its use is signing a JWT assertion to obtain an
     # OAuth token — outbound, cached for the token's lifetime, off the data path.
     #
-    # Pinning the wrappers keeps that true: an update that pulled `rsa` in
-    # somewhere else would put a private-key operation somewhere nobody has
-    # reasoned about, and this fails rather than letting it pass. `reqsign-google`
-    # was missing from this list and nothing noticed, because the audit ran
-    # without the features that reach it.
+    # Audit every feature so all three credential signers are checked.
     { name = "rsa", wrappers = [
         "reqsign-azure-storage",
         "reqsign-core",

@@ -17,7 +17,7 @@
 // suite that needs them.
 #![cfg(feature = "testkit")]
 
-use meterstore::config::{EicType, TableConfig, TimeModel, ValueCheck, checked_column};
+use meterstore::config::{EicType, TableConfig, ValueCheck, checked_column};
 use meterstore::encode::{StoredSeries, to_record_batch_with};
 use meterstore::hot::PostgresHot;
 use meterstore::tiering::store::HotStore;
@@ -103,14 +103,7 @@ async fn hot_with_checked_columns() -> (PostgresHot, TableConfig, PgPool) {
 
     let declared = declared();
     let config = declared.clone().build().expect("config");
-    hot.create_tables(
-        TABLE,
-        &config.merge_key(),
-        &config.extra_columns(),
-        TimeModel::Interval,
-    )
-    .await
-    .expect("hot table");
+    hot.create_tables(&config).await.expect("hot table");
     hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
         .expect("partitions");
@@ -438,14 +431,7 @@ async fn a_value_check_this_build_does_not_know_is_refused_by_both_halves() {
             .attribute_column(odd)
             .build()
             .expect("config");
-        hot.create_tables(
-            TABLE,
-            &config.merge_key(),
-            &config.extra_columns(),
-            TimeModel::Interval,
-        )
-        .await
-        .expect("hot table");
+        hot.create_tables(&config).await.expect("hot table");
         hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
             .await
             .expect("partitions");

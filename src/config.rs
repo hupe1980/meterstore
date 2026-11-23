@@ -24,6 +24,12 @@ pub use metering::ids::EicType;
 /// column with one extra constraint. See [`coded_column`].
 pub const CHECK_VALUES_KEY: &str = "meterstore.check_values";
 
+const ASSERTION_KEY: &str = "meterstore.assertion";
+
+pub(crate) fn is_assertion_column(field: &Field) -> bool {
+    field.metadata().contains_key(ASSERTION_KEY)
+}
+
 /// A `Utf8` attribute-column [`Field`] constrained to `allowed` values.
 ///
 /// A deployment's coded columns — an ingestion source, a delivery status — get
@@ -587,6 +593,8 @@ pub mod defaults {
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     name: String,
+    value_scale: i8,
+    require_single_tier: bool,
     time_model: TimeModel,
     archival_step: Duration,
     settlement_lag: Duration,
@@ -608,6 +616,8 @@ impl TableConfig {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            value_scale: crate::encode::schema::VALUE_SCALE,
+            require_single_tier: false,
             time_model: TimeModel::Interval,
             archival_step: defaults::ARCHIVAL_STEP,
             settlement_lag: defaults::SETTLEMENT_LAG,
@@ -623,6 +633,16 @@ impl TableConfig {
             attribute_columns: Vec::new(),
             subject_column: None,
         }
+    }
+
+    /// Fractional decimal places in this table’s native measurement value.
+    ///
+    /// From zero through eighteen, default six. Precision is eighteen digits:
+    /// raising the scale reduces the available integer digits. Values must fit
+    /// exactly. The scale is fixed when the table is created.
+    pub fn value_scale(mut self, places: i8) -> Self {
+        self.value_scale = places;
+        self
     }
 
     /// Make the **Messlokation** part of what identifies a reading.
@@ -654,6 +674,18 @@ impl TableConfig {
     /// values at an instant rather than energy over a span. See [`TimeModel`].
     pub fn time_model(mut self, model: TimeModel) -> Self {
         self.time_model = model;
+        self
+    }
+
+    /// Require every append to write to a single tier.
+    ///
+    /// An interval start or reading instant exactly at the watermark belongs to
+    /// PostgreSQL. A batch with rows on both sides returns
+    /// [`Error::MixedTierBatch`] before writing.
+    /// Concurrent hot appends share a transaction-scoped guard against archival.
+    /// An active archiver causes a retryable lock error. Disabled by default.
+    pub fn require_single_tier(mut self, yes: bool) -> Self {
+        self.require_single_tier = yes;
         self
     }
 
@@ -818,6 +850,19 @@ impl TableConfig {
         self
     }
 
+    /// Declare an attribute whose value must agree on every replay of a version.
+    ///
+    /// Compared as stored text, including null. A higher version may change the
+    /// attribute without changing the reading's identity. Use this for terms
+    /// such as a settlement price or tariff that are part of the assertion.
+    #[must_use]
+    pub fn assertion_column(self, mut field: Field) -> Self {
+        field
+            .metadata_mut()
+            .insert(ASSERTION_KEY.into(), "true".into());
+        self.attribute_column(field)
+    }
+
     /// Declare the column holding pseudonymous subject references.
     ///
     /// Registers an attribute column of that name and marks it as the link to
@@ -862,6 +907,15 @@ impl TableConfig {
 
     /// Validate and freeze.
     pub fn build(self) -> Result<ValidatedTableConfig> {
+        if !(0..=i16::from(crate::encode::schema::VALUE_PRECISION))
+            .contains(&i16::from(self.value_scale))
+        {
+            return Err(Error::config(format!(
+                "value_scale must be between 0 and {} inclusive; got {}",
+                crate::encode::schema::VALUE_PRECISION,
+                self.value_scale
+            )));
+        }
         // The same rule the declared columns get, and for a stronger reason: the
         // table name reaches PostgreSQL DDL, the partition relation names, the
         // resolution SQL and every scan, always as a quoted identifier and never
@@ -996,6 +1050,12 @@ impl TableConfig {
         }
 
         for f in &self.identity_columns {
+            if is_assertion_column(f) {
+                return Err(Error::config(format!(
+                    "column {:?} declares both identity and assertion: a changed identity names a different reading",
+                    f.name()
+                )));
+            }
             if f.is_nullable() {
                 return Err(Error::config(format!(
                     "identity column {:?} must be non-nullable: a null cannot identify a reading",
@@ -1066,6 +1126,16 @@ impl TableConfig {
 pub struct ValidatedTableConfig(TableConfig);
 
 impl ValidatedTableConfig {
+    /// Fixed fractional decimal places in the native measurement value.
+    pub fn value_scale(&self) -> i8 {
+        self.0.value_scale
+    }
+
+    /// Arrow storage schema for this table, including its native value scale.
+    pub fn storage_schema(&self) -> crate::arrow::datatypes::SchemaRef {
+        crate::encode::schema::storage_schema_at_scale(&self.extra_columns(), self.value_scale())
+    }
+
     /// Table name.
     pub fn name(&self) -> &str {
         &self.0.name
@@ -1073,6 +1143,11 @@ impl ValidatedTableConfig {
     /// Whether this table holds spans or instants.
     pub fn time_model(&self) -> TimeModel {
         self.0.time_model
+    }
+
+    /// Whether a batch spanning the watermark is refused before writing.
+    pub fn requires_single_tier(&self) -> bool {
+        self.0.require_single_tier
     }
     /// Archival window size, which is also the hot table's partition
     /// granularity: one archived window is exactly one partition.
@@ -1129,6 +1204,7 @@ impl ValidatedTableConfig {
                 .map(|f| f.name().clone())
                 .collect(),
         )
+        .with_value_scale(self.value_scale())
         .with_chunk_rows(self.scan_chunk_rows())
     }
     /// How long cold snapshots are kept.
@@ -1162,6 +1238,14 @@ impl ValidatedTableConfig {
     /// Columns that carry data about a reading.
     pub fn attribute_columns(&self) -> &[Field] {
         &self.0.attribute_columns
+    }
+
+    /// Names of the attributes compared on same-version retries, in declaration order.
+    pub fn assertion_column_names(&self) -> impl Iterator<Item = &str> {
+        self.attribute_columns()
+            .iter()
+            .filter(|field| is_assertion_column(field))
+            .map(|field| field.name().as_str())
     }
 
     /// The column holding pseudonymous subject references, if declared.

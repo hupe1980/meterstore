@@ -66,8 +66,7 @@ use crate::error::{Error, Result};
 /// falls back to `FIXED_LEN_BYTE_ARRAY` and loses it.
 pub const VALUE_PRECISION: u8 = 18;
 
-/// Decimal scale for `value`. Six places is well beyond metering practice
-/// and leaves headroom for gas conversion factors.
+/// Default fractional decimal places for `value`.
 pub const VALUE_SCALE: i8 = 6;
 
 /// Precision for `version`, matching MSCONS's ≥14-digit numeric label.
@@ -235,6 +234,10 @@ const EPOCH: time::Date = time::macros::date!(1970 - 01 - 01);
 /// in configuration rather than in a Rust type. They are appended
 /// after the core columns so core field positions stay stable across deployments.
 pub fn storage_schema(extra: &[Field]) -> SchemaRef {
+    storage_schema_at_scale(extra, VALUE_SCALE)
+}
+
+pub(crate) fn storage_schema_at_scale(extra: &[Field], value_scale: i8) -> SchemaRef {
     let mut fields = vec![
         Field::new(col::MALO_ID, DataType::Utf8, false),
         Field::new(col::MELO_ID, DataType::Utf8, true),
@@ -249,7 +252,7 @@ pub fn storage_schema(extra: &[Field]) -> SchemaRef {
         Field::new(col::TO, timestamp_type(), true),
         Field::new(
             col::VALUE,
-            DataType::Decimal128(VALUE_PRECISION, VALUE_SCALE),
+            DataType::Decimal128(VALUE_PRECISION, value_scale),
             false,
         ),
         Field::new(col::UNIT, DataType::Utf8, false),

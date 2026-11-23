@@ -764,13 +764,7 @@ impl Deployment {
         // `create_tables` refusing the table this call had just made for it: the
         // identity columns are the *leading partition fields*, so getting them
         // wrong is not a difference a later call can reconcile.
-        cold.create_tables(
-            config.name(),
-            &config.identity_column_names(),
-            &config.extra_columns(),
-            &config.maintenance_policy(),
-        )
-        .await?;
+        cold.create_tables(&config).await?;
         let provider = cold.table_provider(config.name()).await?;
         Ok(self.with_registry(
             crate::MeterStore::builder()
@@ -965,6 +959,9 @@ impl CatalogKind {
 pub struct TableSettings {
     /// Physical table name.
     pub name: String,
+    /// Fractional decimal places in the native measurement value (0–18, default 6).
+    #[serde(default = "default_value_scale")]
+    pub value_scale: i8,
     /// What a row's timestamps mean: `"interval"` (a Lastgang) or `"point"` (a
     /// Zählerstandsgang).
     ///
@@ -974,6 +971,9 @@ pub struct TableSettings {
     /// exactly like a consumption total.
     #[serde(default)]
     pub time_model: crate::config::TimeModel,
+    /// Reject batches spanning the tiering watermark before publishing any row.
+    #[serde(default)]
+    pub require_single_tier: bool,
     /// Whether the Messlokation is part of what identifies a reading.
     ///
     /// Omitted, it follows `time_model`: on for `"point"`, off for
@@ -1005,11 +1005,17 @@ pub struct TableSettings {
     pub subject_column: Option<String>,
 }
 
+fn default_value_scale() -> i8 {
+    crate::encode::schema::VALUE_SCALE
+}
+
 impl TableSettings {
     /// Build and validate the table configuration.
     pub fn validate(&self) -> Result<crate::config::ValidatedTableConfig> {
         let mut config = TableConfig::new(&self.name)
             .time_model(self.time_model)
+            .require_single_tier(self.require_single_tier)
+            .value_scale(self.value_scale)
             .partition_headroom(self.hot.partition_headroom.0)
             .archival_step(self.archival.archival_step.0)
             .settlement_lag(self.archival.settlement_lag.0)
@@ -1033,6 +1039,8 @@ impl TableSettings {
             let field = column.field()?;
             config = if column.identity {
                 config.identity_column(field)
+            } else if column.assertion {
+                config.assertion_column(field)
             } else {
                 config.attribute_column(field)
             };
@@ -1212,6 +1220,9 @@ pub struct ExtraColumn {
     /// point share a merge key — a cross-tenant leak with no error anywhere.
     #[serde(default)]
     pub identity: bool,
+    /// Compare this attribute on same-version retries. Mutually exclusive with `identity`.
+    #[serde(default)]
+    pub assertion: bool,
     /// The fixed vocabulary this column accepts, if it has one.
     ///
     /// Renders a `CHECK … IN (…)` on the hot table, exactly as
@@ -1247,6 +1258,12 @@ impl ExtraColumn {
     /// Identity columns are non-nullable by construction: a null cannot identify
     /// a reading, and in SQL it does not compare equal to itself.
     fn field(&self) -> Result<Field> {
+        if self.identity && self.assertion {
+            return Err(Error::config(format!(
+                "column {:?} declares both identity and assertion: choose identity to distinguish readings or assertion to check same-version retries",
+                self.name
+            )));
+        }
         let nullable = !self.identity;
 
         if let Some(check) = &self.check {
@@ -1605,11 +1622,13 @@ namespace = "metering"
 [[tables]]
 name = "meter_reads_versions"
 time_model = "point"
+require_single_tier = true
 "#,
         )
         .expect("parse");
 
         let table = s.single_table().expect("validate");
+        assert!(table.requires_single_tier());
         assert_eq!(table.time_model(), crate::config::TimeModel::Point);
         // And the key follows the shape without being spelled out.
         assert!(table.melo_in_merge_key());
@@ -1871,6 +1890,50 @@ extra_columns = [{ name = "subject_ref", values = ["A", "B"] }]
             Some("A,B"),
         );
         assert!(!table.merge_key().contains(&"subject_ref".to_string()));
+    }
+
+    #[test]
+    fn value_scale_is_bounded_by_the_native_decimal_precision() {
+        for (scale, valid) in [(-1, false), (0, true), (7, true), (18, true), (19, false)] {
+            let text = format!("[[tables]]\nname = 'energy'\nvalue_scale = {scale}");
+            let table = Settings::from_toml(&text).unwrap().single_table();
+            if valid {
+                assert_eq!(table.unwrap().value_scale(), scale);
+            } else {
+                assert!(table.unwrap_err().to_string().contains("value_scale"));
+            }
+        }
+        assert_eq!(
+            Settings::from_toml("[[tables]]\nname = 'energy'")
+                .unwrap()
+                .single_table()
+                .unwrap()
+                .value_scale(),
+            crate::encode::schema::VALUE_SCALE
+        );
+    }
+
+    #[test]
+    fn assertion_attributes_are_configurable_without_joining_the_merge_key() {
+        let toml = r#"
+[[tables]]
+name = "readings"
+extra_columns = [{ name = "price", assertion = true, values = ["0", "1"] }]
+"#;
+        let table = Settings::from_toml(toml).unwrap().single_table().unwrap();
+        let field = &table.attribute_columns()[0];
+        assert!(crate::config::is_assertion_column(field));
+        assert_eq!(field.metadata()[crate::config::CHECK_VALUES_KEY], "0,1");
+        assert!(!table.merge_key().contains(field.name()));
+
+        let invalid = toml.replace("assertion = true", "assertion = true, identity = true");
+        assert!(
+            Settings::from_toml(&invalid)
+                .and_then(|s| s.single_table())
+                .unwrap_err()
+                .to_string()
+                .contains("both identity and assertion")
+        );
     }
 
     #[test]

@@ -616,7 +616,7 @@ impl<H: HotStore, C: ColdStore> Archiver<H, C> {
         let Some(stored) = self.cold.stored_schema(table).await? else {
             return Ok(spec);
         };
-        let configured = crate::encode::schema::storage_schema(&self.config.extra_columns());
+        let configured = self.config.storage_schema();
         let compatibility = crate::evolution::compare(&configured, &stored);
         compatibility.require_safe(table)?;
         compatibility.require_applied(table)?;
@@ -986,13 +986,7 @@ mod tests {
             })
         }
 
-        async fn create_tables(
-            &self,
-            _table: &str,
-            _key: &[String],
-            _extra: &[crate::arrow::datatypes::Field],
-            _model: crate::config::TimeModel,
-        ) -> Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> Result<()> {
             Ok(())
         }
 
@@ -1230,13 +1224,7 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(
-            &self,
-            _table: &str,
-            _identity: &[String],
-            _extra: &[crate::arrow::datatypes::Field],
-            _policy: &crate::tiering::store::MaintenancePolicy,
-        ) -> Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> Result<()> {
             Ok(())
         }
 
@@ -1507,14 +1495,8 @@ mod tests {
             async fn purge_table(&self, t: &str) -> Result<()> {
                 self.0.purge_table(t).await
             }
-            async fn create_tables(
-                &self,
-                t: &str,
-                i: &[String],
-                e: &[crate::arrow::datatypes::Field],
-                p: &crate::tiering::store::MaintenancePolicy,
-            ) -> Result<()> {
-                self.0.create_tables(t, i, e, p).await
+            async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+                self.0.create_tables(config).await
             }
             async fn watermark(&self, t: &str) -> Result<TieringWatermark> {
                 self.0.watermark(t).await

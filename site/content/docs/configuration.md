@@ -36,6 +36,8 @@ erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes, turns on suppr
 [[tables]]
 name = "readings_versions"
 time_model = "interval"          # or "point" — a Zählerstandsgang
+# require_single_tier = true     # reject deliveries that span the watermark
+# value_scale = 7                # fractional places in value (default 6)
 # identify_by_melo = true        # omitted, it follows time_model
 # The column holding pseudonymous subject references. Registered as an
 # attribute, never as identity.
@@ -44,6 +46,7 @@ subject_column = "subject_ref"
 # so two rows differing in it are different readings.
 extra_columns = [
   { name = "tenant",        identity = true },
+  { name = "spot",          assertion = true },               # price changes require a higher version
   { name = "bilanzkreis",   check = "EIC:X" },               # an EIC, and a party code
   { name = "lieferant",     check = "BDEW" },                # a Marktpartner-ID, not 13 digits
   { name = "ingest_source", values = ["MSCONS", "SMGW"] },   # renders a CHECK

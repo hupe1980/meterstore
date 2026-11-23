@@ -215,21 +215,8 @@ fn reference_docs_are_not_a_changelog() {
 
 #[test]
 fn the_published_docs_are_not_a_backlog() {
-    // The sibling of the check above, and the same argument pointed forward. A
-    // reader of `site/content/docs` arrives with a question about the code in
-    // front of them — not about the code somebody means to write. A page that
-    // carries a plan is stale the moment the plan changes, and nobody editing
-    // the plan goes looking for the page.
-    //
-    // **Narrower than the changelog check on purpose.** It reads the published
-    // pages only. The README's status section names its gaps deliberately, which
-    // is what a pre-1.0 README is for, and the design notes are a backlog by
-    // definition.
-    // Spellings that *only* introduce a plan, on the same principle as the list
-    // above. A bare "not yet" is absent because "a deployment that cannot yet
-    // hold a key securely" is a statement about the reader, and a bare "planned"
-    // because a query is planned before it is executed — which is what half of
-    // `querying.md` is about.
+    // The landing page, guides and README describe the shipped behavior.
+    // Match explicit promises so ordinary phrases like "query planned" stay valid.
     const PLANS: [&str; 12] = [
         "not yet implemented",
         "not yet supported",
@@ -245,10 +232,12 @@ fn the_published_docs_are_not_a_backlog() {
         "coming soon",
     ];
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("site/content");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let site = root.join("site/content");
+    let readme = root.join("README.md");
     let mut offenders = Vec::new();
     for (path, text) in documented_files() {
-        if !path.starts_with(&root) {
+        if path != readme && !path.starts_with(&site) {
             continue;
         }
         for (i, line) in text.lines().enumerate() {

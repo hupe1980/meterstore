@@ -212,6 +212,12 @@ impl<'a> SystemTables<'a> {
             // Summing a Zählerstandsgang produces a number with no meaning that
             // looks exactly like a consumption total.
             entry("time_model", c.time_model().as_str().to_string()),
+            entry("value_scale", c.value_scale().to_string()),
+            entry(
+                "assertion_columns",
+                c.assertion_column_names().collect::<Vec<_>>().join(", "),
+            ),
+            entry("require_single_tier", c.requires_single_tier().to_string()),
             entry(
                 "identity_columns",
                 c.identity_columns()
@@ -636,11 +642,12 @@ mod tests {
     }
 
     #[test]
-    fn config_reports_the_merge_key_including_identity_columns() {
+    fn config_reports_identity_and_assertion_columns() {
         // If this disagrees with the table's primary key, corrections silently
         // fail to supersede — so it is worth being able to read it back.
         let config = TableConfig::new("readings")
             .identity_column(Field::new("tenant", DataType::Utf8, false))
+            .assertion_column(Field::new("spot", DataType::Utf8, true))
             .build()
             .unwrap();
         let hot: Arc<dyn HotStore> = Arc::new(NoStore);
@@ -649,6 +656,15 @@ mod tests {
 
         let key = entries.iter().find(|e| e.setting == "merge_key").unwrap();
         assert!(key.value.contains("tenant"));
+        assert!(!key.value.contains("spot"));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.setting == "assertion_columns")
+                .unwrap()
+                .value,
+            "spot"
+        );
     }
 
     #[test]
@@ -680,13 +696,7 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(
-            &self,
-            _: &str,
-            _: &[String],
-            _: &[Field],
-            _: crate::config::TimeModel,
-        ) -> Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> Result<()> {
             unreachable!()
         }
         async fn append(&self, _: &str, _: &[String], _: &[RecordBatch]) -> Result<u64> {
@@ -750,13 +760,7 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(
-            &self,
-            _: &str,
-            _: &[String],
-            _: &[Field],
-            _: &crate::tiering::store::MaintenancePolicy,
-        ) -> Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> Result<()> {
             unreachable!()
         }
         async fn watermark(&self, _: &str) -> Result<crate::watermark::TieringWatermark> {

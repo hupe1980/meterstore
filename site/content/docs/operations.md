@@ -129,7 +129,9 @@ that will not plan are not.
 
 | Error | Retryable | What it means |
 |---|---|---|
-| `LockTimeout` | yes | Nothing was changed. Something else holds a conflicting lock |
+| `LockTimeout` | yes | A conflicting lock prevented the operation. Strict hot appends can meet the archiver here. |
+| `ConcurrentWrite` | yes | Concurrent transactions prevented a serializable write. Retry the delivery after backoff. |
+| `MixedTierBatch` | no | Single-tier routing refused the batch. Split at the watermark in the error and submit each delivery separately. |
 | `Storage` | yes | The backend failed — a connection, a timeout, a full disk |
 | `BoundaryMoved` | yes | A write or a scan met the tiering boundary mid-move. A fresh plan, or the same delivery again, sees where it now is |
 | `AlreadyArchived` | no | Another archiver committed this window first. The archiver reports it as a contended run, not a failure |

@@ -79,6 +79,23 @@ pub enum Error {
         detail: String,
     },
 
+    /// PostgreSQL aborted the transaction because concurrent operations could
+    /// not be serialized. The whole transaction can be retried.
+    #[error("concurrent write conflict: retry the transaction")]
+    ConcurrentWrite,
+
+    /// A single-tier append contains rows on both sides of the watermark.
+    #[error(
+        "table {table} requires a single-tier batch: split rows before {watermark} from rows \
+         at or after it; no rows were written"
+    )]
+    MixedTierBatch {
+        /// Table that refused the batch.
+        table: String,
+        /// The first instant assigned to the hot tier.
+        watermark: crate::watermark::TieringWatermark,
+    },
+
     /// Another writer committed this archival window first.
     ///
     /// Not a fault: two archivers for one window is what a lost lease allows,
@@ -248,7 +265,10 @@ impl Error {
     /// answer gets served for a week.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::LockTimeout { .. } | Self::Storage(_) | Self::BoundaryMoved { .. } => true,
+            Self::LockTimeout { .. }
+            | Self::Storage(_)
+            | Self::BoundaryMoved { .. }
+            | Self::ConcurrentWrite => true,
             // DataFusion is both the query *planner* and the thing that reads
             // the object store, so its errors fall on both sides. A statement
             // that will not plan never plans on a retry; a scan that could not
@@ -430,6 +450,11 @@ impl Error {
             Self::BoundaryMoved { table, detail } => Self::BoundaryMoved {
                 table: table.clone(),
                 detail: detail.clone(),
+            },
+            Self::ConcurrentWrite => Self::ConcurrentWrite,
+            Self::MixedTierBatch { table, watermark } => Self::MixedTierBatch {
+                table: table.clone(),
+                watermark: *watermark,
             },
             Self::AlreadyArchived { table, from, to } => Self::AlreadyArchived {
                 table: table.clone(),

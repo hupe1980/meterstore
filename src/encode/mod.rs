@@ -346,42 +346,35 @@ fn decode_resolution(raw: &str) -> Result<Resolution> {
 ///
 /// Rejects values that do not fit rather than truncating: silently dropping a
 /// decimal place is exactly the class of bug this crate exists to avoid.
-fn to_scaled_i128(value: Decimal) -> Result<i128> {
-    let scale = u32::try_from(VALUE_SCALE).expect("scale is non-negative");
-
-    // `Decimal::rescale` to a *lower* scale rounds silently, so it cannot be used
-    // as the guard — it would quietly turn 0.0000001 kWh into 0. Normalising
-    // first strips trailing zeros, so the remaining scale is the number of
-    // significant decimal places the value actually needs.
-    let mut v = value.normalize();
-    if v.scale() > scale {
-        return Err(Error::encode(
+fn to_scaled_i128(value: Decimal, value_scale: i8) -> Result<i128> {
+    let scale = u32::try_from(value_scale).expect("validated table scale");
+    let normalized = value.normalize();
+    let digits = normalized.scale();
+    let padding = scale.checked_sub(digits).ok_or_else(|| {
+        Error::encode(
             col::VALUE,
-            format!(
-                "{value} needs {} decimal places, storage holds {VALUE_SCALE}",
-                v.scale()
-            ),
-        ));
-    }
-    v.rescale(scale);
-
-    let mantissa = v.mantissa();
+            format!("{value} needs {digits} decimal places, storage holds {value_scale}"),
+        )
+    })?;
     let limit = 10i128.pow(u32::from(VALUE_PRECISION));
-    if mantissa >= limit || mantissa <= -limit {
-        return Err(Error::encode(
-            col::VALUE,
-            format!("{value} exceeds Decimal128({VALUE_PRECISION},{VALUE_SCALE})"),
-        ));
-    }
-    Ok(mantissa)
+    normalized
+        .mantissa()
+        .checked_mul(10i128.pow(padding))
+        .filter(|raw| (-limit < *raw) && (*raw < limit))
+        .ok_or_else(|| {
+            Error::encode(
+                col::VALUE,
+                format!("{value} exceeds Decimal128({VALUE_PRECISION},{value_scale})"),
+            )
+        })
 }
 
-/// Inverse of [`to_scaled_i128`].
-fn from_scaled_i128(raw: i128) -> Decimal {
-    Decimal::from_i128_with_scale(
-        raw,
-        u32::try_from(VALUE_SCALE).expect("scale is non-negative"),
-    )
+/// Decode the fixed-point integer with the scale carried by its Arrow array.
+pub(crate) fn decimal_at(values: &Decimal128Array, row: usize, name: &str) -> Result<Decimal> {
+    let scale =
+        u32::try_from(values.scale()).map_err(|_| Error::decode(name, "negative decimal scale"))?;
+    Decimal::try_from_i128_with_scale(values.value(row), scale)
+        .map_err(|e| Error::decode(name, e.to_string()))
 }
 
 /// Encode a source discriminant and its payload.
@@ -616,7 +609,7 @@ impl RowColumns {
     }
 
     /// Assemble the batch.
-    fn finish(self, extra: &[Field]) -> Result<RecordBatch> {
+    fn finish(self, extra: &[Field], value_scale: i8) -> Result<RecordBatch> {
         let tz: Arc<str> = "UTC".into();
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(self.malo)),
@@ -627,7 +620,7 @@ impl RowColumns {
             Arc::new(TimestampMicrosecondArray::from(self.to).with_timezone(tz.clone())),
             Arc::new(
                 Decimal128Array::from(self.value)
-                    .with_precision_and_scale(VALUE_PRECISION, VALUE_SCALE)?,
+                    .with_precision_and_scale(VALUE_PRECISION, value_scale)?,
             ),
             Arc::new(StringArray::from(self.unit)),
             Arc::new(StringArray::from(self.quality)),
@@ -658,7 +651,7 @@ impl RowColumns {
         }
 
         Ok(RecordBatch::try_new(
-            schema::storage_schema(extra),
+            schema::storage_schema_at_scale(extra, value_scale),
             columns,
         )?)
     }
@@ -722,7 +715,7 @@ fn resolve_extra(
 /// Canonicalising rather than merely accepting, because a checked column may be
 /// an identity column — one identifier in two spellings would be two merge keys,
 /// the failure [`canonical_obis`](crate::canonical_obis) prevents for OBIS.
-fn check_declared_value(field: &Field, value: ScalarValue) -> Result<ScalarValue> {
+pub(crate) fn check_declared_value(field: &Field, value: ScalarValue) -> Result<ScalarValue> {
     let Some(code) = crate::config::declared_value_check(field) else {
         return Ok(value);
     };
@@ -786,6 +779,22 @@ fn check_scope(version: &ScopedVersion, at: OffsetDateTime, sparte: Sparte) -> R
 /// the same reading. A nullable column may be absent and becomes null, which is
 /// what nullable was declared to mean.
 pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<RecordBatch> {
+    to_record_batch_at_scale(stored, extra, VALUE_SCALE)
+}
+
+/// Encode interval series using the table’s value scale and declared columns.
+pub fn to_record_batch_for(
+    stored: &[StoredSeries],
+    config: &crate::ValidatedTableConfig,
+) -> Result<RecordBatch> {
+    to_record_batch_at_scale(stored, &config.extra_columns(), config.value_scale())
+}
+
+fn to_record_batch_at_scale(
+    stored: &[StoredSeries],
+    extra: &[Field],
+    value_scale: i8,
+) -> Result<RecordBatch> {
     let mut columns = RowColumns::with_extra(extra);
 
     for s in stored {
@@ -825,7 +834,7 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
                 obis_for(&s.series, interval)?.to_string(),
                 schema::micros(interval.from()),
                 Some(schema::micros(interval.to())),
-                to_scaled_i128(interval.value())?,
+                to_scaled_i128(interval.value(), value_scale)?,
                 interval.quality().as_str(),
                 // The one place the balancing day is derived. Asked of the
                 // calendar per row rather than per delivery, because a delivery
@@ -836,7 +845,7 @@ pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<
         }
     }
 
-    columns.finish(extra)
+    columns.finish(extra, value_scale)
 }
 
 /// Encode Zählerstandsgänge into a single [`RecordBatch`].
@@ -860,6 +869,22 @@ pub fn readings_to_record_batch(stored: &[StoredReadings]) -> Result<RecordBatch
 pub fn readings_to_record_batch_with(
     stored: &[StoredReadings],
     extra: &[Field],
+) -> Result<RecordBatch> {
+    readings_to_record_batch_at_scale(stored, extra, VALUE_SCALE)
+}
+
+/// Encode point readings using the table’s value scale and declared columns.
+pub fn readings_to_record_batch_for(
+    stored: &[StoredReadings],
+    config: &crate::ValidatedTableConfig,
+) -> Result<RecordBatch> {
+    readings_to_record_batch_at_scale(stored, &config.extra_columns(), config.value_scale())
+}
+
+fn readings_to_record_batch_at_scale(
+    stored: &[StoredReadings],
+    extra: &[Field],
+    value_scale: i8,
 ) -> Result<RecordBatch> {
     let mut columns = RowColumns::with_extra(extra);
 
@@ -901,14 +926,14 @@ pub fn readings_to_record_batch_with(
                 schema::micros(reading.at),
                 // The difference that makes this a point series.
                 None,
-                to_scaled_i128(reading.value)?,
+                to_scaled_i128(reading.value, value_scale)?,
                 reading.quality.as_str(),
                 schema::date32(balancing_day(reading.at, s.sparte)?),
             );
         }
     }
 
-    columns.finish(extra)
+    columns.finish(extra, value_scale)
 }
 
 /// Put a batch into the sort order the Parquet footer declares.
@@ -1171,7 +1196,7 @@ pub fn from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredSeries>> {
         let interval = MeterInterval::new(
             schema::instant(from.value(i))?,
             schema::instant(to.value(i))?,
-            from_scaled_i128(value.value(i)),
+            decimal_at(value, i, col::VALUE)?,
             decode_code(col::QUALITY, quality.value(i))?,
         )
         .map_err(|e| Error::decode(col::TO, format!("row {i}: {e}")))?
@@ -1307,7 +1332,7 @@ pub fn readings_from_record_batch(batch: &RecordBatch) -> Result<Vec<StoredReadi
             .readings
             .push(metering::series::reading::MeterReading {
                 at: schema::instant(from.value(i))?,
-                value: from_scaled_i128(value.value(i)),
+                value: decimal_at(value, i, col::VALUE)?,
                 quality: decode_code(col::QUALITY, quality.value(i))?,
                 obis_code: Some(decode_code(col::OBIS_CODE, obis.value(i))?),
             });
@@ -1823,6 +1848,25 @@ mod tests {
                 "value {raw} did not round-trip exactly"
             );
         }
+    }
+
+    #[test]
+    fn value_precision_bounds_apply_after_exact_rescaling() {
+        let max = 999_999_999_999_999_999i128;
+        for scale in [0, 7, 18] {
+            for raw in [-max, 0, max] {
+                let value = Decimal::from_i128_with_scale(raw, scale as u32);
+                assert_eq!(to_scaled_i128(value, scale).unwrap(), raw);
+            }
+            for raw in [max + 1, -(max + 1)] {
+                let value = Decimal::from_i128_with_scale(raw, scale as u32);
+                assert!(
+                    matches!(to_scaled_i128(value, scale), Err(Error::Encode { what, .. }) if what == col::VALUE)
+                );
+            }
+        }
+        assert!(to_scaled_i128(Decimal::MAX, 18).is_err());
+        assert_eq!(to_scaled_i128(Decimal::new(10, 8), 7).unwrap(), 1);
     }
 
     #[test]

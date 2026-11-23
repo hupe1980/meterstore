@@ -92,14 +92,7 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
 
     // The provider is built from the cold table, so it has to exist first — the
     // same order every other suite's harness uses.
-    cold.create_tables(
-        TABLE,
-        &[],
-        &config.extra_columns(),
-        &config.maintenance_policy(),
-    )
-    .await
-    .expect("cold table");
+    cold.create_tables(&config).await.expect("cold table");
 
     let store = meterstore::MeterStore::builder()
         .hot(Arc::clone(&hot) as Arc<dyn HotStore>)
@@ -1056,4 +1049,36 @@ async fn what_a_cold_reconciliation_decides_is_what_is_written() {
         .expect("a stored version beside a new one");
     assert_eq!(second.cold_rows, 4, "only the new version is written");
     assert_eq!(raw_rows(&store).await, 8);
+}
+
+#[tokio::test]
+async fn single_tier_point_batches_use_the_reading_instant() {
+    use meterstore::testkit::TestHarness;
+
+    let config = TableConfig::new(TABLE)
+        .time_model(TimeModel::Point)
+        .require_single_tier(true)
+        .build()
+        .unwrap();
+    let h = TestHarness::with_config(config).await.unwrap();
+    h.seed_watermark(START).await.unwrap();
+    let store = h.store().await.unwrap();
+    // One register delivery contains instants immediately before and exactly at the boundary.
+    let mixed = zsg(START - Duration::minutes(15), 2, 100_000, 3);
+    for _ in 0..2 {
+        let error = store
+            .append_readings(std::slice::from_ref(&mixed))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, meterstore::Error::MixedTierBatch { watermark, .. } if watermark.get() == START)
+        );
+        let rows = store
+            .query("SELECT COUNT(*) AS n FROM meter_reads_versions")
+            .await
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert_eq!(rows[0]["n"].as_i64(), Some(0));
+    }
 }

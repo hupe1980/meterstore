@@ -184,15 +184,9 @@ async fn the_whole_store_runs_on_a_catalog_meterstore_did_not_build() {
         .build()
         .expect("config");
 
-    ColdStore::create_tables(
-        cold.as_ref(),
-        table,
-        &[],
-        &config.extra_columns(),
-        &config.maintenance_policy(),
-    )
-    .await
-    .expect("the cold table is created through the trait");
+    ColdStore::create_tables(cold.as_ref(), &config)
+        .await
+        .expect("the cold table is created through the trait");
 
     let store = harness
         .builder_for(config)
@@ -282,15 +276,7 @@ async fn the_boundary_is_readable_through_a_foreign_catalog() {
     );
 
     let table = "foreign_boundary_versions";
-    ColdStore::create_tables(
-        &cold,
-        table,
-        &[],
-        &[],
-        &meterstore::tiering::store::MaintenancePolicy::default(),
-    )
-    .await
-    .expect("create");
+    cold.create_table(table).await.expect("create");
 
     cold.append_and_commit(
         table,

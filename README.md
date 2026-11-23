@@ -10,9 +10,7 @@ both.
 
 📖 **[Documentation](https://hupe1980.github.io/meterstore)** · [API reference](https://docs.rs/meterstore) · [Changelog](CHANGELOG.md)
 
-> **Pre-alpha, and pre-1.0 on purpose.** Storage, tiering, archival,
-> querying, reproducible reads and completeness work end to end against real
-> PostgreSQL 18 and a real Iceberg warehouse. The API is still settling.
+> **Pre-1.0.** Releases can change the Rust API and SQL schema.
 
 ---
 
@@ -27,19 +25,8 @@ code, per interval. Fifteen minutes is the German settlement grain:
 | 100 k (mid-size utility) | ~9.6 M | ~3.5 B |
 | 1 M (metering operator) | ~96 M | ~35 B |
 
-Retention is regulatory — years to decades for the settlement record. PostgreSQL
-handles the first row comfortably, the second with care, and the third not at all
-without becoming a full-time job.
-
-But the operational workload genuinely needs Postgres: recent data is written
-continuously, corrected, and read transactionally by billing and market
-communication. Meanwhile settlement, forecasting and grid analysis scan years
-across hundreds of thousands of meters — an object-storage-and-columnar-format
-problem.
-
-**The data has a natural split most systems refuse to exploit:** recent intervals
-are hot and still being corrected; historical intervals are cold and settled. The
-boundary between them is a timestamp.
+Recent readings need transactional writes. Settlement and forecasting scan
+years of history. MeterStore routes both workloads by interval start.
 
 ## ⚙️ How it works
 
@@ -118,19 +105,18 @@ let cold = IcebergSqlCatalog {
     auth: &WarehouseAuth { region: Some("eu-central-1".into()), ..Default::default() },
 }.build().await?.cold();
 
+let table = TableConfig::new("readings_versions")
+    .settlement_lag(Duration::days(7))
+    .archival_step(Duration::DAY)
+    .build()?;
+cold.create_table_for(&table).await?;
+let provider = cold.table_provider(table.name()).await?;
 let store = MeterStore::builder()
     .hot(hot)
-    .cold(cold.clone(), cold.table_provider("readings_versions").await?)
-    .table(
-        TableConfig::new("readings_versions")
-            .settlement_lag(Duration::days(7))
-            .archival_step(Duration::DAY)
-            .build()?,
-    )
+    .cold(cold, provider)
+    .table(table)
     .build()
     .await?;
-
-// Setup, archival, maintenance and teardown live behind `admin()`.
 store.admin().create_tables().await?;
 ```
 
@@ -152,6 +138,12 @@ let result = store.query(r#"
 result.watermark();        // where cold ended and hot began
 result.touched_hot_tier(); // whether the answer is only valid for now
 ```
+
+For settlement ingestion, set `require_single_tier(true)` to reject a delivery
+that crosses the watermark before either tier publishes rows. Declare a price
+with `assertion_column` to detect a changed price on replay. Set `value_scale(7)`
+to round-trip **0.0000001 kWh** through archival and historical queries.
+[Configure the settlement writer](https://hupe1980.github.io/meterstore/docs/writing/#settlement-ingestion).
 
 Record shapes, identity versus attribute columns, checked identifiers, scoping,
 completeness, erasure and settlement reruns are on the documentation site.
@@ -231,15 +223,11 @@ drift.
 
 ## 📊 Status
 
-Everything the documentation describes works end to end against real
-infrastructure — both tiers, streaming archival, tier-split queries, reproducible
-reads, completeness, multi-table sessions and both serving surfaces.
-
-**1066 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+**1075 tests** — unit, property, doc and integration against real PostgreSQL 18 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle
 over generated workloads:
 
-| ✅ Checked, not asserted | |
+| Coverage | Verification |
 |---|---|
 | **Concurrency** | Ingest, archival and reads run against one table at once — the only way to reach the states between two steps rather than inside one — and two replicas over separate pools race to archive it |
 | **Foreign readers** | DuckDB and PyIceberg read the output and agree with it, down to the audit trail's timestamps |
@@ -248,27 +236,11 @@ over generated workloads:
 | **The version floor** | The whole integration suite runs again on PostgreSQL 15 |
 | **Compression** | Measured rather than targeted: ~109× (457 B/row against 4.2 B/row; the measurement suite carries the caveats) |
 
-⛔ **Argued rather than measured**, and named here for that reason: query latency
-on reference hardware, so no latency figure is published; Spark and Trino
-interop; a long-horizon soak; and two replicas as two *processes* rather than two
-pools, so a crash mid-lease is reasoned about rather than run. Orphan-file cleanup
-[runs out of band](https://hupe1980.github.io/meterstore/docs/operations/#compaction),
-because `iceberg-rust` cannot list a warehouse; compaction is refused, because it
-destroys the file statistics merge elision proves itself from.
+The retention sweep removes the subject mapping. The stored `malo_id` remains
+personal data. See [privacy and retention](https://hupe1980.github.io/meterstore/docs/privacy/).
 
-⛔ **Known gaps**, each stated where it applies:
-
-- **The retention sweep is pseudonymisation.** Deleting the subject mapping leaves
-  `malo_id` in clear on every row, so what remains is pseudonymised rather than
-  anonymous data; whether that discharges `[MsbG § 60 Abs. 6]` is undecided.
-- **Rows written by 0.12.0–0.14.0 in three shapes do not decode** from 0.15 on:
-  `AUTO_SUBSTITUTE` payloads, resolutions spelled in seconds, and
-  Marktpartner-IDs failing both check-digit procedures.
-
-> ⚠️ **One caveat worth knowing before you deploy.** A query holds the archived
-> partitions its plan is entitled to for up to `max_pin_age` — six hours by
-> default — and one that runs longer loses its window, with an error naming it
-> and never a short answer. Raise the setting past the longest query you run.
+On PostgreSQL, set `max_pin_age` above the longest query you run. A query that
+outlives its pin can fail if archival reclaims a partition it still needs.
 
 ## 🛠️ Development
 

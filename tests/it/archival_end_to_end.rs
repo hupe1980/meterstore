@@ -493,15 +493,14 @@ async fn a_declared_file_size_reaches_the_table_and_a_changed_one_restates_it() 
     // The property is what makes rule 3 self-enforcing, so it has to arrive on
     // the table — and it has to arrive on a table that already exists, because
     // a deployment measures the figure *after* it has archived a window.
-    use meterstore::tiering::store::MaintenancePolicy;
-
     let h = Harness::start().await;
-    let policy = MaintenancePolicy {
-        declared_file_size: Some(41_943_040),
-        ..MaintenancePolicy::default()
-    };
     h.cold
-        .create_table_with(TABLE, &[], &[], &policy)
+        .create_table_for(
+            &TableConfig::new(TABLE)
+                .declared_file_size(41_943_040)
+                .build()
+                .unwrap(),
+        )
         .await
         .expect("restate");
     assert_eq!(
@@ -519,14 +518,11 @@ async fn a_declared_file_size_reaches_the_table_and_a_changed_one_restates_it() 
     // And a deployment that re-measures gets the new figure rather than the
     // first one it ever declared.
     h.cold
-        .create_table_with(
-            TABLE,
-            &[],
-            &[],
-            &MaintenancePolicy {
-                declared_file_size: Some(83_886_080),
-                ..MaintenancePolicy::default()
-            },
+        .create_table_for(
+            &TableConfig::new(TABLE)
+                .declared_file_size(83_886_080)
+                .build()
+                .unwrap(),
         )
         .await
         .expect("restate again");

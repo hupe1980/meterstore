@@ -33,22 +33,40 @@ pub fn stream_of(batches: Vec<RecordBatch>) -> BatchStream {
 /// The two halves travel together rather than as loose slices because they are
 /// easy to transpose and the consequences differ: getting `extra` wrong drops
 /// columns loudly, getting `merge_key` wrong drops **rows** silently.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanSpec {
     /// The table's merge key.
     merge_key: Vec<String>,
     /// Deployment columns to select alongside the core schema.
     extra: Vec<String>,
+    value_scale: i8,
     /// Rows per round trip, or `None` for the store's own default.
     chunk_rows: Option<usize>,
 }
 
+impl Default for ScanSpec {
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+}
+
 impl ScanSpec {
+    pub(crate) fn with_value_scale(mut self, scale: i8) -> Self {
+        self.value_scale = scale;
+        self
+    }
+
+    /// Scale of the native value in every returned Arrow batch.
+    pub fn value_scale(&self) -> i8 {
+        self.value_scale
+    }
+
     /// A spec for a table with the given merge key and deployment columns.
     pub fn new(merge_key: Vec<String>, extra: Vec<String>) -> Self {
         Self {
             merge_key,
             extra,
+            value_scale: crate::encode::schema::VALUE_SCALE,
             chunk_rows: None,
         }
     }
@@ -279,6 +297,12 @@ impl PartitionId {
 /// lock dies with it.
 #[async_trait]
 pub trait TableLease: Send + Sync + std::fmt::Debug {
+    /// Whether the guard excludes competing processes. A single-tier table
+    /// requires this guarantee for cold replay checks.
+    fn enforced(&self) -> bool {
+        false
+    }
+
     /// Give the claim up.
     async fn release(self: Box<Self>) -> Result<()>;
 }
@@ -368,17 +392,11 @@ pub trait HotStore: Send + Sync {
 
     /// Create the table, its primary key, and any deployment columns.
     ///
-    /// `time_model` decides two pieces of DDL and nothing else: whether `to` is
+    /// The time model decides two pieces of DDL: whether `to` is
     /// `NOT NULL` with a forward check, and whether the partition carries the
     /// overlap exclusion. Instants cannot overlap, and a
     /// [`Point`](crate::config::TimeModel::Point) table has no span to check.
-    async fn create_tables(
-        &self,
-        table: &str,
-        merge_key: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        time_model: crate::config::TimeModel,
-    ) -> Result<()>;
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()>;
 
     /// Append rows to the live table.
     ///
@@ -562,6 +580,25 @@ pub trait HotStore: Send + Sync {
         batches: &[RecordBatch],
     ) -> Result<Vec<crate::session::Displacement>>;
 
+    /// Publish a single hot batch under a stable archive boundary.
+    ///
+    /// Hold a guard against archival, then read the cold watermark. If any
+    /// row belongs to the cold tier, return [`Error::BoundaryMoved`] before
+    /// creating partitions or publishing rows. Otherwise ensure the required
+    /// partitions and publish the batch in one transaction. Custom backends
+    /// must implement this contract to accept authoritative hot writes.
+    async fn append_single_tier(
+        &self,
+        config: &crate::ValidatedTableConfig,
+        _batch: &RecordBatch,
+        _cold: &dyn ColdStore,
+    ) -> Result<Vec<crate::session::Displacement>> {
+        Err(crate::Error::config(format!(
+            "{} requires single-tier appends, which this hot backend does not support",
+            config.name()
+        )))
+    }
+
     /// Destroy the table and every partition of it.
     ///
     /// **This is not the purge.** [`drop_partition`](Self::drop_partition)
@@ -598,21 +635,15 @@ pub trait HotStore: Send + Sync {
 pub trait ColdStore: Send + Sync {
     /// Create the table with the deployment's declared extra columns.
     ///
-    /// `identity` names the deployment's identity columns. The cold tier makes
+    /// The configuration names the deployment's identity columns. The cold tier makes
     /// them the leading partition fields, so a tenant-scoped scan prunes at the
     /// manifest rather than by row filter.
     ///
-    /// `policy` is the maintenance contract this table should state in the
+    /// The maintenance policy is the contract this table should state in the
     /// format's own vocabulary, so a tool that never read this crate's
     /// documentation still honours it. A store with nowhere to put it ignores it
     /// — the contract is then a paragraph again, which is where it started.
-    async fn create_tables(
-        &self,
-        table: &str,
-        identity: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        policy: &MaintenancePolicy,
-    ) -> Result<()>;
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()>;
 
     /// Destroy the table, its metadata and its data files.
     ///
@@ -811,16 +842,8 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         (**self).ensure_partitions(table, from, until, step).await
     }
 
-    async fn create_tables(
-        &self,
-        table: &str,
-        merge_key: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        time_model: crate::config::TimeModel,
-    ) -> Result<()> {
-        (**self)
-            .create_tables(table, merge_key, extra, time_model)
-            .await
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+        (**self).create_tables(config).await
     }
 
     async fn append(
@@ -864,6 +887,15 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         batches: &[RecordBatch],
     ) -> Result<Vec<crate::session::Displacement>> {
         (**self).append_reporting(table, merge_key, batches).await
+    }
+
+    async fn append_single_tier(
+        &self,
+        config: &crate::ValidatedTableConfig,
+        batch: &RecordBatch,
+        cold: &dyn ColdStore,
+    ) -> Result<Vec<crate::session::Displacement>> {
+        (**self).append_single_tier(config, batch, cold).await
     }
 
     async fn drop_table(&self, table: &str) -> Result<()> {
@@ -912,14 +944,8 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
 /// and whatever serves reads from it.
 #[async_trait]
 impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
-    async fn create_tables(
-        &self,
-        table: &str,
-        identity: &[String],
-        extra: &[crate::arrow::datatypes::Field],
-        policy: &MaintenancePolicy,
-    ) -> Result<()> {
-        (**self).create_tables(table, identity, extra, policy).await
+    async fn create_tables(&self, config: &crate::ValidatedTableConfig) -> Result<()> {
+        (**self).create_tables(config).await
     }
 
     async fn purge_table(&self, table: &str) -> Result<()> {

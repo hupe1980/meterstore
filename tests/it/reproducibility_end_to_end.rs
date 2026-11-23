@@ -1074,15 +1074,15 @@ async fn a_safe_schema_difference_does_not_halt_the_table() {
     // not be treated like a narrowing change.
     let h = Harness::start().await;
     h.cold
-        .create_table_with(
-            TABLE,
-            &[datafusion::arrow::datatypes::Field::new(
-                "bilanzkreis",
-                datafusion::arrow::datatypes::DataType::Utf8,
-                true,
-            )],
-            &[],
-            &meterstore::tiering::store::MaintenancePolicy::default(),
+        .create_table_for(
+            &TableConfig::new(TABLE)
+                .attribute_column(datafusion::arrow::datatypes::Field::new(
+                    "bilanzkreis",
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    true,
+                ))
+                .build()
+                .unwrap(),
         )
         .await
         .expect("cold table already exists; this is a no-op load");

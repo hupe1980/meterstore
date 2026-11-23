@@ -93,24 +93,8 @@ async fn store_with_subjects() -> (MeterStore, tempfile::TempDir) {
     let hot_dyn: Arc<dyn HotStore> = hot.clone();
     let cold_dyn: Arc<dyn ColdStore> = cold.clone();
     // The provider is resolved at build time, so both tiers must exist first.
-    hot_dyn
-        .create_tables(
-            TABLE,
-            &config.merge_key(),
-            &config.extra_columns(),
-            config.time_model(),
-        )
-        .await
-        .expect("hot table");
-    cold_dyn
-        .create_tables(
-            TABLE,
-            &config.identity_column_names(),
-            &config.extra_columns(),
-            &config.maintenance_policy(),
-        )
-        .await
-        .expect("cold table");
+    hot_dyn.create_tables(&config).await.expect("hot table");
+    cold_dyn.create_tables(&config).await.expect("cold table");
     hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
         .expect("partitions");
@@ -188,24 +172,8 @@ async fn catalog_with_subjects() -> (meterstore::MeterCatalog, tempfile::TempDir
 
         let hot_dyn: Arc<dyn HotStore> = hot.clone();
         let cold_dyn: Arc<dyn ColdStore> = cold.clone();
-        hot_dyn
-            .create_tables(
-                name,
-                &config.merge_key(),
-                &config.extra_columns(),
-                config.time_model(),
-            )
-            .await
-            .expect("hot table");
-        cold_dyn
-            .create_tables(
-                name,
-                &config.identity_column_names(),
-                &config.extra_columns(),
-                &config.maintenance_policy(),
-            )
-            .await
-            .expect("cold table");
+        hot_dyn.create_tables(&config).await.expect("hot table");
+        cold_dyn.create_tables(&config).await.expect("cold table");
         hot.ensure_partitions(name, D20, OLD + Duration::days(400), Duration::DAY)
             .await
             .expect("partitions");
@@ -1049,14 +1017,7 @@ async fn the_sweep_runs_for_a_deployment_that_no_longer_declares_a_subject_colum
             MeterStore::builder()
                 .hot(hot_dyn)
                 .cold(cold_dyn, {
-                    cold.create_tables(
-                        config.name(),
-                        &config.identity_column_names(),
-                        &config.extra_columns(),
-                        &config.maintenance_policy(),
-                    )
-                    .await
-                    .expect("cold table");
+                    cold.create_tables(&config).await.expect("cold table");
                     cold.table_provider(config.name()).await.expect("provider")
                 })
                 .table(config),

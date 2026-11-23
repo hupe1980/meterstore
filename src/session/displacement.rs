@@ -37,6 +37,8 @@ use crate::version::ScopedVersion;
 pub struct StoredValue {
     /// The quantity, in [`unit`](Self::unit).
     pub value: Decimal,
+    /// The table's declared assertion attributes, including explicit nulls.
+    pub assertion_attributes: std::collections::BTreeMap<String, Option<String>>,
     /// What the quantity is measured in.
     ///
     /// Carried because a value without it is dimensionless: water settles in m³
@@ -58,6 +60,18 @@ pub struct StoredValue {
     pub version: ScopedVersion,
     /// Transaction time — when the store learned this value.
     pub recorded_at: OffsetDateTime,
+}
+
+impl StoredValue {
+    /// Both values belong to the same table and carry its declared attributes.
+    pub(crate) fn differing_assertion_field(&self, other: &Self) -> Option<&str> {
+        if self.value != other.value {
+            return Some(crate::encode::schema::col::VALUE);
+        }
+        self.assertion_attributes.iter().find_map(|(name, value)| {
+            (other.assertion_attributes.get(name) != Some(value)).then_some(name.as_str())
+        })
+    }
 }
 
 /// What a write did to the value that was current.
@@ -211,6 +225,7 @@ mod tests {
 
     fn value(v: i64, version: u128, quality: QualityFlag) -> StoredValue {
         StoredValue {
+            assertion_attributes: Default::default(),
             value: Decimal::new(v, 0),
             unit: Unit::KiloWattHour,
             quality,

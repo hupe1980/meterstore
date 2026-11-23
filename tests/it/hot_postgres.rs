@@ -459,17 +459,13 @@ async fn a_changed_merge_key_is_refused_rather_than_silently_ignored() {
     // key.
     let h = Harness::start().await;
 
-    let widened: Vec<String> = ["malo_id", "melo_id", "obis_code", "from"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
     let err = h
         .hot
-        .create_table_with_key(
-            TABLE,
-            &widened,
-            &[],
-            meterstore::config::TimeModel::Interval,
+        .create_tables(
+            &meterstore::TableConfig::new(TABLE)
+                .identify_by_melo(true)
+                .build()
+                .unwrap(),
         )
         .await
         .expect_err("a merge key cannot change under an existing table")
@@ -493,13 +489,15 @@ async fn a_changed_time_model_is_refused_too() {
     // leave a column no aggregate can interpret.
     let h = Harness::start().await;
 
-    let key: Vec<String> = ["malo_id", "obis_code", "from"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
     let err = h
         .hot
-        .create_table_with_key(TABLE, &key, &[], meterstore::config::TimeModel::Point)
+        .create_tables(
+            &meterstore::TableConfig::new(TABLE)
+                .time_model(meterstore::config::TimeModel::Point)
+                .identify_by_melo(false)
+                .build()
+                .unwrap(),
+        )
         .await
         .expect_err("an interval table cannot become a point table")
         .to_string();
@@ -1555,4 +1553,64 @@ async fn a_malformed_version_scope_is_refused_by_the_table() {
     insert("9900000000003:2026-07")
         .await
         .expect("the canonical form must be storable");
+}
+
+/// Both reporters read the same empty key before either may insert. Their
+/// returned effects must still describe one serial ordering of the deliveries.
+#[tokio::test]
+async fn concurrent_hot_appends_report_the_committed_order() {
+    use meterstore::session::Effect;
+    let h = Harness::start().await;
+    h.hot
+        .ensure_partitions(TABLE, D20, D21, Duration::DAY)
+        .await
+        .unwrap();
+    for (slot, versions) in [(D20, [1, 1]), (D20 + Duration::HOUR, [1, 2])] {
+        let mut barrier = h.pool().begin().await.unwrap();
+        sqlx::query("LOCK TABLE readings IN SHARE MODE")
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier)
+            .await
+            .unwrap();
+        let writes = versions.map(|version| {
+            let hot = PostgresHot::new(h.database.clone());
+            tokio::spawn(async move {
+                hot.append_reporting(TABLE, &default_key(), &[batch(slot, 1, 7, version)])
+                    .await
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .effect
+            })
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))"
+                ).bind(blocker).fetch_one(h.pool()).await.unwrap();
+                if waiting == 2 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("both inserts waiting after their prior-state reads");
+        barrier.commit().await.unwrap();
+        let [first, second] = writes;
+        let effects = [first.await.unwrap(), second.await.unwrap()];
+        if versions[0] == versions[1] {
+            assert!(
+                effects.contains(&Effect::Inserted) && effects.contains(&Effect::Duplicate),
+                "{effects:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    effects,
+                    [Effect::Inserted, Effect::Superseded] | [Effect::Shadowed, Effect::Inserted]
+                ),
+                "{effects:?}"
+            );
+        }
+    }
 }

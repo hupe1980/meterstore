@@ -5,50 +5,17 @@ template = "index.html"
 sort_by = "weight"
 +++
 
-## The wall this exists for
+## Settlement ingestion
 
-An intelligent measuring system produces one value per measuring point, per OBIS
-code, per interval, and fifteen minutes is the German settlement grain:
+At 15-minute resolution, 100,000 channels produce 9.6 million readings a day.
+MeterStore archives complete PostgreSQL partitions to Iceberg and records the new
+watermark in the same snapshot as the data.
 
-| Scale | Rows / day | Rows / year |
-|---|---|---|
-| 10 k measuring points | ~1 M | ~350 M |
-| 100 k (mid-size utility) | ~9.6 M | ~3.5 B |
-| 1 M (metering operator) | ~96 M | ~35 B |
-
-Retention runs to years or decades for the settlement record. PostgreSQL handles
-the first row of that table comfortably, the second with care, and the third not
-without becoming a full-time job. Yet recent data is written continuously,
-corrected, and read transactionally — a PostgreSQL workload — while settlement,
-forecasting and grid analysis scan years across hundreds of thousands of meters,
-an object-storage-and-columnar problem.
-
-> The data has a natural split most systems refuse to exploit: recent intervals
-> are hot and still being corrected; historical intervals are cold and settled.
-> **The boundary between them is a timestamp.**
-
-## Four decisions that carry the weight
-
-**The watermark lives inside the Iceberg snapshot.** Archival writes the tier
-boundary into the snapshot summary, in the same commit as the data it describes.
-Iceberg commits are a compare-and-swap, so the rows and the boundary become
-durable together or not at all, with no external checkpoint store to fall out of
-sync.
-
-**Purge is `DROP TABLE`, never `DELETE`.** The hot table is time-partitioned, so
-an archived window is exactly one partition: detached for archival, dropped a
-cycle later once no query planned against the old boundary can still need it.
-Deleting a day for 100 k meters row by row would leave ~9.6 M dead tuples for
-autovacuum.
-
-**Corrections are versions, not overwrites.** In MSCONS a correction *versions*
-the value `[MSCONS AHB 3.2 Kap. 5.1]`. Nothing is updated in place, so the store needs only Iceberg's
-`append`, and a past settlement stays reproducible because the value it used is
-still there.
-
-**Nothing on the archival path holds a window.** The detached partition is paged
-by keyset into the Parquet writer, so peak memory is the chunk size, not the
-~9.6 M rows of a day at 100 k measuring points.
+A settlement writer can reject a batch that crosses the watermark before either
+tier changes. Declare a price as an assertion column to detect conflicting
+replays. Choose the quantity’s decimal scale at table creation to preserve values
+such as 0.0000001 kWh through archival and correction.
+[Configure a settlement writer](@/docs/writing.md#settlement-ingestion).
 
 ## One statement, both tiers
 
@@ -67,39 +34,15 @@ result.tiers_scanned();     // [Cold, Hot]
 result.touched_hot_tier();  // whether the answer is only valid for now
 ```
 
-The range is cut at the watermark, each half is read from the tier that holds it,
-and the halves are concatenated — not merged, not deduplicated, because they are
-disjoint by construction.
+The planner splits the range at the watermark. Use `meter_local_day` for local
+calendar days and `meter_balancing_day` for commodity-specific settlement days.
 
-`meter_local_day` matters: the UTC day boundary sits at 01:00 or 02:00 in Berlin,
-so grouping on UTC days is wrong *every day*, not only at the DST transitions. The
-calendar arithmetic is [`metering`](https://crates.io/crates/metering)'s.
+## Reproduce a settlement
 
-For **gas** it is the wrong function: a *Gastag* runs 06:00 to 06:00 local, so
-`meter_balancing_day("from", sparte)` picks the day each row's commodity is
-settled on. An external engine has neither function, so every row also stores its
-`balancing_day`, and `date_trunc('month', balancing_day)` gives the
-Bilanzierungsmonat too.
+Pin an Iceberg snapshot and version ceiling for an archived settlement. To read
+what was known at an instant across both tiers, use a transaction-time cutoff.
+[Reproducible reads](@/docs/reproducibility.md).
 
-## What you get that a general lakehouse does not
-
-**An open format for regulated data.** Standard Iceberg v2 on object storage,
-readable by Spark, Trino, DuckDB, Snowflake and PyIceberg with MeterStore nowhere
-in the data path — and [read back by DuckDB and PyIceberg](@/docs/interop.md) in
-the test suite.
-
-**Time travel as compliance.** MaBiS settlement must be reproducible. Pin an
-Iceberg snapshot plus a version ceiling to reconstruct what was known at a point
-in time, or pin the row-level transaction-time axis and reproduce across *both*
-tiers.
-
-**A correct domain model, stored correctly.** Readings are `metering`'s types:
-DST-correct calendars, exact decimals, quality flags, all four Sparten, stored at
-35-billion-row scale without losing a decimal, a quality flag or an interval
-boundary.
-
-**No server extension, no server configuration.** A library, not a PostgreSQL
-extension. No `shared_preload_libraries`, no restart and no superuser: the one
-extension it creates, `btree_gist`, ships in contrib and is trusted, so it deploys
-on RDS, Cloud SQL and Azure Postgres unchanged. [Getting started](@/docs/getting-started.md#requirements) lists the
-privileges.
+DuckDB and PyIceberg can read the archived Parquet files through the Iceberg
+catalog. The logical readings view resolves corrections by version.
+[Query from an external engine](@/docs/interop.md).

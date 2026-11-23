@@ -248,6 +248,13 @@ impl TieredTableProvider {
     ) -> Self {
         let schema = cold_provider.schema();
         let core = crate::encode::schema::storage_schema(&[]);
+        let value_scale = match schema
+            .field_with_name(crate::encode::schema::col::VALUE)
+            .map(|f| f.data_type())
+        {
+            Ok(crate::arrow::datatypes::DataType::Decimal128(_, scale)) => *scale,
+            _ => crate::encode::schema::VALUE_SCALE,
+        };
         let extra: Vec<String> = schema
             .fields()
             .iter()
@@ -271,7 +278,8 @@ impl TieredTableProvider {
                     .map(|s| (*s).to_string())
                     .collect(),
                 extra,
-            ),
+            )
+            .with_value_scale(value_scale),
             row_scope: Vec::new(),
             max_pin_age: None,
         }
@@ -346,7 +354,9 @@ impl TieredTableProvider {
     /// is not. The chunk size travels with it so the query path and the archival
     /// path cannot end up bounded differently.
     pub fn with_scan_spec(mut self, spec: crate::tiering::store::ScanSpec) -> Self {
-        self.spec = spec;
+        // The provider’s published schema fixes the measurement scale, including
+        // when a caller supplies only cursor columns or a chunk size.
+        self.spec = spec.with_value_scale(self.spec.value_scale());
         self
     }
 
@@ -1088,13 +1098,7 @@ mod tests {
             let b = batch(self.rows);
             Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
         }
-        async fn create_tables(
-            &self,
-            _table: &str,
-            _key: &[String],
-            _extra: &[crate::arrow::datatypes::Field],
-            _model: crate::config::TimeModel,
-        ) -> crate::Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> crate::Result<()> {
             Ok(())
         }
 
@@ -1154,13 +1158,7 @@ mod tests {
             Ok(())
         }
 
-        async fn create_tables(
-            &self,
-            _table: &str,
-            _identity: &[String],
-            _extra: &[crate::arrow::datatypes::Field],
-            _policy: &crate::tiering::store::MaintenancePolicy,
-        ) -> crate::Result<()> {
+        async fn create_tables(&self, _: &crate::ValidatedTableConfig) -> crate::Result<()> {
             Ok(())
         }
 

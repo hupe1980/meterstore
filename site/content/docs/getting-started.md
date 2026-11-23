@@ -140,22 +140,18 @@ let cold_tier = IcebergSqlCatalog {
 }.build().await?;
 let cold = cold_tier.cold();
 
+let table = TableConfig::new("readings_versions")
+    .settlement_lag(Duration::days(7))
+    .archival_step(Duration::DAY)
+    .build()?;
+cold.create_table_for(&table).await?;
+let provider = cold.table_provider(table.name()).await?;
 let store = MeterStore::builder()
     .hot(hot)
-    .cold(cold.clone(), cold.table_provider("readings_versions").await?)
-    .table(
-        TableConfig::new("readings_versions")
-            .settlement_lag(Duration::days(7))   // stay behind the correction window
-            .archival_step(Duration::DAY)        // one window per commit, one partition per window
-            .build()?,
-    )
+    .cold(cold, provider)
+    .table(table)
     .build()
     .await?;
-
-// Creates both tiers from one configuration. This is deliberately a single
-// entry point: the hot table's primary key, the cold schema and the resolution
-// view all have to agree on what identifies a reading, and creating them
-// separately is where they drift.
 store.admin().create_tables().await?;
 ```
 

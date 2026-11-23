@@ -38,6 +38,12 @@ const D21: OffsetDateTime = datetime!(2026-07-21 00:00 UTC);
 
 /// A store whose readings are identified by tenant as well as measuring point.
 async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
+    store_with_columns(|config| config).await
+}
+
+async fn store_with_columns(
+    extend: impl FnOnce(TableConfig) -> TableConfig,
+) -> (MeterStore, tempfile::TempDir) {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
@@ -70,39 +76,25 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
         8 * 1024 * 1024,
     ));
 
-    let config = TableConfig::new(TABLE)
-        .settlement_lag(Duration::days(1))
-        .identity_column(Field::new("tenant", DataType::Utf8, false))
-        // A coded attribute column: its vocabulary is enforced by a DB CHECK.
-        .attribute_column(meterstore::coded_column(
-            "bilanzkreis",
-            &["BK-1", "BK-2"],
-            true,
-        ))
-        .build()
-        .expect("config");
+    let config = extend(
+        TableConfig::new(TABLE)
+            .settlement_lag(Duration::days(1))
+            .identity_column(Field::new("tenant", DataType::Utf8, false))
+            // A coded attribute column: its vocabulary is enforced by a DB CHECK.
+            .attribute_column(meterstore::coded_column(
+                "bilanzkreis",
+                &["BK-1", "BK-2"],
+                true,
+            )),
+    )
+    .build()
+    .expect("config");
 
     // One call creates both tiers with a consistent key and schema.
     let hot_dyn: Arc<dyn HotStore> = hot.clone();
     let cold_dyn: Arc<dyn ColdStore> = cold.clone();
-    hot_dyn
-        .create_tables(
-            TABLE,
-            &config.merge_key(),
-            &config.extra_columns(),
-            config.time_model(),
-        )
-        .await
-        .expect("hot table");
-    cold_dyn
-        .create_tables(
-            TABLE,
-            &config.identity_column_names(),
-            &config.extra_columns(),
-            &config.maintenance_policy(),
-        )
-        .await
-        .expect("cold table");
+    hot_dyn.create_tables(&config).await.expect("hot table");
+    cold_dyn.create_tables(&config).await.expect("cold table");
     hot.ensure_partitions(TABLE, D20, D21, Duration::DAY)
         .await
         .expect("partitions");
@@ -123,9 +115,13 @@ async fn store_with_tenant_identity() -> (MeterStore, tempfile::TempDir) {
 
 /// A reading for one tenant at a given version and value.
 fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
+    reading_at(D20, tenant, kwh, version)
+}
+
+fn reading_at(at: OffsetDateTime, tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     let interval = metering::series::interval::MeterInterval::new(
-        D20,
-        D20 + Duration::minutes(15),
+        at,
+        at + Duration::minutes(15),
         rust_decimal::Decimal::new(kwh, 0),
         metering::QualityFlag::Measured,
     )
@@ -145,7 +141,7 @@ fn reading(tenant: &str, kwh: i64, version: u128) -> StoredSeries {
     StoredSeries::new(
         series,
         ScopedVersion::new(
-            VersionScope::for_interval("9900000000003", D20, Sparte::Strom).unwrap(),
+            VersionScope::for_interval("9900000000003", at, Sparte::Strom).unwrap(),
             Version::new(version).unwrap(),
         ),
         datetime!(2026-07-27 06:00 UTC),
@@ -805,4 +801,224 @@ async fn the_attribute_audit_reads_the_declaration_back_off_the_data() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].column, "bilanzkreis");
     assert_eq!(all[0].merge_keys_with_several_values, 1);
+}
+
+/// A settlement price belongs to the versioned assertion, while the billing
+/// group remains a descriptive attribute. A replay compares only the former.
+#[tokio::test]
+async fn assertion_attributes_identify_replays_on_both_tiers() {
+    use meterstore::session::Effect;
+
+    let (store, _warehouse) = store_with_columns(|config| {
+        config.assertion_column(Field::new("spot", DataType::Utf8, true))
+    })
+    .await;
+    let site = store.scoped("tenant", "ems").await.unwrap();
+    let original = reading("ems", 10, 1);
+    let mut priced =
+        reading("ems", 10, 2).with_extra("spot", ScalarValue::Utf8(Some("-1.25".into())));
+    priced.recorded_at += Duration::HOUR;
+    let duplicate = original
+        .clone()
+        .with_extra("bilanzkreis", ScalarValue::Utf8(Some("BK-2".into())));
+    let null_to_zero = original
+        .clone()
+        .with_extra("spot", ScalarValue::Utf8(Some("0".into())));
+    let price_to_zero = priced
+        .clone()
+        .with_extra("spot", ScalarValue::Utf8(Some("0".into())));
+    let conflict = |err: meterstore::Error| {
+        assert!(err.to_string().contains("spot"), "{err}");
+        assert!(
+            matches!(err, meterstore::Error::IntegrityViolation { ref constraint, .. } if constraint.as_deref() == Some("version_identifies_one_assertion")),
+            "{err}"
+        );
+    };
+    site.append(std::slice::from_ref(&original)).await.unwrap();
+    assert_eq!(
+        site.append(std::slice::from_ref(&duplicate))
+            .await
+            .unwrap()
+            .hot_rows,
+        0
+    );
+    conflict(
+        site.append(std::slice::from_ref(&null_to_zero))
+            .await
+            .unwrap_err(),
+    );
+
+    let writer = site.hot_writer().await.unwrap();
+    // The insert and its conflict check share one transaction. A valid version
+    // beside a conflicting replay cannot leak through the bulk writer.
+    conflict(
+        writer
+            .append(&[priced.clone(), null_to_zero.clone()])
+            .await
+            .unwrap_err(),
+    );
+    let only = site.append(std::slice::from_ref(&priced)).await.unwrap();
+    assert_eq!(only.hot_rows, 1);
+    assert_eq!(
+        only.displacements[0]
+            .superseded
+            .as_ref()
+            .unwrap()
+            .assertion_attributes["spot"],
+        None
+    );
+    assert_eq!(
+        only.displacements[0].written.assertion_attributes["spot"].as_deref(),
+        Some("-1.25")
+    );
+    conflict(
+        site.append(std::slice::from_ref(&price_to_zero))
+            .await
+            .unwrap_err(),
+    );
+
+    store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+    for replay in [&original, &priced] {
+        let result = site.append(std::slice::from_ref(replay)).await.unwrap();
+        assert_eq!((result.hot_rows, result.cold_rows), (0, 0));
+        assert_eq!(result.displacements[0].effect, Effect::Duplicate);
+    }
+    conflict(site.append(&[null_to_zero]).await.unwrap_err());
+    conflict(
+        site.append(std::slice::from_ref(&price_to_zero))
+            .await
+            .unwrap_err(),
+    );
+
+    let mut zero = price_to_zero;
+    zero.version = priced.version.next().unwrap();
+    zero.recorded_at += Duration::HOUR;
+    assert_eq!(
+        site.append(std::slice::from_ref(&zero))
+            .await
+            .unwrap()
+            .cold_rows,
+        1
+    );
+
+    for (at, predicate) in [
+        (original.recorded_at, "spot IS NULL"),
+        (priced.recorded_at, "spot = '-1.25'"),
+        (zero.recorded_at, "spot = '0'"),
+    ] {
+        let historical = site.as_known_at(at).await.unwrap();
+        assert_eq!(
+            sum_kwh(
+                &historical,
+                &format!("SELECT COUNT(*) FROM readings WHERE {predicate}")
+            )
+            .await,
+            1
+        );
+    }
+
+    // Reasserting an older version with an unchanged quantity but a different
+    // price from the current winner authors a new version.
+    let reapplied = site.append_authoritative(&[priced]).await.unwrap();
+    assert_eq!(reapplied.cold_rows, 1);
+    assert_eq!(
+        sum_kwh(&site, "SELECT COUNT(*) FROM readings WHERE spot = '-1.25'").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn single_tier_rejection_and_retry_preserve_both_visible_histories() {
+    let (store, _warehouse) = store_with_columns(|c| c.require_single_tier(true)).await;
+    let scoped = store.scoped("tenant", "a").await.unwrap();
+    let originals = [reading_at(D20, "a", 10, 1), reading_at(D21, "a", 20, 1)];
+    assert_eq!(scoped.append(&originals).await.unwrap().hot_rows, 2);
+    store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+    assert_eq!(store.watermark().await.unwrap().get(), D21);
+
+    let both = r#"SELECT "from", version, value FROM readings_versions ORDER BY "from", version"#;
+    let before = scoped.query(both).await.unwrap().to_json().unwrap();
+    assert_eq!(before.len(), 2);
+    let mixed = [reading_at(D21, "a", 21, 4), reading_at(D20, "a", 11, 1)];
+    for _ in 0..2 {
+        let error = scoped.append(&mixed).await.unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(
+            matches!(error, meterstore::Error::MixedTierBatch { table, watermark }
+            if table == TABLE && watermark.get() == D21)
+        );
+        assert_eq!(scoped.query(both).await.unwrap().to_json().unwrap(), before);
+    }
+
+    let writer = scoped.hot_writer().await.unwrap();
+    assert!(matches!(
+        writer.append(&mixed).await,
+        Err(meterstore::Error::MixedTierBatch { .. })
+    ));
+    assert_eq!(scoped.query(both).await.unwrap().to_json().unwrap(), before);
+
+    assert_eq!(
+        scoped
+            .append(&[reading_at(D20, "a", 11, 2)])
+            .await
+            .unwrap()
+            .cold_rows,
+        1
+    );
+    assert_eq!(scoped.append(&mixed[..1]).await.unwrap().hot_rows, 1);
+}
+
+/// Re-authoring two intervals preserves each delivery's timestamp and locates
+/// checked identities in the same spelling as its stored displacement.
+#[tokio::test]
+async fn authoritative_retries_preserve_identity_and_transaction_time_per_delivery() {
+    let (store, _warehouse) = store_with_columns(|c| {
+        c.identity_column(meterstore::checked_column(
+            "grid_meter",
+            meterstore::ValueCheck::Melo,
+            false,
+        ))
+    })
+    .await;
+    let make = |slot, version, quantity, recorded_at| {
+        let mut delivery = reading("ems", quantity, version).with_extra(
+            "grid_meter",
+            ScalarValue::Utf8(Some(" de0001234567890123456789012345678 ".into())),
+        );
+        delivery.series.intervals = vec![
+            metering::series::interval::MeterInterval::quarter_hour(
+                slot,
+                rust_decimal::Decimal::new(quantity, 0),
+                metering::QualityFlag::Measured,
+            )
+            .unwrap(),
+        ];
+        delivery.recorded_at = recorded_at;
+        delivery
+    };
+    let later_slot = D20 + Duration::minutes(15);
+    store
+        .append(&[make(D20, 10, 1, D21), make(later_slot, 10, 2, D21)])
+        .await
+        .unwrap();
+    let first = D21 + Duration::HOUR;
+    let second = first + Duration::HOUR;
+    let report = store
+        .append_authoritative(&[make(D20, 1, 3, first), make(later_slot, 1, 4, second)])
+        .await
+        .unwrap();
+    assert_eq!(report.displacements.len(), 2);
+    let historical = store.as_known_at(first).await.unwrap();
+    assert_eq!(
+        sum_kwh(
+            &historical,
+            "SELECT CAST(SUM(value) AS BIGINT) FROM readings"
+        )
+        .await,
+        5
+    );
+    assert_eq!(
+        sum_kwh(&store, "SELECT CAST(SUM(value) AS BIGINT) FROM readings").await,
+        7
+    );
 }

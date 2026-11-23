@@ -165,15 +165,9 @@ async fn setup(
     ));
 
     let config = TableConfig::new(table).build().expect("config");
-    ColdStore::create_tables(
-        plain.as_ref(),
-        table,
-        &[],
-        &config.extra_columns(),
-        &config.maintenance_policy(),
-    )
-    .await
-    .expect("cold table");
+    ColdStore::create_tables(plain.as_ref(), &config)
+        .await
+        .expect("cold table");
     advance(&plain, table, START - Duration::DAY, START)
         .await
         .expect("seed the boundary");

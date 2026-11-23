@@ -906,10 +906,15 @@ impl MeterStore {
     /// [`AppendOutcome::displacements`] covers both tiers, so a late correction
     /// reports what it displaced exactly as a current one does.
     ///
+    /// By default the hot portion of a mixed batch commits before its cold
+    /// portion. A cold error can therefore leave the hot portion visible.
+    /// [`TableConfig::require_single_tier`](crate::TableConfig::require_single_tier)
+    /// rejects mixed batches before either portion is written.
+    ///
     /// # The boundary is read twice, and that is the point
     ///
-    /// Routing is decided against a boundary read before the write, and archival
-    /// can advance that boundary while the write is in flight — leaving an
+    /// With the default routing policy, archival
+    /// can advance the boundary while the write is in flight — leaving an
     /// interval in PostgreSQL below the watermark, where no query looks. So the
     /// boundary is read **again** afterwards, and an append that lost the race
     /// routes a second time against the fresh one. Both writes are idempotent,
@@ -946,6 +951,9 @@ impl MeterStore {
                 }
                 other => other?,
             };
+            if self.config.requires_single_tier() {
+                return Ok(round);
+            }
             let earliest_hot = series
                 .iter()
                 .flat_map(|s| s.series.intervals.iter().map(|i| i.from()))
@@ -990,31 +998,11 @@ impl MeterStore {
             }
         }
 
+        self.check_tiers(watermark, !hot.is_empty(), !cold.is_empty())?;
         let mut outcome = AppendOutcome::default();
-
-        if !hot.is_empty() {
-            // A partitioned table rejects a row with no partition to hold it, so
-            // an insert past the pre-created frontier fails outright. The
-            // archiver maintains headroom on its own schedule, but a store that
-            // has not archived yet — a fresh deployment, or a backfill reaching
-            // further ahead than the headroom — would otherwise get a bare
-            // "no partition of relation found for row" from PostgreSQL.
-            let (first, last) = hot_bounds(&hot);
-            self.hot
-                .ensure_partitions(
-                    table,
-                    first,
-                    // Exclusive, so the partition holding `last` must be created.
-                    last + self.config.archival_step(),
-                    self.config.archival_step(),
-                )
-                .await?;
-
-            let batch = crate::encode::to_record_batch_with(&hot, &self.config.extra_columns())?;
-            let reported = self
-                .hot
-                .append_reporting(table, &self.config.merge_key(), &[batch])
-                .await?;
+        if let Some((first, last)) = hot_bounds(&hot) {
+            let batch = crate::encode::to_record_batch_for(&hot, &self.config)?;
+            let reported = self.append_hot(batch, first, last).await?;
             outcome.hot_rows = reported
                 .iter()
                 .filter(|d| d.effect != crate::session::Effect::Duplicate)
@@ -1022,22 +1010,8 @@ impl MeterStore {
             outcome.displacements.extend(reported);
         }
         if !cold.is_empty() {
-            // Held across the read *and* the write. `append_cold` decides what to
-            // append from what is already stored, so two processes doing that
-            // concurrently would both find no existing row and both write — the
-            // reading stored twice at one version, which resolution cannot
-            // collapse. The hot tier gets that exclusion from its primary key;
-            // Iceberg has none.
-            let lease = self.hot.cold_append_lease(table).await?;
-            let written = self.append_cold(&cold, &mut outcome).await;
-            if let Err(e) = lease.release().await {
-                warn!(
-                    table,
-                    error = %e,
-                    "could not release the cold-append claim; it dies with this session"
-                );
-            }
-            written?;
+            let batch = crate::encode::to_record_batch_for(&cold, &self.config)?;
+            self.append_cold(&batch, &mut outcome).await?;
         }
 
         crate::observe::metrics()
@@ -1086,6 +1060,9 @@ impl MeterStore {
                 }
                 other => other?,
             };
+            if self.config.requires_single_tier() {
+                return Ok(round);
+            }
             let earliest_hot = readings
                 .iter()
                 .flat_map(|d| d.readings.iter().map(|r| r.at))
@@ -1130,29 +1107,16 @@ impl MeterStore {
             }
         }
 
+        self.check_tiers(watermark, !hot.is_empty(), !cold.is_empty())?;
         let mut outcome = AppendOutcome::default();
-        let extra = self.config.extra_columns();
-
         if !hot.is_empty() {
             let starts = || hot.iter().flat_map(|d| d.readings.iter().map(|r| r.at));
             let (first, last) = (
                 starts().min().expect("non-empty"),
                 starts().max().expect("non-empty"),
             );
-            self.hot
-                .ensure_partitions(
-                    table,
-                    first,
-                    last + self.config.archival_step(),
-                    self.config.archival_step(),
-                )
-                .await?;
-
-            let batch = crate::encode::readings_to_record_batch_with(&hot, &extra)?;
-            let reported = self
-                .hot
-                .append_reporting(table, &self.config.merge_key(), &[batch])
-                .await?;
+            let batch = crate::encode::readings_to_record_batch_for(&hot, &self.config)?;
+            let reported = self.append_hot(batch, first, last).await?;
             outcome.hot_rows = reported
                 .iter()
                 .filter(|d| d.effect != crate::session::Effect::Duplicate)
@@ -1161,19 +1125,8 @@ impl MeterStore {
         }
 
         if !cold.is_empty() {
-            // The same claim, the same reason as the interval path: the decision
-            // and the write have to be one step, or two processes both find no
-            // stored row and both append.
-            let lease = self.hot.cold_append_lease(table).await?;
-            let written = self.append_cold_readings(&cold, &extra, &mut outcome).await;
-            if let Err(e) = lease.release().await {
-                warn!(
-                    table,
-                    error = %e,
-                    "could not release the cold-append claim; it dies with this session"
-                );
-            }
-            written?;
+            let batch = crate::encode::readings_to_record_batch_for(&cold, &self.config)?;
+            self.append_cold(&batch, &mut outcome).await?;
         }
 
         crate::observe::metrics()
@@ -1187,6 +1140,38 @@ impl MeterStore {
             "readings routed"
         );
         Ok(outcome)
+    }
+
+    fn check_tiers(&self, watermark: TieringWatermark, hot: bool, cold: bool) -> Result<()> {
+        if self.config.requires_single_tier() && hot && cold {
+            return Err(Error::MixedTierBatch {
+                table: self.config.name().to_string(),
+                watermark,
+            });
+        }
+        Ok(())
+    }
+
+    async fn append_hot(
+        &self,
+        batch: crate::arrow::array::RecordBatch,
+        first: OffsetDateTime,
+        last: OffsetDateTime,
+    ) -> Result<Vec<super::Displacement>> {
+        if self.config.requires_single_tier() {
+            return self
+                .hot
+                .append_single_tier(&self.config, &batch, self.cold.as_ref())
+                .await;
+        }
+        let table = self.config.name();
+        let step = self.config.archival_step();
+        self.hot
+            .ensure_partitions(table, first, last + step, step)
+            .await?;
+        self.hot
+            .append_reporting(table, &self.config.merge_key(), &[batch])
+            .await
     }
 
     /// Whether archival moved the tier boundary past a row this append just
@@ -1391,6 +1376,10 @@ impl MeterStore {
     /// Re-asserting a value already in force is a no-op rather than a version
     /// bump.
     ///
+    /// Each round commits separately. On a single-tier table the rejection
+    /// guarantee applies to each call to [`append`](Self::append). Use that
+    /// method directly when the producer assigns settlement versions.
+    ///
     /// # Errors
     ///
     /// After [`AUTHORITATIVE_ATTEMPTS`] rounds that still fail to take effect.
@@ -1410,6 +1399,20 @@ impl MeterStore {
 
         let discriminators = self.config.discriminator_columns();
         let mut pending: Vec<crate::encode::StoredSeries> = series.to_vec();
+        // Displacements identify the encoded row. Keep checked identities in
+        // their stored spelling when matching a report to its source delivery.
+        for field in self
+            .config
+            .identity_columns()
+            .iter()
+            .filter(|field| crate::config::declared_value_check(field).is_some())
+        {
+            for stored in &mut pending {
+                if let Some(value) = stored.extra.get_mut(field.name()) {
+                    *value = crate::encode::check_declared_value(field, value.clone())?;
+                }
+            }
+        }
         let mut outcome = AppendOutcome::default();
 
         for _ in 0..AUTHORITATIVE_ATTEMPTS {
@@ -1434,7 +1437,7 @@ impl MeterStore {
                 let holds = displacement
                     .superseded
                     .as_ref()
-                    .is_some_and(|p| p.value == displacement.written.value);
+                    .is_some_and(|p| p.differing_assertion_field(&displacement.written).is_none());
                 if displacement.effect == Effect::Duplicate && holds {
                     outcome.displacements.push(displacement);
                     continue;
@@ -1445,7 +1448,7 @@ impl MeterStore {
             if retry.is_empty() {
                 return Ok(outcome);
             }
-            pending = merge_authored(retry);
+            pending = retry;
         }
 
         // A conflict between two producers, not a store whose state is wrong:
@@ -1471,7 +1474,9 @@ impl MeterStore {
     /// per *batch*, not per row — one catalog load per 96 values if a batch is
     /// one meter-day.
     ///
-    /// This reads the boundary **once** and hands back a writer that reuses it.
+    /// The default routing policy reads the boundary once per writer.
+    /// A [single-tier table](crate::TableConfig::require_single_tier) verifies
+    /// it again in each hot insert transaction, under a shared archive lock.
     ///
     /// # Why reusing a boundary is safe here, and where it stops being
     ///
@@ -1587,102 +1592,59 @@ impl MeterStore {
         )))
     }
 
-    /// [`append_cold`](Self::append_cold) for a point delivery.
-    ///
-    /// The reconciliation is shared — a register reading differs from an
-    /// interval only in having no span end — so this is the encode and the write.
-    async fn append_cold_readings(
-        &self,
-        cold: &[crate::encode::StoredReadings],
-        extra: &[crate::arrow::datatypes::Field],
-        outcome: &mut AppendOutcome,
-    ) -> Result<()> {
-        let table = self.config.name();
-        let identity = self.config.discriminator_columns();
-        let reconciled = self.reconcile_cold(reading_rows(cold, &identity)?).await?;
-        let write: Vec<bool> = reconciled.iter().map(|o| o.write).collect();
-
-        crate::observe::metrics().rows_deduplicated.add(
-            reconciled.iter().filter(|o| !o.write).count() as u64,
-            &crate::observe::table(table),
-        );
-
-        let cold = retain_readings(cold.to_vec(), &write)?;
-        outcome
-            .displacements
-            .extend(reconciled.into_iter().map(|o| o.displacement));
-
-        if cold.is_empty() {
-            return Ok(());
-        }
-
-        // Sorted into the order the Parquet footer declares. Archival gets that
-        // from the hot scan's keyset cursor; a correction is written straight
-        // from the delivery, so it has to be put there — see
-        // `encode::sorted_for_storage`.
-        let batch = crate::encode::sorted_for_storage(
-            &crate::encode::readings_to_record_batch_with(&cold, extra)?,
-        )?;
-        let hints = crate::tiering::store::WriteHints {
-            distinct_malo_ids: Some(crate::encode::distinct_malo_ids(std::slice::from_ref(
-                &batch,
-            ))),
-        };
-        outcome.cold_rows = self
-            .cold
-            .append_only(table, crate::tiering::store::stream_of(vec![batch]), hints)
-            .await?
-            .rows;
-        Ok(())
-    }
-
-    /// Reconcile a late-correction batch against what is stored, then append
-    /// what is left.
-    ///
-    /// The caller holds the cold-append lease across this, because the decision
-    /// and the write have to be one step.
+    /// Hold one claim across replay detection and publication.
     async fn append_cold(
         &self,
-        cold: &[crate::encode::StoredSeries],
+        batch: &crate::arrow::array::RecordBatch,
         outcome: &mut AppendOutcome,
     ) -> Result<()> {
         let table = self.config.name();
+        let lease = self.hot.cold_append_lease(table).await?;
+        let result = if self.config.requires_single_tier() && !lease.enforced() {
+            Err(Error::config(format!(
+                "{table} requires an enforced cold-append lease for single-tier writes"
+            )))
+        } else {
+            self.write_cold(batch, outcome).await
+        };
+        if let Err(error) = lease.release().await {
+            warn!(table, %error, "could not release the cold-append claim");
+        }
+        result
+    }
+
+    /// Reconcile the encoded delivery under the cold-append lease. Both time
+    /// models compare the exact representation the writer would publish,
+    /// including canonical identifiers and nullable assertion attributes.
+    async fn write_cold(
+        &self,
+        batch: &crate::arrow::array::RecordBatch,
+        outcome: &mut AppendOutcome,
+    ) -> Result<()> {
+        let table = self.config.name();
+        let assertions: Vec<_> = self.config.assertion_column_names().collect();
+        let identity = self.config.discriminator_columns();
+        let incoming = decode_cold_rows(batch, &identity, &assertions)?;
         let reconciled = self
-            .reconcile_cold(interval_rows(cold, &self.config.discriminator_columns())?)
+            .reconcile_cold(incoming, &identity, &assertions)
             .await?;
-
-        // Rows already stored at this `(merge key, version)` are dropped rather
-        // than appended: resolution ranks one row per version, so a duplicate
-        // makes two winners and doubles every sum over the interval. The
-        // decision is per row, so it is applied per row — a key two rows share
-        // would keep both whenever either is new.
-        let write: Vec<bool> = reconciled.iter().map(|o| o.write).collect();
-
-        // The same instrument as the hot tier's `ON CONFLICT` skips, so
-        // `write.rows_deduplicated` is the redelivery rate for the store rather
-        // than for one of its halves.
-        crate::observe::metrics().rows_deduplicated.add(
-            reconciled.iter().filter(|o| !o.write).count() as u64,
-            &crate::observe::table(table),
+        let keep = crate::arrow::array::BooleanArray::from(
+            reconciled
+                .iter()
+                .map(|decision| decision.write)
+                .collect::<Vec<_>>(),
         );
-
-        let cold = retain_intervals(cold.to_vec(), &write)?;
+        crate::observe::metrics()
+            .rows_deduplicated
+            .add(keep.false_count() as u64, &crate::observe::table(table));
         outcome
             .displacements
-            .extend(reconciled.into_iter().map(|o| o.displacement));
-
-        if cold.is_empty() {
+            .extend(reconciled.into_iter().map(|row| row.displacement));
+        if keep.true_count() == 0 {
             return Ok(());
         }
-
-        // Sorted into the order the Parquet footer declares, for the reason
-        // `encode::sorted_for_storage` gives: archival satisfies it through the
-        // hot scan's keyset cursor, a correction is written in delivery order
-        // and would otherwise declare an order it is not in.
-        let batch = crate::encode::sorted_for_storage(&crate::encode::to_record_batch_with(
-            &cold,
-            &self.config.extra_columns(),
-        )?)?;
+        let fresh = crate::arrow::compute::filter_record_batch(batch, &keep)?;
+        let batch = crate::encode::sorted_for_storage(&fresh)?;
         // Appended without moving the watermark: the boundary is about which
         // range each tier owns, and a correction does not change that. The batch
         // is in memory, so the bloom-filter hint is exact.
@@ -1718,7 +1680,7 @@ impl MeterStore {
     ///   Reported [`Duplicate`](crate::session::Effect::Duplicate) and dropped,
     ///   because resolution ranks one row per *version* and a duplicate makes
     ///   two winners.
-    /// - **A different value under an existing version**, which is a producer
+    /// - **A different value or assertion attribute under an existing version**, which is a producer
     ///   error: a version identifies one assertion.
     ///
     /// # Keyed on the full merge key
@@ -1732,11 +1694,15 @@ impl MeterStore {
     /// One query, scoped to the measuring points and interval range being
     /// written, so it is proportional to the correction rather than to the
     /// history.
-    async fn reconcile_cold(&self, incoming: Vec<IncomingRow>) -> Result<Vec<ColdOutcome>> {
+    async fn reconcile_cold(
+        &self,
+        incoming: Vec<IncomingRow>,
+        identity: &[String],
+        assertions: &[&str],
+    ) -> Result<Vec<ColdOutcome>> {
         use crate::session::{Displacement, Effect, StoredValue};
         use datafusion::scalar::ScalarValue;
 
-        let identity = self.config.discriminator_columns();
         let mut malo_ids: std::collections::BTreeSet<String> = Default::default();
         let (mut lo, mut hi) = (None::<OffsetDateTime>, None::<OffsetDateTime>);
         for row in &incoming {
@@ -1771,12 +1737,14 @@ impl MeterStore {
         // columns of one name in the result schema.
         let identity_select = identity
             .iter()
-            .filter(|c| c.as_str() != col::MELO_ID)
+            .map(String::as_str)
+            .chain(assertions.iter().copied())
+            .filter(|c| *c != col::MELO_ID)
             .map(|c| format!(r#", "{c}""#))
             .collect::<String>();
         let sql = format!(
             r#"SELECT "{malo}", "{obis}", "{from}", "{value}", "{unit}", "{quality}",
-                      "{version}", "{scope}", "{recorded}", "{melo}"{identity_select}
+                      "{version}", "{scope}", "{recorded}", "{melo}", "to"{identity_select}
                FROM {raw}
                WHERE "{from}" >= $1 AND "{from}" <= $2
                  AND "{malo}" IN ({places})"#,
@@ -1799,22 +1767,16 @@ impl MeterStore {
         // The highest version stored per reading, and every version stored for
         // it: the first decides displacement, the second decides replay.
         let mut current: std::collections::HashMap<ColdKey, StoredValue> = Default::default();
-        let mut stored_versions: std::collections::HashMap<(ColdKey, u128), StoredValue> =
-            Default::default();
-
-        // What the cold tier already names as the Messlokation of each stored
-        // version. Compared below for the same reason the hot tier's divergence
-        // check asks about it: on a table not keyed by Messlokation, two meters
-        // under one Marktlokation share a merge key, and a replay check that
-        // ignored the column would drop the second meter's register as a
-        // redelivery of the first — silently, whenever the two readings agree.
-        let mut stored_melo: std::collections::HashMap<(ColdKey, u128), Option<String>> =
-            Default::default();
+        let mut stored_versions = std::collections::HashMap::new();
 
         for batch in existing.batches() {
-            for row in decode_cold_rows(batch, &identity)? {
-                let (key, held, melo) = row;
-                stored_melo.insert((key.clone(), held.version.version().get()), melo);
+            for row in decode_cold_rows(batch, identity, assertions)? {
+                let IncomingRow {
+                    key,
+                    written: held,
+                    melo,
+                    ..
+                } = row;
                 match current.get(&key) {
                     // Two scopes already stored for one reading: the versions are
                     // not comparable, so both survive resolution and every sum
@@ -1841,7 +1803,7 @@ impl MeterStore {
                         current.insert(key.clone(), held.clone());
                     }
                 }
-                stored_versions.insert((key, held.version.version().get()), held);
+                stored_versions.insert((key, held.version.version().get()), (held, melo));
             }
         }
 
@@ -1852,26 +1814,28 @@ impl MeterStore {
             if let Some(held) = current.get(&row.key)
                 && held.version.scope().operator() != row.written.version.scope().operator()
             {
-                return Err(Error::config(format!(
-                    "reading {} {} at {} is already stored under network operator {} \
+                return Err(Error::IntegrityViolation {
+                    table: self.config.name().to_string(),
+                    constraint: Some("one_operator_per_reading".to_string()),
+                    detail: format!(
+                        "reading {} {} at {} is already stored under network operator {} \
                      but this delivery asserts {}. A version is comparable only \
                      within its (operator, month) scope, so both would survive resolution \
                      and double every sum over them. Check that the scope carries the \
                      *network operator* rather than a forwarding party or a tenant",
-                    row.key.malo_id,
-                    row.key.obis_code,
-                    row.key.from,
-                    held.version.scope().operator(),
-                    row.written.version.scope().operator(),
-                )));
+                        row.key.malo_id,
+                        row.key.obis_code,
+                        row.key.from,
+                        held.version.scope().operator(),
+                        row.written.version.scope().operator(),
+                    ),
+                });
             }
 
             // Already stored at this exact version. A replay is ordinary; a
             // restated value is a producer error.
-            if let Some(held) = stored_versions.get(&(row.key.clone(), version)) {
-                if let Some(stored) = stored_melo.get(&(row.key.clone(), version))
-                    && *stored != row.melo
-                {
+            if let Some((held, stored)) = stored_versions.get(&(row.key.clone(), version)) {
+                if *stored != row.melo {
                     // A delivery the store refused, not a state the store is in:
                     // the cold-tier twin of the hot path's `melo_id` check.
                     return Err(Error::IntegrityViolation {
@@ -1892,20 +1856,13 @@ impl MeterStore {
                         ),
                     });
                 }
-                if held.value != row.written.value {
+                if let Some(field) = held.differing_assertion_field(&row.written) {
                     return Err(Error::IntegrityViolation {
                         table: self.config.name().to_string(),
                         constraint: Some("version_identifies_one_assertion".to_string()),
                         detail: format!(
-                            "reading {} {} at {} is already stored at version {version} with \
-                             value {} but this delivery restates it as {} — a version \
-                             identifies one assertion, so a corrected value needs a higher \
-                             version",
-                            row.key.malo_id,
-                            row.key.obis_code,
-                            row.key.from,
-                            held.value,
-                            row.written.value,
+                            "reading {} {} at {} has a different {field:?} at version {version}. A corrected assertion needs a higher version",
+                            row.key.malo_id, row.key.obis_code, row.key.from,
                         ),
                     });
                 }
@@ -1940,8 +1897,7 @@ impl MeterStore {
             // asserting the same `(merge key, version)` meets the checks above as
             // a stored row would: a replay is written once, and a second meter's
             // register is refused rather than read as a replay of the first.
-            stored_versions.insert((row.key.clone(), version), row.written.clone());
-            stored_melo.insert((row.key.clone(), version), row.melo.clone());
+            stored_versions.insert((row.key.clone(), version), (row.written.clone(), row.melo));
 
             out.push(ColdOutcome {
                 displacement: Displacement {
@@ -2185,84 +2141,6 @@ struct ColdOutcome {
     write: bool,
 }
 
-/// The rows an interval delivery asserts, for reconciliation.
-fn interval_rows(
-    cold: &[crate::encode::StoredSeries],
-    identity: &[String],
-) -> Result<Vec<IncomingRow>> {
-    let mut out = Vec::new();
-    for stored in cold {
-        // Rendered once per delivery: the identifiers are the same for every row.
-        let malo = stored.series.malo_id.to_string();
-        let melo = stored.series.melo_id.as_ref().map(ToString::to_string);
-        let ident = discriminator_values(stored.series.melo_id.as_ref(), &stored.extra, identity)?;
-        for interval in &stored.series.intervals {
-            let code = interval.obis().or(stored.series.obis_code).ok_or_else(|| {
-                Error::encode(
-                    crate::encode::schema::col::OBIS_CODE,
-                    format!("neither interval nor series {malo} carries one"),
-                )
-            })?;
-            out.push(IncomingRow {
-                key: ColdKey {
-                    malo_id: malo.clone(),
-                    obis_code: crate::encode::canonical_obis(&code.to_string())?,
-                    from: interval.from(),
-                    identity: ident.clone(),
-                },
-                to: Some(interval.to()),
-                melo: melo.clone(),
-                written: crate::session::StoredValue {
-                    value: interval.value(),
-                    unit: stored.unit,
-                    quality: interval.quality(),
-                    version: stored.version.clone(),
-                    recorded_at: stored.recorded_at,
-                },
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// The rows a point delivery asserts, for reconciliation.
-///
-/// The same shape as [`interval_rows`], with no span end — which is the whole of
-/// what a register reading differs by, so the reconciliation itself is shared.
-fn reading_rows(
-    cold: &[crate::encode::StoredReadings],
-    identity: &[String],
-) -> Result<Vec<IncomingRow>> {
-    let mut out = Vec::new();
-    for stored in cold {
-        let malo = stored.malo_id.to_string();
-        let melo = stored.melo_id.as_ref().map(ToString::to_string);
-        let ident = discriminator_values(stored.melo_id.as_ref(), &stored.extra, identity)?;
-        let delivery_obis = stored.obis_code;
-        for reading in &stored.readings {
-            let code = reading.obis_code.unwrap_or(delivery_obis);
-            out.push(IncomingRow {
-                key: ColdKey {
-                    malo_id: malo.clone(),
-                    obis_code: crate::encode::canonical_obis(&code.to_string())?,
-                    from: reading.at,
-                    identity: ident.clone(),
-                },
-                to: None,
-                melo: melo.clone(),
-                written: crate::session::StoredValue {
-                    value: reading.value,
-                    unit: stored.unit,
-                    quality: reading.quality,
-                    version: stored.version.clone(),
-                    recorded_at: stored.recorded_at,
-                },
-            });
-        }
-    }
-    Ok(out)
-}
-
 /// The merge key's discriminator values for one delivery, in key order.
 ///
 /// `melo_id` is read from the delivery itself rather than from `extra`: it is a
@@ -2318,88 +2196,12 @@ fn identity_value(
     }
 }
 
-/// Keep the intervals reconciliation decided to write, dropping emptied series.
-///
-/// `write` holds one decision per interval, in the order [`interval_rows`]
-/// produced them, and is applied by position. Matching by key instead would keep
-/// every row of a key whenever one of them is new — an in-batch replay written
-/// twice, a stored version rewritten beside the new one.
-fn retain_intervals(
-    cold: Vec<crate::encode::StoredSeries>,
-    write: &[bool],
-) -> Result<Vec<crate::encode::StoredSeries>> {
-    let mut decisions = write.iter().copied();
-    let mut out = Vec::with_capacity(cold.len());
-    for mut stored in cold {
-        let mut kept = Vec::with_capacity(stored.series.intervals.len());
-        for interval in std::mem::take(&mut stored.series.intervals) {
-            if decided(decisions.next())? {
-                kept.push(interval);
-            }
-        }
-        if !kept.is_empty() {
-            stored.series.intervals = kept;
-            out.push(stored);
-        }
-    }
-    exhausted(decisions)?;
-    Ok(out)
-}
-
-/// [`retain_intervals`] for a point delivery, in [`reading_rows`]' order.
-fn retain_readings(
-    cold: Vec<crate::encode::StoredReadings>,
-    write: &[bool],
-) -> Result<Vec<crate::encode::StoredReadings>> {
-    let mut decisions = write.iter().copied();
-    let mut out = Vec::with_capacity(cold.len());
-    for mut stored in cold {
-        let mut kept = Vec::with_capacity(stored.readings.len());
-        for reading in std::mem::take(&mut stored.readings) {
-            if decided(decisions.next())? {
-                kept.push(reading);
-            }
-        }
-        if !kept.is_empty() {
-            stored.readings = kept;
-            out.push(stored);
-        }
-    }
-    exhausted(decisions)?;
-    Ok(out)
-}
-
-/// One reconciliation decision, or the error a missing one is.
-///
-/// Unreachable while reconciliation answers every row it is given. Spelled as an
-/// error rather than a default all the same: either default is a silent wrong
-/// write — a dropped reading or a duplicated one.
-fn decided(decision: Option<bool>) -> Result<bool> {
-    decision.ok_or_else(|| {
-        Error::encode(
-            crate::encode::schema::col::VERSION,
-            "a row of this delivery has no reconciliation decision",
-        )
-    })
-}
-
-/// The counterpart of [`decided`]: a decision left over belongs to no row.
-fn exhausted(mut rest: impl Iterator<Item = bool>) -> Result<()> {
-    match rest.next() {
-        None => Ok(()),
-        Some(_) => Err(Error::encode(
-            crate::encode::schema::col::VERSION,
-            "reconciliation decided more rows than this delivery holds",
-        )),
-    }
-}
-
-/// Decode the reconciliation query's rows into `(key, stored value)` pairs.
-#[allow(clippy::type_complexity)]
+/// Decode the projected rows of either an incoming or stored assertion.
 fn decode_cold_rows(
     batch: &crate::arrow::array::RecordBatch,
     identity: &[String],
-) -> Result<Vec<(ColdKey, crate::session::StoredValue, Option<String>)>> {
+    assertions: &[&str],
+) -> Result<Vec<IncomingRow>> {
     use crate::arrow::array::{Array, Decimal128Array, TimestampMicrosecondArray};
     use crate::encode::schema::col;
 
@@ -2414,6 +2216,10 @@ fn decode_cold_rows(
         .map(|name| column_str(batch, name))
         .collect::<Result<Vec<_>>>()?;
 
+    let assertion_columns = assertions
+        .iter()
+        .map(|name| Ok((*name, column_str(batch, name)?)))
+        .collect::<Result<Vec<_>>>()?;
     let timestamps = |name: &'static str| -> Result<&TimestampMicrosecondArray> {
         batch
             .column_by_name(name)
@@ -2428,13 +2234,11 @@ fn decode_cold_rows(
     };
 
     let from = timestamps(col::FROM)?;
+    let to = timestamps(col::TO)?;
     let recorded_at = timestamps(col::RECORDED_AT)?;
     let value = decimals(col::VALUE)?;
     let version = decimals(col::VERSION)?;
 
-    let scale = |raw: i128, s: i8| -> rust_decimal::Decimal {
-        rust_decimal::Decimal::from_i128_with_scale(raw, u32::try_from(s).unwrap_or(0))
-    };
     let instant = |micros: i64, what: &'static str| -> Result<OffsetDateTime> {
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000)
             .map_err(|e| Error::decode(what, e.to_string()))
@@ -2459,7 +2263,16 @@ fn decode_cold_rows(
             identity: ident,
         };
         let held = crate::session::StoredValue {
-            value: scale(value.value(i), crate::encode::schema::VALUE_SCALE),
+            assertion_attributes: assertion_columns
+                .iter()
+                .map(|(name, column)| {
+                    (
+                        (*name).to_string(),
+                        (!column.is_null(i)).then(|| column.value(i).to_string()),
+                    )
+                })
+                .collect(),
+            value: crate::encode::decimal_at(value, i, col::VALUE)?,
             unit: unit
                 .value(i)
                 .parse::<metering::Unit>()
@@ -2480,11 +2293,14 @@ fn decode_cold_rows(
             ),
             recorded_at: instant(recorded_at.value(i), col::RECORDED_AT)?,
         };
-        out.push((
+        out.push(IncomingRow {
             key,
-            held,
-            (!melo.is_null(i)).then(|| melo.value(i).to_string()),
-        ));
+            written: held,
+            melo: (!melo.is_null(i)).then(|| melo.value(i).to_string()),
+            to: (!to.is_null(i))
+                .then(|| instant(to.value(i), col::TO))
+                .transpose()?,
+        });
     }
     Ok(out)
 }
@@ -2583,7 +2399,10 @@ fn reauthored(
     let matches = |s: &crate::encode::StoredSeries,
                    i: &metering::series::interval::MeterInterval|
      -> Result<bool> {
-        if s.series.malo_id.to_string() != displacement.malo_id || i.from() != displacement.from {
+        if s.series.malo_id.to_string() != displacement.malo_id
+            || i.from() != displacement.from
+            || s.version != displacement.written.version
+        {
             return Ok(false);
         }
         let Some(code) = i.obis().or(s.series.obis_code) else {
@@ -2640,59 +2459,14 @@ fn reauthored(
     Ok(next)
 }
 
-/// Fold re-authored single-interval series back into one delivery per
-/// `(measuring point, version)`.
-///
-/// A round can produce many one-interval series for one meter, and appending
-/// them separately would cost a boundary read and an encode per interval. They
-/// merge whenever they agree on everything a decoded run has to agree on, which
-/// here reduces to the series identity and the version they were re-authored at.
-fn merge_authored(mut rows: Vec<crate::encode::StoredSeries>) -> Vec<crate::encode::StoredSeries> {
-    rows.sort_by(|a, b| {
-        a.series
-            .malo_id
-            .to_string()
-            .cmp(&b.series.malo_id.to_string())
-            .then_with(|| a.version.version().get().cmp(&b.version.version().get()))
-            .then_with(|| {
-                a.series
-                    .intervals
-                    .first()
-                    .map(|i| i.from())
-                    .cmp(&b.series.intervals.first().map(|i| i.from()))
-            })
-    });
-
-    let mut out: Vec<crate::encode::StoredSeries> = Vec::with_capacity(rows.len());
-    for row in rows {
-        match out.last_mut() {
-            Some(last)
-                if last.series.malo_id == row.series.malo_id
-                    && last.version == row.version
-                    && last.series.obis_code == row.series.obis_code
-                    && last.extra == row.extra =>
-            {
-                last.series.intervals.extend(row.series.intervals);
-            }
-            _ => out.push(row),
-        }
-    }
-    out
-}
-
-/// The earliest and latest interval start in a batch bound for the hot tier.
-///
-/// The caller has already established the slice is non-empty and that every
-/// series in it has at least one interval, so both bounds exist.
-fn hot_bounds(hot: &[crate::encode::StoredSeries]) -> (time::OffsetDateTime, time::OffsetDateTime) {
-    let starts = || {
-        hot.iter()
-            .flat_map(|s| s.series.intervals.iter().map(|i| i.from()))
-    };
-    (
-        starts().min().expect("non-empty"),
-        starts().max().expect("non-empty"),
-    )
+/// The earliest and latest interval starts, including empty deliveries.
+fn hot_bounds(hot: &[crate::encode::StoredSeries]) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let mut starts = hot
+        .iter()
+        .flat_map(|s| &s.series.intervals)
+        .map(|i| i.from());
+    let first = starts.next()?;
+    Some(starts.fold((first, first), |(lo, hi), at| (lo.min(at), hi.max(at))))
 }
 
 #[async_trait::async_trait]
@@ -2733,17 +2507,10 @@ pub struct AppendOutcome {
     /// was a new reading, a correction that took effect, a backfill an existing
     /// higher version still outranks, or a replay that wrote nothing.
     ///
-    /// Reading it separately would race the write — and be wrong exactly when
-    /// two corrections arrive together, which is when an audit trail matters.
-    ///
-    /// The two tiers close that race differently, and only one of them closes it
-    /// completely. On the hot tier the prior state and the insert share **one
-    /// transaction**, so nothing can land between them. Iceberg has no
-    /// transaction a reader can join, so a cold row is reported against the state
-    /// read immediately before its append. The gap is narrow by construction —
-    /// late corrections are rare, and the archiver, the other cold writer, holds
-    /// an exclusive lease — but it is a gap, and saying so beats implying
-    /// otherwise.
+    /// PostgreSQL reads the prior assertion and inserts in a serializable
+    /// transaction. Cold appends reconcile against the Iceberg snapshot while
+    /// holding the table's cold-append lease. A custom backend that leaves the
+    /// lease unenforced can observe concurrent cold corrections out of order.
     ///
     /// See [`Displacement`](crate::session::Displacement).
     pub displacements: Vec<crate::session::Displacement>,
@@ -2777,7 +2544,7 @@ impl AppendOutcome {
 
 /// A bulk writer bound to one snapshot of the tier boundary.
 ///
-/// Produced by [`MeterStore::hot_writer`]. Reuses the boundary it was opened
+/// Produced by [`MeterStore::hot_writer`]. By default it reuses the boundary it was opened
 /// with, so a run of batches costs one Iceberg metadata load rather than one per
 /// batch, and **refuses** anything below that boundary rather than routing it —
 /// see [`MeterStore::hot_writer`] for why that refusal is the safety argument
@@ -2841,22 +2608,18 @@ impl HotWriter<'_> {
         // rather than landing its current half and leaving the caller to work
         // out which intervals made it.
         let watermark = self.watermark();
-        for stored in series {
-            for interval in &stored.series.intervals {
-                if interval.from() < watermark.get() {
-                    return Err(Error::config(format!(
-                        "interval starting {} is below the tier boundary {} and belongs \
-                         to the cold tier: a hot writer refuses it rather than placing \
-                         it where no query looks. Use MeterStore::append, which routes \
-                         each interval to the tier that owns it",
-                        interval.from(),
-                        watermark,
-                    )));
-                }
-            }
+        let Some((first, last)) = hot_bounds(series) else {
+            return Ok(0);
+        };
+        if first < watermark.get() {
+            store.check_tiers(watermark, last >= watermark.get(), true)?;
+            return Err(Error::config(format!(
+                "interval starting {first} is below the tier boundary {watermark} and belongs \
+                 to the cold tier. Use MeterStore::append for archived intervals"
+            )));
         }
 
-        match self.write(series).await {
+        match self.write(series, first, last).await {
             Err(e @ Error::BoundaryMoved { .. }) => {
                 self.refresh().await?;
                 Err(e)
@@ -2875,19 +2638,24 @@ impl HotWriter<'_> {
     }
 
     /// The write itself, once the batch is known to lie above the boundary.
-    async fn write(&self, series: &[crate::encode::StoredSeries]) -> Result<u64> {
+    async fn write(
+        &self,
+        series: &[crate::encode::StoredSeries],
+        first: OffsetDateTime,
+        last: OffsetDateTime,
+    ) -> Result<u64> {
         let store = self.store;
-
-        // Nothing to write, including the case that is not `is_empty()`: a
-        // delivery of series that carry no intervals. `hot_bounds` has no answer
-        // for that, and the honest report is that zero rows were written.
-        if series.iter().all(|s| s.series.intervals.is_empty()) {
-            return Ok(0);
-        }
-
         let table = store.config.name();
         let step = store.config.archival_step();
-        let (first, last) = hot_bounds(series);
+
+        if store.config.requires_single_tier() {
+            let batch = crate::encode::to_record_batch_for(series, &store.config)?;
+            let written = store.append_hot(batch, first, last).await?;
+            return Ok(written
+                .iter()
+                .filter(|d| d.effect != super::Effect::Duplicate)
+                .count() as u64);
+        }
 
         // Only the bounds this writer has not already confirmed. A run of
         // meter-days touches the same one or two partitions over and over, and
@@ -2914,7 +2682,7 @@ impl HotWriter<'_> {
             }
         }
 
-        let batch = crate::encode::to_record_batch_with(series, &store.config.extra_columns())?;
+        let batch = crate::encode::to_record_batch_for(series, &store.config)?;
         let rows = store
             .hot
             .append(table, &store.config.merge_key(), &[batch])
@@ -3079,7 +2847,7 @@ impl<'a> StoreAdmin<'a> {
         else {
             return Ok(None);
         };
-        let configured = crate::encode::schema::storage_schema(&self.store.config.extra_columns());
+        let configured = self.store.config.storage_schema();
         Ok(Some(crate::evolution::compare(&configured, &stored)))
     }
 
@@ -3091,25 +2859,8 @@ impl<'a> StoreAdmin<'a> {
     /// to keep in step, and a mismatch shows up as readings that fail to
     /// supersede rather than as an error.
     pub async fn create_tables(&self) -> Result<()> {
-        let extra = self.store.config.extra_columns();
-        self.store
-            .hot
-            .create_tables(
-                self.store.config.name(),
-                &self.store.config.merge_key(),
-                &extra,
-                self.store.config.time_model(),
-            )
-            .await?;
-        self.store
-            .cold
-            .create_tables(
-                self.store.config.name(),
-                &self.store.config.identity_column_names(),
-                &extra,
-                &self.store.config.maintenance_policy(),
-            )
-            .await?;
+        self.store.hot.create_tables(&self.store.config).await?;
+        self.store.cold.create_tables(&self.store.config).await?;
         // The registry's tables belong to the same creation step: a subject
         // column whose registry has no tables accepts writes and fails the first
         // erasure request, which is exactly when failing is least useful.
@@ -3461,7 +3212,7 @@ impl MeterStoreBuilder {
         // a table that already holds rows changes what "the same reading" means,
         // and the operator needs to be told that, not shown a schema dump.
         if let Some(stored) = cold.stored_schema(config.name()).await? {
-            let configured = crate::encode::schema::storage_schema(&config.extra_columns());
+            let configured = config.storage_schema();
             let compatibility = crate::evolution::compare(&configured, &stored);
             compatibility.require_safe(config.name())?;
             // A declared column the cold table does not have yet: the query

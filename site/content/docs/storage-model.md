@@ -17,7 +17,7 @@ plus the three things storage adds. Column names match `metering`'s field names.
 | `sparte` | `Utf8` | `string` | `STROM`, `GAS`, `WAERME`, `WASSER` |
 | `from` | `Timestamp(µs, UTC)` | `timestamptz` | Interval start, inclusive |
 | `to` | `Timestamp(µs, UTC)` | `timestamptz` | Interval end — **stored, never derived** |
-| `value` | `Decimal128(18,6)` | `decimal(18,6)` | The quantity |
+| `value` | `Decimal128(18,s)` | `decimal(18,s)` | The quantity at the table’s fixed scale (default 6) |
 | `unit` | `Utf8` | `string` | `KWH` or `M3` |
 | `quality` | `Utf8` | `string` | `MEASURED`, `SUBSTITUTED`, … |
 | `resolution` | `Utf8`, nullable | `string` | ISO 8601, e.g. `PT15M` |
@@ -36,6 +36,15 @@ span's end on an interval table, null on a point one.
 [identifies a reading by its Messlokation](#the-messlokation-may-be-part-of-the-identity),
 plus any [identity columns](#identity-versus-attribute-columns) · **winner:**
 `max(version)` within the same `version_scope`.
+
+### Quantity precision
+
+Choose `value_scale` when provisioning the table. At scale seven the smallest
+positive quantity is 0.0000001 and up to eleven digits fit before the decimal
+point. Trailing fractional zeros are insignificant. A nonzero eighth fractional
+digit or an integer part outside that range yields an encoding error. The same
+scale applies to the PostgreSQL column, the Arrow field and the Iceberg column.
+Iceberg preserves scale during decimal type promotion. [Iceberg schema evolution](https://iceberg.apache.org/spec/#schema-evolution)
 
 ### `balancing_day` is derived, and stored anyway
 
@@ -83,18 +92,10 @@ cast one straight out of the JSON:
 `delivery` formats that instant itself, because `time`'s serde shape depends on
 its Cargo features, and the on-disk shape must not.
 
-> A change to a serialised type is a **stored-data** break: rows already written
-> stop deserialising. What a build writes is asserted byte for byte, and
-> `tests/stored-form/` holds the rows earlier releases wrote; a build must decode
-> them unless the file names the release that **broke** them, so a break fails the
-> test suite rather than the next reader of the warehouse.
->
-> One break is recorded. Rows written by 0.12.0–0.14.0 in three shapes raise
-> `Error::Decode` under 0.15.0 and later: every `AUTO_SUBSTITUTE` payload (its
-> `method` predates `metering` 0.25's procedure codes), every resolution spelled in
-> seconds (`PT60S` rather than `PT1M`), and a Marktpartner-ID failing both
-> check-digit procedures. The rows stay on disk and in the lake, readable by a
-> 0.14 build and by any engine reading the columns as text.
+A typed read returns `Error::Decode` for an `AUTO_SUBSTITUTE` payload with an
+unknown procedure code, a noncanonical resolution such as `PT60S`, or a
+Marktpartner-ID that fails both check-digit procedures. External engines can
+inspect the raw text.
 
 ### Codes are stored canonically, and only canonically
 
@@ -220,7 +221,10 @@ TableConfig::new("readings_versions")
 readings. A tenant discriminator belongs here: as an attribute, one tenant's
 correction would silently supersede another's reading of the same measuring point.
 
-**Attribute columns carry data.** A correction may change them freely.
+**Attribute columns carry data.** A higher version may change them. Declare an
+attribute with `assertion_column` when a change at the *same* version should
+raise a conflict. A nullable settlement price is one example. It stays outside
+the merge key, so a new price at a higher version still corrects the same reading.
 
 The wrong choice raises no error, so it can be checked afterwards:
 `store.admin().audit_attribute_column("tenant")` (or `meterstore audit`) counts

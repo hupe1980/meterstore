@@ -1775,6 +1775,22 @@ async fn two_network_operators_for_one_interval_do_not_silently_double_a_sum() {
     )
     .await;
 
+    // An exact native value under a different operator cannot be a replay.
+    let mut restated = correction("11111111115", D20, 2, 10, 20_260_720_000_001);
+    restated.version = meterstore::ScopedVersion::new(
+        meterstore::VersionScope::for_interval(
+            "9900000000029",
+            D20,
+            metering::series::interval::Sparte::Strom,
+        )
+        .unwrap(),
+        restated.version.version(),
+    );
+    let store = h.store(ReadMode::Unified).await;
+    assert!(matches!(store.append(&[restated]).await,
+        Err(meterstore::Error::IntegrityViolation { constraint, .. })
+            if constraint.as_deref() == Some("one_operator_per_reading")));
+
     // Same interval, same month, *different* operator.
     let second = h
         .try_insert_scoped(
@@ -1923,6 +1939,10 @@ async fn a_late_correction_cannot_smuggle_a_second_operator_past_the_hot_guard()
         .await;
 
     let err = late.expect_err("the cold path must refuse a second operator too");
+    assert!(
+        matches!(&err, meterstore::Error::IntegrityViolation { constraint, .. }
+        if constraint.as_deref() == Some("one_operator_per_reading"))
+    );
     let msg = err.to_string();
     assert!(msg.contains("network operator"), "{msg}");
     assert!(
