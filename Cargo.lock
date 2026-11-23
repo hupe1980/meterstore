@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "meterstore"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arrow",
  "arrow-flight",

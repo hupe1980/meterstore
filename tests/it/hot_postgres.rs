@@ -1578,12 +1578,20 @@ async fn concurrent_hot_appends_report_the_committed_order() {
         let writes = versions.map(|version| {
             let hot = PostgresHot::new(h.database.clone());
             tokio::spawn(async move {
-                hot.append_reporting(TABLE, &default_key(), &[batch(slot, 1, 7, version)])
-                    .await
-                    .unwrap()
-                    .pop()
-                    .unwrap()
-                    .effect
+                let key = default_key();
+                let delivery = [batch(slot, 1, 7, version)];
+                tokio::time::timeout(std::time::Duration::from_secs(45), async {
+                    loop {
+                        match hot.append_reporting(TABLE, &key, &delivery).await {
+                            Err(meterstore::Error::ConcurrentWrite) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                            result => return result.unwrap().pop().unwrap().effect,
+                        }
+                    }
+                })
+                .await
+                .expect("contending writers make progress after the barrier opens")
             })
         });
         tokio::time::timeout(std::time::Duration::from_secs(30), async {

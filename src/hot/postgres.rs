@@ -617,7 +617,9 @@ impl PostgresHot {
                 .insert_reporting_once(table, merge_key, batch, guard)
                 .await
             {
-                Err(Error::ConcurrentWrite) if attempts < 3 => continue,
+                Err(Error::ConcurrentWrite) if attempts < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempts)).await;
+                }
                 outcome => return outcome,
             }
         }

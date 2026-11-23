@@ -12,7 +12,7 @@ in place rather than through a migration.
 This is the only file in the repository that carries history. Reference
 documentation says what is true now; a test enforces it.
 
-## [0.18.0] — 2026-11-23
+## [0.18.1] — 2026-11-23
 
 ### Added
 
@@ -30,10 +30,10 @@ documentation says what is true now; a test enforces it.
 
 ### Fixed
 
-- Concurrent hot writers report displacements in a consistent serial order. A rejected
-  bulk write rolls back the entire insert. Authored retries preserve the declared
-  assertion attributes, canonical identity and original transaction time of each
-  reading. A redelivery under a different version scope is refused on both tiers.
+- Hot writers back off between serialization retries and report displacements in
+  committed order. A rejected bulk write rolls back the entire insert.
+- Authored retries preserve assertion attributes, canonical identity and original
+  transaction time. Both tiers refuse redelivery under a different version scope.
 
 ### Dependencies
 
