@@ -907,7 +907,7 @@ impl MeterStore {
     /// reports what it displaced exactly as a current one does.
     ///
     /// By default the hot portion of a mixed batch commits before its cold
-    /// portion. A cold error can therefore leave the hot portion visible.
+    /// portion. A later error returns the confirmed work in [`Error::PartialAppend`].
     /// [`TableConfig::require_single_tier`](crate::TableConfig::require_single_tier)
     /// rejects mixed batches before either portion is written.
     ///
@@ -926,6 +926,16 @@ impl MeterStore {
     /// anything near it rather than routing — see there for when that trade is
     /// the right one and when it is not.
     pub async fn append(&self, series: &[crate::encode::StoredSeries]) -> Result<AppendOutcome> {
+        let mut confirmed = AppendOutcome::default();
+        let result = self.append_into(series, &mut confirmed).await;
+        confirmed.finish(result)
+    }
+
+    async fn append_into(
+        &self,
+        series: &[crate::encode::StoredSeries],
+        confirmed: &mut AppendOutcome,
+    ) -> Result<()> {
         self.require_current_knowledge("append")?;
         self.require_time_model(crate::config::TimeModel::Interval, "append")?;
         self.check_subject_refs(series).await?;
@@ -937,10 +947,9 @@ impl MeterStore {
         )?;
         self.require_in_scope(series.iter().map(|s| (s.series.melo_id.as_ref(), &s.extra)))?;
 
-        let mut total = AppendOutcome::default();
         for attempt in 0..BOUNDARY_ATTEMPTS {
             let watermark = self.watermark().await?;
-            let round = match self.append_routed(series, watermark).await {
+            match self.append_routed(series, watermark, confirmed).await {
                 // Archival detached a window this delivery routed into; nothing
                 // was written. Route again against the boundary it publishes.
                 Err(Error::BoundaryMoved { .. }) => {
@@ -952,17 +961,16 @@ impl MeterStore {
                 other => other?,
             };
             if self.config.requires_single_tier() {
-                return Ok(round);
+                return Ok(());
             }
             let earliest_hot = series
                 .iter()
                 .flat_map(|s| s.series.intervals.iter().map(|i| i.from()))
                 .filter(|from| *from >= watermark.get())
                 .min();
-            total.absorb(round);
 
             if !self.boundary_moved_under(watermark, earliest_hot).await? {
-                return Ok(total);
+                return Ok(());
             }
         }
         Err(self.boundary_conflict())
@@ -973,7 +981,8 @@ impl MeterStore {
         &self,
         series: &[crate::encode::StoredSeries],
         watermark: TieringWatermark,
-    ) -> Result<AppendOutcome> {
+        confirmed: &mut AppendOutcome,
+    ) -> Result<()> {
         let table = self.config.name();
 
         let mut hot = Vec::new();
@@ -999,32 +1008,157 @@ impl MeterStore {
         }
 
         self.check_tiers(watermark, !hot.is_empty(), !cold.is_empty())?;
-        let mut outcome = AppendOutcome::default();
+        let hot_before = confirmed.hot_rows;
+        let cold_before = confirmed.cold_rows;
         if let Some((first, last)) = hot_bounds(&hot) {
             let batch = crate::encode::to_record_batch_for(&hot, &self.config)?;
             let reported = self.append_hot(batch, first, last).await?;
-            outcome.hot_rows = reported
+            confirmed.hot_rows += reported
                 .iter()
                 .filter(|d| d.effect != crate::session::Effect::Duplicate)
                 .count() as u64;
-            outcome.displacements.extend(reported);
+            confirmed.displacements.extend(reported);
         }
         if !cold.is_empty() {
             let batch = crate::encode::to_record_batch_for(&cold, &self.config)?;
-            self.append_cold(&batch, &mut outcome).await?;
+            self.append_cold(&batch, confirmed).await?;
         }
 
-        crate::observe::metrics()
-            .late_corrections
-            .add(outcome.cold_rows, &crate::observe::table(table));
+        crate::observe::metrics().late_corrections.add(
+            confirmed.cold_rows - cold_before,
+            &crate::observe::table(table),
+        );
 
         info!(
             table,
-            hot = outcome.hot_rows,
-            cold = outcome.cold_rows,
+            hot = confirmed.hot_rows - hot_before,
+            cold = confirmed.cold_rows - cold_before,
             "append routed"
         );
-        Ok(outcome)
+        Ok(())
+    }
+
+    /// Correct one interval if its current scoped version matches `correction.version`.
+    ///
+    /// The full reading identity (including any tenant or meter discriminator)
+    /// and version identify the predecessor. Supply the replacement payload and
+    /// its transaction time. The writer appends the successor in the same scope
+    /// and returns the displacement that committed. Obtain the predecessor from
+    /// the slot's resolved delivery or a previous displacement.
+    ///
+    /// An absent or changed predecessor returns [`Error::PredecessorMismatch`].
+    /// An exact repeat after success also finds a changed predecessor. Read the
+    /// current value to decide whether a further correction is necessary.
+    ///
+    /// Publish an approved replacement and distinguish a stale approval from a
+    /// storage failure. The approval binds the full slot identity and the version
+    /// observed with [`collect_deliveries`](super::SeriesQuery::collect_deliveries).
+    ///
+    /// ```no_run
+    /// use meterstore::{Error, Result, ScopedVersion};
+    /// use meterstore::prelude::{MeterStore, StoredSeries};
+    ///
+    /// async fn publish(
+    ///     store: &MeterStore,
+    ///     mut replacement: StoredSeries,
+    ///     approved_predecessor: ScopedVersion,
+    /// ) -> Result<Option<ScopedVersion>> {
+    ///     replacement.version = approved_predecessor;
+    ///     match store.correct_if_current(&replacement).await {
+    ///         Ok(change) => Ok(Some(change.written.version)),
+    ///         Err(Error::PredecessorMismatch { .. }) => Ok(None),
+    ///         Err(error) => Err(error),
+    ///     }
+    /// }
+    /// ```
+    pub async fn correct_if_current(
+        &self,
+        correction: &crate::encode::StoredSeries,
+    ) -> Result<super::Displacement> {
+        self.require_current_knowledge("correct_if_current")?;
+        self.require_time_model(crate::config::TimeModel::Interval, "correct_if_current")?;
+        let [interval] = correction.series.intervals.as_slice() else {
+            return Err(Error::encode(
+                "intervals",
+                "a conditional correction requires one interval",
+            ));
+        };
+        self.require_melo([(
+            &correction.series.malo_id,
+            correction.series.melo_id.is_some(),
+        )])?;
+        self.require_in_scope([(correction.series.melo_id.as_ref(), &correction.extra)])?;
+        self.check_subject_refs(std::slice::from_ref(correction))
+            .await?;
+
+        let expected = &correction.version;
+        let mut successor = correction.clone();
+        successor.version = expected.next()?;
+        let batch = crate::encode::to_record_batch_for(&[successor], &self.config)?;
+        if interval.from() >= self.watermark().await?.get() {
+            let reported = self
+                .hot
+                .append_single_tier(&self.config, &batch, self.cold.as_ref(), Some(expected))
+                .await?;
+            let [displacement]: [super::Displacement; 1] =
+                reported.try_into().map_err(|_| Error::InvariantViolated {
+                    table: self.table().to_owned(),
+                    detail:
+                        "the hot writer must report one displacement for one conditional correction"
+                            .into(),
+                })?;
+            return Ok(displacement);
+        }
+
+        let lease = self.hot.cold_append_lease(self.table()).await?;
+        let result = if lease.enforced() {
+            self.correct_cold_if_current(batch, expected).await
+        } else {
+            Err(Error::config(format!(
+                "{} requires an enforced cold-append lease for conditional corrections",
+                self.table()
+            )))
+        };
+        if let Err(error) = lease.release().await {
+            warn!(table = self.table(), %error, "could not release the cold-append claim");
+        }
+        result
+    }
+
+    async fn correct_cold_if_current(
+        &self,
+        batch: crate::arrow::array::RecordBatch,
+        expected: &crate::ScopedVersion,
+    ) -> Result<super::Displacement> {
+        let table = self.table();
+        let head = self.cold.current_snapshot_id(table).await?.ok_or_else(|| {
+            Error::PredecessorMismatch {
+                expected: expected.clone(),
+                actual: None,
+            }
+        })?;
+        let pinned = self.as_of(crate::SnapshotSelector::Id(head), None).await?;
+        let identity = self.config.discriminator_columns();
+        let assertions: Vec<_> = self.config.assertion_column_names().collect();
+        let incoming = decode_cold_rows(&batch, &identity, &assertions)?;
+        let mut decisions = pinned
+            .reconcile_cold(incoming, &identity, &assertions, Some(expected))
+            .await?;
+        let decision = decisions.pop().expect("one decision per encoded interval");
+        self.cold
+            .append_if_snapshot(
+                table,
+                head,
+                crate::tiering::store::stream_of(vec![batch]),
+                crate::tiering::store::WriteHints {
+                    distinct_malo_ids: Some(1),
+                },
+            )
+            .await?;
+        crate::observe::metrics()
+            .late_corrections
+            .add(1, &crate::observe::table(table));
+        Ok(decision.displacement)
     }
 
     /// Append a **Zählerstandsgang** — register readings at instants.
@@ -1041,6 +1175,16 @@ impl MeterStore {
         &self,
         readings: &[crate::encode::StoredReadings],
     ) -> Result<AppendOutcome> {
+        let mut confirmed = AppendOutcome::default();
+        let result = self.append_readings_into(readings, &mut confirmed).await;
+        confirmed.finish(result)
+    }
+
+    async fn append_readings_into(
+        &self,
+        readings: &[crate::encode::StoredReadings],
+        confirmed: &mut AppendOutcome,
+    ) -> Result<()> {
         self.require_current_knowledge("append_readings")?;
         self.require_time_model(crate::config::TimeModel::Point, "append_readings")?;
         self.check_reading_subject_refs(readings).await?;
@@ -1048,10 +1192,12 @@ impl MeterStore {
         self.require_melo(readings.iter().map(|d| (&d.malo_id, d.melo_id.is_some())))?;
         self.require_in_scope(readings.iter().map(|d| (d.melo_id.as_ref(), &d.extra)))?;
 
-        let mut total = AppendOutcome::default();
         for attempt in 0..BOUNDARY_ATTEMPTS {
             let watermark = self.watermark().await?;
-            let round = match self.append_readings_routed(readings, watermark).await {
+            match self
+                .append_readings_routed(readings, watermark, confirmed)
+                .await
+            {
                 Err(Error::BoundaryMoved { .. }) => {
                     if attempt + 1 < BOUNDARY_ATTEMPTS {
                         tokio::time::sleep(boundary_backoff(attempt)).await;
@@ -1061,17 +1207,16 @@ impl MeterStore {
                 other => other?,
             };
             if self.config.requires_single_tier() {
-                return Ok(round);
+                return Ok(());
             }
             let earliest_hot = readings
                 .iter()
                 .flat_map(|d| d.readings.iter().map(|r| r.at))
                 .filter(|at| *at >= watermark.get())
                 .min();
-            total.absorb(round);
 
             if !self.boundary_moved_under(watermark, earliest_hot).await? {
-                return Ok(total);
+                return Ok(());
             }
         }
         Err(self.boundary_conflict())
@@ -1083,7 +1228,8 @@ impl MeterStore {
         &self,
         readings: &[crate::encode::StoredReadings],
         watermark: TieringWatermark,
-    ) -> Result<AppendOutcome> {
+        confirmed: &mut AppendOutcome,
+    ) -> Result<()> {
         let table = self.config.name();
 
         let mut hot = Vec::new();
@@ -1108,7 +1254,8 @@ impl MeterStore {
         }
 
         self.check_tiers(watermark, !hot.is_empty(), !cold.is_empty())?;
-        let mut outcome = AppendOutcome::default();
+        let hot_before = confirmed.hot_rows;
+        let cold_before = confirmed.cold_rows;
         if !hot.is_empty() {
             let starts = || hot.iter().flat_map(|d| d.readings.iter().map(|r| r.at));
             let (first, last) = (
@@ -1117,29 +1264,30 @@ impl MeterStore {
             );
             let batch = crate::encode::readings_to_record_batch_for(&hot, &self.config)?;
             let reported = self.append_hot(batch, first, last).await?;
-            outcome.hot_rows = reported
+            confirmed.hot_rows += reported
                 .iter()
                 .filter(|d| d.effect != crate::session::Effect::Duplicate)
                 .count() as u64;
-            outcome.displacements.extend(reported);
+            confirmed.displacements.extend(reported);
         }
 
         if !cold.is_empty() {
             let batch = crate::encode::readings_to_record_batch_for(&cold, &self.config)?;
-            self.append_cold(&batch, &mut outcome).await?;
+            self.append_cold(&batch, confirmed).await?;
         }
 
-        crate::observe::metrics()
-            .late_corrections
-            .add(outcome.cold_rows, &crate::observe::table(table));
+        crate::observe::metrics().late_corrections.add(
+            confirmed.cold_rows - cold_before,
+            &crate::observe::table(table),
+        );
 
         info!(
             table,
-            hot = outcome.hot_rows,
-            cold = outcome.cold_rows,
+            hot = confirmed.hot_rows - hot_before,
+            cold = confirmed.cold_rows - cold_before,
             "readings routed"
         );
-        Ok(outcome)
+        Ok(())
     }
 
     fn check_tiers(&self, watermark: TieringWatermark, hot: bool, cold: bool) -> Result<()> {
@@ -1161,7 +1309,7 @@ impl MeterStore {
         if self.config.requires_single_tier() {
             return self
                 .hot
-                .append_single_tier(&self.config, &batch, self.cold.as_ref())
+                .append_single_tier(&self.config, &batch, self.cold.as_ref(), None)
                 .await;
         }
         let table = self.config.name();
@@ -1351,41 +1499,19 @@ impl MeterStore {
     /// Append values **the operator authors**, ensuring each one becomes
     /// current.
     ///
-    /// [`append`](Self::append) records a **delivery** — something a market
-    /// partner sent, at the version they assigned — and being outranked by a
-    /// newer one is the correct outcome for it. A value the *store's own
-    /// operator* authors is not that: a § 60 Abs. 2 MsbG Ersatzwert, a
-    /// correction after a dispute, a manual entry after a meter exchange must
-    /// take effect **or be refused**. Through `append` such a value is silently
-    /// shadowed — stored, audited, confirmed, and never current — which is
-    /// precisely the case Ersatzwertbildung exists for, since the interval it
-    /// replaces arrived under a real MSCONS version.
+    /// Use this for an operator-authored replacement. The submitted version is
+    /// a floor. When a higher version wins, the writer retries with its successor
+    /// in the stored scope. Each round uses the prior value reported by the
+    /// write itself ([`Displacement::superseded`]).
     ///
-    /// The version each row carries is a *floor*. Where a higher one already
-    /// holds the reading, this re-appends at
-    /// [`ScopedVersion::next`](crate::version::ScopedVersion::next) of the one in
-    /// force — continuing the **stored** sequence under the **stored** scope,
-    /// because a version is comparable only within its own and the hot tier
-    /// refuses a second network operator for one reading. That decision comes
-    /// from [`Displacement::superseded`], which the write itself observed inside
-    /// its own transaction; a read-then-write cannot say that.
+    /// Successful displacements report an insertion, a supersession or a duplicate
+    /// whose assertion already holds. [`Displacement::written`] identifies the
+    /// stored row. Use [`append`](Self::append) for producer-assigned versions.
     ///
-    /// Every returned displacement is `Inserted` or `Superseded`, and
-    /// [`Displacement::written`] carries the version the row actually landed at —
-    /// which is what an audit trail records, not the one the caller asked for.
-    /// Re-asserting a value already in force is a no-op rather than a version
-    /// bump.
-    ///
-    /// Each round commits separately. On a single-tier table the rejection
-    /// guarantee applies to each call to [`append`](Self::append). Use that
-    /// method directly when the producer assigns settlement versions.
-    ///
-    /// # Errors
-    ///
-    /// After [`AUTHORITATIVE_ATTEMPTS`] rounds that still fail to take effect.
-    /// That means another writer is authoring the same reading continuously,
-    /// which is a conflict for an operator rather than something to retry
-    /// through.
+    /// Each round commits separately. A later error returns [`Error::PartialAppend`]
+    /// with every confirmed effect, including shadowed rows. After
+    /// [`AUTHORITATIVE_ATTEMPTS`] rounds of contention, the cause is an integrity
+    /// violation. Reconcile the competing authors before retrying.
     ///
     /// [`Displacement::superseded`]: crate::session::Displacement::superseded
     /// [`Displacement::written`]: crate::session::Displacement::written
@@ -1393,8 +1519,30 @@ impl MeterStore {
         &self,
         series: &[crate::encode::StoredSeries],
     ) -> Result<AppendOutcome> {
-        use crate::session::Effect;
+        let mut confirmed = AppendOutcome::default();
+        let result = self.author_rounds(series, &mut confirmed).await;
+        let mut outcome = confirmed.finish(result)?;
+        outcome
+            .displacements
+            .retain(|d| self.authored_value_holds(d));
+        Ok(outcome)
+    }
 
+    /// Whether the requested value took effect or already held at the time of the write.
+    fn authored_value_holds(&self, d: &super::Displacement) -> bool {
+        d.effect.changed_current_value()
+            || (d.effect == super::Effect::Duplicate
+                && d.superseded.as_ref().is_some_and(|p| {
+                    p.differing_assertion_field(&d.written, self.config.replay_fields())
+                        .is_none()
+                }))
+    }
+
+    async fn author_rounds(
+        &self,
+        series: &[crate::encode::StoredSeries],
+        confirmed: &mut AppendOutcome,
+    ) -> Result<()> {
         self.require_current_knowledge("append_authoritative")?;
 
         let discriminators = self.config.discriminator_columns();
@@ -1413,40 +1561,22 @@ impl MeterStore {
                 }
             }
         }
-        let mut outcome = AppendOutcome::default();
 
         for _ in 0..AUTHORITATIVE_ATTEMPTS {
             if pending.iter().all(|s| s.series.intervals.is_empty()) {
-                return Ok(outcome);
+                return Ok(());
             }
 
-            let round = self.append(&pending).await?;
-            outcome.hot_rows += round.hot_rows;
-            outcome.cold_rows += round.cold_rows;
-
-            // Everything that took effect is final. Everything that did not is
-            // re-authored one version above whatever beat it.
-            let mut retry: Vec<crate::encode::StoredSeries> = Vec::new();
-            for displacement in round.displacements {
-                if displacement.effect.changed_current_value() {
-                    outcome.displacements.push(displacement);
-                    continue;
+            let start = confirmed.displacements.len();
+            self.append_into(&pending, confirmed).await?;
+            let mut retry = Vec::new();
+            for d in &confirmed.displacements[start..] {
+                if !self.authored_value_holds(d) {
+                    retry.push(reauthored(&pending, &discriminators, d)?);
                 }
-                // A duplicate whose stored value is already what we are
-                // asserting *is* current, so there is nothing to take effect.
-                let holds = displacement
-                    .superseded
-                    .as_ref()
-                    .is_some_and(|p| p.differing_assertion_field(&displacement.written).is_none());
-                if displacement.effect == Effect::Duplicate && holds {
-                    outcome.displacements.push(displacement);
-                    continue;
-                }
-                retry.push(reauthored(&pending, &discriminators, &displacement)?);
             }
-
             if retry.is_empty() {
-                return Ok(outcome);
+                return Ok(());
             }
             pending = retry;
         }
@@ -1626,7 +1756,7 @@ impl MeterStore {
         let identity = self.config.discriminator_columns();
         let incoming = decode_cold_rows(batch, &identity, &assertions)?;
         let reconciled = self
-            .reconcile_cold(incoming, &identity, &assertions)
+            .reconcile_cold(incoming, &identity, &assertions, None)
             .await?;
         let keep = crate::arrow::array::BooleanArray::from(
             reconciled
@@ -1637,27 +1767,28 @@ impl MeterStore {
         crate::observe::metrics()
             .rows_deduplicated
             .add(keep.false_count() as u64, &crate::observe::table(table));
+        if keep.true_count() > 0 {
+            let fresh = crate::arrow::compute::filter_record_batch(batch, &keep)?;
+            let batch = crate::encode::sorted_for_storage(&fresh)?;
+            // Appended without moving the watermark: the boundary is about which
+            // range each tier owns, and a correction does not change that. The batch
+            // is in memory, so the bloom-filter hint is exact.
+            let hints = crate::tiering::store::WriteHints {
+                distinct_malo_ids: Some(crate::encode::distinct_malo_ids(std::slice::from_ref(
+                    &batch,
+                ))),
+            };
+            outcome.cold_rows += self
+                .cold
+                .append_only(table, crate::tiering::store::stream_of(vec![batch]), hints)
+                .await?
+                .rows;
+        }
+        // A candidate row becomes a confirmed effect only once the catalog
+        // acknowledges publication. A batch of duplicates needs only its read.
         outcome
             .displacements
             .extend(reconciled.into_iter().map(|row| row.displacement));
-        if keep.true_count() == 0 {
-            return Ok(());
-        }
-        let fresh = crate::arrow::compute::filter_record_batch(batch, &keep)?;
-        let batch = crate::encode::sorted_for_storage(&fresh)?;
-        // Appended without moving the watermark: the boundary is about which
-        // range each tier owns, and a correction does not change that. The batch
-        // is in memory, so the bloom-filter hint is exact.
-        let hints = crate::tiering::store::WriteHints {
-            distinct_malo_ids: Some(crate::encode::distinct_malo_ids(std::slice::from_ref(
-                &batch,
-            ))),
-        };
-        outcome.cold_rows = self
-            .cold
-            .append_only(table, crate::tiering::store::stream_of(vec![batch]), hints)
-            .await?
-            .rows;
         Ok(())
     }
 
@@ -1699,6 +1830,7 @@ impl MeterStore {
         incoming: Vec<IncomingRow>,
         identity: &[String],
         assertions: &[&str],
+        expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<ColdOutcome>> {
         use crate::session::{Displacement, Effect, StoredValue};
         use datafusion::scalar::ScalarValue;
@@ -1809,6 +1941,9 @@ impl MeterStore {
 
         let mut out = Vec::with_capacity(incoming.len());
         for row in incoming {
+            if let Some(expected) = expected {
+                expected.require_current(current.get(&row.key).map(|held| &held.version))?;
+            }
             let version = row.written.version.version().get();
 
             if let Some(held) = current.get(&row.key)
@@ -1856,7 +1991,9 @@ impl MeterStore {
                         ),
                     });
                 }
-                if let Some(field) = held.differing_assertion_field(&row.written) {
+                if let Some(field) =
+                    held.differing_assertion_field(&row.written, self.config.replay_fields())
+                {
                     return Err(Error::IntegrityViolation {
                         table: self.config.name().to_string(),
                         constraint: Some("version_identifies_one_assertion".to_string()),
@@ -1871,11 +2008,11 @@ impl MeterStore {
                         malo_id: row.key.malo_id.clone(),
                         obis_code: row.key.obis_code.clone(),
                         from: row.key.from,
-                        to: row.to,
+                        to: held.to,
                         identity: row.key.identity.clone(),
                         effect: Effect::Duplicate,
                         superseded: current.get(&row.key).cloned(),
-                        written: row.written,
+                        written: held.clone(),
                     },
                     write: false,
                 });
@@ -1904,7 +2041,7 @@ impl MeterStore {
                     malo_id: row.key.malo_id.clone(),
                     obis_code: row.key.obis_code.clone(),
                     from: row.key.from,
-                    to: row.to,
+                    to: row.written.to,
                     identity: row.key.identity,
                     effect,
                     superseded: prior,
@@ -2122,8 +2259,7 @@ pub(crate) struct ColdKey {
 /// One interval a late correction asserts, before it is reconciled.
 struct IncomingRow {
     key: ColdKey,
-    /// `None` for a register reading, which has no span end.
-    to: Option<OffsetDateTime>,
+
     /// The Messlokation the delivery names, whether or not it is in the key.
     ///
     /// Carried even where it is not part of the identity, because that is
@@ -2263,6 +2399,9 @@ fn decode_cold_rows(
             identity: ident,
         };
         let held = crate::session::StoredValue {
+            to: (!to.is_null(i))
+                .then(|| instant(to.value(i), col::TO))
+                .transpose()?,
             assertion_attributes: assertion_columns
                 .iter()
                 .map(|(name, column)| {
@@ -2297,9 +2436,6 @@ fn decode_cold_rows(
             key,
             written: held,
             melo: (!melo.is_null(i)).then(|| melo.value(i).to_string()),
-            to: (!to.is_null(i))
-                .then(|| instant(to.value(i), col::TO))
-                .transpose()?,
         });
     }
     Ok(out)
@@ -2388,19 +2524,15 @@ fn reauthored(
     discriminators: &[String],
     displacement: &crate::session::Displacement,
 ) -> Result<crate::encode::StoredSeries> {
-    // Matched on the **whole** merge key, not on `(malo_id, from)`.
-    //
-    // A batch may carry one measuring point's channels, two tenants' readings
-    // for it, or two Messlokationen under it — all sharing a `malo_id` and an
-    // interval start. Located by that pair alone, a displacement reported for
-    // one of them re-authors another: the wrong value is written, at a version
-    // derived from a reading it is not about, and the reading that actually
-    // needed authoring is left shadowed. Nothing downstream can see it.
+    use crate::encode::schema::micros;
+
+    // Compare the full key at stored precision. Channels, tenants and meters
+    // can share a MaLo and interval start while identifying different readings.
     let matches = |s: &crate::encode::StoredSeries,
                    i: &metering::series::interval::MeterInterval|
      -> Result<bool> {
         if s.series.malo_id.to_string() != displacement.malo_id
-            || i.from() != displacement.from
+            || micros(i.from()) != micros(displacement.from)
             || s.version != displacement.written.version
         {
             return Ok(false);
@@ -2502,7 +2634,9 @@ pub struct AppendOutcome {
     pub cold_rows: u64,
     /// What each written row did to the value that was current.
     ///
-    /// One entry per interval in the batch. This is what a caller building a
+    /// A boundary retry can report a slot more than once. Partial receipts keep
+    /// every confirmed effect in the order the tier operations completed.
+    /// This is what a caller building a
     /// correction audit trail needs and cannot get from a count: whether a write
     /// was a new reading, a correction that took effect, a backfill an existing
     /// higher version still outranks, or a replay that wrote nothing.
@@ -2517,18 +2651,17 @@ pub struct AppendOutcome {
 }
 
 impl AppendOutcome {
-    /// Fold another round's result into this one.
-    ///
-    /// Used when [`append`](MeterStore::append) has to route a second time
-    /// because archival moved the boundary underneath it. Rows are **added**
-    /// rather than replaced, and the displacements of both rounds are kept: a
-    /// re-routed interval really was written twice, once to each tier, and the
-    /// second write reports itself as an insert into the tier that now owns it
-    /// while the first reports the duplicate it has become.
-    fn absorb(&mut self, other: Self) {
-        self.hot_rows += other.hot_rows;
-        self.cold_rows += other.cold_rows;
-        self.displacements.extend(other.displacements);
+    /// Attach backend acknowledgements to a failure, preserving a refusal's
+    /// original type when the call has received none.
+    fn finish(self, result: Result<()>) -> Result<Self> {
+        match result {
+            Ok(()) => Ok(self),
+            Err(source) if self.displacements.is_empty() => Err(source),
+            Err(source) => Err(Error::PartialAppend {
+                confirmed: Box::new(self),
+                source: Box::new(source),
+            }),
+        }
     }
 
     /// Total rows written.

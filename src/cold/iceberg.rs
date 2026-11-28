@@ -862,6 +862,11 @@ impl IcebergCold {
         summary: Summary,
     ) -> Result<CommitInfo> {
         let mut base = self.load(table).await?;
+        if let Summary::IfSnapshot(expected) = summary
+            && current_snapshot_id(&base) != Some(expected)
+        {
+            return Err(Error::ConcurrentWrite);
+        }
         let (data_files, rows) = self.write_data_files(&base, batches, hints).await?;
         // One id for every attempt of this commit, so an outcome the catalogue
         // never answered can be resolved by looking for it.
@@ -1195,6 +1200,8 @@ enum Summary {
     /// boundary is about which tier owns a range, and a correction does not
     /// change that.
     Preserve,
+    /// A predecessor was validated at this exact head.
+    IfSnapshot(i64),
 }
 
 impl Summary {
@@ -1202,7 +1209,10 @@ impl Summary {
     fn watermark_for(self, table: &str, base: &Table) -> Result<TieringWatermark> {
         let current = watermark_of(base)?;
         match self {
-            Self::Preserve => Ok(current),
+            Self::IfSnapshot(expected) if current_snapshot_id(base) != Some(expected) => {
+                Err(Error::ConcurrentWrite)
+            }
+            Self::Preserve | Self::IfSnapshot(_) => Ok(current),
             Self::Advance(window, _, _) => {
                 let next = window.resulting_watermark();
                 // Asserted against the commit base, not only by the caller. An
@@ -1921,6 +1931,21 @@ impl ColdStore for IcebergCold {
         let arrow = iceberg::arrow::schema_to_arrow_schema(loaded.metadata().current_schema())
             .map_err(ice)?;
         Ok(Some(std::sync::Arc::new(arrow)))
+    }
+
+    async fn current_snapshot_id(&self, table: &str) -> Result<Option<i64>> {
+        Ok(current_snapshot_id(&self.load(table).await?))
+    }
+
+    async fn append_if_snapshot(
+        &self,
+        table: &str,
+        snapshot: i64,
+        batches: BatchStream,
+        hints: WriteHints,
+    ) -> Result<CommitInfo> {
+        self.append_with_summary(table, batches, hints, Summary::IfSnapshot(snapshot))
+            .await
     }
 
     async fn append_only(

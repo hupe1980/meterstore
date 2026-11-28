@@ -6,15 +6,9 @@ template = "section.html"
 page_template = "page.html"
 +++
 
-MeterStore is a Rust library. It is not a database, not a service and not an EDM
-system: it stores [`metering`](https://crates.io/crates/metering)'s types across
-two tiers and serves them through one SQL surface.
+MeterStore stores [`metering`](https://crates.io/crates/metering) readings in PostgreSQL and Apache Iceberg and queries them through one SQL interface.
 
-Read [Getting started](@/docs/getting-started.md) first, then
-[Architecture](@/docs/architecture.md) — almost everything else follows from the
-tiering boundary.
-
-If you are evaluating rather than integrating, the two pages that matter are
-[Reproducibility](@/docs/reproducibility.md) and
-[External engines](@/docs/interop.md): those carry the arguments that are hard to
-retrofit later.
+[Getting started](@/docs/getting-started.md) walks through deployment.
+[Architecture](@/docs/architecture.md) explains the tier boundary.
+For settlement reruns or SQL clients outside Rust, see
+[Reproducibility](@/docs/reproducibility.md) and [External engines](@/docs/interop.md).

@@ -11,10 +11,9 @@ At 15-minute resolution, 100,000 channels produce 9.6 million readings a day.
 MeterStore archives complete PostgreSQL partitions to Iceberg and records the new
 watermark in the same snapshot as the data.
 
-A settlement writer can reject a batch that crosses the watermark before either
-tier changes. Declare a price as an assertion column to detect conflicting
-replays. Choose the quantity’s decimal scale at table creation to preserve values
-such as 0.0000001 kWh through archival and correction.
+A settlement writer can reject batches that cross the watermark and require
+replays to match quality, span, unit, or a declared price. A correction can
+name its expected predecessor so two authors cannot both replace the same version.
 [Configure a settlement writer](@/docs/writing.md#settlement-ingestion).
 
 ## One statement, both tiers

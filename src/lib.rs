@@ -256,8 +256,8 @@ pub use cold::IcebergSqlCatalog;
 pub use cold::S3TablesCatalog;
 pub use cold::{ColdTier, IcebergCold, WarehouseAuth};
 pub use config::{
-    CHECK_VALUES_KEY, EicType, TableConfig, TimeModel, VALUE_CHECK_KEY, ValidatedTableConfig,
-    ValueCheck, checked_column, coded_column, declared_value_check,
+    CHECK_VALUES_KEY, EicType, ReplayField, TableConfig, TimeModel, VALUE_CHECK_KEY,
+    ValidatedTableConfig, ValueCheck, checked_column, coded_column, declared_value_check,
 };
 pub use database::{Database, DatabaseOptions};
 pub use delivery::{
@@ -308,8 +308,8 @@ pub mod prelude {
     pub use crate::cold::S3TablesCatalog;
     pub use crate::cold::{ColdTier, IcebergCold, WarehouseAuth};
     pub use crate::config::{
-        EicType, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck, checked_column,
-        coded_column,
+        EicType, ReplayField, TableConfig, TimeModel, ValidatedTableConfig, ValueCheck,
+        checked_column, coded_column,
     };
     pub use crate::database::{Database, DatabaseOptions};
     pub use crate::delivery::{MeasurementSeries, MeasurementSource};

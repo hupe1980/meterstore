@@ -76,7 +76,7 @@ fn the_handles_a_caller_holds_stay_the_size_they_are() {
     // writes readings; `StoreAdmin` runs the deployment's operations against a
     // table; `MeterCatalog` is the deployment, which is why the subject API —
     // one map for the whole of it — lives there and has no per-table form.
-    let expected = [("MeterStore", 32), ("StoreAdmin", 17), ("MeterCatalog", 32)];
+    let expected = [("MeterStore", 33), ("StoreAdmin", 17), ("MeterCatalog", 32)];
 
     let counts = public_methods();
     let mut wrong = Vec::new();
@@ -129,7 +129,7 @@ fn the_prelude_carries_only_what_a_caller_writes() {
         .sum::<usize>();
 
     assert_eq!(
-        names, 38,
+        names, 39,
         "the prelude exports {names} names. If the new one is something a caller \
          has to *write* — a builder argument, a struct literal, a trait bound — \
          update the number. If it only ever comes back from a method, leave it at \

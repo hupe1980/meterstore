@@ -65,3 +65,6 @@ target
 
 # Built documentation site (see .github/workflows/site.yml).
 site/public/
+
+# Local consumer bug reports and feature requests.
+/FEEDBACK_*.md

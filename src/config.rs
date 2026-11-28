@@ -24,10 +24,43 @@ pub use metering::ids::EicType;
 /// column with one extra constraint. See [`coded_column`].
 pub const CHECK_VALUES_KEY: &str = "meterstore.check_values";
 
-const ASSERTION_KEY: &str = "meterstore.assertion";
+pub(crate) const ASSERTION_KEY: &str = "meterstore.assertion";
 
 pub(crate) fn is_assertion_column(field: &Field) -> bool {
     field.metadata().contains_key(ASSERTION_KEY)
+}
+
+/// A native reading term a table can require to match when a version is replayed.
+///
+/// Quantity and declared assertion attributes are always compared. Each selected
+/// term adds a comparison at the precision used by both storage tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayField {
+    /// The stored quality flag.
+    Quality,
+    /// The exclusive interval end. The start already identifies the reading.
+    Span,
+    /// The unit of the stored quantity.
+    Unit,
+}
+
+impl ReplayField {
+    pub(crate) const fn column(self) -> &'static str {
+        use crate::encode::schema::col;
+        match self {
+            Self::Quality => col::QUALITY,
+            Self::Span => col::TO,
+            Self::Unit => col::UNIT,
+        }
+    }
+
+    pub(crate) const fn setting(self) -> &'static str {
+        match self {
+            Self::Span => "span",
+            other => other.column(),
+        }
+    }
 }
 
 /// A `Utf8` attribute-column [`Field`] constrained to `allowed` values.
@@ -595,6 +628,7 @@ pub struct TableConfig {
     name: String,
     value_scale: i8,
     require_single_tier: bool,
+    replay_fields: Vec<ReplayField>,
     time_model: TimeModel,
     archival_step: Duration,
     settlement_lag: Duration,
@@ -618,6 +652,7 @@ impl TableConfig {
             name: name.into(),
             value_scale: crate::encode::schema::VALUE_SCALE,
             require_single_tier: false,
+            replay_fields: Vec::new(),
             time_model: TimeModel::Interval,
             archival_step: defaults::ARCHIVAL_STEP,
             settlement_lag: defaults::SETTLEMENT_LAG,
@@ -850,6 +885,18 @@ impl TableConfig {
         self
     }
 
+    /// Require a native reading term to agree on every replay of a version.
+    ///
+    /// Call once per term. The default selection is empty. Span applies to
+    /// interval tables, whose start is already part of the merge key.
+    #[must_use]
+    pub fn assert_on(mut self, field: ReplayField) -> Self {
+        if !self.replay_fields.contains(&field) {
+            self.replay_fields.push(field);
+        }
+        self
+    }
+
     /// Declare an attribute whose value must agree on every replay of a version.
     ///
     /// Compared as stored text, including null. A higher version may change the
@@ -907,6 +954,11 @@ impl TableConfig {
 
     /// Validate and freeze.
     pub fn build(self) -> Result<ValidatedTableConfig> {
+        if self.time_model == TimeModel::Point && self.replay_fields.contains(&ReplayField::Span) {
+            return Err(Error::config(
+                "assert_on includes span for a point table: a register reading has no interval end",
+            ));
+        }
         if !(0..=i16::from(crate::encode::schema::VALUE_PRECISION))
             .contains(&i16::from(self.value_scale))
         {
@@ -1133,7 +1185,11 @@ impl ValidatedTableConfig {
 
     /// Arrow storage schema for this table, including its native value scale.
     pub fn storage_schema(&self) -> crate::arrow::datatypes::SchemaRef {
-        crate::encode::schema::storage_schema_at_scale(&self.extra_columns(), self.value_scale())
+        crate::encode::schema::storage_schema_at_scale(
+            &self.extra_columns(),
+            self.value_scale(),
+            self.replay_fields(),
+        )
     }
 
     /// Table name.
@@ -1238,6 +1294,11 @@ impl ValidatedTableConfig {
     /// Columns that carry data about a reading.
     pub fn attribute_columns(&self) -> &[Field] {
         &self.0.attribute_columns
+    }
+
+    /// Native terms compared on same-version retries, in declaration order.
+    pub fn replay_fields(&self) -> &[ReplayField] {
+        &self.0.replay_fields
     }
 
     /// Names of the attributes compared on same-version retries, in declaration order.

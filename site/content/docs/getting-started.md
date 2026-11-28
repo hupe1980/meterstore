@@ -8,9 +8,9 @@ weight = 1
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.95 | Set by `iceberg` 0.11's floor, not by this crate's own syntax or by `metering`, which need 1.88 |
-| PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18, and whole again on 15 |
-| `metering` | **0.26** | The domain layer. MeterStore stores its types; it does not redefine them |
+| Rust | 1.95 | Minimum supported toolchain |
+| PostgreSQL | **15 or later** | Integration-tested on 15 and 18 |
+| `metering` | **0.27** | The domain layer that supplies MeterStore's public measurement types |
 | Apache Iceberg | format v2 | Deliberately not v3 — see [Architecture](@/docs/architecture.md#format-version) |
 
 MeterStore needs no server configuration, no restart and no superuser — which is
@@ -26,22 +26,6 @@ than `SELECT`:
 - **`INSERT` and `DELETE` on `meterstore_pins`** for every role that queries:
   each plan with a hot half registers the boundary it was cut at there. A
   read-only role or a hot standby therefore cannot query the unified view.
-
-### Why 15, when the SQL runs on 12
-
-**The design needs 12.** `CREATE TABLE … PARTITION OF` takes `ACCESS EXCLUSIVE`
-on the parent, and PostgreSQL queues locks in arrival order, so on the write path
-one long query would stall every insert behind it. MeterStore builds the partition
-standalone and *attaches* it, which from 12 takes only `SHARE UPDATE EXCLUSIVE`
-and conflicts with no read and no write.
-[Locks](@/docs/operations.md#locks-and-why-ddl-gives-up) covers the detach, which
-does need the strong lock.
-
-**The support floor is 15**, the oldest release still receiving fixes into 2027
-and still under standard support on RDS, Cloud SQL and Azure Database (12, 13 and 14
-are end-of-life). CI runs the whole integration suite
-on 15 and on 18. An older server will very likely work, but nothing demonstrates
-it and no security fix is coming for it.
 
 ## Install
 
@@ -77,6 +61,7 @@ cargo add meterstore --no-default-features --features rest-catalog
 ```bash
 cargo install meterstore --features cli
 
+# Set DATABASE_URL to the PostgreSQL connection URL before validation.
 meterstore init            # a commented starter configuration
 meterstore check           # validate it — no database needed
 meterstore create          # both tiers, every declared table
@@ -117,7 +102,6 @@ the tiers in code:
 
 ```rust
 use meterstore::prelude::*;
-use meterstore::hot::PostgresHot;
 use std::sync::Arc;
 use time::Duration;
 
@@ -131,12 +115,12 @@ let hot = Arc::new(PostgresHot::new(database));
 // backend directly; the backend follows from the warehouse URI scheme.
 let cold_tier = IcebergSqlCatalog {
     database_url: &db_url,
-    warehouse_uri: "s3://bucket/warehouse",   // or file:// memory:// gs:// abfss://
+    warehouse_uri: "file:///var/lib/meterstore/warehouse",
     catalog_name: "meterstore",
     namespace: "metering",
     file_target_bytes: 512 * 1024 * 1024,
     metadata_pool_max_connections: 4,
-    auth: &WarehouseAuth { region: Some("eu-central-1".into()), ..Default::default() },
+    auth: &WarehouseAuth::default(),
 }.build().await?;
 let cold = cold_tier.cold();
 

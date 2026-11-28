@@ -156,7 +156,8 @@ cannot enter the typed path as an identifier it is not.
 |---|---|
 | `.collect()` | `Option<MeasurementSeries>` |
 | `.collect_with_sparte()` | …plus the commodity |
-| `.collect_resolved()` | …plus the declared attribute/identity columns |
+| `.collect_resolved()` | A channel summary with attributes from the newest contributing delivery |
+| `.collect_deliveries()` | Winning intervals grouped by their own scoped version, transaction time and delivery attributes |
 | `.collect_by_channel()` | `BTreeMap<ObisCode, ResolvedSeries>` — **every** channel, one scan |
 | `.channels()` | The channels this range holds, without decoding an interval |
 | `.latest()` | The newest interval, via `ORDER BY … DESC LIMIT 1` — not a full scan |

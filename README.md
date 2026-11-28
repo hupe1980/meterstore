@@ -66,19 +66,15 @@ Without writing a program:
 ```bash
 cargo install meterstore --features cli
 
+# Set DATABASE_URL to the PostgreSQL connection URL before validation.
 meterstore init      # a commented starter configuration
 meterstore check     # full validation — no database needed
 meterstore create    # both tiers, every declared table
 meterstore status    # boundary, lag, write runway, health
 ```
 
-`meterstore query` runs SQL across both tiers and prints the boundary the answer
-was computed against; `meterstore completeness --month 2026-06` reports which
-channels are short before a settlement run trusts a `SUM`; `meterstore erasures`
-prints the audit trail a regulator asks for; `meterstore maintain` is the archival
-loop as a foreground process, and `meterstore reassert-watermark` is the step to
-run before somebody else's maintenance tool expires anything.
-[The CLI →](https://hupe1980.github.io/meterstore/docs/cli/)
+Use `meterstore query` for SQL, `meterstore completeness` to check coverage, and
+`meterstore maintain` to run archival. [CLI reference](https://hupe1980.github.io/meterstore/docs/cli/).
 
 As a library:
 
@@ -88,36 +84,9 @@ cargo add meterstore
 
 ```rust
 use meterstore::prelude::*;
-use std::sync::Arc;
-use time::Duration;
 
-// The store opens its own pool; no `sqlx` type is in the API.
-let database = Database::connect_with(&db_url, &DatabaseOptions::new().max_connections(16)).await?;
-let hot = Arc::new(PostgresHot::new(database));
-
-let cold = IcebergSqlCatalog {
-    database_url: &db_url,
-    warehouse_uri: "s3://bucket/warehouse",   // or file:// memory:// gs:// abfss://
-    catalog_name: "meterstore",
-    namespace: "metering",
-    file_target_bytes: 512 * 1024 * 1024,
-    metadata_pool_max_connections: 4,
-    auth: &WarehouseAuth { region: Some("eu-central-1".into()), ..Default::default() },
-}.build().await?.cold();
-
-let table = TableConfig::new("readings_versions")
-    .settlement_lag(Duration::days(7))
-    .archival_step(Duration::DAY)
-    .build()?;
-cold.create_table_for(&table).await?;
-let provider = cold.table_provider(table.name()).await?;
-let store = MeterStore::builder()
-    .hot(hot)
-    .cold(cold, provider)
-    .table(table)
-    .build()
-    .await?;
-store.admin().create_tables().await?;
+let deployment = Settings::from_path("meterstore.toml")?.connect().await?;
+let store = deployment.store().await?;
 ```
 
 Then write and read:
@@ -139,53 +108,33 @@ result.watermark();        // where cold ended and hot began
 result.touched_hot_tier(); // whether the answer is only valid for now
 ```
 
-For settlement ingestion, set `require_single_tier(true)` to reject a delivery
-that crosses the watermark before either tier publishes rows. Declare a price
-with `assertion_column` to detect a changed price on replay. Set `value_scale(7)`
-to round-trip **0.0000001 kWh** through archival and historical queries.
+For settlement ingestion, `require_single_tier(true)` rejects a delivery across
+the watermark before either tier publishes rows. Use `assert_on` to select native
+quality, span and unit for replay checks, and `assertion_column` for an
+application field such as price. Set `value_scale(7)` for **0.0000001 kWh**.
+
+Use `collect_deliveries()` to read each winning slot with its original metadata
+and version. A one-interval `correct_if_current` publishes the successor only
+while that predecessor is current. An interrupted multi-round append reports
+confirmed effects through `Error::PartialAppend`.
 [Configure the settlement writer](https://hupe1980.github.io/meterstore/docs/writing/#settlement-ingestion).
-
-Record shapes, identity versus attribute columns, checked identifiers, scoping,
-completeness, erasure and settlement reruns are on the documentation site.
-
-[Getting started →](https://hupe1980.github.io/meterstore/docs/getting-started/)
 
 ## 📋 Requirements
 
 | | Version | Why |
 |---|---|---|
-| Rust | 1.95 | Set by `iceberg` 0.11's floor; `metering` and this crate's own syntax need 1.88 |
-| PostgreSQL | **15 or later** | A support floor, not a syntax one — see below. The suite runs on 18 and whole again on 15 |
-| `metering` | **0.26** | The domain layer — MeterStore stores its types, it does not redefine them |
+| Rust | 1.95 | Minimum supported toolchain |
+| PostgreSQL | **15 or later** | Integration-tested on 15 and 18 |
+| `metering` | **0.27** | The domain layer that supplies MeterStore's public measurement types |
 | Apache Iceberg | format v2 | [Deliberately not v3](https://hupe1980.github.io/meterstore/docs/architecture/#format-version) |
 
-Nothing here needs more than PostgreSQL 12: attaching a standalone-built
-partition takes only `SHARE UPDATE EXCLUSIVE`, where `CREATE TABLE … PARTITION OF`
-takes `ACCESS EXCLUSIVE` on the parent and would stall every insert behind one
-long query
-([Locks →](https://hupe1980.github.io/meterstore/docs/operations/#locks-and-why-ddl-gives-up)).
-The floor is **15** because a support promise must name versions still patched;
-CI runs the whole integration suite on 15 and 18.
+The default features support SQL and REST Iceberg catalogs. Enable `s3tables`
+for AWS S3 Tables or the matching `object-store-*` feature for cloud storage.
 
-The cold tier takes **any** `Arc<dyn Catalog>` — SQL, REST, Polaris, Lakekeeper,
-Glue — and that seam is driven end to end by the test suite rather than asserted.
-Three are built for you: a PostgreSQL-backed SQL catalogue on the same database as
-the hot tier (`sql-catalog`, on by default), a REST catalogue (`rest-catalog`, on
-by default), and AWS S3 Tables behind the `s3tables` feature. A configuration file
-builds whichever it names — all three, by `catalog = "sql" | "rest" | "s3tables"` —
-and `Settings::connect()` returns the store's `Database`, both tiers and every
-validated table.
-[Details](https://hupe1980.github.io/meterstore/docs/getting-started/).
-
-MeterStore needs no server configuration, no restart, no superuser and no
-extension beyond `btree_gist`, which ships in contrib, is *trusted*, and is created
-on demand. That is what makes it deployable on RDS, Cloud SQL and Azure Postgres,
-where an extension-based approach is not. It does need more than `SELECT`: `CREATE`
-on the schema for its relations and on the database for the extension, and
-`INSERT`/`DELETE` on `meterstore_pins` for every role that queries — a read-only
-role cannot query the unified view. Connections use TLS: a URL naming no
-`sslmode` connects with `verify-full`, and `prefer`/`allow` are refused.
-[Requirements →](https://hupe1980.github.io/meterstore/docs/getting-started/#requirements)
+PostgreSQL provisioning needs `CREATE` on the schema and permission to install
+`btree_gist` when integrity constraints are enabled. Unified reads need
+`INSERT` and `DELETE` on `meterstore_pins`. Connections default to `verify-full`.
+[Deployment requirements](https://hupe1980.github.io/meterstore/docs/getting-started/#requirements).
 
 ## 🔗 Relationship to `metering`
 
@@ -199,10 +148,6 @@ flags, DST-correct calendars, the identifiers (`MaloId`, `MeloId`, `BdewCode`, `
 validation, Ersatzwertbildung, gas conversion and aggregation. MeterStore adds
 exactly three things: **correction versioning**, the **transaction-time axis**,
 and the **tiering boundary**.
-
-That boundary is deliberate. Duplicating a domain rule here — a unit conversion, a
-DST calendar — would create a second implementation to keep correct, and it would
-drift.
 
 ## 📚 Documentation
 
@@ -223,7 +168,7 @@ drift.
 
 ## 📊 Status
 
-**1075 tests** — unit, property, doc and integration against real PostgreSQL 18 and
+**1087 tests** — unit, property, doc and integration against real PostgreSQL 18 and
 a real Iceberg warehouse, plus an independently implemented correctness oracle
 over generated workloads:
 
@@ -255,19 +200,10 @@ just cli status # run the command-line tool from source
 just site       # serve the documentation site
 ```
 
-The integration suites are **one test binary against one PostgreSQL container**.
-Cargo would otherwise compile each file under `tests/` into its own statically
-linked executable — twenty-odd full copies of DataFusion, Arrow, Iceberg, sqlx and
-tonic, about 9 GB, which exhausts a CI runner's disk and fails as a linker bus
-error rather than as "no space left". A database per test gives the isolation of a
-container per test at a seventh of the wall clock.
-
-`datafusion`, `arrow`, `iceberg`, `parquet`, `metering`, `time`, `rust_decimal`,
-`sqlx` and `sqlx-postgres` must each appear exactly once in the dependency graph;
-`just deps` fails the build otherwise. Two versions of `arrow` mean two incompatible
-`RecordBatch` types, which does not fail obviously. The one admitted duplicate is
-the `sqlx` 0.8 `iceberg-catalog-sql` uses for its own metadata pool. `sqlx` is
-private — the store opens its own pool — so its version never constrains yours.
+The integration tests share a PostgreSQL container and use a separate database per test.
+`just deps` checks the dependency graph for incompatible copies of core storage
+types. The Iceberg SQL catalog uses SQLx 0.8 alongside the hot tier’s private
+SQLx 0.9 pool.
 
 ## ⚖️ License
 

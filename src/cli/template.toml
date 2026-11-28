@@ -1,13 +1,6 @@
-# MeterStore — deployment configuration.
-#
-# `meterstore check` validates this file without connecting to anything, and it
-# runs the same cross-field checks the Rust builder does. There is no setting
-# reachable from one and not the other.
-#
-# A `${DATABASE_URL}`-style placeholder in any value is interpolated from the
-# environment. A missing variable is an error, not an empty string: a connection
-# URL that silently became `postgresql://@/` would fail somewhere far from the
-# typo. Comments are left alone, which is why this one can say so.
+# MeterStore deployment configuration. Validate with `meterstore check`.
+# Values can reference environment variables as `${DATABASE_URL}`.
+# A missing variable fails validation.
 
 # --- The hot tier: PostgreSQL holds the recent interval window. ---
 [hot]
@@ -17,17 +10,8 @@
 url = "${DATABASE_URL}"
 max_connections = 16
 
-# How long a DDL statement waits for a lock before giving up.
-#
-# PostgreSQL grants locks in arrival order, so a statement waiting for an
-# ACCESS EXCLUSIVE lock blocks every reader and writer that arrives behind it.
-# Archival detaches a partition on its own schedule, and a detach that queued
-# would take ingest down for as long as whatever it waits on runs. With this it
-# gives up having changed nothing, and the cycle is reported as deferred.
-#
-# Raise it on a deployment that reports out of the same tables it writes; every
-# second added is a second the whole table can stall for. `0s` disables it,
-# which is PostgreSQL's own default and this crate's advice against.
+# Limit the time archival DDL queues behind a conflicting lock. On timeout,
+# the cycle is deferred. A value of 0s disables the timeout.
 ddl_lock_timeout = "3s"
 
 # --- The cold tier: Apache Iceberg holds the history. ---
@@ -55,18 +39,9 @@ metadata_pool_max_connections = 4
 
 # --- The subject registry, if any table declares a `subject_column`. ---
 #
-# Only needed then. A `subject_column` names the column holding pseudonymous
-# references to data subjects, and a deployment declaring one without a registry
-# is refused at startup: the references would resolve to nothing and an Article
-# 17 erasure would have no mapping to destroy.
-#
-# `erasure_secret` (at least 32 bytes) turns on the suppression list. Without it
-# erasure works and does not *stay* worked — once the mapping is gone, nothing
-# distinguishes an erased identifier from one never seen, so a pipeline replaying
-# old messages registers a fresh reference and silently re-links the subject.
-# That is every deployment fed by a message broker.
-#
-# The key must outlive every erasure and is not recoverable from the database.
+# Configure a registry for tables with a subject_column. An erasure_secret
+# of at least 32 bytes prevents re-registration of a suppressed identifier.
+# Keep the key for the lifetime of those erasures.
 #
 # [privacy]
 # erasure_secret = "${METERSTORE_ERASURE_SECRET}"
@@ -89,6 +64,9 @@ time_model = "interval"
 
 # Refuse deliveries spanning the watermark before writing either tier.
 # require_single_tier = true
+# Same-version retries always compare the quantity and declared assertion columns.
+# Choose additional native terms here. Span applies only to interval tables.
+# assert_on = ["quality", "span", "unit"]
 # Fractional places in each energy or register value, from 0 through 18.
 # Higher scales leave fewer integer digits. The default is 6.
 # value_scale = 7
@@ -172,25 +150,13 @@ snapshot_retention = "10y"
 # name = "spot"
 # assertion = true
 #
-# `values` declares a closed vocabulary and renders a `CHECK ... IN (...)`;
-# `check` declares an identifier scheme, and the write path parses every value
-# with it and stores that scheme's canonical spelling. The two are mutually
-# exclusive.
-#
-#   "EIC"   16 characters, ENTSO-E — a Bilanzkreis, a Bilanzierungsgebiet.
-#           The check character is enforced, so a transposition is caught while
-#           the delivery that carried it is still in hand.
-#   "EIC:X" the same, and a party code — which is what a Bilanzkreis is.
-#           "EIC:Y" is an area (a Bilanzierungsgebiet); the rest of ENTSO-E's
-#           list is Z W T V A. The two share everything but position 3, so
-#           without this a Bilanzierungsgebiet stores as a Bilanzkreis and every
-#           MaBiS grouping over it is wrong. Unlike the check character, this
-#           half is a regular expression, so the database enforces it as well.
-#   "MALO"  11 digits — a Marktlokations-ID, check digit enforced.
-#   "MELO"  33 characters — a Zählpunktbezeichnung. No check digit exists;
-#           what this adds is the casing, so one Messlokation is one key.
-#   "BDEW"  13 digits — a Marktpartner-ID. The 13th digit must satisfy BDEW's
-#           check-digit procedure or, for a GS1-issued GLN, GS1's.
+# Choose either `values` for a closed vocabulary or `check` for an identifier
+# scheme. Checked values are stored in canonical form.
+#   EIC      16-character EIC with a check character
+#   EIC:X    EIC restricted to a party (Y for an area)
+#   MALO     11-digit Marktlokations-ID
+#   MELO     33-character Zählpunktbezeichnung
+#   BDEW     13-digit Marktpartner-ID (BDEW code or GS1 GLN)
 #
 # [[tables.extra_columns]]
 # name = "bilanzkreis"

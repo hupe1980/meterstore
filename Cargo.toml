@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -12,7 +12,7 @@ keywords = ["metering", "iceberg", "timeseries", "postgres"]
 categories = ["database", "data-structures"]
 readme = "README.md"
 # Set by the highest dependency floor (`iceberg` 0.11 wants 1.95), not by this
-# crate's own syntax or by `metering` 0.26, both of which need only 1.88.
+# crate's own syntax or by `metering` 0.27, both of which need only 1.88.
 rust-version = "1.95"
 
 # The crate documentation describes Flight SQL, the façade and the testkit, none
@@ -98,7 +98,7 @@ sqlx-postgres = { version = "0.9", default-features = false, features = ["time",
 # and identifier is its type, and this crate computes with none of them. A floor
 # rather than a preference — `ids::{BdewCode, Eic, MaloId, MeloId}` are what a
 # `check =` column parses with.
-metering = { version = "0.26", features = ["serde"] }
+metering = { version = "0.27", features = ["serde"] }
 
 # `metering`'s choice, not chrono: mixing the two would convert at every row.
 # Deliberately without `serde-human-readable` — `time`'s serde impl is
@@ -139,7 +139,7 @@ toml = "1.1"
 # decision, so nothing here pulls one.
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 # Same major as `arrow`; the duplicate gate fails the build if they diverge.
-parquet = { version = "58.4", default-features = false, features = ["arrow", "zstd", "snap"] }
+parquet = { version = "58.4.2", default-features = false, features = ["arrow", "zstd", "snap"] }
 
 # --- Optional: the `cli` feature ---
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"], optional = true }

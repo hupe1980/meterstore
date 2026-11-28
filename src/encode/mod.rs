@@ -609,7 +609,12 @@ impl RowColumns {
     }
 
     /// Assemble the batch.
-    fn finish(self, extra: &[Field], value_scale: i8) -> Result<RecordBatch> {
+    fn finish(
+        self,
+        extra: &[Field],
+        value_scale: i8,
+        replay_fields: &[crate::config::ReplayField],
+    ) -> Result<RecordBatch> {
         let tz: Arc<str> = "UTC".into();
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(self.malo)),
@@ -651,7 +656,7 @@ impl RowColumns {
         }
 
         Ok(RecordBatch::try_new(
-            schema::storage_schema_at_scale(extra, value_scale),
+            schema::storage_schema_at_scale(extra, value_scale, replay_fields),
             columns,
         )?)
     }
@@ -779,7 +784,7 @@ fn check_scope(version: &ScopedVersion, at: OffsetDateTime, sparte: Sparte) -> R
 /// the same reading. A nullable column may be absent and becomes null, which is
 /// what nullable was declared to mean.
 pub fn to_record_batch_with(stored: &[StoredSeries], extra: &[Field]) -> Result<RecordBatch> {
-    to_record_batch_at_scale(stored, extra, VALUE_SCALE)
+    to_record_batch_at_scale(stored, extra, VALUE_SCALE, &[])
 }
 
 /// Encode interval series using the table’s value scale and declared columns.
@@ -787,13 +792,19 @@ pub fn to_record_batch_for(
     stored: &[StoredSeries],
     config: &crate::ValidatedTableConfig,
 ) -> Result<RecordBatch> {
-    to_record_batch_at_scale(stored, &config.extra_columns(), config.value_scale())
+    to_record_batch_at_scale(
+        stored,
+        &config.extra_columns(),
+        config.value_scale(),
+        config.replay_fields(),
+    )
 }
 
 fn to_record_batch_at_scale(
     stored: &[StoredSeries],
     extra: &[Field],
     value_scale: i8,
+    replay_fields: &[crate::config::ReplayField],
 ) -> Result<RecordBatch> {
     let mut columns = RowColumns::with_extra(extra);
 
@@ -826,14 +837,21 @@ fn to_record_batch_at_scale(
         };
 
         for interval in &s.series.intervals {
-            // An empty span is unrepresentable: `MeterInterval::new` refuses one.
             check_scope(&s.version, interval.from(), s.sparte)?;
+            let from = schema::micros(interval.from());
+            let to = schema::micros(interval.to());
+            if to <= from {
+                return Err(Error::encode(
+                    col::TO,
+                    "an interval must cover at least one stored microsecond",
+                ));
+            }
 
             columns.push(
                 &fields,
                 obis_for(&s.series, interval)?.to_string(),
-                schema::micros(interval.from()),
-                Some(schema::micros(interval.to())),
+                from,
+                Some(to),
                 to_scaled_i128(interval.value(), value_scale)?,
                 interval.quality().as_str(),
                 // The one place the balancing day is derived. Asked of the
@@ -845,7 +863,7 @@ fn to_record_batch_at_scale(
         }
     }
 
-    columns.finish(extra, value_scale)
+    columns.finish(extra, value_scale, replay_fields)
 }
 
 /// Encode Zählerstandsgänge into a single [`RecordBatch`].
@@ -870,7 +888,7 @@ pub fn readings_to_record_batch_with(
     stored: &[StoredReadings],
     extra: &[Field],
 ) -> Result<RecordBatch> {
-    readings_to_record_batch_at_scale(stored, extra, VALUE_SCALE)
+    readings_to_record_batch_at_scale(stored, extra, VALUE_SCALE, &[])
 }
 
 /// Encode point readings using the table’s value scale and declared columns.
@@ -878,13 +896,19 @@ pub fn readings_to_record_batch_for(
     stored: &[StoredReadings],
     config: &crate::ValidatedTableConfig,
 ) -> Result<RecordBatch> {
-    readings_to_record_batch_at_scale(stored, &config.extra_columns(), config.value_scale())
+    readings_to_record_batch_at_scale(
+        stored,
+        &config.extra_columns(),
+        config.value_scale(),
+        config.replay_fields(),
+    )
 }
 
 fn readings_to_record_batch_at_scale(
     stored: &[StoredReadings],
     extra: &[Field],
     value_scale: i8,
+    replay_fields: &[crate::config::ReplayField],
 ) -> Result<RecordBatch> {
     let mut columns = RowColumns::with_extra(extra);
 
@@ -933,7 +957,7 @@ fn readings_to_record_batch_at_scale(
         }
     }
 
-    columns.finish(extra, value_scale)
+    columns.finish(extra, value_scale, replay_fields)
 }
 
 /// Put a batch into the sort order the Parquet footer declares.
@@ -1766,6 +1790,24 @@ mod tests {
         )
         .expect("a non-empty interval")
         .with_obis("1-0:1.8.0".parse().unwrap())
+    }
+
+    #[test]
+    fn interval_must_span_at_least_one_stored_microsecond() {
+        let start = datetime!(2026-07-20 00:00 UTC);
+        let interval = |end| {
+            series(vec![
+                MeterInterval::new(start, end, Decimal::ONE, QualityFlag::Measured).unwrap(),
+            ])
+        };
+        let error =
+            to_record_batch(&[interval(start + time::Duration::nanoseconds(999))]).unwrap_err();
+        assert!(matches!(error, Error::Encode { what, .. } if what == col::TO));
+        let batch = to_record_batch(&[interval(start + time::Duration::MICROSECOND)]).unwrap();
+        assert_eq!(
+            from_record_batch(&batch).unwrap()[0].series.intervals[0].to(),
+            start + time::Duration::MICROSECOND
+        );
     }
 
     #[test]

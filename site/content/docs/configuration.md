@@ -37,6 +37,7 @@ erasure_secret = "${METERSTORE_ERASURE_SECRET}"   # ≥ 32 bytes, turns on suppr
 name = "readings_versions"
 time_model = "interval"          # or "point" — a Zählerstandsgang
 # require_single_tier = true     # reject deliveries that span the watermark
+# assert_on = ["quality", "span", "unit"]  # native fields compared on replay
 # value_scale = 7                # fractional places in value (default 6)
 # identify_by_melo = true        # omitted, it follows time_model
 # The column holding pseudonymous subject references. Registered as an

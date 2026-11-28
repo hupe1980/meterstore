@@ -298,11 +298,13 @@ async fn a_suppression_key_makes_erasure_stick() {
     .await
     .unwrap();
 
-    let replayed = r.register("customer-4821", IN_2026, Sparte::Strom).await;
-    assert!(
-        replayed.is_err(),
-        "a replayed message must not re-link an erased subject"
-    );
+    let refusal = r
+        .register("customer-4821", IN_2026, Sparte::Strom)
+        .await
+        .unwrap_err();
+    assert!(matches!(refusal, meterstore::Error::SubjectSuppressed));
+    assert!(!refusal.is_retryable());
+    assert!(!refusal.to_string().contains("customer-4821"));
     assert!(r.is_suppressed("customer-4821").await.unwrap());
     // Everyone else is unaffected — suppression is per identifier, not a mode.
     assert!(

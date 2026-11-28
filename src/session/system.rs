@@ -214,6 +214,14 @@ impl<'a> SystemTables<'a> {
             entry("time_model", c.time_model().as_str().to_string()),
             entry("value_scale", c.value_scale().to_string()),
             entry(
+                "assert_on",
+                c.replay_fields()
+                    .iter()
+                    .map(|f| f.setting())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            entry(
                 "assertion_columns",
                 c.assertion_column_names().collect::<Vec<_>>().join(", "),
             ),
@@ -648,6 +656,7 @@ mod tests {
         let config = TableConfig::new("readings")
             .identity_column(Field::new("tenant", DataType::Utf8, false))
             .assertion_column(Field::new("spot", DataType::Utf8, true))
+            .assert_on(crate::ReplayField::Span)
             .build()
             .unwrap();
         let hot: Arc<dyn HotStore> = Arc::new(NoStore);
@@ -657,6 +666,14 @@ mod tests {
         let key = entries.iter().find(|e| e.setting == "merge_key").unwrap();
         assert!(key.value.contains("tenant"));
         assert!(!key.value.contains("spot"));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.setting == "assert_on")
+                .unwrap()
+                .value,
+            "span"
+        );
         assert_eq!(
             entries
                 .iter()

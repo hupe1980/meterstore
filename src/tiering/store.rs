@@ -586,12 +586,17 @@ pub trait HotStore: Send + Sync {
     /// row belongs to the cold tier, return [`Error::BoundaryMoved`] before
     /// creating partitions or publishing rows. Otherwise ensure the required
     /// partitions and publish the batch in one transaction. Custom backends
-    /// must implement this contract to accept authoritative hot writes.
+    /// must implement this contract to accept authoritative hot writes. With an
+    /// expected predecessor, the batch must be its single-row successor. Compare
+    /// the current scoped version at the full key before publishing, in the same
+    /// transaction. An absent or different predecessor is a
+    /// [`PredecessorMismatch`](Error::PredecessorMismatch).
     async fn append_single_tier(
         &self,
         config: &crate::ValidatedTableConfig,
         _batch: &RecordBatch,
         _cold: &dyn ColdStore,
+        _expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<crate::session::Displacement>> {
         Err(crate::Error::config(format!(
             "{} requires single-tier appends, which this hot backend does not support",
@@ -707,6 +712,28 @@ pub trait ColdStore: Send + Sync {
         batches: BatchStream,
         hints: WriteHints,
     ) -> Result<CommitInfo>;
+
+    /// The current head of the table's main branch. A conditional correction
+    /// reads this exact snapshot and commits only if it is still the head.
+    async fn current_snapshot_id(&self, table: &str) -> Result<Option<i64>> {
+        Err(Error::config(format!(
+            "{table} does not support conditional cold writes"
+        )))
+    }
+
+    /// Publish a correction only if `snapshot` remains the current head.
+    /// A changed head returns [`Error::ConcurrentWrite`] without publication.
+    async fn append_if_snapshot(
+        &self,
+        table: &str,
+        _snapshot: i64,
+        _batches: BatchStream,
+        _hints: WriteHints,
+    ) -> Result<CommitInfo> {
+        Err(Error::config(format!(
+            "{table} does not support conditional cold writes"
+        )))
+    }
 
     /// Put the tiering boundary back on the current snapshot.
     ///
@@ -894,8 +921,11 @@ impl<T: HotStore + ?Sized> HotStore for std::sync::Arc<T> {
         config: &crate::ValidatedTableConfig,
         batch: &RecordBatch,
         cold: &dyn ColdStore,
+        expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<crate::session::Displacement>> {
-        (**self).append_single_tier(config, batch, cold).await
+        (**self)
+            .append_single_tier(config, batch, cold, expected)
+            .await
     }
 
     async fn drop_table(&self, table: &str) -> Result<()> {
@@ -992,6 +1022,22 @@ impl<T: ColdStore + ?Sized> ColdStore for std::sync::Arc<T> {
         range: (OffsetDateTime, OffsetDateTime),
     ) -> Result<Vec<crate::planner::FileStats>> {
         (**self).version_stats(table, range).await
+    }
+
+    async fn current_snapshot_id(&self, table: &str) -> Result<Option<i64>> {
+        (**self).current_snapshot_id(table).await
+    }
+
+    async fn append_if_snapshot(
+        &self,
+        table: &str,
+        snapshot: i64,
+        batches: BatchStream,
+        hints: WriteHints,
+    ) -> Result<CommitInfo> {
+        (**self)
+            .append_if_snapshot(table, snapshot, batches, hints)
+            .await
     }
 
     async fn reassert_watermark(&self, table: &str) -> Result<Option<CommitInfo>> {

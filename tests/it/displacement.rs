@@ -26,13 +26,22 @@ const START: OffsetDateTime = datetime!(2026-07-20 00:00 UTC);
 
 /// One reading, at a chosen value, version and quality.
 fn reading(kwh: i64, version: u128, quality: QualityFlag) -> meterstore::encode::StoredSeries {
+    reading_at(START, kwh, version, quality)
+}
+
+fn reading_at(
+    at: OffsetDateTime,
+    kwh: i64,
+    version: u128,
+    quality: QualityFlag,
+) -> meterstore::encode::StoredSeries {
     let mut series = MeasurementSeries::new(
         "12345678905".parse().unwrap(),
         "1-0:1.8.0".parse().ok(),
         vec![
             MeterInterval::new(
-                START,
-                START + Duration::minutes(15),
+                at,
+                at + Duration::minutes(15),
                 Decimal::new(kwh, 0),
                 quality,
             )
@@ -53,7 +62,7 @@ fn reading(kwh: i64, version: u128, quality: QualityFlag) -> meterstore::encode:
         meterstore::ScopedVersion::new(
             meterstore::VersionScope::for_interval(
                 "9900000000003",
-                START,
+                at,
                 metering::series::interval::Sparte::Strom,
             )
             .unwrap(),
@@ -363,7 +372,12 @@ async fn an_authored_value_beats_a_chain_of_higher_versions() {
     }
 
     let outcome = store
-        .append_authoritative(&[reading(42, 1, QualityFlag::Corrected)])
+        .append_authoritative(&[reading_at(
+            START + Duration::nanoseconds(321),
+            42,
+            1,
+            QualityFlag::Corrected,
+        )])
         .await
         .expect("authoritative");
 
@@ -391,6 +405,155 @@ async fn a_pinned_session_cannot_author_a_value() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("append_authoritative"), "{err}");
+}
+
+#[tokio::test]
+async fn interrupted_authored_round_reports_the_whole_confirmed_batch() {
+    let (h, store) = store().await;
+    let pool = crate::fixture_pool(h.url());
+    store
+        .append(&[reading(10, 5, QualityFlag::Measured)])
+        .await
+        .unwrap();
+    // The first round lands both rows. The successor in the second round
+    // reaches a real transaction which the fixture deliberately rejects.
+    sqlx::query("ALTER TABLE readings_versions ADD CONSTRAINT refuse_six CHECK (version <> 6)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let adjacent = START + Duration::minutes(15);
+    let batch = [
+        reading(42, 1, QualityFlag::Corrected),
+        reading_at(adjacent, 30, 1, QualityFlag::Measured),
+    ];
+    let err = store.append_authoritative(&batch).await.unwrap_err();
+    assert!(!err.is_retryable());
+    let meterstore::Error::PartialAppend { confirmed, source } = err else {
+        panic!("expected a confirmed first round, got {err}");
+    };
+    assert!(
+        matches!(*source, meterstore::Error::IntegrityViolation { ref constraint, .. }
+        if constraint.as_deref() == Some("refuse_six")),
+        "{source}"
+    );
+    assert_eq!((confirmed.hot_rows, confirmed.cold_rows), (2, 0));
+    assert_eq!(confirmed.displacements.len(), 2);
+    for (at, effect, original) in [
+        (START, Effect::Shadowed, &batch[0]),
+        (adjacent, Effect::Inserted, &batch[1]),
+    ] {
+        let report = confirmed
+            .displacements
+            .iter()
+            .find(|d| d.from == at)
+            .unwrap();
+        assert_eq!(report.effect, effect);
+        assert_eq!(report.written.version, original.version);
+        assert_eq!(report.written.recorded_at, original.recorded_at);
+    }
+    let stored: Vec<(Decimal, Decimal)> =
+        sqlx::query_as(r#"SELECT version, value FROM readings_versions ORDER BY "from", version"#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        [
+            (1.into(), 42.into()),
+            (5.into(), 10.into()),
+            (1.into(), 30.into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn interrupted_authored_delivery_omits_the_unpublished_cold_portion() {
+    let (h, store) = store().await;
+    let pool = crate::fixture_pool(h.url());
+    // Seed metadata remains readable. Publishing a new metadata location fails
+    // after cold reconciliation has already found the candidate insert.
+    sqlx::query(
+        "ALTER TABLE iceberg_tables ADD CONSTRAINT refuse_catalog_update CHECK (false) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let hot = reading(30, 1, QualityFlag::Measured);
+    let cold = reading_at(START - Duration::minutes(15), 42, 1, QualityFlag::Corrected);
+    let err = store
+        .append_authoritative(&[cold.clone(), hot.clone()])
+        .await
+        .unwrap_err();
+    let meterstore::Error::PartialAppend { confirmed, source } = err else {
+        panic!("expected the confirmed hot portion, got {err}");
+    };
+    assert!(matches!(*source, meterstore::Error::Storage(_)), "{source}");
+    assert_eq!((confirmed.hot_rows, confirmed.cold_rows), (1, 0));
+    assert_eq!(confirmed.displacements.len(), 1);
+    assert_eq!(confirmed.displacements[0].from, START);
+    assert_eq!(confirmed.displacements[0].effect, Effect::Inserted);
+    let failed_alone = store
+        .append_authoritative(std::slice::from_ref(&cold))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failed_alone, meterstore::Error::Storage(_)),
+        "{failed_alone}"
+    );
+    sqlx::query("ALTER TABLE iceberg_tables DROP CONSTRAINT refuse_catalog_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resumed = store.append_authoritative(&[cold, hot]).await.unwrap();
+    assert_eq!((resumed.hot_rows, resumed.cold_rows), (0, 1));
+    assert!(
+        resumed
+            .displacements
+            .iter()
+            .any(|d| d.from == START && d.effect == Effect::Duplicate)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_receipts_identify_the_exact_stored_version_on_either_tier() {
+    let (_h, store) = store().await;
+    for at in [START, START - Duration::minutes(15)] {
+        let original = reading_at(at, 30, 1, QualityFlag::Estimated);
+        let mut retried = reading_at(at, 30, 1, QualityFlag::Measured);
+        retried.recorded_at += Duration::HOUR;
+        retried.series.intervals[0] = MeterInterval::new(
+            at,
+            at + Duration::minutes(5),
+            30.into(),
+            QualityFlag::Measured,
+        )
+        .unwrap();
+        let first = store
+            .append(&[original.clone(), retried.clone()])
+            .await
+            .unwrap();
+        let same_batch = first
+            .displacements
+            .iter()
+            .find(|d| d.effect == Effect::Duplicate)
+            .unwrap();
+        let successor = reading_at(at, 42, 2, QualityFlag::Corrected);
+        store
+            .append(std::slice::from_ref(&successor))
+            .await
+            .unwrap();
+        let again = store.append(&[retried]).await.unwrap();
+        let stored = &again.displacements[0];
+        assert_eq!(stored.effect, Effect::Duplicate);
+        assert_eq!(stored.current().version, successor.version);
+        for receipt in [same_batch, stored] {
+            assert_eq!(receipt.written.version, original.version);
+            assert_eq!(receipt.written.recorded_at, original.recorded_at);
+            assert_eq!(receipt.written.quality, QualityFlag::Estimated);
+            assert_eq!(receipt.written.to, Some(at + Duration::minutes(15)));
+            assert_eq!(receipt.to, receipt.written.to);
+        }
+    }
 }
 
 /// The value a query currently returns for the single seeded interval.
@@ -421,7 +584,7 @@ async fn single_tier_hot_writes_share_the_archival_guard_with_the_insert_transac
     let hot = PostgresHot::new(database);
     let batch =
         meterstore::encode::to_record_batch(&[reading(10, 1, QualityFlag::Measured)]).unwrap();
-    let write = || hot.append_single_tier(h.config(), &batch, h.cold().as_ref());
+    let write = || hot.append_single_tier(h.config(), &batch, h.cold().as_ref(), None);
 
     let lease = h
         .hot()

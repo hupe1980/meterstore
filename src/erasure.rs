@@ -1006,7 +1006,7 @@ impl SubjectRegistry {
     /// returns the same reference, so an ingest path may call it per batch
     /// without accumulating references for one subject.
     ///
-    /// Refuses to re-register an identifier whose reference has been erased —
+    /// Returns [`Error::SubjectSuppressed`] when re-registering an erased identifier —
     /// **only when a suppression key is configured**
     /// ([`with_erasure_secret`](Self::with_erasure_secret)). Re-registration
     /// resurrects the link erasure destroyed, and it almost always means a stale
@@ -1067,13 +1067,7 @@ impl SubjectRegistry {
                 .registrations_suppressed
                 .add(1, &[]);
             warn!("registration refused for an erased identifier");
-            return Err(Error::config(
-                "this identifier was erased and must not be re-registered: \
-                 registering it would rebuild the link Article 17 destroyed. \
-                 A subject who genuinely returns should arrive under a new \
-                 identifier; if the erasure itself was mistaken, lift it \
-                 explicitly with `lift_suppression`",
-            ));
+            return Err(Error::SubjectSuppressed);
         }
 
         let reference = SubjectRef::mint(epoch);

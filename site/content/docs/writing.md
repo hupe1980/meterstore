@@ -4,7 +4,7 @@ description = "Routed writes, the bulk path for steady-state ingest, idempotent 
 weight = 4
 +++
 
-## Two entry points, and when each is right
+## Ingesting deliveries
 
 | | Use for | Cost |
 |---|---|---|
@@ -38,13 +38,14 @@ for batch in stream {
 A single delivery can contain current and archived readings. The default routed
 append commits its hot rows first. If the cold append subsequently fails, a
 fresh query can already see the hot rows. For a producer that treats a delivery
-as a unit, configure the table when you provision it:
+as a unit, configure the table at provisioning.
 
 ```toml
 [[tables]]
 name = "readings_versions"
 require_single_tier = true
 value_scale = 7
+assert_on = ["quality", "span", "unit"]
 extra_columns = [{ name = "spot", assertion = true }]
 ```
 
@@ -59,16 +60,18 @@ Use `append` for settlement deliveries with producer-assigned versions.
 A custom hot backend must implement guarded hot inserts and enforce the
 cold-append lease to support this policy. Configure every writer of the table
 with the same assertion fields. Inspect
-`require_single_tier`, `assertion_columns` and `value_scale` through
+`require_single_tier`, `assert_on`, `assertion_columns` and `value_scale` through
 `system.config` to check a running deployment.
 
-Routing and assertion equality serve different purposes. Single-tier routing
-controls where one delivery can commit. An assertion column controls which
-changes a producer must version. Here a retry at the same key and version with
-the same quantity and `spot` succeeds, while changing `spot` from null to
-`"0"` or from `"-1.25"` to `"0"` conflicts. The column stores text, so use one
-decimal spelling across producers. A higher version carries its own price and
-the earlier version remains available to an as-of query.
+`assert_on` selects native reading terms. Quantity is always compared. An
+interval's start identifies its slot, so `span` compares its stored end at
+microsecond precision. Point tables accept `quality` and `unit`. The default
+selection is empty. The Rust builder accepts one `ReplayField` per
+`assert_on` call.
+
+In this example, changing `spot` from null to `"0"` at the same version is a
+conflict. Assertion columns store text, so agree on one decimal spelling across
+producers. Publish a changed price at a higher version.
 
 ### The boundary can move under a write
 
@@ -124,7 +127,8 @@ A cold duplicate would be two winners at one version, and resolution is
 so the sum would be silently overstated.
 
 **A version identifies one assertion.** The same
-`(malo_id, obis_code, from, version)` must always carry the same native value and the same declared assertion attributes.
+reading key and scoped version must always carry the same quantity, selected
+native terms and declared assertion attributes.
 Redelivering an identical row is fine; restating a *different* value under an
 existing version is refused in both tiers. A corrected value needs a higher
 version.
@@ -147,41 +151,76 @@ delivery carrying its own version wins. (Microseconds would outrank the network
 operator; seconds would collide within a second.) `is_well_formed()` is false for
 these.
 
+For a restartable ingest session, persist the first receipt before assigning an
+arrival version. Reuse it on every retry. Persist the original transaction time
+as well when reconstructing rows. The receipt and the time the store learned a
+value serve separate purposes. Two receipts in the same millisecond can produce
+the same arrival version for a slot.
+
 ## Values the operator authors
 
-Two kinds of write, and only one of them is a *delivery*:
+Choose the write method by the promise you make to the caller.
 
-| | Meaning | Being outranked is |
+| Method | Use it when | If another version is current |
 |---|---|---|
-| `append` | something a market partner sent, at the version they assigned | **correct** — a backfill after a correction is ordinary |
-| `append_authoritative` | something **you** authored: a § 60 Abs. 2 MsbG Ersatzwert, a correction after a dispute, a manual entry after a meter exchange | **a silent failure** |
+| `append` | A market partner supplied the version. | A lower version is recorded as a backfill. |
+| `correct_if_current` | The author approved a correction against a specific interval version. | A stale predecessor returns `PredecessorMismatch`. |
+| `append_authoritative` | The operator requires the supplied assertion to become current. | The writer can author a successor above the current version. |
 
-Through `append`, an authored value that a higher version already beats is stored
-and quietly shadowed — audited, confirmed, never current. That is the ordinary
-case for Ersatzwertbildung: the `FAULTY` interval being replaced arrived under a
-real MSCONS version, so the version you can put on your own value is *lower* than
-the one you have to beat.
+Use `append_authoritative` for an operator-authored replacement such as an
+Ersatzwert for a faulty interval. Its version is a floor. If a higher version
+holds, the writer retries with the successor in that version’s scope.
 
 ```rust
 let outcome = store.append_authoritative(&[ersatzwert]).await?;
-// Every displacement is Inserted or Superseded. Anything else was retried.
+// A duplicate already in force is also acknowledged.
 for d in outcome.displacements {
-    audit.record(d.malo_id, d.from, d.written.version);   // the version it landed at
+    if d.effect.changed_current_value() {
+        audit.record(d.malo_id, d.from, d.written.version);
+    }
 }
 ```
 
-The version each row carries is a **floor**, not an assertion. Where a higher one
-already holds the reading, the store re-appends at `ScopedVersion::next` of the
-one actually in force — continuing the *stored* sequence under the *stored*
-scope, because a version is comparable only within its own and the hot tier
-refuses a second network operator for one reading.
+A duplicate whose assertion already holds needs no further write. On sustained
+contention, reconcile the confirmed work and the `one_author_per_reading`
+conflict with the other author.
 
-The decision reads `Displacement::superseded`, observed inside the write's own
-transaction, which a caller's read-then-write could not do. Re-asserting a value
-already in force is a no-op. After `AUTHORITATIVE_ATTEMPTS` rounds it gives up:
-another writer is authoring the same reading continuously. That is refused as an
-`IntegrityViolation` (`one_author_per_reading`): a conflict between producers to
-settle, not something to retry and not a fault in the store.
+### Correcting a specific predecessor
+
+Read the slot through a tenant-scoped handle and narrow the query by channel,
+identity and time. `collect_deliveries()` returns the winners with their scoped
+versions and delivery attributes. Check the original terms supplied by the
+producer against that result. Build a one-interval correction carrying the
+observed `version`, the replacement value and quality, the correction's source
+and the time it was recorded.
+
+```rust
+let change = store.correct_if_current(&correction).await?;
+let published_version = change.written.version;
+```
+
+The writer checks the predecessor and publishes its successor in one storage
+operation. `Error::PredecessorMismatch { expected, actual }` means another
+version is current, or the slot is absent (`actual == None`). Read the slot
+again and reconcile the producer's intent before submitting a new correction.
+A replay after a successful conditional write also sees the successor.
+
+If archival moves the slot during a hot write (`BoundaryMoved`) or another
+Iceberg commit advances the snapshot (`ConcurrentWrite`), retry with the same
+approved predecessor. The next attempt checks it against the current tier.
+After a lost acknowledgement, read the slot and its history to establish
+whether the correction committed.
+
+### Recovering an interrupted append
+
+A routed append can commit hot rows before a cold write fails. An authoritative
+append can commit several rounds as it raises versions. On
+`Error::PartialAppend { confirmed, source }`, inspect the confirmed counts and
+displacements, including shadowed insertions, and retain the underlying cause.
+A final commit whose acknowledgement was lost may also be visible. Read the
+affected versions before resuming an authored correction. If the process dies
+before receiving a result, recovery likewise starts from the durable version
+history and the producer's original receipt.
 
 ## Knowing what a write displaced
 

@@ -1,16 +1,45 @@
 # Changelog
 
-All notable changes to `meterstore` are documented here, newest first, under
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)'s headings from 0.14.0
-onward. Releases before that group their entries by subject instead; they are
-left as written.
+MeterStore is pre-1.0. Releases can change the Rust API and SQL schema.
 
-The crate is published on crates.io and pre-1.0. Until 1.0 every version is a
-hard cut: breaking changes carry no deprecation shim, and the SQL schema changes
-in place rather than through a migration.
+## [0.19.0] — 2026-11-28
 
-This is the only file in the repository that carries history. Reference
-documentation says what is true now; a test enforces it.
+### Added
+
+- Settlement tables can select native quality, span and unit for replay checks.
+  The typed delivery reader retains each winning slot's version and metadata.
+- `correct_if_current` publishes a successor to one observed interval version.
+  A stale correction returns the expected and actual scoped versions.
+- `Error::PartialAppend` reports acknowledged effects and the underlying failure
+  when an append stops partway. `Error::SubjectSuppressed` identifies an
+  erased subject's refused registration without including the identifier.
+
+### Changed — breaking
+
+- MeterStore's public measurement types come from `metering` 0.27. Applications
+  that pass these types across the store API must also use `metering` 0.27.
+- Custom `HotStore::append_single_tier` implementations take an optional scoped
+  predecessor. Conditional cold writes require snapshot pinning, guarded commits
+  and an enforced cold-append lease.
+- `StoredValue` includes the stored interval end (`to`), or `None` for point readings.
+
+### Fixed
+
+- A duplicate receipt carries the transaction time, span and reading terms of
+  the original stored version, including when a higher version is current.
+- Authored retries match interval starts at stored microsecond precision. An
+  interval whose endpoints collapse to one stored instant fails encoding.
+  Pre-epoch timestamps round down consistently with query planning, and
+  arrival-derived versions reject submillisecond instants before the epoch.
+
+### Dependencies
+
+- Raised the minimum `parquet` version to 58.4.2, which addresses plaintext
+  Bloom filters in encrypted files. [RUSTSEC-2026-0595](https://rustsec.org/advisories/RUSTSEC-2026-0595.html)
+
+### Verification
+
+- 1087 tests pass (597 unit, 460 integration and 30 doc).
 
 ## [0.18.1] — 2026-11-23
 
@@ -113,9 +142,12 @@ documentation says what is true now; a test enforces it.
   that destroys the mapping, for every request-triggered erasure and once per
   reference destroyed; a failing cascade fails the erasure. The retention sweep
   runs none. `erase_in` and `erase_all_in` are removed.
-- `iceberg`, `iceberg-datafusion`, `iceberg-catalog-{sql,rest,s3tables}` and
-  `iceberg-storage-opendal` 0.11; DataFusion 54; `sqlx` 0.9; `opendal` 0.58;
-  MSRV 1.95.
+- Moved to `iceberg`, `iceberg-datafusion`, `iceberg-catalog-{sql,rest,s3tables}`
+  and `iceberg-storage-opendal` 0.11, DataFusion 54 and `opendal` 0.58. The
+  minimum supported Rust version is 1.95.
+- The store-owned PostgreSQL pool moved to `sqlx` 0.9. The default
+  `sql-catalog` feature also enables `sqlx` 0.8 under the dependency name
+  `sqlx-catalog`, sharing 0.8.6 with `iceberg-catalog-sql` in the published lockfile.
 
 ### Fixed
 

@@ -160,6 +160,41 @@ async fn sum_kwh(store: &MeterStore, sql: &str) -> i64 {
 }
 
 #[tokio::test]
+async fn resolved_deliveries_keep_each_slots_version_and_source_attributes() {
+    let (store, _warehouse) = store_with_tenant_identity().await;
+    let first = reading("a", 10, 1);
+    let mut next = reading_at(D21, "a", 20, 2)
+        .with_extra("bilanzkreis", ScalarValue::Utf8(Some("BK-2".into())));
+    next.recorded_at += Duration::HOUR;
+    store
+        .append(&[first.clone(), next.clone(), reading("b", 99, 7)])
+        .await
+        .unwrap();
+    let scoped = store.scoped("tenant", "a").await.unwrap();
+
+    // The same export spans both tiers after the first day settles.
+    for archived in [false, true] {
+        if archived {
+            store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+        }
+        let deliveries = scoped
+            .series("11111111115")
+            .unwrap()
+            .range(D20, D21 + Duration::DAY)
+            .collect_deliveries()
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        for (actual, expected) in deliveries.iter().zip([&first, &next]) {
+            assert_eq!(actual.version, expected.version);
+            assert_eq!(actual.extra, expected.extra);
+            assert_eq!(actual.recorded_at, expected.recorded_at);
+            assert_eq!(actual.series.intervals, expected.series.intervals);
+        }
+    }
+}
+
+#[tokio::test]
 async fn one_tenants_correction_does_not_supersede_anothers_reading() {
     let (store, _w) = store_with_tenant_identity().await;
 
@@ -1021,4 +1056,229 @@ async fn authoritative_retries_preserve_identity_and_transaction_time_per_delive
         sum_kwh(&store, "SELECT CAST(SUM(value) AS BIGINT) FROM readings").await,
         7
     );
+}
+
+/// The quantity is unchanged in every delivery. Only the selected term distinguishes versions.
+#[tokio::test]
+async fn selected_native_terms_identify_a_replay_on_both_tiers() {
+    use metering::{MeterInterval, QualityFlag, Unit};
+    use meterstore::{ReplayField, session::Effect};
+
+    let (store, _warehouse) = store_with_columns(|c| {
+        c.assert_on(ReplayField::Quality)
+            .assert_on(ReplayField::Span)
+            .assert_on(ReplayField::Unit)
+    })
+    .await;
+    let mut original = reading("gas", 10, 1);
+    original.sparte = Sparte::Gas;
+    let interval = &original.series.intervals[0];
+    let with_interval = |end, quality| {
+        let mut delivery = original.clone();
+        delivery.series.intervals =
+            vec![MeterInterval::new(interval.from(), end, interval.value(), quality).unwrap()];
+        delivery
+    };
+    let changes = [
+        (
+            "quality",
+            with_interval(interval.to(), QualityFlag::Estimated),
+        ),
+        (
+            "to",
+            with_interval(interval.to() + Duration::MICROSECOND, interval.quality()),
+        ),
+        ("unit", original.clone().in_unit(Unit::CubicMetre)),
+    ];
+    let same_end = with_interval(interval.to() + Duration::NANOSECOND, interval.quality());
+    store.append(std::slice::from_ref(&original)).await.unwrap();
+
+    for cold in [false, true] {
+        if cold {
+            store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+            assert!(D20 < store.watermark().await.unwrap().get());
+        }
+        for (field, delivery) in &changes {
+            let err = store
+                .append(std::slice::from_ref(delivery))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, meterstore::Error::IntegrityViolation {constraint: Some(name), detail, ..}
+                    if name == "version_identifies_one_assertion" && detail.contains(&format!("{field:?}"))),
+                "{err}"
+            );
+        }
+        let same = store.append(std::slice::from_ref(&same_end)).await.unwrap();
+        assert_eq!(same.displacements[0].effect, Effect::Duplicate);
+        assert_eq!(same.total(), 0);
+
+        // An otherwise insertable version alongside a conflict rolls back.
+        let conflict = &[reading("another", 10, 1), changes[0].1.clone()];
+        if cold {
+            assert!(store.append(conflict).await.is_err());
+        } else {
+            assert!(
+                store
+                    .hot_writer()
+                    .await
+                    .unwrap()
+                    .append(conflict)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            sum_kwh(
+                &store,
+                "SELECT COUNT(*) FROM readings_versions WHERE tenant = 'another'"
+            )
+            .await,
+            0
+        );
+
+        // Authored retries consult the current winner even when the requested
+        // version already exists with an unchanged quantity.
+        for (_, change) in &changes {
+            let current = store
+                .append_authoritative(std::slice::from_ref(&original))
+                .await
+                .unwrap();
+            assert_eq!(current.total(), 0);
+            let mut changed = change.clone();
+            changed.version = current.displacements[0].current().version.next().unwrap();
+            store.append(&[changed]).await.unwrap();
+            let reapplied = store
+                .append_authoritative(std::slice::from_ref(&original))
+                .await
+                .unwrap();
+            assert_eq!(reapplied.total(), 1);
+            assert_eq!(reapplied.displacements[0].effect, Effect::Superseded);
+        }
+    }
+}
+
+#[tokio::test]
+async fn selecting_quality_leaves_unit_and_span_descriptive() {
+    use metering::{MeterInterval, Unit};
+    let (store, _warehouse) =
+        store_with_columns(|c| c.assert_on(meterstore::ReplayField::Quality)).await;
+    let mut original = reading("gas", 10, 1);
+    original.sparte = Sparte::Gas;
+    store.append(std::slice::from_ref(&original)).await.unwrap();
+    let mut changed = original.in_unit(Unit::CubicMetre);
+    let interval = &changed.series.intervals[0];
+    changed.series.intervals = vec![
+        MeterInterval::new(
+            interval.from(),
+            interval.to() + Duration::SECOND,
+            interval.value(),
+            interval.quality(),
+        )
+        .unwrap(),
+    ];
+    for cold in [false, true] {
+        if cold {
+            store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+        }
+        assert_eq!(
+            store
+                .append(std::slice::from_ref(&changed))
+                .await
+                .unwrap()
+                .total(),
+            0
+        );
+    }
+}
+
+/// Exactly one correction can consume a slot's current scoped version. Both
+/// contenders carry the same quantity, so treating a retry as a successful
+/// duplicate would give two producers confirmation for the same transition.
+#[tokio::test]
+async fn a_predecessor_can_be_consumed_once_per_identity_in_either_tier() {
+    let (store, _warehouse) = store_with_tenant_identity().await;
+    let a = store.scoped("tenant", "a").await.unwrap();
+    let b = store.scoped("tenant", "b").await.unwrap();
+    let original = reading("a", 10, 7);
+    let mut change = reading("a", 25, 7);
+    change.recorded_at += Duration::HOUR;
+    let absent = a.correct_if_current(&change).await.unwrap_err();
+    assert!(matches!(
+        absent,
+        meterstore::Error::PredecessorMismatch { actual: None, .. }
+    ));
+    store
+        .append(&[original, reading("b", 20, 30)])
+        .await
+        .unwrap();
+
+    let mut wrong_scope = change.clone();
+    wrong_scope.version = ScopedVersion::new(
+        VersionScope::for_interval("9910000000010", D20, Sparte::Strom).unwrap(),
+        change.version.version(),
+    );
+    let wrong = a.correct_if_current(&wrong_scope).await.unwrap_err();
+    assert!(
+        matches!(wrong, meterstore::Error::PredecessorMismatch { actual: Some(ref actual), .. } if actual == &change.version)
+    );
+    assert!(b.correct_if_current(&change).await.is_err());
+    let mut empty = change.clone();
+    empty.series.intervals.clear();
+    assert!(a.correct_if_current(&empty).await.is_err());
+    let mut multiple = change.clone();
+    multiple
+        .series
+        .intervals
+        .push(change.series.intervals[0].clone());
+    assert!(a.correct_if_current(&multiple).await.is_err());
+
+    for archived in [false, true] {
+        if archived {
+            store.admin().archive(D21 + Duration::DAY, 4).await.unwrap();
+            assert!(store.watermark().await.unwrap().get() > D20);
+        }
+        let deliveries = a
+            .series(change.series.malo_id)
+            .unwrap()
+            .range(D20, D21)
+            .collect_deliveries()
+            .await
+            .unwrap();
+        let [observed] = deliveries.as_slice() else {
+            panic!("one slot")
+        };
+        assert_eq!(observed.version, change.version);
+        let expected = observed.version.clone();
+        let next = expected.next().unwrap();
+        let other = store.scoped("tenant", "a").await.unwrap();
+        let (left, right) = tokio::join!(
+            a.correct_if_current(&change),
+            other.correct_if_current(&change)
+        );
+        let (success, failure) = match (left, right) {
+            (Ok(success), Err(failure)) | (Err(failure), Ok(success)) => (success, failure),
+            pair => panic!("exactly one correction must succeed: {pair:?}"),
+        };
+        assert!(!failure.is_retryable());
+        assert!(
+            matches!(failure, meterstore::Error::PredecessorMismatch { expected: ref exp, actual: Some(ref actual) } if exp == &expected && actual == &next)
+        );
+        assert_eq!(success.effect, meterstore::session::Effect::Superseded);
+        assert_eq!(success.superseded.unwrap().version, expected);
+        assert_eq!(success.written.version, next);
+        assert_eq!(success.written.recorded_at, change.recorded_at);
+        assert_eq!(success.identity, [("tenant".to_string(), "a".to_string())]);
+        let independent = reading("a", 70, next.version().get() + 2);
+        a.append(std::slice::from_ref(&independent)).await.unwrap();
+        change.version = next;
+        let stale = a.correct_if_current(&change).await.unwrap_err();
+        assert!(
+            matches!(stale, meterstore::Error::PredecessorMismatch { actual: Some(ref actual), .. } if actual == &independent.version)
+        );
+        change.version = independent.version;
+        change.recorded_at += Duration::HOUR;
+    }
+    assert_eq!(count(&b, "SELECT COUNT(*) FROM readings_versions").await, 1);
+    assert_eq!(count(&a, "SELECT COUNT(*) FROM readings_versions").await, 5);
 }

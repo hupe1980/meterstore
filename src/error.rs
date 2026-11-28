@@ -79,7 +79,17 @@ pub enum Error {
         detail: String,
     },
 
-    /// PostgreSQL aborted the transaction because concurrent operations could
+    /// The reading's scoped version differs from the correction's expected predecessor.
+    /// Read its current delivery before deciding whether the correction still applies.
+    #[error("the expected predecessor {expected:?} differs from the current version {actual:?}")]
+    PredecessorMismatch {
+        /// The caller's observed version.
+        expected: crate::ScopedVersion,
+        /// The winner at this reading's full identity, or `None` for an absent slot.
+        actual: Option<crate::ScopedVersion>,
+    },
+
+    /// A backend aborted the write because concurrent operations could
     /// not be serialized. The whole transaction can be retried.
     #[error("concurrent write conflict: retry the transaction")]
     ConcurrentWrite,
@@ -130,6 +140,11 @@ pub enum Error {
         /// When the sweep expired it.
         expired_at: time::OffsetDateTime,
     },
+
+    /// A suppression tombstone prevents registration of the identifier.
+    /// The error carries no identifying data and can be matched by an ingest consumer.
+    #[error("subject registration refused because erasure suppression is active")]
+    SubjectSuppressed,
 
     /// Configuration failed validation.
     #[error("invalid configuration: {0}")]
@@ -204,6 +219,21 @@ pub enum Error {
         detail: String,
     },
 
+    /// An append stopped after one or more tier operations were acknowledged.
+    ///
+    /// The receipt includes confirmed duplicates and shadowed writes. A failed
+    /// acknowledgement can leave the final commit uncertain. Reconcile that
+    /// operation against version history before resuming an authored delivery.
+    #[error("append interrupted after confirming {hot} hot and {cold} cold rows: {source}",
+        hot = .confirmed.hot_rows, cold = .confirmed.cold_rows)]
+    PartialAppend {
+        /// Confirmed row counts and effects across all completed portions.
+        confirmed: Box<crate::session::AppendOutcome>,
+        /// The error that stopped the append.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A storage backend failed: a connection that dropped, a disk that filled, a
     /// catalogue that timed out. Retrying is the right default for all of it.
     ///
@@ -265,6 +295,7 @@ impl Error {
     /// answer gets served for a week.
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::PartialAppend { source, .. } => source.is_retryable(),
             Self::LockTimeout { .. }
             | Self::Storage(_)
             | Self::BoundaryMoved { .. }
@@ -420,6 +451,7 @@ impl Error {
                 detail: detail.clone(),
             },
             Self::Config(m) => Self::Config(m.clone()),
+            Self::SubjectSuppressed => Self::SubjectSuppressed,
             Self::Quarantined { table, detail } => Self::Quarantined {
                 table: table.clone(),
                 detail: detail.clone(),
@@ -446,10 +478,18 @@ impl Error {
                 constraint: constraint.clone(),
                 detail: detail.clone(),
             },
+            Self::PartialAppend { confirmed, source } => Self::PartialAppend {
+                confirmed: confirmed.clone(),
+                source: Box::new(source.reissue()),
+            },
             Self::Storage(m) => Self::Storage(m.clone()),
             Self::BoundaryMoved { table, detail } => Self::BoundaryMoved {
                 table: table.clone(),
                 detail: detail.clone(),
+            },
+            Self::PredecessorMismatch { expected, actual } => Self::PredecessorMismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
             },
             Self::ConcurrentWrite => Self::ConcurrentWrite,
             Self::MixedTierBatch { table, watermark } => Self::MixedTierBatch {

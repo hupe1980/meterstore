@@ -52,6 +52,10 @@ async fn point_store() -> (meterstore::MeterStore, tempfile::TempDir) {
 
 /// [`point_store`] with the Messlokation in or out of the merge key.
 async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::TempDir) {
+    point_store_with(TableConfig::new(TABLE).identify_by_melo(by_melo)).await
+}
+
+async fn point_store_with(config: TableConfig) -> (meterstore::MeterStore, tempfile::TempDir) {
     let url = meterstore::testkit::postgres::fresh_database()
         .await
         .expect("postgres");
@@ -83,9 +87,8 @@ async fn point_store_keyed(by_melo: bool) -> (meterstore::MeterStore, tempfile::
         8 * 1024 * 1024,
     ));
 
-    let config = TableConfig::new(TABLE)
+    let config = config
         .time_model(TimeModel::Point)
-        .identify_by_melo(by_melo)
         .settlement_lag(Duration::days(1))
         .build()
         .expect("config");
@@ -1080,5 +1083,50 @@ async fn single_tier_point_batches_use_the_reading_instant() {
             .to_json()
             .unwrap();
         assert_eq!(rows[0]["n"].as_i64(), Some(0));
+    }
+}
+
+#[tokio::test]
+async fn point_replays_compare_selected_quality_and_unit_in_both_tiers() {
+    let (store, _warehouse) = point_store_with(
+        TableConfig::new(TABLE)
+            .assert_on(meterstore::ReplayField::Quality)
+            .assert_on(meterstore::ReplayField::Unit),
+    )
+    .await;
+    let mut original = zsg(START, 1, 10, 1);
+    original.sparte = Sparte::Gas;
+    store
+        .append_readings(std::slice::from_ref(&original))
+        .await
+        .unwrap();
+    let mut estimated = original.clone();
+    estimated.readings[0].quality = QualityFlag::Estimated;
+    let volume = original.clone().in_unit(Unit::CubicMetre);
+    for cold in [false, true] {
+        if cold {
+            store
+                .admin()
+                .archive(START + Duration::days(2), 4)
+                .await
+                .unwrap();
+            assert!(START < store.watermark().await.unwrap().get());
+        }
+        for (field, delivery) in [("quality", &estimated), ("unit", &volume)] {
+            let error = store
+                .append_readings(std::slice::from_ref(delivery))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, meterstore::Error::IntegrityViolation {constraint: Some(name), detail, ..}
+                if name == "version_identifies_one_assertion" && detail.contains(&format!("{field:?}"))),
+                "{error}"
+            );
+        }
+        let replay = store
+            .append_readings(std::slice::from_ref(&original))
+            .await
+            .unwrap();
+        assert_eq!(replay.total(), 0);
     }
 }

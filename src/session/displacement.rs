@@ -35,6 +35,8 @@ use crate::version::ScopedVersion;
 /// One stored assertion about a reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredValue {
+    /// Exclusive interval end at storage precision, or `None` for a register reading.
+    pub to: Option<OffsetDateTime>,
     /// The quantity, in [`unit`](Self::unit).
     pub value: Decimal,
     /// The table's declared assertion attributes, including explicit nulls.
@@ -64,9 +66,24 @@ pub struct StoredValue {
 
 impl StoredValue {
     /// Both values belong to the same table and carry its declared attributes.
-    pub(crate) fn differing_assertion_field(&self, other: &Self) -> Option<&str> {
+    pub(crate) fn differing_assertion_field(
+        &self,
+        other: &Self,
+        fields: &[crate::ReplayField],
+    ) -> Option<&str> {
+        use crate::ReplayField;
         if self.value != other.value {
             return Some(crate::encode::schema::col::VALUE);
+        }
+        for field in fields {
+            let differs = match field {
+                ReplayField::Quality => self.quality != other.quality,
+                ReplayField::Span => self.to != other.to,
+                ReplayField::Unit => self.unit != other.unit,
+            };
+            if differs {
+                return Some(field.column());
+            }
         }
         self.assertion_attributes.iter().find_map(|(name, value)| {
             (other.assertion_attributes.get(name) != Some(value)).then_some(name.as_str())
@@ -160,7 +177,9 @@ pub struct Displacement {
     /// where it is *still* current: the caller can see that its write did not
     /// take, and what holds instead.
     pub superseded: Option<StoredValue>,
-    /// The value this write asserted.
+    /// The stored row at the submitted version. On a duplicate this carries
+    /// the original transaction time and stored reading terms. A higher version
+    /// may already hold the reading, as reported by [`current`](Self::current).
     pub written: StoredValue,
 }
 
@@ -225,6 +244,7 @@ mod tests {
 
     fn value(v: i64, version: u128, quality: QualityFlag) -> StoredValue {
         StoredValue {
+            to: Some(datetime!(2026-07-20 00:15 UTC)),
             assertion_attributes: Default::default(),
             value: Decimal::new(v, 0),
             unit: Unit::KiloWattHour,

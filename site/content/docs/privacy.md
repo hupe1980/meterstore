@@ -182,6 +182,11 @@ matches. Keyed, because identifiers come from small structured spaces an unkeyed
 hash could be enumerated over. `SubjectRegistry::new` omits the secret, and replay
 then defeats erasure — wrong for anything fed by a message broker.
 
+Match `meterstore::Error::SubjectSuppressed` to discard a suppressed delivery.
+The refusal is non-retryable and carries no subject data. Matching the error
+from registration itself keeps the decision in the transaction that checks the
+tombstone. A separate `is_suppressed` call can race with erasure.
+
 `lift_subject_suppression` on the catalog (`lift_suppression` on the registry)
 undoes an erasure carried out against the wrong subject: it allows registering
 again under a new reference, restores no old link, and is itself audited —

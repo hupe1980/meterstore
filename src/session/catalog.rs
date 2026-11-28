@@ -640,7 +640,8 @@ impl MeterCatalog {
     /// reference with, so what this mints is by construction what that accepts.
     ///
     /// Idempotent: the same identifier and epoch return the same reference, so an
-    /// ingest path may call it per batch.
+    /// ingest path may call it per batch. A matching erasure tombstone returns
+    /// [`Error::SubjectSuppressed`].
     ///
     /// [`retention_epoch`]: crate::erasure::retention_epoch
     pub async fn register_subject(

@@ -607,6 +607,7 @@ impl PostgresHot {
         merge_key: &[String],
         batch: &RecordBatch,
         guard: Option<(Duration, &dyn ColdStore)>,
+        expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<crate::session::Displacement>> {
         // The reporting snapshot is valid only for a committed transaction.
         // Both a serialization failure and a deadlock confirm a complete abort.
@@ -614,7 +615,7 @@ impl PostgresHot {
         loop {
             attempts += 1;
             match self
-                .insert_reporting_once(table, merge_key, batch, guard)
+                .insert_reporting_once(table, merge_key, batch, guard, expected)
                 .await
             {
                 Err(Error::ConcurrentWrite) if attempts < 3 => {
@@ -631,10 +632,17 @@ impl PostgresHot {
         merge_key: &[String],
         batch: &RecordBatch,
         guard: Option<(Duration, &dyn ColdStore)>,
+        expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<crate::session::Displacement>> {
         use crate::session::{Displacement, Effect, StoredValue};
 
         let n = batch.num_rows();
+        if expected.is_some() && n != 1 {
+            return Err(Error::encode(
+                "intervals",
+                "a conditional correction requires one row",
+            ));
+        }
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -653,12 +661,16 @@ impl PostgresHot {
         let assertions: Vec<_> = schema
             .fields()
             .iter()
-            .filter(|field| crate::config::is_assertion_column(field))
+            .filter(|field| {
+                crate::config::is_assertion_column(field)
+                    && !matches!(field.name().as_str(), col::TO | col::QUALITY | col::UNIT)
+            })
             .map(|field| field.name())
             .collect();
         let value_of = |row: usize| -> Result<StoredValue> {
             let r = RowView::new(batch, row)?;
             Ok(StoredValue {
+                to: r.to,
                 value: r.value,
                 assertion_attributes: assertions
                     .iter()
@@ -701,7 +713,6 @@ impl PostgresHot {
             rows.push((
                 (r.malo.to_string(), r.obis.to_string(), r.from, ident),
                 value_of(row)?,
-                r.to,
             ));
         }
 
@@ -727,7 +738,7 @@ impl PostgresHot {
             .collect::<String>();
         let sql = format!(
             r#"SELECT s.malo_id, s.obis_code, s."from", s.value, s.unit, s.quality,
-                      s.version, s.version_scope, s.recorded_at{ident_select}
+                      s.version, s.version_scope, s.recorded_at, s."to"{ident_select}
                FROM "{table}" s
                JOIN unnest($1::text[], $2::text[], $3::timestamptz[])
                       AS k(malo_id, obis_code, "from")
@@ -751,12 +762,12 @@ impl PostgresHot {
 
         type Key = (String, String, OffsetDateTime, Vec<(String, String)>);
         let mut current: std::collections::HashMap<Key, StoredValue> = Default::default();
-        let mut seen: std::collections::HashSet<(Key, u128)> = Default::default();
+        let mut exact: std::collections::HashMap<(Key, u128), StoredValue> = Default::default();
 
         for row in &stored {
             let mut ident = Vec::with_capacity(identity.len());
             for (i, name) in identity.iter().enumerate() {
-                ident.push((name.clone(), row.try_get::<String, _>(9 + i).map_err(pg)?));
+                ident.push((name.clone(), row.try_get::<String, _>(10 + i).map_err(pg)?));
             }
             let key: Key = (
                 row.try_get(0).map_err(pg)?,
@@ -769,6 +780,7 @@ impl PostgresHot {
             let quality: String = row.try_get(5).map_err(pg)?;
             let scope: String = row.try_get(7).map_err(pg)?;
             let held = StoredValue {
+                to: row.try_get(col::TO).map_err(pg)?,
                 value: row.try_get(3).map_err(pg)?,
                 assertion_attributes: assertions
                     .iter()
@@ -787,7 +799,7 @@ impl PostgresHot {
                 recorded_at: row.try_get(8).map_err(pg)?,
             };
 
-            seen.insert((key.clone(), held.version.version().get()));
+            exact.insert((key.clone(), held.version.version().get()), held.clone());
             match current.get(&key) {
                 // Ordered through `ScopedVersion`, which refuses a comparison
                 // across scopes rather than guessing — and the one-operator
@@ -799,6 +811,16 @@ impl PostgresHot {
             }
         }
 
+        if let Some(expected) = expected {
+            let (key, written) = &rows[0];
+            expected.require_current(current.get(key).map(|held| &held.version))?;
+            if written.version != expected.next()? {
+                return Err(Error::encode(
+                    col::VERSION,
+                    "a conditional correction must write the predecessor's successor",
+                ));
+            }
+        }
         let inserted = self.insert_rows(&mut tx, table, merge_key, batch).await?;
 
         // Folded in ascending version order, so a batch carrying two versions of
@@ -809,9 +831,17 @@ impl PostgresHot {
 
         let mut out = vec![None; rows.len()];
         for i in order {
-            let (key, written, to) = &rows[i];
+            let (key, written) = &rows[i];
             let prior = current.get(key).cloned();
-            let replayed = !seen.insert((key.clone(), written.version.version().get()));
+            // An exact replay returns the original stored terms and transaction
+            // time even when another version now wins the reading.
+            let (written, replayed) =
+                match exact.entry((key.clone(), written.version.version().get())) {
+                    std::collections::hash_map::Entry::Occupied(entry) => (entry.into_mut(), true),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        (entry.insert(written.clone()), false)
+                    }
+                };
 
             let effect = match &prior {
                 None => Effect::Inserted,
@@ -828,7 +858,7 @@ impl PostgresHot {
                 malo_id: key.0.clone(),
                 obis_code: key.1.clone(),
                 from: key.2,
-                to: *to,
+                to: written.to,
                 identity: key.3.clone(),
                 effect,
                 superseded: prior,
@@ -1079,8 +1109,17 @@ impl PostgresHot {
                 .filter(|field| crate::config::is_assertion_column(field))
                 .map(|field| field.name());
             let compared: Vec<_> = identity.iter().copied().chain(assertions.clone()).collect();
-            let compared_params = (0..compared.len())
-                .map(|i| format!(", ${}::text[]", 8 + i))
+            let compared_params = compared
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let ty = if name.as_str() == col::TO {
+                        "timestamptz"
+                    } else {
+                        "text"
+                    };
+                    format!(", ${}::{ty}[]", 8 + i)
+                })
                 .collect::<String>();
             let compared_cols = compared
                 .iter()
@@ -1133,13 +1172,18 @@ impl PostgresHot {
                     .bind(&value)
                     .bind(&melo)
                     .bind(&version_scope);
-
             for name in compared {
-                let index = extra
-                    .iter()
-                    .position(|e| e == name)
-                    .ok_or_else(|| Error::encode(name.as_str(), "comparison column missing"))?;
-                query = query.bind(&extra_values[index]);
+                query = match name.as_str() {
+                    col::QUALITY => query.bind(&quality),
+                    col::TO => query.bind(&to),
+                    col::UNIT => query.bind(&unit),
+                    _ => {
+                        let index = extra.iter().position(|e| e == name).ok_or_else(|| {
+                            Error::encode(name.as_str(), "comparison column missing")
+                        })?;
+                        query.bind(&extra_values[index])
+                    }
+                };
             }
 
             // On **this** connection, never `self.pool`.
@@ -2048,7 +2092,7 @@ fn rows_to_batches(
     }
 
     Ok(vec![RecordBatch::try_new(
-        schema::storage_schema_at_scale(&fields, value_scale),
+        schema::storage_schema_at_scale(&fields, value_scale, &[]),
         columns,
     )?])
 }
@@ -2678,12 +2722,14 @@ impl HotStore for PostgresHot {
         config: &crate::ValidatedTableConfig,
         batch: &RecordBatch,
         cold: &dyn ColdStore,
+        expected: Option<&crate::ScopedVersion>,
     ) -> Result<Vec<crate::session::Displacement>> {
         self.insert_reporting(
             config.name(),
             &config.merge_key(),
             batch,
             Some((config.archival_step(), cold)),
+            expected,
         )
         .await
     }
@@ -2696,7 +2742,10 @@ impl HotStore for PostgresHot {
     ) -> Result<Vec<crate::session::Displacement>> {
         let mut out = Vec::new();
         for batch in batches {
-            out.extend(self.insert_reporting(table, merge_key, batch, None).await?);
+            out.extend(
+                self.insert_reporting(table, merge_key, batch, None, None)
+                    .await?,
+            );
         }
         Ok(out)
     }

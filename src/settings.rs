@@ -974,6 +974,9 @@ pub struct TableSettings {
     /// Reject batches spanning the tiering watermark before publishing any row.
     #[serde(default)]
     pub require_single_tier: bool,
+    /// Native terms to compare on same-version replay. Span applies to interval tables.
+    #[serde(default)]
+    pub assert_on: Vec<crate::config::ReplayField>,
     /// Whether the Messlokation is part of what identifies a reading.
     ///
     /// Omitted, it follows `time_model`: on for `"point"`, off for
@@ -1025,6 +1028,9 @@ impl TableSettings {
             .snapshot_retention(self.maintenance.snapshot_retention.0)
             .min_snapshots_to_keep(self.maintenance.min_snapshots_to_keep);
 
+        for &field in &self.assert_on {
+            config = config.assert_on(field);
+        }
         if let Some(bytes) = self.archival.declared_file_size {
             config = config.declared_file_size(bytes);
         }
@@ -1934,6 +1940,29 @@ extra_columns = [{ name = "price", assertion = true, values = ["0", "1"] }]
                 .to_string()
                 .contains("both identity and assertion")
         );
+    }
+
+    #[test]
+    fn native_replay_fields_are_validated_against_the_time_model() {
+        use crate::ReplayField;
+        let config = r#"[[tables]]
+name = "readings"
+assert_on = ["quality", "span", "unit"]
+"#;
+        let table = Settings::from_toml(config).unwrap().single_table().unwrap();
+        assert_eq!(
+            table.replay_fields(),
+            &[ReplayField::Quality, ReplayField::Span, ReplayField::Unit]
+        );
+        let point = format!("{config}time_model = \"point\"");
+        assert!(
+            Settings::from_toml(&point)
+                .and_then(|s| s.single_table())
+                .unwrap_err()
+                .to_string()
+                .contains("span")
+        );
+        assert!(Settings::from_toml(&config.replace("quality", "misspelled")).is_err());
     }
 
     #[test]

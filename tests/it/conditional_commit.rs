@@ -480,3 +480,27 @@ async fn a_commit_that_landed_unanswered_is_reported_as_landed() {
         "the landed snapshot's files are still in the warehouse"
     );
 }
+
+/// A correction checked against a pinned snapshot can only consume that head.
+#[tokio::test]
+async fn a_conditional_correction_cannot_rebase_onto_an_independent_commit() {
+    let table = "predecessor_snapshot";
+    let (_harness, plain, guarded, interleave) = setup(table).await;
+    let head = plain.current_snapshot_id(table).await.unwrap().unwrap();
+
+    // A new head observed before staging and one published inside the catalogue
+    // loop must both invalidate the decision. A commit-id acknowledgement can
+    // still recognise an ambiguous success.
+    interleave.arm(2, archive_next_day(&plain, table));
+    for _ in 0..2 {
+        let refusal = guarded
+            .append_if_snapshot(table, head, stream_of(some_rows(2)), WriteHints::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refusal, meterstore::Error::ConcurrentWrite),
+            "{refusal}"
+        );
+    }
+    assert_eq!(plain.snapshots(table).await.unwrap().len(), 2);
+}

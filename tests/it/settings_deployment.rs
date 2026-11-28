@@ -357,7 +357,7 @@ archival_step = "1d"
         )
         .await
         .expect_err("suppressed");
-    assert!(err.to_string().contains("erased"), "{err}");
+    assert!(matches!(err, meterstore::Error::SubjectSuppressed), "{err}");
 }
 
 #[tokio::test]

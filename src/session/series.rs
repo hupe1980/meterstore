@@ -292,6 +292,16 @@ impl<'a> SeriesQuery<'a> {
         Ok(self.resolve().await?.0.map(|r| (r.sparte, r.series)))
     }
 
+    /// Read the winning intervals with the metadata and scoped version of each delivery.
+    ///
+    /// Each returned group contains intervals that share all delivery fields, including
+    /// transaction time and application attributes. A delivery can span several groups
+    /// at record-batch boundaries. The query's filters and tenant scope apply to every row.
+    /// Use this when exporting provenance or taking a predecessor version for a correction.
+    pub async fn collect_deliveries(self) -> Result<Vec<crate::encode::StoredSeries>> {
+        Ok(self.scan().await?.0)
+    }
+
     /// As [`collect`](Self::collect), but also returning the commodity **and** the
     /// values of the deployment's declared attribute/identity columns for the
     /// series (tenant, reporting party, ingestion source, …), taken from the newest

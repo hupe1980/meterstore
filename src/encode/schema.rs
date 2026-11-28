@@ -187,7 +187,7 @@ pub fn micros(instant: time::OffsetDateTime) -> i64 {
     // The saturating fallback is unreachable while the test below passes; it is
     // here so that a graph which does enable `large-dates` clamps to a wrong-but-
     // bounded instant instead of wrapping to a plausible one in the far past.
-    i64::try_from(instant.unix_timestamp_nanos() / 1_000).unwrap_or(i64::MAX)
+    i64::try_from(instant.unix_timestamp_nanos().div_euclid(1_000)).unwrap_or(i64::MAX)
 }
 
 /// The inverse of [`micros`].
@@ -234,10 +234,14 @@ const EPOCH: time::Date = time::macros::date!(1970 - 01 - 01);
 /// in configuration rather than in a Rust type. They are appended
 /// after the core columns so core field positions stay stable across deployments.
 pub fn storage_schema(extra: &[Field]) -> SchemaRef {
-    storage_schema_at_scale(extra, VALUE_SCALE)
+    storage_schema_at_scale(extra, VALUE_SCALE, &[])
 }
 
-pub(crate) fn storage_schema_at_scale(extra: &[Field], value_scale: i8) -> SchemaRef {
+pub(crate) fn storage_schema_at_scale(
+    extra: &[Field],
+    value_scale: i8,
+    replay_fields: &[crate::config::ReplayField],
+) -> SchemaRef {
     let mut fields = vec![
         Field::new(col::MALO_ID, DataType::Utf8, false),
         Field::new(col::MELO_ID, DataType::Utf8, true),
@@ -270,6 +274,15 @@ pub(crate) fn storage_schema_at_scale(extra: &[Field], value_scale: i8) -> Schem
         Field::new(col::RECORDED_AT, timestamp_type(), false),
         Field::new(col::BALANCING_DAY, DataType::Date32, false),
     ];
+    for selected in replay_fields {
+        let native = fields
+            .iter_mut()
+            .find(|f| f.name() == selected.column())
+            .expect("native replay column");
+        native
+            .metadata_mut()
+            .insert(crate::config::ASSERTION_KEY.into(), "true".into());
+    }
     fields.extend_from_slice(extra);
     Arc::new(Schema::new(fields))
 }
@@ -327,7 +340,7 @@ mod tests {
         for date in [Date::MIN, Date::MAX] {
             for at in [Time::MIDNIGHT, Time::MAX] {
                 let instant = PrimitiveDateTime::new(date, at).assume_utc();
-                let nanos = instant.unix_timestamp_nanos() / 1_000;
+                let nanos = instant.unix_timestamp_nanos().div_euclid(1_000);
                 assert!(
                     i64::try_from(nanos).is_ok(),
                     "{instant} does not fit the storage encoding — has `large-dates` \
@@ -336,6 +349,12 @@ mod tests {
                 assert_eq!(micros(instant), nanos as i64);
             }
         }
+
+        // Encoding keeps the instant in its microsecond on both sides of the epoch.
+        assert_eq!(
+            micros(OffsetDateTime::UNIX_EPOCH - time::Duration::NANOSECOND),
+            -1
+        );
 
         // And the inverse round-trips over the range the store actually holds.
         let mut at = time::macros::datetime!(1970-01-01 00:00 UTC);

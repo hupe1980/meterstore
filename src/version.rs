@@ -115,7 +115,7 @@ impl Version {
     /// # Ok::<(), meterstore::Error>(())
     /// ```
     pub fn arrival(recorded_at: OffsetDateTime) -> Result<Self> {
-        let millis = recorded_at.unix_timestamp_nanos() / 1_000_000;
+        let millis = recorded_at.unix_timestamp_nanos().div_euclid(1_000_000);
         let millis = u128::try_from(millis).map_err(|_| {
             Error::encode(
                 "version",
@@ -450,6 +450,17 @@ impl ScopedVersion {
         self.version
     }
 
+    /// Check the version observed for a single reading in the writer's transaction.
+    pub(crate) fn require_current(&self, actual: Option<&Self>) -> Result<()> {
+        if actual != Some(self) {
+            return Err(Error::PredecessorMismatch {
+                expected: self.clone(),
+                actual: actual.cloned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Order against another version, or fail if the scopes differ.
     ///
     /// This is the whole point of the type. `max(version)` resolution
@@ -659,7 +670,7 @@ mod tests {
 
         // Versions are unsigned and must ascend; a negative one cannot be stored
         // and would order wrongly if it could.
-        let err = Version::arrival(datetime!(1969-12-31 23:59 UTC))
+        let err = Version::arrival(datetime!(1970-01-01 00:00 UTC) - Duration::NANOSECOND)
             .unwrap_err()
             .to_string();
         assert!(err.contains("epoch"), "{err}");
