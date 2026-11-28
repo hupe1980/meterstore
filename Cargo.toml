@@ -1,6 +1,6 @@
 [package]
 name = "meterstore"
-version = "0.19.0"
+version = "0.19.1"
 edition = "2024"
 authors = ["hupe1980"]
 description = "Hot/cold tiered store for metering time series — PostgreSQL for the recent window, Apache Iceberg for history."
@@ -19,7 +19,6 @@ rust-version = "1.95"
 # of which are default features.
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 # Full debug info makes each test binary ~420 MB of dependency DWARF, and enough
 # of those exhaust a CI runner's disk — reported by `rust-lld` as a bus error.

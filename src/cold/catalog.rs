@@ -215,7 +215,7 @@ fn apply_warehouse_auth(
     }
 }
 
-/// Everything needed to build a `SqlCatalog`-backed [`IcebergCold`] cold tier.
+/// Builds an [`IcebergCold`] cold tier backed by a SQL catalog. Requires the `sql-catalog` feature.
 ///
 /// The catalog's metadata lives in `database_url` (normally the same PostgreSQL as
 /// the hot tier), and the table files in `warehouse_uri`'s object store. Pass it to
@@ -227,7 +227,6 @@ fn apply_warehouse_auth(
 /// recommended deployment puts the catalogue on the same database.
 #[derive(Clone)]
 #[cfg(feature = "sql-catalog")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sql-catalog")))]
 pub struct IcebergSqlCatalog<'a> {
     /// PostgreSQL URL for the catalog's own metadata (create/load table).
     pub database_url: &'a str,

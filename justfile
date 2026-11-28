@@ -92,7 +92,7 @@ lint:
 
 # Build docs, warnings as errors.
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo doc --no-deps --all-features
 
 # Open the docs in a browser.
 doc-open:

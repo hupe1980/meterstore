@@ -77,7 +77,7 @@ jobs:
       - run: cargo test --all-features
       - run: cargo doc --no-deps --all-features
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
       # Catches packaging problems — a file excluded from the crate that the
       # build needs — which only appear once published.

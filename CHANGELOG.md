@@ -2,6 +2,13 @@
 
 MeterStore is pre-1.0. Releases can change the Rust API and SQL schema.
 
+## [0.19.1] — 2026-11-28
+
+### Fixed
+
+- Fixed the docs.rs build for the SQL catalog API. Local and release checks
+  exercise the hosted documentation configuration.
+
 ## [0.19.0] — 2026-11-28
 
 ### Added

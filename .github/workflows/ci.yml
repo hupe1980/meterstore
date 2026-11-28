@@ -52,7 +52,7 @@ jobs:
       - name: Docs
         run: cargo doc --no-deps --all-features
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
   # A support floor nobody runs is a claim. This crate's other claims are not, so
   # the whole integration suite runs against the oldest PostgreSQL the
